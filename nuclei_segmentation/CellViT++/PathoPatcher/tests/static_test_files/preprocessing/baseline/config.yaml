@@ -1,0 +1,15 @@
+# dataset paths
+wsi_paths: ./test_database/input/WSI/CMU-1-Small-Region.svs
+output_path: ./tests/tmp_results_folder/baseline
+wsi_extension: svs
+
+# basic setups
+downsample: 1
+processes: 8
+
+# other
+log_level: debug
+overwrite: True
+
+apply_prefilter: True
+filter_patches: False
