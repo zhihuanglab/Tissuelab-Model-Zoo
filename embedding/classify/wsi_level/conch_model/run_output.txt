@@ -1,0 +1,32 @@
+Wed Jan 15 17:28:18 2025       
++---------------------------------------------------------------------------------------+
+| NVIDIA-SMI 535.183.01             Driver Version: 535.183.01   CUDA Version: 12.2     |
+|-----------------------------------------+----------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |         Memory-Usage | GPU-Util  Compute M. |
+|                                         |                      |               MIG M. |
+|=========================================+======================+======================|
+|   0  NVIDIA A100 80GB PCIe          On  | 00000000:D8:00.0 Off |                    0 |
+| N/A   25C    P0              43W / 300W |      0MiB / 81920MiB |      0%      Default |
+|                                         |                      |             Disabled |
++-----------------------------------------+----------------------+----------------------+
+                                                                                         
++---------------------------------------------------------------------------------------+
+| Processes:                                                                            |
+|  GPU   GI   CI        PID   Type   Process name                            GPU Memory |
+|        ID   ID                                                             Usage      |
+|=======================================================================================|
+|  No running processes found                                                           |
++---------------------------------------------------------------------------------------+
+Initialized with CONCH model
+CONCH updated with 3 classes: ['nodular melanoma', 'congenital naevi', 'lung squamous cell carcinoma']
+CONCH received 1 WSI images
+
+WSI Path: /cbica/home/yaoji/Projects/VLM/a_tissuelab/test_wsi_image/CMU-1.svs
+Predicted Class: nodular melanoma
+
+Class Probabilities:
+nodular melanoma: 0.5333
+congenital naevi: 0.2972
+lung squamous cell carcinoma: 0.1695
+--------------------------------------------------

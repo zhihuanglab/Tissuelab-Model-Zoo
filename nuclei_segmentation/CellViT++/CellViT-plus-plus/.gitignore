@@ -1,0 +1,51 @@
+# pytorch
+*.pt
+*.pth
+*.bin
+
+# Exception for .pth files in ./checkpoints/classifier
+!checkpoints/classifier/**/*.pth
+
+# vscode
+.vscode
+
+# cache
+*.pyc
+__pycache__/
+**/cache/
+
+# wsi and examples
+*.svs
+*.tiff
+/examples/wsi
+/examples/output
+/examples/preprocessing_tcga.yaml
+/examples/preprocessing_apoptosis.yaml
+/examples/preprocessing_cmu.yaml
+/examples/preprocessing_selocan.yaml
+/examples/preprocessing_selocan_roi.yaml
+/test-results
+/tests
+/debug
+
+# notebooks
+/notebooks
+
+# other
+.DS_Store
+cufile.log
+
+# local testing and checkpoints
+/logs_local
+/logs/Head-Evaluation
+
+# shell scripts for automation
+/runtime-scripts
+/scripts_local
+
+# due to privacy and security reasons
+/train_configs
+
+# annotation tool
+/annotation_tool/application
+/annotation_tool/Dockerfile
