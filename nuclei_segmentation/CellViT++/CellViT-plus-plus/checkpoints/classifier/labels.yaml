@@ -1,0 +1,40 @@
+pannuke:
+  0: Background
+  1: Neoplastic
+  2: Inflammatory
+  3: Connective
+  4: Dead
+  5: Epithelial
+
+consep:
+  0: Other
+  1: Inflammatory
+  2: Epithelial
+  3: Spindle-Shaped
+
+lizard:
+  0: Neutrophil
+  1: Epithelial
+  2: Lymphocyte
+  3: Plasma
+  4: Eosinophil
+  5: Connective tissue
+
+nucls_main:
+
+nucls_super:
+
+
+panoptils:
+  0: Other Cells
+  1: Epithelial Cells
+  2: Stromal Cells
+  3: TILs
+
+ocelot:
+  0: Other Cell
+  1: Tumor Cell
+
+midog:
+  0: Mitotic
+  1: Non-Mitotic
