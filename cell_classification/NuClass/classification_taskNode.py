@@ -199,6 +199,8 @@ def run_classification(args) -> Dict[str, Any]:
             else:
                 annotations_data = None
                 use_supervised = False
+        
+        time.sleep(1)
 
         # B) read embedding => "SegmentationNode/embedding"
         with h5py.File(h5_path, 'r') as hf:
@@ -208,6 +210,8 @@ def run_classification(args) -> Dict[str, Any]:
             if 'embedding' not in seg_grp:
                 raise ValueError("embedding dataset not found in h5 file => no cell_embeddings")
             cell_embeddings = seg_grp['embedding'][()]
+        
+        time.sleep(1)
 
         # C) supervised or zero-shot
         tissue_type = getattr(args, "tissue_type", None)
@@ -243,8 +247,8 @@ def run_classification(args) -> Dict[str, Any]:
             # color
             final_class_colors = None
             with h5py.File(h5_path, 'r') as hf:
-                if 'cell_classification' in hf and 'nuclei_class_HEX_color' in hf['cell_classification']:
-                    old_colors = hf['cell_classification']['nuclei_class_HEX_color'][()]
+                if 'ClassificationNode' in hf and 'nuclei_class_HEX_color' in hf['ClassificationNode']:
+                    old_colors = hf['ClassificationNode']['nuclei_class_HEX_color'][()]
                     if len(old_colors) == len(nuclei_classes):
                         final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
             if final_class_colors is None:
@@ -253,9 +257,9 @@ def run_classification(args) -> Dict[str, Any]:
 
         # D) result => cell_classification
         with h5py.File(h5_path, 'a') as hf:
-            if 'cell_classification' in hf:
-                del hf['cell_classification']
-            grp_cls = hf.create_group('cell_classification')
+            if NODE_NAME in hf:
+               del hf[NODE_NAME]
+            grp_cls = hf.create_group(NODE_NAME)
 
             grp_cls.create_dataset('nuclei_class_id', data=predictions.astype(np.int32))
 
@@ -366,6 +370,7 @@ def read_node(data: Dict[str, Any]):
 @app.post("/execute")
 def execute_node():
     global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME
+    
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
 
@@ -390,6 +395,7 @@ def execute_node():
             hf.create_dataset(out_ds, data=out_str.encode("utf-8"))
             hf.flush()
         time.sleep(1)
+
 
     return {"status": "ok", "output": out_val}
 
