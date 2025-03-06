@@ -70,14 +70,14 @@ def _generate_text_description(processor,
                                text_encoder,
                                text_projection,
                                nuclei_classes: list[str],
-                               tissue_type: str = None,
+                               organ: str = None,
                                device: str = "cuda"
                                ) -> list[np.ndarray]:
     """Generate text prompts for each nuclei_class and create their feature vectors."""
     embeddings = []
     for nuclei_class in nuclei_classes:
-        if tissue_type:
-            prompt = f"{nuclei_class} cell in {tissue_type} tissue"
+        if organ:
+            prompt = f"{nuclei_class} cell in {organ} organ"
         else:
             prompt = f"{nuclei_class} cell"
         embedding = encode_text(processor, text_encoder, text_projection, prompt, device)
@@ -214,7 +214,7 @@ def run_classification(args) -> Dict[str, Any]:
         time.sleep(1)
 
         # C) supervised or zero-shot
-        tissue_type = getattr(args, "tissue_type", None)
+        organ = getattr(args, "organ", None)
         nuclei_classes = getattr(args, "nuclei_classes", [])
         if len(nuclei_classes) == 0:
             nuclei_classes = ["Negative control", "Tumor", "Lymphocyte"]
@@ -235,7 +235,7 @@ def run_classification(args) -> Dict[str, Any]:
 
             # construct class_embeddings
             class_embeddings = _generate_text_description(processor, text_encoder, text_projection,
-                                                          nuclei_classes, tissue_type, device)
+                                                          nuclei_classes, organ, device)
             sims = []
             for ce in class_embeddings:
                 sim = np.dot(cell_embeddings, ce.T)
@@ -272,7 +272,7 @@ def run_classification(args) -> Dict[str, Any]:
             metadata = {
                 "nuclei_classes": final_class_names,
                 "classification_method": classification_method,
-                "tissue_type": tissue_type
+                "organ": organ
             }
             if use_supervised and annotations_data is not None:
                 metadata["training_time"] = train_time
@@ -341,7 +341,7 @@ def read_node(data: Dict[str, Any]):
     if ARGS is None:
         ARGS = argparse.Namespace(
             slidepath="",
-            tissue_type="Breast",
+            organ="Breast",
             nuclei_classes=["Negative control", "Tumor", "Lymphocyte"]
         )
 
@@ -359,8 +359,8 @@ def read_node(data: Dict[str, Any]):
 
                 if k == "path":
                     ARGS.slidepath = val_json
-                elif k == "tissue_type":
-                    ARGS.tissue_type = val_json
+                elif k == "organ":
+                    ARGS.organ = val_json
                 elif k == "nuclei_classes":
                     if isinstance(val_json, list):
                         ARGS.nuclei_classes = val_json
