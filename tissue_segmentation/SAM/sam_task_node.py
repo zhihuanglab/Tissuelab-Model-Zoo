@@ -542,7 +542,7 @@ def main():
     print(torch.cuda.is_available())
     print(torch.cuda.device_count())
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8004)
+    parser.add_argument("--port", type=int, default=8007)
     parser.add_argument("--name", type=str, default="SAMNode")
     args = parser.parse_args()
     manager_url = "http://localhost:5001/api/tasks/v1/create_node"
