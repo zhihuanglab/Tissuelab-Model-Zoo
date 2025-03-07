@@ -136,8 +136,8 @@ def read_wsi_to_patches(wsi_path, bbox, patch_size=1024, overlap=100):
     scaled_height = int(height / downsample_factor)
 
     stride = patch_size - overlap
-    n_cols = ((scaled_width - patch_size) // stride) + 1
-    n_rows = ((scaled_height - patch_size) // stride) + 1
+    n_cols = max(1, ((scaled_width - patch_size) // stride) + 1)
+    n_rows = max(1, ((scaled_height - patch_size) // stride) + 1)
 
     print(f"Best Level: {best_level}, Downsample Factor: {downsample_factor}")
     print(f"Scaled Size: {scaled_width}x{scaled_height}, Patches: {n_rows}x{n_cols} (overlap={overlap}px)")
