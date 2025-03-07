@@ -1,4 +1,0 @@
-/cbica/home/yaoji/.conda/envs/llava/lib/python3.10/site-packages/torch/_utils.py:831: UserWarning: TypedStorage is deprecated. It will be removed in the future and UntypedStorage will be the only storage class. This should only matter to you if you are using storages directly.  To access UntypedStorage directly, use tensor.untyped_storage() instead of tensor.storage()
-  return self.fget.__get__(instance, owner)()
-/gpfs/fs001/cbica/home/yaoji/Projects/VLM/a_tissuelab/wsi_level/plip_model/wsi_process.py:15: UserWarning: compatibility: aliasing tiffslide.TiffSlide to 'OpenSlide'
-  slide = openslide.OpenSlide(wsi_path)
