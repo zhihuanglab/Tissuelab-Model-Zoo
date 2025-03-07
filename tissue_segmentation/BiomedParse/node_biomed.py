@@ -10,9 +10,12 @@ import cv2
 import numpy as np
 import requests
 from PIL import Image
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 from typing import Dict, Any
 from pathlib import Path
+from sse_starlette.sse import EventSourceResponse
+import time
+import asyncio
 
 # =========== 2)other user's independency ===========
 from PIL import Image
@@ -279,6 +282,8 @@ DOWNSAMPLE_RATE = 16
 
 IMAGE_ARR = None        # normal image array PNG
 
+progress_value = 0  # Global variable to store progress
+
 # =========== define /status, /init, /read, /execute four routers ===========
 
 @app.get("/status")
@@ -347,7 +352,10 @@ def read_node(data: Dict[str, Any]):
     global NODE_NAME, DEPENDENCIES, H5_PATH
     global PROMPT, IMAGE_ARR, USE_WSI
     global PATCHES, WSI_GRID_SIZE, WSI_ORIGINAL_WH, BBOX
-    global DOWNSAMPLE_RATE
+    global DOWNSAMPLE_RATE, progress_value
+
+    # Reset progress to 0
+    progress_value = 0
 
     # 1) Extract node_name / dependencies / h5_path from request data
     NODE_NAME = data.get("node_name", "BiomedParseNode")
@@ -426,6 +434,7 @@ def read_node(data: Dict[str, Any]):
     # 4.4) path: determine if it's a normal image or a WSI
     if "path" in user_data_dict:
         path_str = user_data_dict["path"]
+        print(path_str)
         # If it's an SVS/TIF, treat it as a WSI
         if path_str.lower().endswith(".svs") or path_str.lower().endswith(".tif"):
             USE_WSI = True
@@ -447,15 +456,42 @@ def read_node(data: Dict[str, Any]):
             IMAGE_ARR = read_rgb(path_str)
             print(f"[BiomedParse] read normal => shape={IMAGE_ARR.shape}")
 
+    print(USE_WSI, IMAGE_ARR)
     return {"status": "ok", "message": "biomed read done"}
 
+@app.get("/progress")
+async def progress():
+    """
+    SSE endpoint to provide progress updates
+    """
+    async def event_generator():
+        global progress_value
+        last_value = -1
+        while progress_value < 100:
+            if progress_value != last_value:
+                yield {"data": str(progress_value)}
+                last_value = progress_value
+            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+
+        # Ensure the final progress update to 100 is sent
+        if last_value != 100:
+            yield {"data": "100"}
+
+        # Keep the connection open for a short time to ensure the client receives the final update
+        await asyncio.sleep(1)
+
+        # Reset progress to 0 after sending the final update
+        progress_value = 0
+
+    return EventSourceResponse(event_generator())
+
 @app.post("/execute")
-def execute_node():
+def execute_node(background_tasks: BackgroundTasks):
     """
     Execute actual model inference
     """
     global MODEL, PROMPT, USE_WSI, PATCHES, WSI_GRID_SIZE, WSI_ORIGINAL_WH, IMAGE_ARR, BBOX
-    global H5_PATH
+    global H5_PATH, progress_value
 
     if MODEL is None:
         return {"status":"error","message":"Model not loaded. Please call /init first."}
@@ -469,16 +505,22 @@ def execute_node():
         print(f"[BiomedParse] Executing on device: {device}")
 
         if USE_WSI:
-            # each patch predict => merge masks => polygons
             patch_size = 1024
-            # 1) for each patch => infer => mask(1024x1024)
             mask_patches = []
             original_patches = []
+            total_patches = len(PATCHES)
             for idx, arr1024 in enumerate(tqdm(PATCHES, desc="WSI patches")):
                 original_patches.append(arr1024)
                 mask = interactive_infer_image(MODEL, Image.fromarray(arr1024), [PROMPT])[0]
                 mask_bin = binary_mask(mask, threshold=0.5) * 255
                 mask_patches.append(mask_bin)
+
+                # Update progress
+                progress_value = int((idx + 1) / total_patches * 100)
+                print(f"Progress: {progress_value}%")
+
+            # Ensure progress is set to 100 after processing all patches
+            progress_value = 100
 
             debug_dir = "debug_output"
             os.makedirs(debug_dir, exist_ok=True)
@@ -531,6 +573,8 @@ def execute_node():
                 try:
                     pred_mask = interactive_infer_image(MODEL, Image.fromarray(IMAGE_ARR), [PROMPT])[0]
                     polygons = mask_to_polygons(pred_mask, threshold=0.5)
+                    progress_value = 100
+                    print("Progress: 100%")
                     result_value = {
                         "status": "ok",
                         "prompt": PROMPT,
