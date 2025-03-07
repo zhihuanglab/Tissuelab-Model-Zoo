@@ -19,7 +19,6 @@ from PIL import Image
 Image.MAX_IMAGE_PIXELS = None
 
 import torch
-# 删除 BiomedParse 相关的模型导入，改为 SAM 模型组件
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
 import cv2
@@ -42,11 +41,11 @@ def binary_mask_to_polygons(binary_mask):
     contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     polygons = []
     for contour in contours:
-        # 忽略面积小于1000像素的轮廓
+        # ignore
         if cv2.contourArea(contour) < 1000:
             continue
         polygon = contour.reshape(-1, 2).tolist()
-        if len(polygon) >= 10:  # 仅添加至少有10个点的多边形
+        if len(polygon) >= 10:  # at least 10 control points
             polygons.append(polygon)
     return polygons
 
@@ -68,7 +67,7 @@ def mask_to_polygons(mask_array, threshold=0.5, upsample_factor=1):
 
 def read_rgb(image_path):
     """
-    读取 RGB 图像并调整为 1024x1024，与原始代码一致
+    read RGB image in 1024x1024
     """
     image = Image.open(image_path)
     image = np.array(image)
@@ -96,7 +95,7 @@ def read_rgb(image_path):
 
 def process_pil_patch(pil_img: Image.Image):
     """
-    将每个 patch 调整为 1024x1024，确保有 3 个通道
+    make sure each patch is 1024x1024，make sure 3 channels
     """
     arr = np.array(pil_img)
     if len(arr.shape)==2:
@@ -116,11 +115,10 @@ def process_pil_patch(pil_img: Image.Image):
                                       order=3, mode='constant', preserve_range=True, anti_aliasing=True)
     return out
 
-# ------------------ 修改1：重叠patch切割 ------------------
 def read_wsi_to_patches(wsi_path, bbox, patch_size=1024, overlap=100):
     """
-    使用并行处理读取 WSI，并提取具有重叠区域的patch
-    overlap: 相邻patch重叠的像素数
+    read wsi into patches
+    overlap
     """
     import tiffslide
     import time
@@ -155,25 +153,25 @@ def read_wsi_to_patches(wsi_path, bbox, patch_size=1024, overlap=100):
         for future in futures:
             processed_patches.append(future.result())
 
-    # 保存完整区域图像（用于调试）
+    # debug
     full_img = svs.read_region((x_start, y_start), level=best_level, size=(scaled_width, scaled_height))
     full_img.save("full_wsi_image.png")
     end_time = time.time()
     print(f"Processing time: {end_time - start_time:.2f} seconds")
     return processed_patches, (n_rows, n_cols), (scaled_width, scaled_height)
 
-# ------------------ 修改2：重叠mask融合 ------------------
+
 def patch_concat_mask_overlap(masks_np: list[np.ndarray], original_wh: tuple[int,int], patch_size:int, grid_size: tuple[int,int], overlap:int):
     """
-    将具有重叠区域的多个mask融合成一整张mask
-    masks_np: list of (patch_size, patch_size) numpy数组, 值范围0/255
-    original_wh: (w, h) => 最终区域大小
-    grid_size: (n_rows, n_cols) 重叠patch的排列数量
-    overlap: 重叠像素数
+    Fuse multiple masks with overlapping regions into a single mask.
+    masks_np: list of (patch_size, patch_size) numpy arrays, value range 0/255
+    original_wh: (w, h) => final region size
+    grid_size: (n_rows, n_cols) the number of overlapping patch arrangements
+    overlap: number of overlapping pixels
     """
     w, h = original_wh
     stride = patch_size - overlap
-    # 初始化累加器和计数矩阵（大小为区域实际尺寸）
+
     acc = np.zeros((h, w), dtype=np.float32)
     count = np.zeros((h, w), dtype=np.float32)
     n_rows, n_cols = grid_size
@@ -193,11 +191,11 @@ def patch_concat_mask_overlap(masks_np: list[np.ndarray], original_wh: tuple[int
             idx += 1
     count[count == 0] = 1
     fused = acc / count
-    # 二值化：阈值可根据实际情况调整
+
     fused_bin = (fused > 128).astype(np.uint8) * 255
     return fused_bin
 
-# 原有的简单拼接函数保持不变（仅用于非重叠情况）
+
 def patch_concat_mask(masks_np: list[np.ndarray], original_wh: tuple[int,int], patch_size:int, grid_size: tuple[int,int]):
     w, h = original_wh
     new_w = ((w + patch_size - 1) // patch_size) * patch_size
@@ -231,7 +229,7 @@ def process_patch(svs, x, y, level, patch_size):
     img = svs.read_region((x, y), level=level, size=(patch_size, patch_size))
     return process_pil_patch(img)
 
-# ------------------ 下面代码保持不变 ------------------
+
 # =========== global variable ===========
 app = FastAPI()
 
