@@ -1,4 +1,0 @@
-/cbica/home/yaoji/.conda/envs/llava/lib/python3.10/site-packages/timm/models/layers/__init__.py:48: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
-  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
-/gpfs/fs001/cbica/home/yaoji/Projects/VLM/a_tissuelab/wsi_level/conch_model/wsi_process.py:15: UserWarning: compatibility: aliasing tiffslide.TiffSlide to 'OpenSlide'
-  slide = openslide.OpenSlide(wsi_path)
