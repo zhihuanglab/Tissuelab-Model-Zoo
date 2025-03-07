@@ -10,9 +10,11 @@ import cv2
 import numpy as np
 import requests
 from PIL import Image
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 from typing import Dict, Any
 from pathlib import Path
+from sse_starlette.sse import EventSourceResponse
+import asyncio
 
 # =========== 2)other user's independency ===========
 from PIL import Image
@@ -248,6 +250,8 @@ DOWNSAMPLE_RATE = 16
 
 IMAGE_ARR = None        # normal image array PNG
 
+progress_value = 0  # Global variable to store progress
+
 # =========== define /status, /init, /read, /execute routers ===========
 @app.get("/status")
 def get_status():
@@ -368,13 +372,39 @@ def sam_infer_image(model, image: Image.Image, prompt=None):
     combined_mask = combined_mask.astype(np.uint8)
     return [combined_mask]
 
+@app.get("/progress")
+async def progress():
+    """
+    SSE endpoint to provide progress updates
+    """
+    async def event_generator():
+        global progress_value
+        last_value = -1
+        while progress_value < 100:
+            if progress_value != last_value:
+                yield {"data": str(progress_value)}
+                last_value = progress_value
+            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+
+        # Ensure the final progress update to 100 is sent
+        if last_value != 100:
+            yield {"data": "100"}
+
+        # Keep the connection open for a short time to ensure the client receives the final update
+        await asyncio.sleep(1)
+
+        # Reset progress to 0 after sending the final update
+        progress_value = 0
+
+    return EventSourceResponse(event_generator())
+
 @app.post("/execute")
-def execute_node():
+def execute_node(background_tasks: BackgroundTasks):
     """
     Execute SAM inference. Regardless of prompt, always infer.
     """
     global MODEL, PROMPT, USE_WSI, PATCHES, WSI_GRID_SIZE, WSI_ORIGINAL_WH, IMAGE_ARR, BBOX
-    global H5_PATH
+    global H5_PATH, progress_value
 
     if MODEL is None:
         return {"status": "error", "message": "Model not loaded. Please call /init first."}
@@ -395,6 +425,7 @@ def execute_node():
         white_mean_threshold = 235
         white_std_threshold = 10
 
+        total_patches = len(PATCHES)
         for idx, arr1024 in enumerate(tqdm(PATCHES, desc="WSI patches")):
             patch_filename = os.path.join(debug_patch_dir, f"patch_{idx}.png")
             cv2.imwrite(patch_filename, cv2.cvtColor(arr1024, cv2.COLOR_RGB2BGR))
@@ -432,6 +463,10 @@ def execute_node():
                 cv2.polylines(patch_res, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
             patch_res_filename = os.path.join(debug_patch_dir, f"patch_res_{idx}.png")
             cv2.imwrite(patch_res_filename, cv2.cvtColor(patch_res, cv2.COLOR_RGB2BGR))
+
+            # Update progress
+            progress_value = int((idx + 1) / total_patches * 100)
+            print(f"Progress: {progress_value}%")
 
         bigmask = patch_concat_mask_overlap(mask_patches, WSI_ORIGINAL_WH, patch_size, WSI_GRID_SIZE, overlap=100)
         bigmask_path = os.path.join(debug_dir, 'full_region_mask.png')
@@ -512,6 +547,9 @@ def execute_node():
                     "prompt": PROMPT,
                     "contours": polygons,
                 }
+                # Update progress for non-WSI
+                progress_value = 100
+                print("Progress: 100%")
             except Exception as e:
                 print("[SAM] PNG inference error:", e)
                 result_value = {"status": "error", "message": str(e)}
