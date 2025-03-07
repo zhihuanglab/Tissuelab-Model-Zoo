@@ -347,7 +347,7 @@ def read_node(data: Dict[str, Any]):
             USE_WSI = True
             if not BBOX:
                 BBOX = [0, 0, 5000, 5000]
-            # 调用修改后的带重叠参数的切割函数（例如 overlap=100）
+
             PATCHES, WSI_GRID_SIZE, WSI_ORIGINAL_WH = read_wsi_to_patches(path_str, BBOX, 1024, overlap=100)
             print(f"[SAM] read WSI => patches={len(PATCHES)}, grid={WSI_GRID_SIZE}, wh={WSI_ORIGINAL_WH}")
         else:
@@ -394,7 +394,6 @@ def execute_node():
         debug_patch_dir = os.path.join(debug_dir, "patches")
         os.makedirs(debug_patch_dir, exist_ok=True)
 
-        # 设置判断近似纯白的阈值
         white_mean_threshold = 235
         white_std_threshold = 10
 
@@ -436,13 +435,11 @@ def execute_node():
             patch_res_filename = os.path.join(debug_patch_dir, f"patch_res_{idx}.png")
             cv2.imwrite(patch_res_filename, cv2.cvtColor(patch_res, cv2.COLOR_RGB2BGR))
 
-        # 使用重叠融合方法拼接mask
         bigmask = patch_concat_mask_overlap(mask_patches, WSI_ORIGINAL_WH, patch_size, WSI_GRID_SIZE, overlap=100)
         bigmask_path = os.path.join(debug_dir, 'full_region_mask.png')
         cv2.imwrite(bigmask_path, bigmask)
         print(f"[DEBUG] Saved full region mask to {bigmask_path}")
 
-        # 拼接原始patch（这里仍用简单拼接，你也可以采用类似融合方法）
         def patch_concat_rgb(patches, original_wh, patch_size, grid_size, overlap):
             w, h = original_wh
             stride = patch_size - overlap
@@ -473,6 +470,12 @@ def execute_node():
         print(f"[DEBUG] Saved full region image to {full_image_path}")
 
         polygons = binary_mask_to_polygons(bigmask)
+
+        absolute_polygons = [
+            [[x + BBOX[0], y + BBOX[1]] for x, y in polygon]
+            for polygon in polygons
+        ]
+        
         result_img = full_image.copy()
         for poly in polygons:
             pts = np.array(poly, np.int32).reshape((-1, 1, 2))
@@ -484,8 +487,8 @@ def execute_node():
         result_value = {
             "status": "ok",
             "prompt": PROMPT,
-            "polygons_count": len(polygons),
-            "polygons": polygons,
+            "contours_count": len(absolute_polygons),
+            "contours": absolute_polygons,
             "bbox": BBOX
         }
     else:
@@ -509,7 +512,7 @@ def execute_node():
                 result_value = {
                     "status": "ok",
                     "prompt": PROMPT,
-                    "polygons": polygons,
+                    "contours": polygons,
                 }
             except Exception as e:
                 print("[SAM] PNG inference error:", e)
@@ -545,7 +548,7 @@ def main():
     manager_url = "http://localhost:5001/api/tasks/v1/create_node"
     create_req_body = {
         "service_name": args.name,
-        "file_path": "toolbox/tissue_segmentation/SAM/sam_task_node.py",  # 如有需要请更新此路径
+        "file_path": "toolbox/tissue_segmentation/SAM/sam_task_node.py",
         "port": args.port
     }
     try:
