@@ -205,8 +205,8 @@ def read_wsi_to_patches(wsi_path, bbox, patch_size=1024):
     scaled_width = int(width / downsample_factor)
     scaled_height = int(height / downsample_factor)
 
-    n_cols = scaled_width // patch_size
-    n_rows = scaled_height // patch_size
+    n_cols = max(1, scaled_width // patch_size)
+    n_rows = max(1, scaled_height // patch_size)
 
     print(f"Best Level: {best_level}, Downsample Factor: {downsample_factor}")
     print(f"Scaled Size: {scaled_width}x{scaled_height}, Patches: {n_rows}x{n_cols}")
