@@ -113,12 +113,13 @@ def collate_patches(batch):
     return [patch for patch in batch if patch is not None]
 
 class NucleiEmbedding:
-    def __init__(self, args, centroids):
+    def __init__(self, args, centroids, progress_callback=None):
         """Initialize the NucleiEmbedding class."""
         self.args = args
         self.centroids = centroids
         self.patch_size = 224  # Target size for 40x magnification
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.progress_callback = progress_callback  # Store the reference to progress callback
         print(f"Using device: {self.device}")
         
         # Get magnification from a temporary slide object
@@ -286,6 +287,12 @@ class NucleiEmbedding:
                     # Update progress
                     processed_count += len(current_batch)
                     pbar.update(len(current_batch))
+                    
+                    # Update progress callback
+                    if self.progress_callback:
+                        progress = int((processed_count / len(dataset)) * 100)
+                        self.progress_callback(progress)
+                        print(f"Embedding progress updated: {progress}%")
         
         pbar.close()
         total_time = time.time() - total_start_time
