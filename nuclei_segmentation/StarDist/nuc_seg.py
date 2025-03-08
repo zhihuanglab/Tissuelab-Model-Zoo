@@ -452,21 +452,22 @@ class SlideSegmentation():
         coord_all = None
         prob_all = None
         
-        total_tiles = n_row * n_col
-        processed_tiles = 0
-        iter = 0
+        total_tiles = n_row * n_col  # 总的瓦片数
+        processed_tiles = 0  # 已处理的瓦片数
+        iter = 0  # 初始化 iter 变量
 
         pbar = tqdm(total=total_tiles, mininterval=0.1)
 
         for ir in range(n_row):
             for ic in range(n_col):
-                iter += 1
+                iter += 1  # 在循环中增加 iter
                 pbar.update(1)
                 processed_tiles += 1
+                # 更新进度值
                 progress = int((processed_tiles / total_tiles) * 100)
                 if self.progress_callback:
                     self.progress_callback(progress)
-
+                print(f"Progress updated: {progress}%")  # 添加日志输出
                 # x: col direction (dim[0])
                 # y: row direction (dim[1])
                 
@@ -675,7 +676,8 @@ class SlideSegmentation():
         self.final_coord = final_coord
         self.prob_all = prob_all
         # self.final_features = final_features
-
+        
+        # 确保在完成后将进度设置为100%
         if self.progress_callback:
             self.progress_callback(100)
 
