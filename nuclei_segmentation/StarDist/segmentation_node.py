@@ -18,6 +18,8 @@ import cv2
 from fastapi import FastAPI
 from typing import Dict, Any
 from pathlib import Path
+from sse_starlette.sse import EventSourceResponse
+import asyncio
 
 from nuc_seg import SlideSegmentation
 
@@ -29,6 +31,7 @@ IS_MODEL_INITED = False
 H5_PATH = None
 NODE_NAME = None
 DEPENDENCIES = []
+progress_value = 0  # Global variable to track progress
 
 
 def parse_args():
@@ -56,6 +59,11 @@ def print_h5_structure(file_path):
             print(f"{indent}{name} (Dataset), shape: {obj.shape}, dtype: {obj.dtype}")
     with h5py.File(file_path, "r") as hf:
         hf.visititems(print_item)
+
+def update_progress(value):
+    global progress_value
+    progress_value = value
+    print(f"Global progress updated: {progress_value}%")  # 添加日志输出
 
 def run_segmentation(args):
     """
@@ -106,7 +114,8 @@ def run_segmentation(args):
             nms_thresh=0.3,
             n_tiles=(2, 2, 1),
             stardist_pretrain=args.stardist_pretrain,
-            isIHC=args.isIHC
+            isIHC=args.isIHC,
+            progress_callback=update_progress  # Use the update_progress function
         )
         ss.run_WSI_segmentation()
 
@@ -247,6 +256,33 @@ def execute_node():
             hf.create_dataset(node_out_path, data=out_str.encode("utf-8"))
 
     return {"status": "ok", "output": out_val}
+
+
+@app.get("/progress")
+async def progress():
+    """
+    SSE endpoint to provide progress updates
+    """
+    async def event_generator():
+        global progress_value
+        last_value = -1
+        while progress_value < 100:
+            if progress_value != last_value:
+                yield {"data": str(progress_value)}
+                last_value = progress_value
+            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+
+        # Ensure the final progress update to 100 is sent
+        if last_value != 100:
+            yield {"data": "100"}
+
+        # Keep the connection open for a short time to ensure the client receives the final update
+        await asyncio.sleep(1)
+
+        # Reset progress to 0 after sending the final update
+        progress_value = 0
+
+    return EventSourceResponse(event_generator())
 
 
 def main():
