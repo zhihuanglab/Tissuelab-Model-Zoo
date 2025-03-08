@@ -14,6 +14,8 @@ import requests
 import platform
 import numpy as np
 import cv2
+from sse_starlette.sse import EventSourceResponse
+import asyncio
 
 from fastapi import FastAPI
 from typing import Dict, Any
@@ -30,6 +32,8 @@ IS_MODEL_INITED = False
 H5_PATH = None
 NODE_NAME = None
 DEPENDENCIES = []
+progress_value = 0  # Global variable to track progress
+progress_complete = False  # New flag to indicate completion
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -69,6 +73,8 @@ def run_segmentation(args):
     3) according to segmentation, generate embedding
     4) write segmentation + embedding to workflow_data.h5
     """
+    global progress_complete
+
     if H5_PATH is None or NODE_NAME is None:
         raise ValueError("H5_PATH and NODE_NAME must be set before running segmentation")
 
@@ -106,7 +112,8 @@ def run_segmentation(args):
                                    nms_thresh=0.3,
                                    n_tiles=(2, 2, 1),
                                    stardist_pretrain=args.stardist_pretrain,
-                                   isIHC=args.isIHC)
+                                   isIHC=args.isIHC,
+                                   progress_callback=update_progress)
             ss.run_WSI_segmentation()
             contours = ss.final_coord.astype(np.int32)
             centroids = ss.final_points.astype(np.int32)
@@ -134,7 +141,7 @@ def run_segmentation(args):
 
             if not have_cached_embedding:
                 print("No cached embedding => generate new")
-                ne = NucleiEmbedding(args, centroids)
+                ne = NucleiEmbedding(args, centroids, progress_callback=update_progress)  # Pass the progress callback
                 embedding_data = ne.generate_embeddings()
                 # write out to temp
                 with h5py.File(temp_h5_path, "w") as tf:
@@ -163,6 +170,11 @@ def run_segmentation(args):
                 hf.flush()  # force write to disk
             # sleep for a while to ensure h5 is written
             time.sleep(2)
+
+        # Ensure progress is set to 100 after Step C and D are completed
+        print('to True')
+        progress_complete = True
+        update_progress(100)
 
         end_time = time.time()
         print(f"Time taken: {end_time - start_time:.2f}s")
@@ -266,6 +278,45 @@ def execute_node():
             hf.create_dataset(node_out_path, data=out_str.encode("utf-8"))
 
     return {"status": "ok", "output": out_val}
+
+
+def update_progress(value):
+    global progress_value
+    progress_value = value
+    print(f"Global progress updated: {progress_value}%")  # Add debug output
+
+
+@app.get("/progress")
+async def progress():
+    """
+    SSE endpoint to provide progress updates
+    """
+    async def event_generator():
+        global progress_value, progress_complete
+        last_value = -1
+        while True:
+            if progress_value != last_value or (progress_value == 100 and progress_complete):
+                yield {"data": str(progress_value)}
+                last_value = progress_value
+                print(f"Progress updated to: {progress_value}%, {progress_complete}")
+
+                # If progress reaches 100 and completion flag is set, wait a bit before breaking
+                if progress_value == 100 and progress_complete:
+                    print("Progress complete, closing connection.")  # Add debug output
+                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
+                    break
+
+            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+
+        # Keep the connection open for a short time to ensure the client receives the final update
+        await asyncio.sleep(1)
+
+        # Reset progress to 0 and completion flag after sending the final update
+        progress_value = 0
+        progress_complete = False
+        print("Progress reset to 0.")  # Add debug output
+
+    return EventSourceResponse(event_generator())
 
 
 def main():
