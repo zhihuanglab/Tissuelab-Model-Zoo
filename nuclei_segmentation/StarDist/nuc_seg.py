@@ -37,6 +37,7 @@ class SlideSegmentation():
                  n_tiles=(4,4,1),
                  stardist_pretrain='2D_versatile_he',
                  isIHC=False,
+                 progress_callback=None
                  ):
         
         super(SlideSegmentation, self).__init__()
@@ -90,6 +91,7 @@ class SlideSegmentation():
         self.n_tiles = n_tiles
         self.isIHC = isIHC
         
+        self.progress_callback = progress_callback  # Store the reference to progress callback
 
         # Pre-define feature names (no need to compute first nucleus separately)
         self.feature_names = [
@@ -450,16 +452,22 @@ class SlideSegmentation():
         coord_all = None
         prob_all = None
         
-        iter = 0
-        
-        
-        pbar = tqdm(total=n_row*n_col)
+        total_tiles = n_row * n_col  # 总的瓦片数
+        processed_tiles = 0  # 已处理的瓦片数
+        iter = 0  # 初始化 iter 变量
+
+        pbar = tqdm(total=total_tiles, mininterval=0.1)
+
         for ir in range(n_row):
             for ic in range(n_col):
-                
-                iter+=1
+                iter += 1  # 在循环中增加 iter
                 pbar.update(1)
-                
+                processed_tiles += 1
+                # 更新进度值
+                progress = int((processed_tiles / total_tiles) * 100)
+                if self.progress_callback:
+                    self.progress_callback(progress)
+                print(f"Progress updated: {progress}%")  # 添加日志输出
                 # x: col direction (dim[0])
                 # y: row direction (dim[1])
                 
@@ -651,6 +659,7 @@ class SlideSegmentation():
                 
                 #print('curr:', len(points), '\t total:', len(points_all))
                 
+
         final_points = points_all[['x','y']].values.astype(np.int32)
         final_coord = coord_all.astype(np.int32)
         final_coord = np.swapaxes(final_coord, 1, 2)
@@ -668,6 +677,11 @@ class SlideSegmentation():
         self.prob_all = prob_all
         # self.final_features = final_features
         
+        # 确保在完成后将进度设置为100%
+        if self.progress_callback:
+            self.progress_callback(100)
+
+        pbar.close()
 
         print("---- Segmentation ends successfully ----")
         
