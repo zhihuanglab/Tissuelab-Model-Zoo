@@ -18,6 +18,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import colorsys
+import asyncio
+from sse_starlette.sse import EventSourceResponse
 
 from fastapi import FastAPI
 from typing import Dict, Any
@@ -36,6 +38,9 @@ DEPENDENCIES = []
 
 # new global variable for PLIP model
 PLIP_MODELS = None  # tuple: (processor, model, text_projection, device)
+
+# new global variable for progress
+progress_value = 0  # Global variable to store progress
 
 # --------------- utils functions ---------------
 
@@ -162,10 +167,19 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     clf.fit(X_train, y_train)
     train_time = time.time() - start_time
 
+    # Update progress after training
+    global progress_value
+    progress_value = 50
+    print("Progress: 50%")
+
     start_time = time.time()
     predictions = clf.predict(cell_embeddings)
     prediction_probs = clf.predict_proba(cell_embeddings)
     test_time = time.time() - start_time
+
+    # Update progress after prediction
+    progress_value = 100
+    print("Progress: 100%")
 
     return (clf, class_names, class_colors, predictions, prediction_probs,
             clf.coef_, clf.intercept_, train_time, test_time)
@@ -175,6 +189,7 @@ def run_classification(args) -> Dict[str, Any]:
         raise ValueError("H5_PATH not set => please ensure /read is called first.")
 
     global PLIP_MODELS
+    global progress_value  # Declare the global variable
 
     result = {"status": "success", "message": "", "classification_count": 0}
     try:
@@ -237,9 +252,12 @@ def run_classification(args) -> Dict[str, Any]:
             class_embeddings = _generate_text_description(processor, text_encoder, text_projection,
                                                           nuclei_classes, organ, device)
             sims = []
-            for ce in class_embeddings:
+            for idx, ce in enumerate(class_embeddings):
                 sim = np.dot(cell_embeddings, ce.T)
                 sims.append(sim)
+                # Update progress
+                progress_value = int((idx + 1) / len(class_embeddings) * 100)
+                print(f"Progress: {progress_value}%")
             sims_arr = np.array(sims).squeeze(axis=2).T
             predictions = np.argmax(sims_arr, axis=1)
             prediction_probs = None
@@ -369,7 +387,7 @@ def read_node(data: Dict[str, Any]):
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME
+    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME, progress_value
     
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
@@ -381,6 +399,9 @@ def execute_node():
             "message": "no H5 => skip classification",
             "classification_count": 0
         }
+        # Update progress to 100 when skipping
+        progress_value = 100
+        print("Progress: 100%")
     else:
         print(f"[ClassificationNode] /execute => run_classification with h5={H5_PATH}")
         out_val = run_classification(ARGS)
@@ -398,6 +419,32 @@ def execute_node():
 
 
     return {"status": "ok", "output": out_val}
+
+@app.get("/progress")
+async def progress():
+    """
+    SSE endpoint to provide progress updates
+    """
+    async def event_generator():
+        global progress_value
+        last_value = -1
+        while progress_value < 100:
+            if progress_value != last_value:
+                yield {"data": str(progress_value)}
+                last_value = progress_value
+            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+
+        # Ensure the final progress update to 100 is sent
+        if last_value != 100:
+            yield {"data": "100"}
+
+        # Keep the connection open for a short time to ensure the client receives the final update
+        await asyncio.sleep(1)
+
+        # Reset progress to 0 after sending the final update
+        progress_value = 0
+
+    return EventSourceResponse(event_generator())
 
 def main():
     import threading
