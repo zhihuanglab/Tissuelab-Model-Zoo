@@ -3,6 +3,8 @@
 import sys
 import imagecodecs
 from PyInstaller.utils.hooks import collect_all
+import argparse
+import multiprocessing as mp
 
 block_cipher = None
 
@@ -33,19 +35,22 @@ hiddenimport_data = (
         'tqdm',
         'natsort',
         'einops',
+        'multiprocess',
+        'transformers',
         *stardist_hiddenimports,
         *transformers_hiddenimports,
     ])
 
 a = Analysis(
-    ['nuc_seg_task_node.py'],  # Main entry script
+    ['segmentation_taskNode.py'],  # Main entry script
     pathex=[],
     binaries=[],
     datas=[
-        ('nuc_embedding.py', '.'),
         ('nuc_seg.py', '.'),
         ('nuc_stat.py', '.'),
+        ('nuc_embedding.py', '.'),
         ('checkpoints', 'checkpoints'),
+        ('checkpoints/contrastive_checkpoint_epoch_0.pt', 'checkpoints'),
         ('histomicstk_scripts', 'histomicstk_scripts'),
         ('models', 'models'),
         ("Resources\\imagecodecs\\_zlib.cp39-win_amd64.pyd", "imagecodecs"),
@@ -74,7 +79,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='NucSegNode',
+    name='SegmentationNode',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -85,6 +90,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    runtime_tmpdir=None,
 )
 
 coll = COLLECT(
@@ -95,5 +101,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='NucSegNode',
+    name='SegmentationNode',
 )

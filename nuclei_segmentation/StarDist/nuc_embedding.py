@@ -292,7 +292,6 @@ class NucleiEmbedding:
                     if self.progress_callback:
                         progress = int((processed_count / len(dataset)) * 100)
                         self.progress_callback(progress)
-                        print(f"Embedding progress updated: {progress}%")
         
         pbar.close()
         total_time = time.time() - total_start_time
