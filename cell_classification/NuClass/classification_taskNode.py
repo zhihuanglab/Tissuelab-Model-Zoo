@@ -151,11 +151,11 @@ def generate_distinct_colors(nuclei_classes: list[str]) -> list[str]:
 def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
     unique_classes = annotations['cell_class'].unique().tolist()
     # 1) must have "Negative control" class
-    if "Negative control" not in unique_classes:
-        raise ValueError("No 'Negative control' => fallback to zero-shot")
+    # if "Negative control" not in unique_classes:
+    #     raise ValueError("No 'Negative control' => fallback to zero-shot")
 
-    # 2) must have at least 2 classes
-    if len(unique_classes) < 2:
+    # 2) must have at least 1 classes
+    if len(unique_classes) < 1:
         raise ValueError("Need at least 2 classes in annotation => fallback to zero-shot")
 
     class_names = ["Negative control"] + [c for c in unique_classes if c != "Negative control"]
@@ -165,11 +165,22 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         if cn in class_colors_map:
             class_colors.append(class_colors_map[cn])
         else:
-            class_colors.append("F3F4F5")
+            class_colors.append("#F3F4F5")
+
+    print(f"class_names: {class_names}")
+    print(f"class_colors: {class_colors}")
 
     cell_indices = annotations['cell_ID'].astype(int).values
     X_train = cell_embeddings[cell_indices]
     y_train = pd.Categorical(annotations['cell_class'], categories=class_names).codes
+    
+    if "Negative control" not in annotations["cell_class"].values.astype(str):
+        print("Found annotations, but there is no 'Negative control' class, we will use negative_control_example_vectors.npy as negative control")
+        negative_control_vectors = np.load("negative_control_example_vectors.npy") # (N, 512)
+        print(f"negative_control_vectors: {negative_control_vectors.shape}")
+        X_train = np.concatenate([negative_control_vectors, X_train], axis=0)
+        y_train = np.concatenate([np.zeros(negative_control_vectors.shape[0]), y_train], axis=0).astype(int)
+    
 
     import time
     start_time = time.time()
@@ -215,12 +226,11 @@ def run_classification(args) -> Dict[str, Any]:
                 ann_dict = json.loads(raw_bytes.decode("utf-8"))
                 annotations_data = pd.DataFrame(ann_dict).T
 
-                unique_classes = annotations_data["cell_class"].unique().tolist()
-                # if "Negative control" in unique_classes and len(unique_classes) >= 2:
-                if ("Negative control" in unique_classes) and (len(unique_classes) >= 2):
-                    use_supervised = True
-                else:
-                    use_supervised = False
+                # unique_classes = annotations_data["cell_class"].unique().tolist()
+                # if ("Negative control" in unique_classes) and (len(unique_classes) >= 2):
+                use_supervised = True
+                # else:
+                #     use_supervised = False
             else:
                 annotations_data = None
                 use_supervised = False
@@ -250,8 +260,10 @@ def run_classification(args) -> Dict[str, Any]:
             final_class_names = class_names
             final_class_colors = class_colors
             classification_method = "supervised"
+            print(f"Supervised classification completed using {classification_method}")
         else:
             classification_method = "zero-shot"
+            print(f"Zero-shot classification completed using {classification_method}")
             # use PLIP model to encode text
             if PLIP_MODELS is None:
                 raise ValueError("PLIP_MODELS not loaded => please ensure /init is called first.")
@@ -297,6 +309,13 @@ def run_classification(args) -> Dict[str, Any]:
             colors_ascii = [c.encode('utf-8') for c in final_class_colors]
             grp_cls.create_dataset('nuclei_class_HEX_color', (len(colors_ascii),), dtype='S256', data=colors_ascii)
 
+            print("================")
+            print({
+                "predictions": set(predictions),
+                "nuclei_classes": set(final_class_names),
+                "classification_method": classification_method,
+                "organ": organ
+            })
             metadata = {
                 "nuclei_classes": final_class_names,
                 "classification_method": classification_method,
