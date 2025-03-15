@@ -171,7 +171,6 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     print(f"class_colors: {class_colors}")
 
     cell_indices = annotations['cell_ID'].astype(int).values
-    print(f"cell_indices: {cell_indices}")
     X_train = cell_embeddings[cell_indices]
     y_train = pd.Categorical(annotations['cell_class'], categories=class_names).codes
     
