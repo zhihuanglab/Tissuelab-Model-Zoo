@@ -172,7 +172,6 @@ def run_segmentation(args):
             time.sleep(2)
 
         # Ensure progress is set to 100 after Step C and D are completed
-        print('to True')
         progress_complete = True
         update_progress(100)
 
@@ -283,7 +282,7 @@ def execute_node():
 def update_progress(value):
     global progress_value
     progress_value = value
-    print(f"Global progress updated: {progress_value}%")  # Add debug output
+    # print(f"Global progress updated: {progress_value}%")  # Add debug output
 
 
 @app.get("/progress")
@@ -298,7 +297,7 @@ async def progress():
             if progress_value != last_value or (progress_value == 100 and progress_complete):
                 yield {"data": str(progress_value)}
                 last_value = progress_value
-                print(f"Progress updated to: {progress_value}%, {progress_complete}")
+                # print(f"Progress updated to: {progress_value}%, {progress_complete}")
 
                 # If progress reaches 100 and completion flag is set, wait a bit before breaking
                 if progress_value == 100 and progress_complete:
@@ -320,10 +319,15 @@ async def progress():
 
 
 def main():
-    try:
-        args = parse_args()
-        print(f"Starting SegmentationNode (with embedding) at port={args.port}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--port', type=int, default=8006, help='port')
+    parser.add_argument('--name', type=str, default='SegmentationNode', help='node name')
+    parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
+    args, unknown = parser.parse_known_args()
 
+    print(f"Starting SegmentationNode at port={args.port}")
+
+    try:
         def run_uvicorn():
             uvicorn.run(app, host="0.0.0.0", port=args.port)
 
