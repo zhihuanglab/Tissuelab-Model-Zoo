@@ -178,13 +178,15 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     if "Negative control" not in annotations["cell_class"].values.astype(str):
         print("Found annotations, but there is no 'Negative control' class, we will use negative_control_example_vectors.npy as negative control")
         negative_control_vectors = np.load("negative_control_example_vectors.npy") # (N, 512)
+        print(f"negative_control_vectors: {negative_control_vectors.shape}")
         X_train = np.concatenate([negative_control_vectors, X_train], axis=0)
         y_train = np.concatenate([np.zeros(negative_control_vectors.shape[0]), y_train], axis=0).astype(int)
     
 
     import time
     start_time = time.time()
-    clf = LogisticRegression(random_state=42, max_iter=1000, multi_class='multinomial', solver='lbfgs')
+    clf = LogisticRegression(random_state=42, max_iter=1000, multi_class='multinomial', 
+                            solver='lbfgs', class_weight='balanced')
     clf.fit(X_train, y_train)
     train_time = time.time() - start_time
 
@@ -201,6 +203,10 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     # Update progress after prediction
     progress_value = 100
     print("Progress: 100%")
+
+    unique, counts = np.unique(predictions, return_counts=True)
+    pred_distribution = dict(zip(unique, counts))
+    print(f"Prediction distribution: {pred_distribution}")
 
     return (clf, class_names, class_colors, predictions, prediction_probs,
             clf.coef_, clf.intercept_, train_time, test_time)
