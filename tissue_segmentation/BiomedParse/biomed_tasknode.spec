@@ -78,7 +78,7 @@ hiddenimport_data = (
     ])
 
 a = Analysis(
-    ['node_biomed.py'],
+    ['biomed_tasknode.py'],
     pathex=['.'],  # current folder
     binaries=[],
     datas=added_files,
