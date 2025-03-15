@@ -170,6 +170,13 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     cell_indices = annotations['cell_ID'].astype(int).values
     X_train = cell_embeddings[cell_indices]
     y_train = pd.Categorical(annotations['cell_class'], categories=class_names).codes
+    
+    if "Negative control" not in annotations["cell_class"].values.astype(str):
+        print("Found annotations, but there is no 'Negative control' class, we will use negative_control_example_vectors.npy as negative control")
+        negative_control_vectors = np.load("negative_control_example_vectors.npy") # (N, 512)
+        X_train = np.concatenate([negative_control_vectors, X_train], axis=0)
+        y_train = np.concatenate([np.zeros(negative_control_vectors.shape[0]), y_train], axis=0).astype(int)
+    
 
     import time
     start_time = time.time()
