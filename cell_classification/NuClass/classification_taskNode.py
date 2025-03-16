@@ -415,9 +415,11 @@ def read_node(data: Dict[str, Any]):
                 elif k == "nuclei_classes":
                     if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.nuclei_classes = val_json
+                        print(f"[ClassificationNode] nuclei_classes: {ARGS.nuclei_classes}")
                 elif k == "nuclei_colors":
                     if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.nuclei_colors = val_json
+                        print(f"[ClassificationNode] nuclei_colors: {ARGS.nuclei_colors}")
 
     return {"status": "ok", "message": "ClassificationNode read done"}
 
@@ -440,6 +442,7 @@ def execute_node():
         print("Progress: 100%")
     else:
         print(f"[ClassificationNode] /execute => run_classification with h5={H5_PATH}")
+        print(f"[ClassificationNode] ARGS: {ARGS}")
         out_val = run_classification(ARGS)
 
     # write out to /ClassificationNode/output
