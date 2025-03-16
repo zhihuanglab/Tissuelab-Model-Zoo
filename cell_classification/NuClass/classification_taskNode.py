@@ -251,8 +251,7 @@ def run_classification(args) -> Dict[str, Any]:
         # C) supervised or zero-shot
         organ = getattr(args, "organ", None)
         nuclei_classes = getattr(args, "nuclei_classes", [])
-        if len(nuclei_classes) == 0:
-            nuclei_classes = ["Negative control", "Tumor", "Lymphocyte"]
+        nuclei_colors = getattr(args, "nuclei_colors", [])
 
         if use_supervised and annotations_data is not None:
             clf, class_names, class_colors, predictions, prediction_probs, \
@@ -292,7 +291,10 @@ def run_classification(args) -> Dict[str, Any]:
                     if len(old_colors) == len(nuclei_classes):
                         final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
             if final_class_colors is None:
-                final_class_colors = generate_distinct_colors(nuclei_classes)
+                if nuclei_colors:
+                    final_class_colors = nuclei_colors
+                else:
+                    final_class_colors = generate_distinct_colors(nuclei_classes)
             final_class_names = nuclei_classes
 
         # D) result => cell_classification
@@ -379,6 +381,8 @@ def read_node(data: Dict[str, Any]):
     NODE_NAME = data.get("node_name", "ClassificationNode")
     DEPENDENCIES = data.get("dependencies", [])
     H5_PATH = data.get("h5_path", None)
+    # CLASS_LIST = data.get("class_list", ["Negative control", "Tumor", "Lymphocyte"])
+    # CLASS_COLORS = data.get("class_colors", [])
 
     print(f"[ClassificationNode] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}")
     if not H5_PATH or not os.path.exists(H5_PATH):
@@ -409,8 +413,13 @@ def read_node(data: Dict[str, Any]):
                 elif k == "organ":
                     ARGS.organ = val_json
                 elif k == "nuclei_classes":
-                    if isinstance(val_json, list):
+                    if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.nuclei_classes = val_json
+                        print(f"[ClassificationNode] nuclei_classes: {ARGS.nuclei_classes}")
+                elif k == "nuclei_colors":
+                    if isinstance(val_json, list) and len(val_json) > 0:
+                        ARGS.nuclei_colors = val_json
+                        print(f"[ClassificationNode] nuclei_colors: {ARGS.nuclei_colors}")
 
     return {"status": "ok", "message": "ClassificationNode read done"}
 
@@ -433,6 +442,7 @@ def execute_node():
         print("Progress: 100%")
     else:
         print(f"[ClassificationNode] /execute => run_classification with h5={H5_PATH}")
+        print(f"[ClassificationNode] ARGS: {ARGS}")
         out_val = run_classification(ARGS)
 
     # write out to /ClassificationNode/output
