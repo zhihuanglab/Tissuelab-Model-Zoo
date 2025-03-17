@@ -469,6 +469,13 @@ def read_node(data: Dict[str, Any]):
     print(USE_WSI, IMAGE_ARR)
     return {"status": "ok", "message": "biomed read done"}
 
+@app.options("/progress")
+async def progress_options():
+    """
+    Handle OPTIONS preflight request for CORS
+    """
+    return {"status": "ok"}
+
 @app.get("/progress")
 async def progress():
     """
@@ -493,7 +500,17 @@ async def progress():
         # Reset progress to 0 after sending the final update
         progress_value = 0
 
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS"
+        }
+    )
 
 @app.post("/execute")
 def execute_node(background_tasks: BackgroundTasks):
