@@ -22,12 +22,22 @@ import asyncio
 from sse_starlette.sse import EventSourceResponse
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from pathlib import Path
 from sklearn.linear_model import LogisticRegression
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
 
 app = FastAPI()
+
+# Add CORS middleware to allow cross-origin requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 # global variables
 ARGS = None
