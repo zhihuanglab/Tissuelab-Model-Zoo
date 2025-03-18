@@ -117,6 +117,7 @@ Config/*
 xdecoder_data
 output
 debug_output
+full_wsi_image.png
 
 #biomedparse_eval_results.json
 
