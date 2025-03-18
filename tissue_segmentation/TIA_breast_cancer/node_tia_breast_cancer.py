@@ -18,6 +18,7 @@ from pathlib import Path
 # Clear logger to use tiatoolbox.logger
 import logging
 import warnings
+import pickle
 
 if logging.getLogger().hasHandlers():
     logging.getLogger().handlers.clear()
@@ -248,6 +249,40 @@ def read_wsi_to_patches(wsi_path, bbox, patch_size=1024):
 
     return processed_patches, (n_rows, n_cols), (scaled_width, scaled_height)
 
+# read normal image to patches
+def read_img_to_patches(img_path, bbox, patch_size=1024):
+
+    img = cv2.imread(img_path, cv2.IMREAD_COLOR)  
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) 
+    h, w, _ = img.shape  
+
+    if bbox:
+        x_min, y_min, x_max, y_max = bbox
+        x_min, y_min = max(0, x_min), max(0, y_min)
+        x_max, y_max = min(w, x_max), min(h, y_max)
+        img = img[y_min:y_max, x_min:x_max]
+        h, w, _ = img.shape 
+    
+    n_rows = (h + patch_size - 1) // patch_size 
+    n_cols = (w + patch_size - 1) // patch_size  
+
+    patches = []
+    for y in range(0, h, patch_size):
+        for x in range(0, w, patch_size):
+            patch = img[y:y+patch_size, x:x+patch_size]  
+
+            if patch.shape[0] != patch_size or patch.shape[1] != patch_size:
+                padded_patch = np.zeros((patch_size, patch_size, 3), dtype=np.uint8)
+                padded_patch[:patch.shape[0], :patch.shape[1], :] = patch
+                patch = padded_patch
+
+            patches.append(patch)
+
+    return patches, (n_rows, n_cols), (w, h)
+
+
+
+
 def patch_concat_mask(masks_np: list[np.ndarray], original_wh: tuple[int,int], patch_size:int, grid_size: tuple[int,int]):
     """
     masks_np: list of (1024,1024) numpy, range=0/255
@@ -275,6 +310,51 @@ def patch_concat_mask(masks_np: list[np.ndarray], original_wh: tuple[int,int], p
     # crop back
     bigmask=bigmask[:h, :w]
     return bigmask
+
+# def patch_concat_mask_smooth(masks_np: list[np.ndarray], original_wh: tuple[int, int], patch_size: int, grid_size: tuple[int, int], overlap=0):
+
+#     w, h = original_wh
+#     stride = int(patch_size * (1 - overlap))  
+
+#     new_w = ((w + patch_size - 1) // patch_size) * patch_size
+#     new_h = ((h + patch_size - 1) // patch_size) * patch_size
+
+#     bigmask = np.zeros((new_h, new_w), dtype=np.float32)
+#     weight_map = np.zeros((new_h, new_w), dtype=np.float32)
+
+#     idx = 0
+#     rows, cols = grid_size
+#     for row in range(rows):
+#         for col in range(cols):
+#             if idx < len(masks_np):
+#                 pm = masks_np[idx].astype(np.float32) 
+#                 if pm.max() <= 1:
+#                     pm *= 255 
+                
+#                 x, y = col * stride, row * stride 
+
+#                 weight_patch = np.ones((patch_size, patch_size), dtype=np.float32)
+
+#                 for i in range(patch_size):
+#                     for j in range(patch_size):
+#                         weight_patch[i, j] *= min(i, patch_size - i - 1, j, patch_size - j - 1) + 1
+
+#                 weight_patch /= weight_patch.max()
+
+#                 bigmask[y:y+patch_size, x:x+patch_size] += pm * weight_patch
+#                 weight_map[y:y+patch_size, x:x+patch_size] += weight_patch
+
+#                 idx += 1
+
+#     weight_map = np.maximum(weight_map, 1e-5)
+    
+#     bigmask /= weight_map
+
+#     bigmask = bigmask[:h, :w].astype(np.uint8)
+
+#     return bigmask
+
+
 
 # =========== define /status, /init, /read, /execute four routers ===========
 
@@ -417,7 +497,15 @@ def read_node(data: Dict[str, Any]):
             # Otherwise, assume it's a normal PNG/JPG/etc.
             USE_WSI = False
             IMAGE_ARR = read_rgb(path_str)
+
+            PATCHES, WSI_GRID_SIZE, WSI_ORIGINAL_WH = read_img_to_patches(
+                path_str, BBOX, 1024
+            )
+
+            # read normal image without down sampling
+
             print(f"[TIABreastCancer] read normal => shape={IMAGE_ARR.shape}")
+            print(f"patches={len(PATCHES)}, grid={WSI_GRID_SIZE}, wh={WSI_ORIGINAL_WH}")
 
     return {"status": "ok", "message": "TIABreastCancer read done"}
 
@@ -437,37 +525,48 @@ def execute_node():
     patch_dir = "patches"
     patch_paths = sorted([os.path.join(patch_dir, f) for f in os.listdir(patch_dir) if f.endswith(".png")])
 
+    # clear output dir if already exists, each time
+    if os.path.exists(output_dir) and os.path.isdir(output_dir):
+        shutil.rmtree(output_dir)
+
     # 保存原始patch
     original_patches = []
 
-    # prediction for each patch 
     for patch_path in patch_paths:
 
-        # clear output dir if already exists, each time
-        if os.path.exists(output_dir) and os.path.isdir(output_dir):
-            shutil.rmtree(output_dir)
-
-        model_output = MODEL.predict(
-            [patch_path],
-            save_dir=output_dir,
-            mode="tile",
-            resolution=1.0,
-            units="baseline",
-            patch_input_shape=[patch_size, patch_size],
-            patch_output_shape=[patch_size, patch_size],
-            # stride_shape=[512, 512],
-            device=DEVICE,
-            crash_on_exception=True,
-        )
-
-        #read output & process
-        mask_patch = np.load(model_output[0][1] + ".raw.0.npy")
-        mask_patches.append(mask_patch)
-
-        # 保存原始patch
         img = cv2.imread(patch_path)
         original_patches.append(img)
 
+    # prediction
+    model_output = MODEL.predict(
+        patch_paths,
+        save_dir=output_dir,
+        mode="tile",
+        resolution=1.0,
+        units="baseline",
+        # patch_input_shape=[patch_size, patch_size],
+        # patch_output_shape=[patch_size, patch_size],
+        stride_shape=[128, 128],
+        device=DEVICE,
+        crash_on_exception=True,
+    )
+
+    dat_path = "model_output/file_map.dat"
+
+    with open(dat_path, "rb") as file:
+        file_map = pickle.load(file)
+
+    patches_path = []
+    for map in file_map:
+        patches_path.append(map[1])
+
+    mask_patches = []
+
+    for path in patches_path:
+        patch = np.load(path + ".raw.0.npy")
+        mask_patches.append(patch)
+
+    # =====
 
     # 创建debug目录
     debug_dir = "debug_output"
@@ -494,13 +593,11 @@ def execute_node():
     # 拼接并保存原始图像
     full_image = patch_concat_rgb(original_patches, WSI_ORIGINAL_WH, patch_size, WSI_GRID_SIZE)
     full_image_path = os.path.join(debug_dir, 'full_region.png')
-    cv2.imwrite(full_image_path, cv2.cvtColor(full_image, cv2.COLOR_RGB2BGR))  # 注意BGR转换
+    cv2.imwrite(full_image_path, cv2.cvtColor(full_image, cv2.COLOR_RGB2BGR))
     print(f"[DEBUG] Saved full region image to {full_image_path}")
-
     
-
-    # choose class type according to prompt
-    mask_patches = np.array(mask_patches)
+    # # choose class type according to prompt
+    # mask_patches = np.array(mask_patches)
 
     if PROMPT.lower() == "tumour":
         mask_class = mask_patches[:, :, :, 0]
@@ -510,11 +607,10 @@ def execute_node():
         mask_class = mask_patches[:, :, :, 2]
     elif PROMPT.lower() == "necrosis":
         mask_class = mask_patches[:, :, :, 3]
-    else:
+    elif PROMPT.lower() == "other":
         mask_class = mask_patches[:, :, :, 4]
-
-    # mask_patches = np.array(mask_patches)
-    # mask_class = mask_patches[:, :, :, 0]
+    else:
+        mask_class = mask_patches[:, :, :, 0]
 
     nd_path = os.path.join(debug_dir, 'mask.npy')
     np.save(nd_path, mask_class)
@@ -527,11 +623,27 @@ def execute_node():
 
     polygons = mask_to_polygons(bigmask)
 
+    # output polygon on original image to debug dir
+    for polygon in polygons:
+        polygon = np.array(polygon, np.int32)  
+        polygon = polygon.reshape((-1, 1, 2))  
+        cv2.polylines(full_image, [polygon], isClosed=True, color=(0, 255, 0), thickness=2)  # Green color
+    
+    polygon_path = os.path.join(debug_dir, 'full_region_polygons.png')
+    cv2.imwrite(polygon_path, full_image)
+    print(f"[DEBUG] Saved image with polygons to {polygon_path}")
+
+
+    absolute_polygons = [
+        [[x + BBOX[0], y + BBOX[1]] for x, y in polygon]
+        for polygon in polygons
+    ]
+
     result_value = {
         "status": "ok",
         "prompt": PROMPT,
-        "polygons_count": len(polygons),
-        "polygons": polygons,
+        "polygons_count": len(absolute_polygons),
+        "polygons": absolute_polygons,
         "bbox": BBOX
     }
 
