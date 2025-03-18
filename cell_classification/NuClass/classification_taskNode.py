@@ -22,12 +22,22 @@ import asyncio
 from sse_starlette.sse import EventSourceResponse
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from pathlib import Path
 from sklearn.linear_model import LogisticRegression
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
 
 app = FastAPI()
+
+# Add CORS middleware to allow cross-origin requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 # global variables
 ARGS = None
@@ -459,6 +469,13 @@ def execute_node():
 
     return {"status": "ok", "output": out_val}
 
+@app.options("/progress")
+async def progress_options():
+    """
+    Handle OPTIONS preflight request for CORS
+    """
+    return {"status": "ok"}
+
 @app.get("/progress")
 async def progress():
     """
@@ -483,7 +500,17 @@ async def progress():
         # Reset progress to 0 after sending the final update
         progress_value = 0
 
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS"
+        }
+    )
 
 def main():
     import threading
