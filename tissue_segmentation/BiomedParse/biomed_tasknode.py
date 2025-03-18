@@ -49,14 +49,14 @@ def binary_mask_to_polygons(binary_mask):
     polygons = []
     for contour in contours:
         polygon = contour.reshape(-1, 2).tolist()
-        if len(polygon) >= 10:  # Only add polygons with at least 10 points
+        if len(polygon) >= 10 and cv2.contourArea(contour) >= 10000:
             polygons.append(polygon)
     return polygons
 
 def binary_mask_to_contours(binary_mask):
     contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    filtered_polygons = [contour for contour in contours if len(contour) >= 10]
+    filtered_polygons = [contour for contour in contours if len(contour) >= 10 and cv2.contourArea(contour) >= 10000]
 
     if not filtered_polygons:
         return np.zeros((0, 10, 2), dtype=np.int32)
@@ -469,6 +469,13 @@ def read_node(data: Dict[str, Any]):
     print(USE_WSI, IMAGE_ARR)
     return {"status": "ok", "message": "biomed read done"}
 
+@app.options("/progress")
+async def progress_options():
+    """
+    Handle OPTIONS preflight request for CORS
+    """
+    return {"status": "ok"}
+
 @app.get("/progress")
 async def progress():
     """
@@ -493,7 +500,17 @@ async def progress():
         # Reset progress to 0 after sending the final update
         progress_value = 0
 
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS"
+        }
+    )
 
 @app.post("/execute")
 def execute_node(background_tasks: BackgroundTasks):
@@ -562,6 +579,16 @@ def execute_node(background_tasks: BackgroundTasks):
 
             # 3) polygons on bigmask and convert to absolute coordinates
             polygons = binary_mask_to_polygons(bigmask)
+            
+            print("area size:")
+            total_area = 0
+            for i, poly in enumerate(polygons):
+                contour = np.array(poly).reshape((-1, 1, 2)).astype(np.int32)
+                area = cv2.contourArea(contour)
+                print(f"  polygon #{i+1}: {area:.2f} pixels")
+                total_area += area
+            print(f"tital area: {total_area:.2f} pixels")
+            
             # Convert to absolute coordinates by adding bbox offset
             absolute_polygons = [
                 [[x + BBOX[0], y + BBOX[1]] for x, y in polygon]
@@ -574,7 +601,7 @@ def execute_node(background_tasks: BackgroundTasks):
                 "contours": absolute_polygons,
                 "bbox": BBOX
             }
-            print(result_value)
+            # print(result_value)
         else:
             # normal PNG
             if IMAGE_ARR is None:
@@ -603,7 +630,7 @@ def execute_node(background_tasks: BackgroundTasks):
             out_str = json.dumps(result_value, ensure_ascii=False)
             hf.create_dataset(out_path, data=out_str.encode("utf-8"))
 
-            print(f"[DEBUG] => wrote JSON to {out_path}: {out_str}")
+            # print(f"[DEBUG] => wrote JSON to {out_path}: {out_str}")
             try:
                 with h5py.File(H5_PATH, "r") as hf:
                     print("[DEBUG] H5 top-level keys:", list(hf.keys()))
