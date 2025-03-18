@@ -47,8 +47,10 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-        ('checkpoints/contrastive_checkpoint_epoch_0.pt', 'checkpoints'),
+        ('checkpoints/contrastive_checkpoint_epoch_4.pt', 'checkpoints'),
         ('checkpoints', 'checkpoints'),
+        ('negative_control_example_vectors.npy', '.'),
+        ('negative_control_examples', 'negative_control_examples'),
         ("Resources\\imagecodecs\\_zlib.cp39-win_amd64.pyd", "imagecodecs"),
         ("Resources\\imagecodecs\\_jpeg8.cp39-win_amd64.pyd", "imagecodecs"),
         ("Resources\\imagecodecs\\_jpeg2k.cp39-win_amd64.pyd", "imagecodecs"),
