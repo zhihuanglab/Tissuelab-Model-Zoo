@@ -18,6 +18,7 @@ from pathlib import Path
 # Clear logger to use tiatoolbox.logger
 import logging
 import warnings
+import pickle
 
 if logging.getLogger().hasHandlers():
     logging.getLogger().handlers.clear()
@@ -248,6 +249,37 @@ def read_wsi_to_patches(wsi_path, bbox, patch_size=1024):
 
     return processed_patches, (n_rows, n_cols), (scaled_width, scaled_height)
 
+# read normal image to patches
+def read_img_to_patches(img_path, bbox, patch_size=1024):
+
+    img = cv2.imread(img_path, cv2.IMREAD_COLOR)  
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) 
+    h, w, _ = img.shape  
+
+    if bbox:
+        x_min, y_min, x_max, y_max = bbox
+        x_min, y_min = max(0, x_min), max(0, y_min)
+        x_max, y_max = min(w, x_max), min(h, y_max)
+        img = img[y_min:y_max, x_min:x_max]
+        h, w, _ = img.shape 
+    
+    n_rows = (h + patch_size - 1) // patch_size 
+    n_cols = (w + patch_size - 1) // patch_size  
+
+    patches = []
+    for y in range(0, h, patch_size):
+        for x in range(0, w, patch_size):
+            patch = img[y:y+patch_size, x:x+patch_size]  
+
+            if patch.shape[0] != patch_size or patch.shape[1] != patch_size:
+                padded_patch = np.zeros((patch_size, patch_size, 3), dtype=np.uint8)
+                padded_patch[:patch.shape[0], :patch.shape[1], :] = patch
+                patch = padded_patch
+
+            patches.append(patch)
+
+    return patches, (n_rows, n_cols), (w, h)
+
 def patch_concat_mask(masks_np: list[np.ndarray], original_wh: tuple[int,int], patch_size:int, grid_size: tuple[int,int]):
     """
     masks_np: list of (1024,1024) numpy, range=0/255
@@ -284,12 +316,11 @@ def get_status():
 
 @app.post("/init")
 def init_node():
-    # load TIA breast cancer segmentation model 
 
     global DEVICE, MODEL
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"[TIABreastCancer] Using device: {device}")
+    print(f"[TIATissueMasking] Using device: {device}")
 
     try:
         MODEL = SemanticSegmentor(
@@ -301,10 +332,10 @@ def init_node():
         )
         
         DEVICE = device
-        result_value = {"status":"ok","message":f"TIABreastCancer model init done on {DEVICE}"}
+        result_value = {"status":"ok","message":f"TIATissueMasking model init done on {DEVICE}"}
 
     except Exception as e:
-        print("[TIABreastCancer] initialization error:", e)
+        print("[TIATissueMasking] initialization error:", e)
         result_value = {"status": "error", "message": str(e)}
         
     return result_value
@@ -323,7 +354,7 @@ def read_node(data: Dict[str, Any]):
     global DOWNSAMPLE_RATE
 
     # 1) Extract node_name / dependencies / h5_path from request data
-    NODE_NAME = data.get("node_name", "TIABreastCancerNode")
+    NODE_NAME = data.get("node_name", "TIATissueMaskingNode")
     DEPENDENCIES = data.get("dependencies", [])
     H5_PATH = data.get("h5_path", None)
 
@@ -337,10 +368,10 @@ def read_node(data: Dict[str, Any]):
     # Default downsample rate
     DOWNSAMPLE_RATE = 16
 
-    print(f"[TIABreastCancer] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}")
+    print(f"[TIATissueMasking] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}")
 
     if not H5_PATH or not os.path.exists(H5_PATH):
-        print("[TIABreastCancer] no H5 file found, skip reading.")
+        print("[TIATissueMasking] no H5 file found, skip reading.")
         return {"status": "ok", "message": "no H5 file."}
 
     # Dictionary to store all userData
@@ -360,7 +391,7 @@ def read_node(data: Dict[str, Any]):
                 except:
                     val_json = val_str
 
-                print(f"[TIABreastCancer] user param {k} => {val_json}")
+                print(f"[TIATissueMasking] user param {k} => {val_json}")
                 user_data_dict[k] = val_json
 
         # 3.2) Read the outputs of dependency nodes
@@ -373,7 +404,7 @@ def read_node(data: Dict[str, Any]):
                     out_json = json.loads(out_str)
                 except:
                     out_json = out_str
-                print(f"[TIABreastCancer] sees {dep_name}'s output => {out_json}")
+                print(f"[TIATissueMasking] sees {dep_name}'s output => {out_json}")
 
     # 4) Process userData in the desired order
     # 4.1) prompt
@@ -394,7 +425,7 @@ def read_node(data: Dict[str, Any]):
             print("==========down sample==========")
             print(DOWNSAMPLE_RATE)
         else:
-            print(f"[TIABreastCancer] Warning: rate is not a numeric type: {val}")
+            print(f"[TIATissueMasking] Warning: rate is not a numeric type: {val}")
 
     # 4.4) path: determine if it's a normal image or a WSI
     if "path" in user_data_dict:
@@ -411,16 +442,22 @@ def read_node(data: Dict[str, Any]):
                 path_str, BBOX, 1024
             )
             print(
-                f"[TIABreastCancer] read WSI => patches={len(PATCHES)}, "
+                f"[TIATissueMasking] read WSI => patches={len(PATCHES)}, "
                 f"grid={WSI_GRID_SIZE}, wh={WSI_ORIGINAL_WH}"
             )
         else:
             # Otherwise, assume it's a normal PNG/JPG/etc.
             USE_WSI = False
             IMAGE_ARR = read_rgb(path_str)
-            print(f"[TIABreastCancer] read normal => shape={IMAGE_ARR.shape}")
 
-    return {"status": "ok", "message": "TIABreastCancer read done"}
+            PATCHES, WSI_GRID_SIZE, WSI_ORIGINAL_WH = read_img_to_patches(
+                path_str, BBOX, 1024
+            )
+
+            print(f"[TIATissueMasking] read normal => shape={IMAGE_ARR.shape}")
+            print(f"patches={len(PATCHES)}, grid={WSI_GRID_SIZE}, wh={WSI_ORIGINAL_WH}")
+
+    return {"status": "ok", "message": "TIATissueMasking read done"}
 
 @app.post("/execute")
 def execute_node():
@@ -438,36 +475,46 @@ def execute_node():
     patch_dir = "patches"
     patch_paths = sorted([os.path.join(patch_dir, f) for f in os.listdir(patch_dir) if f.endswith(".png")])
 
+    # clear output dir if already exists, each time
+    if os.path.exists(output_dir) and os.path.isdir(output_dir):
+        shutil.rmtree(output_dir)
+
     # 保存原始patch
     original_patches = []
 
-    # prediction for each patch 
     for patch_path in patch_paths:
 
-        # clear output dir if already exists, each time
-        if os.path.exists(output_dir) and os.path.isdir(output_dir):
-            shutil.rmtree(output_dir)
-
-        model_output = MODEL.predict(
-            [patch_path],
-            save_dir=output_dir,
-            mode="tile",
-            resolution=1.0,
-            units="baseline",
-            patch_input_shape=[patch_size, patch_size],
-            patch_output_shape=[patch_size, patch_size],
-            # stride_shape=[512, 512],
-            device=DEVICE,
-            crash_on_exception=True,
-        )
-
-        #read output & process
-        mask_patch = np.load(model_output[0][1] + ".raw.0.npy")
-        mask_patches.append(mask_patch)
-
-        # 保存原始patch
         img = cv2.imread(patch_path)
         original_patches.append(img)
+        
+    # prediction
+    model_output = MODEL.predict(
+        patch_paths,
+        save_dir=output_dir,
+        mode="tile",
+        resolution=1.0,
+        units="baseline",
+        # patch_input_shape=[patch_size, patch_size],
+        # patch_output_shape=[patch_size, patch_size],
+        stride_shape=[128, 128],
+        device=DEVICE,
+        crash_on_exception=True,
+    )
+
+    dat_path = "model_output/file_map.dat"
+
+    with open(dat_path, "rb") as file:
+        file_map = pickle.load(file)
+
+    patches_path = []
+    for map in file_map:
+        patches_path.append(map[1])
+
+    mask_patches = []
+
+    for path in patches_path:
+        patch = np.load(path + ".raw.0.npy")
+        mask_patches.append(patch)
 
 
     # 创建debug目录
@@ -512,11 +559,27 @@ def execute_node():
 
     polygons = mask_to_polygons(bigmask)
 
+    # output polygon on original image to debug dir
+    for polygon in polygons:
+        polygon = np.array(polygon, np.int32)  
+        polygon = polygon.reshape((-1, 1, 2))  
+        cv2.polylines(full_image, [polygon], isClosed=True, color=(0, 255, 0), thickness=2)  # Green color
+    
+    polygon_path = os.path.join(debug_dir, 'full_region_polygons.png')
+    cv2.imwrite(polygon_path, full_image)
+    print(f"[DEBUG] Saved image with polygons to {polygon_path}")
+
+    # get absolute value for polygons
+    absolute_polygons = [
+        [[x + BBOX[0], y + BBOX[1]] for x, y in polygon]
+        for polygon in polygons
+    ]
+
     result_value = {
         "status": "ok",
         "prompt": PROMPT,
-        "polygons_count": len(polygons),
-        "polygons": polygons,
+        "polygons_count": len(absolute_polygons),
+        "polygons": absolute_polygons,
         "bbox": BBOX
     }
 
@@ -548,13 +611,13 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8004)
-    parser.add_argument("--name", type=str, default="TIABreastCancerNode")
+    parser.add_argument("--name", type=str, default="TIATissueMaskingNode")
     args = parser.parse_args()
 
     manager_url = "http://localhost:5001/api/tasks/v1/create_node"
     create_req_body = {
         "service_name": args.name,
-        "file_path": "toolbox/tissue_segmentation/TIA_breast_cancer/node_tia_breast_cancer.py",
+        "file_path": "toolbox/tissue_segmentation/TIA_tissue_masking/node_tia_tissue_masking.py",
         "port": args.port
     }
     try:
