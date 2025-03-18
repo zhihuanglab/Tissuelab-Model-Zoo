@@ -566,8 +566,6 @@ def execute_node():
         patch = np.load(path + ".raw.0.npy")
         mask_patches.append(patch)
 
-    # =====
-
     # 创建debug目录
     debug_dir = "debug_output"
     os.makedirs(debug_dir, exist_ok=True)
@@ -597,7 +595,10 @@ def execute_node():
     print(f"[DEBUG] Saved full region image to {full_image_path}")
     
     # # choose class type according to prompt
-    # mask_patches = np.array(mask_patches)
+    mask_patches = np.array(mask_patches)
+    print("=========shape!")
+    print(mask_patches.shape)
+
 
     if PROMPT.lower() == "tumour":
         mask_class = mask_patches[:, :, :, 0]
@@ -633,7 +634,7 @@ def execute_node():
     cv2.imwrite(polygon_path, full_image)
     print(f"[DEBUG] Saved image with polygons to {polygon_path}")
 
-
+    # get absolute value for polygons
     absolute_polygons = [
         [[x + BBOX[0], y + BBOX[1]] for x, y in polygon]
         for polygon in polygons
