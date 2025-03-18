@@ -600,7 +600,7 @@ def execute_node():
     print(mask_patches.shape)
 
 
-    if PROMPT.lower() == "tumour":
+    if PROMPT.lower() == "tumor" or PROMPT.lower() == "tumour":
         mask_class = mask_patches[:, :, :, 0]
     elif PROMPT.lower() == "stroma":
         mask_class = mask_patches[:, :, :, 1]
@@ -643,8 +643,8 @@ def execute_node():
     result_value = {
         "status": "ok",
         "prompt": PROMPT,
-        "polygons_count": len(absolute_polygons),
-        "polygons": absolute_polygons,
+        "contours_count": len(absolute_polygons),
+        "contours": absolute_polygons,
         "bbox": BBOX
     }
 
