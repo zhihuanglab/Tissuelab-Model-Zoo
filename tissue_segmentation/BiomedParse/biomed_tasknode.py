@@ -137,6 +137,22 @@ def process_pil_patch(pil_img: Image.Image):
     elif arr.shape[2]==4:
         arr = arr[:,:,:3]
     hh,ww,cc = arr.shape
+    
+    # Reduce image size and then pad to reduce initial memory usage
+    max_dim = max(hh, ww)
+    if max_dim > 2048:  # If size is too large, resize first then process
+        scale = 2048 / max_dim
+        arr = transform.resize(
+            arr, 
+            (int(hh * scale), int(ww * scale), 3),
+            order=1,  # Use lower order interpolation to reduce memory usage
+            mode='constant', 
+            preserve_range=True, 
+            anti_aliasing=True
+        ).astype(arr.dtype)
+        hh, ww = arr.shape[:2]
+        
+    # Continue normal processing
     if hh>ww:
         pd = (hh-ww)//2
         arr = np.pad(arr, ((0,0),(pd,pd),(0,0)), 'constant', constant_values=0)
@@ -148,6 +164,9 @@ def process_pil_patch(pil_img: Image.Image):
     for i in range(3):
         out[:,:,i] = transform.resize(arr[:,:,i], (1024,1024),
             order=3, mode='constant', preserve_range=True, anti_aliasing=True)
+    
+    # Actively release memory
+    del arr
     return out
 
 def patch_concat_mask(masks_np: list[np.ndarray], original_wh: tuple[int,int], patch_size:int, grid_size: tuple[int,int]):
@@ -195,6 +214,7 @@ def process_patch(svs, x, y, level, patch_size):
 def read_wsi_to_patches(wsi_path, bbox, patch_size=1024):
     import tiffslide
     import time
+    import gc
     from concurrent.futures import ThreadPoolExecutor
     """
     read WSI using parallel processing
@@ -209,29 +229,84 @@ def read_wsi_to_patches(wsi_path, bbox, patch_size=1024):
     scaled_width = int(width / downsample_factor)
     scaled_height = int(height / downsample_factor)
 
-    n_cols = max(1, scaled_width // patch_size)
-    n_rows = max(1, scaled_height // patch_size)
+    # Calculate number of blocks needed
+    n_cols = max(1, (scaled_width + patch_size - 1) // patch_size)
+    n_rows = max(1, (scaled_height + patch_size - 1) // patch_size)
 
     print(f"Best Level: {best_level}, Downsample Factor: {downsample_factor}")
     print(f"Scaled Size: {scaled_width}x{scaled_height}, Patches: {n_rows}x{n_cols}")
+    print(f"Total blocks: {n_rows * n_cols}, please wait patiently for processing...")
 
+    # Use smaller block size for processing
     processed_patches = []
     start_time = time.time()
 
-    with ThreadPoolExecutor() as executor:
-        futures = []
-        for row in range(n_rows):
-            for col in range(n_cols):
+    # Reduce concurrent threads to avoid memory explosion
+    max_workers = min(4, (n_rows * n_cols))
+    print(f"Using {max_workers} worker threads")
+    
+    # Process in batches to avoid loading all data at once
+    batch_size = 50
+    num_batches = (n_rows * n_cols + batch_size - 1) // batch_size
+    
+    for batch in range(num_batches):
+        start_idx = batch * batch_size
+        end_idx = min(start_idx + batch_size, n_rows * n_cols)
+        print(f"Processing batch {batch+1}/{num_batches} (blocks {start_idx+1}-{end_idx})")
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for idx in range(start_idx, end_idx):
+                row = idx // n_cols
+                col = idx % n_cols
                 x = x_start + col * patch_size * downsample_factor
                 y = y_start + row * patch_size * downsample_factor
                 futures.append(executor.submit(process_patch, svs, x, y, best_level, patch_size))
 
-        for future in futures:
-            processed_patches.append(future.result())
-
-    # Save only the final full image
-    full_img = svs.read_region((x_start, y_start), level=best_level, size=(scaled_width, scaled_height))
-    full_img.save("full_wsi_image.png")
+            # Process results of this batch
+            for i, future in enumerate(futures):
+                try:
+                    patch = future.result()
+                    processed_patches.append(patch)
+                except Exception as e:
+                    print(f"Error processing patch #{start_idx+i+1}: {e}")
+                    # Add blank patch as placeholder
+                    processed_patches.append(np.zeros((patch_size, patch_size, 3), dtype=np.uint8))
+                
+                if (i+1) % 10 == 0:
+                    print(f"Processed {start_idx+i+1}/{n_rows * n_cols} blocks ({((start_idx+i+1)/(n_rows*n_cols)*100):.1f}%)")
+        
+        # Force garbage collection after each batch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    # Try to save debug preview image
+    try:
+        debug_dir = "debug_output"
+        os.makedirs(debug_dir, exist_ok=True)
+        
+        # Save smaller preview image
+        preview_scale = min(1.0, 1024 / max(scaled_width, scaled_height))
+        preview_width = int(scaled_width * preview_scale)
+        preview_height = int(scaled_height * preview_scale)
+        
+        # Create small preview image - limit to smaller size
+        if preview_width * preview_height < 10000000:  # Limit to about 10M pixels
+            preview = Image.new('RGB', (preview_width, preview_height))
+            for row in range(n_rows):
+                for col in range(n_cols):
+                    idx = row * n_cols + col
+                    if idx < len(processed_patches):
+                        patch_img = Image.fromarray(processed_patches[idx])
+                        patch_img = patch_img.resize((int(patch_size*preview_scale), int(patch_size*preview_scale)))
+                        x = int(col * patch_size * preview_scale)
+                        y = int(row * patch_size * preview_scale)
+                        preview.paste(patch_img, (x, y))
+            preview.save(os.path.join(debug_dir, "wsi_preview.png"))
+            print(f"Preview image saved to {os.path.join(debug_dir, 'wsi_preview.png')}")
+    except Exception as e:
+        print(f"Error saving preview image: {e}")
 
     end_time = time.time()
     print(f"Processing time: {end_time - start_time:.2f} seconds")
@@ -534,74 +609,195 @@ def execute_node(background_tasks: BackgroundTasks):
         if USE_WSI:
             patch_size = 1024
             mask_patches = []
-            original_patches = []
             total_patches = len(PATCHES)
-            for idx, arr1024 in enumerate(tqdm(PATCHES, desc="WSI patches")):
-                original_patches.append(arr1024)
-                mask = interactive_infer_image(MODEL, Image.fromarray(arr1024), [PROMPT])[0]
-                mask_bin = binary_mask(mask, threshold=0.5) * 255
-                mask_patches.append(mask_bin)
-
-                # Update progress
-                progress_value = int((idx + 1) / total_patches * 100)
-                print(f"Progress: {progress_value}%")
-
-            # Ensure progress is set to 100 after processing all patches
-            progress_value = 100
-
-            debug_dir = "debug_output"
-            os.makedirs(debug_dir, exist_ok=True)
-            def patch_concat_rgb(patches, original_wh, patch_size, grid_size):
-                w,h = original_wh
+            
+            # Greatly reduce batch processing size
+            batch_size = 50  # Process only 50 patches per batch
+            num_batches = (total_patches + batch_size - 1) // batch_size
+            
+            try:
+                for batch_idx in range(num_batches):
+                    # Actively clean memory before each batch
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(start_idx + batch_size, total_patches)
+                    
+                    # Process only one batch of patches at a time
+                    batch_masks = []
+                    for idx in range(start_idx, end_idx):
+                        try:
+                            # Load only one patch into memory at a time
+                            arr1024 = PATCHES[idx]
+                            
+                            # Use with torch.no_grad() to reduce GPU memory usage
+                            with torch.no_grad():
+                                # Convert to PIL image for input
+                                img = Image.fromarray(arr1024)
+                                
+                                # Release original patch memory immediately
+                                del arr1024
+                                gc.collect()
+                                
+                                try:
+                                    mask = interactive_infer_image(MODEL, img, [PROMPT])[0]
+                                    # Release image memory immediately
+                                    del img
+                                    gc.collect()
+                                    
+                                    # Convert to binary mask and use uint8 to reduce memory
+                                    mask_bin = (mask > 0.5).astype(np.uint8) * 255
+                                    del mask
+                                    gc.collect()
+                                    
+                                    batch_masks.append(mask_bin)
+                                    del mask_bin
+                                    gc.collect()
+                                except Exception as e:
+                                    print(f"Error processing mask: {e}")
+                                    try:
+                                        # Try to create a smaller empty mask
+                                        small_mask = np.zeros((512, 512), dtype=np.uint8)
+                                        # Then resize
+                                        empty_mask = cv2.resize(small_mask, (patch_size, patch_size), 
+                                                               interpolation=cv2.INTER_NEAREST)
+                                        batch_masks.append(empty_mask)
+                                    except Exception as mem_err:
+                                        print(f"Failed to create empty mask: {mem_err}")
+                                        # If this also fails, skip this patch
+                                        continue
+                            
+                            # Clean memory after each patch
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                
+                        except Exception as e:
+                            print(f"Error processing patch: {e}")
+                            try:
+                                # Try to create a smaller empty mask then enlarge
+                                small_mask = np.zeros((512, 512), dtype=np.uint8)
+                                empty_mask = cv2.resize(small_mask, (patch_size, patch_size),
+                                                      interpolation=cv2.INTER_NEAREST)
+                                batch_masks.append(empty_mask)
+                                del small_mask
+                            except:
+                                # Skip if even empty mask cannot be created
+                                print("Cannot create empty mask, skipping this patch")
+                                continue
+                    
+                    # Save this batch of masks, then clear temporary variables
+                    mask_patches.extend(batch_masks)
+                    del batch_masks
+                    
+                    # Update progress
+                    progress_value = min(99, int((end_idx / total_patches) * 100))
+                    print(f"Progress: {progress_value}%, Processed {end_idx}/{total_patches} patches")
+                    
+                    # Force memory cleanup between batches
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                
+                # Ensure progress is set to 100%
+                progress_value = 100
+                
+                debug_dir = "debug_output"
+                os.makedirs(debug_dir, exist_ok=True)
+                
+                # Process masks block by block to reduce memory usage
+                print("Starting mask processing...")
+                rows, cols = WSI_GRID_SIZE
+                w, h = WSI_ORIGINAL_WH
+                
+                # Calculate new dimensions with padding
                 new_w = ((w+patch_size-1)//patch_size)*patch_size
                 new_h = ((h+patch_size-1)//patch_size)*patch_size
-                bigimage = np.zeros((new_h, new_w, 3), dtype=np.uint8)
-                idx=0
-                rows,cols=grid_size
-                for row in range(rows):
-                    for col in range(cols):
-                        if idx<len(patches):
-                            pm = patches[idx]
-                            x=col*patch_size
-                            y=row*patch_size
-                            bigimage[y:y+patch_size, x:x+patch_size]=pm
-                            idx+=1
-                return bigimage[:h, :w]
-            full_image = patch_concat_rgb(original_patches, WSI_ORIGINAL_WH, patch_size, WSI_GRID_SIZE)
-            full_image_path = os.path.join(debug_dir, 'full_region.png')
-            cv2.imwrite(full_image_path, cv2.cvtColor(full_image, cv2.COLOR_RGB2BGR))  # 注意BGR转换
-            print(f"[DEBUG] Saved full region image to {full_image_path}")
-
-            bigmask = patch_concat_mask(mask_patches, WSI_ORIGINAL_WH, patch_size, WSI_GRID_SIZE)
-            bigmask_path = os.path.join(debug_dir, 'full_region_mask.png')
-            cv2.imwrite(bigmask_path, bigmask)
-            print(f"[DEBUG] Saved full region mask to {bigmask_path}")
-
-            # 3) polygons on bigmask and convert to absolute coordinates
-            polygons = binary_mask_to_polygons(bigmask)
-            
-            print("area size:")
-            total_area = 0
-            for i, poly in enumerate(polygons):
-                contour = np.array(poly).reshape((-1, 1, 2)).astype(np.int32)
-                area = cv2.contourArea(contour)
-                print(f"  polygon #{i+1}: {area:.2f} pixels")
-                total_area += area
-            print(f"tital area: {total_area:.2f} pixels")
-            
-            # Convert to absolute coordinates by adding bbox offset
-            absolute_polygons = [
-                [[x + BBOX[0], y + BBOX[1]] for x, y in polygon]
-                for polygon in polygons
-            ]
-            result_value = {
-                "status": "ok",
-                "prompt": PROMPT,
-                "contours_count": len(absolute_polygons),
-                "contours": absolute_polygons,
-                "bbox": BBOX
-            }
-            # print(result_value)
+                
+                # Create sparse mask or process in blocks
+                full_mask = None
+                try:
+                    # Try to create complete mask
+                    full_mask = np.zeros((new_h, new_w), dtype=np.uint8)
+                    print(f"Created full-size mask: {full_mask.shape}")
+                except Exception as e:
+                    print(f"Cannot create complete mask: {e}, will use block processing")
+                
+                if full_mask is not None:
+                    # If complete mask can be created, process normally
+                    for idx, pm in enumerate(mask_patches):
+                        if idx < rows * cols:
+                            row = idx // cols
+                            col = idx % cols
+                            y = row * patch_size
+                            x = col * patch_size
+                            try:
+                                full_mask[y:y+patch_size, x:x+patch_size] = pm
+                            except Exception as e:
+                                print(f"Error stitching mask: {e}")
+                    
+                    # Crop back to original size
+                    bigmask = full_mask[:h, :w]
+                    
+                    # Save result
+                    bigmask_path = os.path.join(debug_dir, 'full_region_mask.png')
+                    cv2.imwrite(bigmask_path, bigmask)
+                    print(f"Saved complete mask to {bigmask_path}")
+                    
+                    # Extract contours
+                    polygons = binary_mask_to_polygons(bigmask)
+                else:
+                    # Process in blocks and extract contours directly
+                    print("Using block processing to extract contours...")
+                    polygons = []
+                    
+                    # Process mask block by block
+                    for idx, pm in enumerate(mask_patches):
+                        if idx < rows * cols:
+                            row = idx // cols
+                            col = idx % cols
+                            # Calculate absolute position in original image
+                            abs_x = col * patch_size
+                            abs_y = row * patch_size
+                            
+                            # Extract contours for current block
+                            block_polygons = binary_mask_to_polygons(pm)
+                            
+                            # Convert to absolute coordinates
+                            for poly in block_polygons:
+                                # Adjust polygon coordinates
+                                adjusted_poly = [[x + abs_x, y + abs_y] for x, y in poly]
+                                polygons.append(adjusted_poly)
+                
+                print("area size:")
+                total_area = 0
+                for i, poly in enumerate(polygons):
+                    contour = np.array(poly).reshape((-1, 1, 2)).astype(np.int32)
+                    area = cv2.contourArea(contour)
+                    print(f"  polygon #{i+1}: {area:.2f} pixels")
+                    total_area += area
+                print(f"Total area: {total_area:.2f} pixels")
+                
+                # Convert to absolute coordinates
+                absolute_polygons = [
+                    [[x + BBOX[0], y + BBOX[1]] for x, y in polygon]
+                    for polygon in polygons
+                ]
+                result_value = {
+                    "status": "ok",
+                    "prompt": PROMPT,
+                    "contours_count": len(absolute_polygons),
+                    "contours": absolute_polygons,
+                    "bbox": BBOX
+                }
+            except Exception as e:
+                print(f"[BiomedParse] WSI processing error: {e}")
+                import traceback
+                traceback.print_exc()
+                result_value = {"status": "error", "message": str(e)}
         else:
             # normal PNG
             if IMAGE_ARR is None:
@@ -630,15 +826,6 @@ def execute_node(background_tasks: BackgroundTasks):
             out_str = json.dumps(result_value, ensure_ascii=False)
             hf.create_dataset(out_path, data=out_str.encode("utf-8"))
 
-            # print(f"[DEBUG] => wrote JSON to {out_path}: {out_str}")
-            try:
-                with h5py.File(H5_PATH, "r") as hf:
-                    print("[DEBUG] H5 top-level keys:", list(hf.keys()))
-                    for key in hf.keys():
-                        print(f"    - {key} => subkeys:", list(hf[key].keys()))
-            except Exception as e:
-                print(f"[DEBUG] Error reading H5 structure: {e}")
-
     return {"status":"ok","output":result_value}
 
 # =========== main ===========
@@ -655,7 +842,7 @@ def main():
     manager_url = "http://localhost:5001/api/tasks/v1/create_node"
     create_req_body = {
         "service_name": args.name,
-        "file_path": "toolbox/tissue_segmentation/BiomedParse/node_biomed.py",
+        "file_path": "toolbox/tissue_segmentation/BiomedParse/biomed_tasknode.py",
         "port": args.port
     }
     try:
