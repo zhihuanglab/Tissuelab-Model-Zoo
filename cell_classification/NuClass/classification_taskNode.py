@@ -186,10 +186,19 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     
     if "Negative control" not in annotations["cell_class"].values.astype(str):
         print("Found annotations, but there is no 'Negative control' class, we will use negative_control_example_vectors.npy as negative control")
-        negative_control_vectors = np.load("negative_control_example_vectors.npy") # (N, 512)
-        print(f"negative_control_vectors: {negative_control_vectors.shape}")
-        X_train = np.concatenate([negative_control_vectors, X_train], axis=0)
-        y_train = np.concatenate([np.zeros(negative_control_vectors.shape[0]), y_train], axis=0).astype(int)
+        
+        base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
+        neg_control_path = os.path.join(base_path, "negative_control_example_vectors.npy")
+        print(f"Looking for negative control vectors at: {neg_control_path}")
+        
+        try:
+            negative_control_vectors = np.load(neg_control_path)
+            print(f"negative_control_vectors: {negative_control_vectors.shape}")
+            X_train = np.concatenate([negative_control_vectors, X_train], axis=0)
+            y_train = np.concatenate([np.zeros(negative_control_vectors.shape[0]), y_train], axis=0).astype(int)
+        except Exception as e:
+            print(f"Warning: Could not load negative control vectors: {e}")
+            print("Proceeding without negative control vectors")
     
 
     import time
