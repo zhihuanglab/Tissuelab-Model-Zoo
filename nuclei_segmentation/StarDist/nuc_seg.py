@@ -22,9 +22,54 @@ from scipy.ndimage import zoom
 from skimage.feature import graycomatrix, graycoprops
 from skimage import draw
 import tensorflow as tf
+from wrappers import CziImageWrapper
+import xml.etree.ElementTree as ET
+import czifile
 
 
 opj = os.path.join
+
+def get_czi_scale(file_path):
+    """
+    Extract scaling information (microns/pixel) from CZI file
+    
+    Args:
+        file_path (str): Path to CZI file
+        
+    Returns:
+        float: Microns per pixel value, returns None if extraction fails
+    """
+    try:
+        # Open CZI file directly using czifile library
+        with czifile.CziFile(file_path) as czi:
+            # Get metadata
+            metadata = czi.metadata()
+            
+            # Parse XML metadata
+            metadata_root = ET.fromstring(metadata)
+            
+            # Try different possible metadata paths
+            possible_paths = [
+                './/Scaling/Items/Distance[@Id="X"]/Value',
+                './/ImageScaling/ImagePixelSize/X',
+                './/ImageDocument/Metadata/Information/Image/PixelSize/X',
+                './/Image/PixelSize/X'
+            ]
+            
+            for path in possible_paths:
+                element = metadata_root.find(path)
+                if element is not None:
+                    # Convert from meters to microns (multiply by 10^6)
+                    meters_per_pixel = float(element.text)
+                    microns_per_pixel = meters_per_pixel * 1e6
+                    print(f"Found pixel size from CZI metadata: {microns_per_pixel:.3f} microns/pixel")
+                    return microns_per_pixel
+            
+            print("Pixel size information not found in CZI metadata")
+            return None
+    except Exception as e:
+        print(f"Error reading CZI file: {str(e)}")
+        return None
 
 class SlideSegmentation():
 
@@ -77,7 +122,7 @@ class SlideSegmentation():
             self.dim = self.slide.level_dimensions[self.level]
         except:
             self.dim = self.slide.dimensions
-        self.downsample = self.slide.level_downsamples[self.level]
+        # self.downsample = self.slide.level_downsamples[self.level]
         
         self.mask_ratio_x = None
         self.mask_ratio_y = None
@@ -115,7 +160,7 @@ class SlideSegmentation():
         self.max_cache_size = 4  # Adjust based on memory constraints
         
     def read_data(self):
-        print("Read data ...", datetime.now().strftime("%H:%M:%S"))
+        print("Reading data ...", datetime.now().strftime("%H:%M:%S"))
 
         try:
             import openslide
@@ -123,13 +168,50 @@ class SlideSegmentation():
             mpp = float(self.slide.properties['openslide.mpp-x'])
 
         except:
-            print('OpenSlide failed. Try TiffSlide.')
-            import tiffslide
-            self.slide = tiffslide.TiffSlide(self.args.slidepath)
-            mpp = float(self.slide.properties['tiffslide.mpp-x'])
-
+            print('OpenSlide failed. Trying TiffSlide or other formats.')
+            
+            file_extension = os.path.splitext(self.args.slidepath)[1].lower()[1:]
+            
+            if file_extension == 'czi':
+                print('CZI format detected, using CziImageWrapper')
+                self.slide = CziImageWrapper(self.args.slidepath)
+                
+                # Try to get actual mpp value
+                mpp = get_czi_scale(self.args.slidepath)
+                if mpp is None:
+                    print('Warning: Unable to get mpp value from CZI file, using default value 0.25')
+                    mpp = 0.25
+                else:
+                    print(f'Resolution obtained from CZI file: {mpp:.3f} microns/pixel')
+                
+                # Calculate magnification
+                reference_mpp_10x = 1.0  # At 10x, mpp is about 1.0 microns/pixel
+                magnification = reference_mpp_10x / mpp * 10
+                self.args.magnification = magnification
+                print(f'Calculated magnification: {magnification:.1f}x')
+            else:
+                try:
+                    import tiffslide
+                    self.slide = tiffslide.TiffSlide(self.args.slidepath)
+                    mpp = float(self.slide.properties['tiffslide.mpp-x'])
+                except Exception as e:
+                    print(f"TiffSlide also failed: {e}")
+                    
+                    if file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
+                        from .wrappers import SimpleImageWrapper
+                        self.slide = SimpleImageWrapper(self.args.slidepath)
+                        mpp = 0.25  # default value
+                    elif file_extension in ['dcm']:
+                        from .wrappers import DicomImageWrapper
+                        self.slide = DicomImageWrapper(self.args.slidepath)
+                        mpp = 0.25  # default value
+                    else:
+                        from .wrappers import TiffSlideWrapper
+                        self.slide = TiffSlideWrapper(self.args.slidepath)
+                        mpp = 0.25  # default value
         
         reference_mpp_1x = 10  # objective magnification
+        print(self.args.magnification)
         self.args.magnification = reference_mpp_1x / mpp
         print("Magnification: ", self.args.magnification)
         if self.args.magnification > 80+1:
@@ -153,10 +235,12 @@ class SlideSegmentation():
 
         # temp_thumb = self.slide.get_thumbnail(size=(2000, 2000))
         try:
-            level = np.min([3, len(self.slide.level_dimensions)-1])
+            level = np.min([5, len(self.slide.level_dimensions)-1])
             #downsample=self.slide.level_downsamples[level]
+            print(self.slide.level_dimensions)
             dim = list(self.slide.level_dimensions)[level]
-            if (dim[0] > 10000) or (dim[1] > 10000):
+            print(dim)
+            if (dim[0] > 20000) or (dim[1] > 20000):
                 print('Thumb is too big. skip this.')
                 return None
             temp_thumb = self.slide.read_region((0,0), level, dim)
