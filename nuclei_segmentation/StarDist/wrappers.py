@@ -6,9 +6,6 @@ from pylibCZIrw import czi
 import threading
 import time
 import pythoncom
-import czifile
-import xml.etree.ElementTree as ET
-import os
 TILE_SIZE = 1024
 
 class TiffSlideWrapper:
@@ -218,201 +215,67 @@ class DicomImageWrapper:
 
 
 class CziImageWrapper:
-    """
-    Wrapper for CZI images that implements the same interface as OpenSlide.
-    """
-    def __init__(self, filename):
-        """
-        Initialize CZI image wrapper.
-        
-        Args:
-            filename: Path to CZI file
-        """
-        self.filename = filename
-        self.czi = czifile.CziFile(filename)
-        self._dimensions = None
-        self._metadata = None
-        self.mpp = None  # Microns per pixel
-        self.magnification = None
-        
-        # Extract metadata and calculate magnification
-        self._extract_metadata()
-        
-    def _extract_metadata(self):
-        """Extract metadata from CZI file and calculate resolution information"""
-        try:
-            # Get metadata
-            self._metadata = self.czi.metadata()
-            metadata_root = ET.fromstring(self._metadata)
-            
-            # Try different possible paths for pixel size
-            possible_paths = [
-                './/Scaling/Items/Distance[@Id="X"]/Value',
-                './/ImageScaling/ImagePixelSize/X',
-                './/ImageDocument/Metadata/Information/Image/PixelSize/X',
-                './/Image/PixelSize/X'
-            ]
-            
-            for path in possible_paths:
-                element = metadata_root.find(path)
-                if element is not None:
-                    # Convert from meters to microns (multiply by 10^6)
-                    meters_per_pixel = float(element.text)
-                    self.mpp = meters_per_pixel * 1e6
-                    # Calculate equivalent magnification (assuming 10x = 1.0 microns per pixel)
-                    reference_mpp_10x = 1.0
-                    self.magnification = reference_mpp_10x / self.mpp * 10
-                    print(f"CZI metadata: {self.mpp:.3f} microns per pixel")
-                    print(f"Calculated magnification: {self.magnification:.1f}x")
-                    break
-            
-            if self.mpp is None:
-                print("Warning: Could not find pixel size information in CZI metadata")
-                self.mpp = 0.25  # Default value (40x magnification)
-                self.magnification = 40.0
-        except Exception as e:
-            print(f"Error extracting CZI metadata: {str(e)}")
-            self.mpp = 0.25  # Default to 40x magnification
-            self.magnification = 40.0
-    
-    def get_metadata(self):
-        """Return the raw metadata string from the CZI file"""
-        if self._metadata is None:
-            self._metadata = self.czi.metadata()
-        return self._metadata
-    
-    @property
-    def dimensions(self):
-        """Get image dimensions (width, height)"""
-        if self._dimensions is None:
-            # Extract dimensions from CZI
-            data = self.czi.asarray()
-            if len(data.shape) > 2:
-                # Handle multi-dimensional data (e.g., TZCYX)
-                # Find the dimensions corresponding to X, Y
-                shape_dict = dict(zip(self.czi.axes, data.shape))
-                
-                # Default to last two dimensions if X, Y not found
-                if 'X' in shape_dict and 'Y' in shape_dict:
-                    width, height = shape_dict['X'], shape_dict['Y']
-                else:
-                    width, height = data.shape[-1], data.shape[-2]
-            else:
-                # Simple 2D image
-                height, width = data.shape
-            self._dimensions = (width, height)
-        return self._dimensions
-    
-    @property
-    def level_count(self):
-        """Return the number of levels (always 1 for CZI files)"""
-        return 1
-    
-    @property
-    def level_dimensions(self):
-        """Return a list of dimensions for each level"""
-        return [self.dimensions]
-    
-    @property
-    def properties(self):
-        """Return a dictionary of properties, similar to OpenSlide"""
-        props = {
-            'czi.mpp-x': str(self.mpp) if self.mpp is not None else '0.25',
-            'czi.mpp-y': str(self.mpp) if self.mpp is not None else '0.25',
-            'czi.magnification': str(self.magnification) if self.magnification is not None else '40.0',
-            'czi.filename': os.path.basename(self.filename)
+
+    def __init__(self, czi_path, max_levels=5):
+        self.path = czi_path
+        self._init_metadata()
+        self._init_levels(max_levels)
+        self.lock = threading.Lock()
+
+
+    def _init_metadata(self):
+        with czi.open_czi(self.path) as reader:
+            bounds = reader.total_bounding_box
+            self.x_range = bounds['X']
+            self.y_range = bounds['Y']
+            self.dimensions = (self.x_range[1] - self.x_range[0],
+                               self.y_range[1] - self.y_range[0])
+
+    def _init_levels(self, max_levels):
+        self.level_dimensions = []
+        w, h = self.dimensions
+        for i in range(max_levels):
+            self.level_dimensions.append((int(w >> i), int(h >> i)))
+        self.level_count = len(self.level_dimensions)
+        self.properties = {
+            'vendor': 'CziImageWrapper',
+            'dimensions': f'{self.dimensions[0]}x{self.dimensions[1]}',
+            'level_count': str(self.level_count),
         }
-        return props
-    
-    def read_region(self, location, level, size):
-        """
-        Read a region from the image.
-        
-        Args:
-            location: (x, y) coordinates of the top-left pixel
-            level: Level to read from (ignored, always reads from level 0)
-            size: (width, height) of region to read
-            
-        Returns:
-            PIL.Image in RGBA mode
-        """
-        x, y = location
-        width, height = size
-        
-        # Read the entire image data
-        try:
-            data = self.czi.asarray()
-            
-            # Handle multi-dimensional data
-            if len(data.shape) > 2:
-                # Find X and Y dimensions
-                axes = self.czi.axes
-                
-                # Get indices for X and Y axes
-                x_idx = axes.find('X')
-                y_idx = axes.find('Y')
-                
-                # If X and Y dimensions are identified
-                if x_idx >= 0 and y_idx >= 0:
-                    # Create a slice tuple for all dimensions
-                    slices = [slice(None)] * len(axes)
-                    
-                    # Set X and Y slices
-                    slices[x_idx] = slice(x, x + width)
-                    slices[y_idx] = slice(y, y + height)
-                    
-                    # Extract region
-                    region_data = data[tuple(slices)]
-                    
-                    # Reduce to 2D by taking the first index of other dimensions
-                    while len(region_data.shape) > 2:
-                        flatten_dim = [i for i in range(len(region_data.shape)) 
-                                       if i != x_idx and i != y_idx][0]
-                        region_data = region_data.take(0, axis=flatten_dim)
-                else:
-                    # Fallback method if axes aren't properly identified
-                    # Assume last two dimensions are spatial (Y, X)
-                    slices = tuple([0] * (len(data.shape) - 2) + 
-                                   [slice(y, y + height), slice(x, x + width)])
-                    region_data = data[slices]
-            else:
-                # Simple 2D image
-                region_data = data[y:y+height, x:x+width]
-            
-            # Convert to 8-bit RGB
-            if region_data.dtype != np.uint8:
-                if region_data.max() > 0:
-                    region_data = (region_data / region_data.max() * 255).astype(np.uint8)
-                else:
-                    region_data = np.zeros(region_data.shape, dtype=np.uint8)
-            
-            # Ensure we have an RGB image
-            if len(region_data.shape) == 2:
-                # Convert grayscale to RGB
-                rgb_data = np.stack([region_data] * 3, axis=-1)
-            elif region_data.shape[-1] >= 3:
-                # Use first three channels as RGB
-                rgb_data = region_data[..., :3]
-            else:
-                # Grayscale with 1 channel
-                rgb_data = np.stack([region_data[..., 0]] * 3, axis=-1)
-            
-            # Create PIL image
-            image = Image.fromarray(rgb_data, 'RGB')
-            
-            # Add alpha channel to make it RGBA
-            alpha = Image.new('L', image.size, 255)
-            image.putalpha(alpha)
-            
-            return image
-        
-        except Exception as e:
-            print(f"Error reading region at {location}, size {size}: {str(e)}")
-            # Return a blank RGBA image
-            image = Image.new('RGBA', size, (0, 0, 0, 0))
-            return image
-    
-    def close(self):
-        """Close the CZI file"""
-        if hasattr(self, 'czi') and self.czi is not None:
-            self.czi.close()
+
+    def read_region(self, location, level, size, as_array=False):
+        with self.lock:
+            pythoncom.CoInitialize()
+            try:
+                if level >= self.level_count:
+                    raise ValueError(
+                        f"Requested level {level} exceeds available levels {self.level_count}"
+                    )
+
+                downsample = 2**level
+                x, y = location
+                w, h = size
+
+                roi_x = int(x + self.x_range[0])
+                roi_y = int(y + self.y_range[0])
+                roi_w = int(w * downsample)
+                roi_h = int(h * downsample)
+                zoom = 1.0 / downsample
+
+                with czi.open_czi(self.path) as reader:
+                    try:
+                        img = reader.read(roi=(roi_x, roi_y, roi_w, roi_h),
+                                        zoom=zoom,
+                                        scene=0)
+                    except Exception as e:
+                        print(f"roi_x: {roi_x}, roi_y: {roi_y}, roi_w: {roi_w}, roi_h: {roi_h}, zoom: {zoom}, scene: {0}")
+                        print(f"Error reading region: {e}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                        raise e
+                    # print(f"finished reading")
+                # time.sleep(5)
+
+                pil_img = Image.fromarray(img)
+            finally:
+                pythoncom.CoUninitialize()
+            return np.array(pil_img) if as_array else pil_img
+        return None
