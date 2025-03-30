@@ -274,6 +274,10 @@ class CziImageWrapper:
                     # print(f"finished reading")
                 # time.sleep(5)
 
+                #BGR to RGB, fill blank space with white
+                img = img[:, :, ::-1]
+                img[img == 0] = 255
+
                 pil_img = Image.fromarray(img)
             finally:
                 pythoncom.CoUninitialize()

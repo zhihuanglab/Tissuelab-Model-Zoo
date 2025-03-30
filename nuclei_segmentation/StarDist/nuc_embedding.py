@@ -286,41 +286,25 @@ class NucleiEmbedding:
 
     def generate_embeddings(self, batch_size=None, num_workers=None):
         """Generate embeddings for all nuclei using PyTorch DataLoader."""
+        # Reduce default worker count or use single process by default
         if num_workers is None:
-            num_workers = min(mp.cpu_count(), 4)
-
-        # Dynamically determine batch size based on available GPU memory
+            num_workers = 0  # Default to single process mode to avoid crashes
+        
+        # Dynamically determine batch size
         if batch_size is None and torch.cuda.is_available():
             try:
-                # Get GPU memory in GB
                 total_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                allocated_memory = torch.cuda.memory_allocated(0) / (1024**3)
-                cached_memory = torch.cuda.memory_reserved(0) / (1024**3)
-                
-                print(f"GPU Memory Status:")
-                print(f"Total: {total_memory:.2f} GB")
-                print(f"Allocated: {allocated_memory:.2f} GB")
-                print(f"Cached: {cached_memory:.2f} GB")
-                
-                # Reserve some memory for the model and system
-                available_memory = total_memory * 0.9  # Use 90% of total memory
-                print(f"Setting available memory to: {available_memory:.2f} GB")
-                # Estimate memory per sample (in GB) - PLIP model typically uses about 0.5GB for batch_size=1
-                memory_per_sample = 0.01
-                # Calculate maximum possible batch size
-                max_batch_size = int(available_memory / memory_per_sample)
-
-                # Set a reasonable range for batch size
-                batch_size = max(1, min(max_batch_size, 128))
-                print(f"Automatically set batch size to {batch_size} based on available GPU memory")
+                batch_size = max(1, min(int(total_memory * 4), 32))  # More conservative batch size
+                print(f"Automatically set batch size to {batch_size}")
             except Exception as e:
                 print(f"Error setting dynamic batch size: {e}")
-                batch_size = 128
+                batch_size = 32  # Smaller default value
         elif batch_size is None:
-            batch_size = 128
+            batch_size = 32  # Smaller default value
 
-        print(f"Generating embeddings using {num_workers} workers and batch size {batch_size}...")
+        print(f"Generating embeddings with {num_workers} workers and batch size {batch_size}...")
         
+        # Create dataset
         dataset = NucleiPatchDataset(
             slide_path=self.args.slidepath,
             read_image_method=self.args.read_image_method,
@@ -330,72 +314,146 @@ class NucleiEmbedding:
             processor=self.processor
         )
         
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            shuffle=False,
-            collate_fn=collate_patches,
-            prefetch_factor=1,
-            persistent_workers=True,
-            pin_memory=True
-        )
+        # Try using DataLoader with different configurations
+        dataloader = None
+        error_message = ""
         
-        embeddings_list = []
-        total_start_time = time.time()
+        # Configuration options list, from optimal to fallback configurations
+        config_options = [
+            {"num_workers": num_workers, "pin_memory": True, "prefetch_factor": 1, 
+             "persistent_workers": True if num_workers > 0 else False},
+            {"num_workers": 1, "pin_memory": True, "prefetch_factor": 1, "persistent_workers": False},
+            {"num_workers": 0, "pin_memory": False}  # Final fallback: single process, no pin memory
+        ]
         
-        # Create progress bar
-        pbar = tqdm(total=len(dataset), desc="Generating embeddings")
-        processed_count = 0
-        
-        # Create iterator for prefetching
-        dataloader_iterator = iter(dataloader)
-        
-        from concurrent.futures import ThreadPoolExecutor
-        
-        def load_next_batch():
+        for config in config_options:
             try:
-                return next(dataloader_iterator)
-            except StopIteration:
-                return None
-
-        # Use 2 threads: one for current batch, one for prefetching next batch
-        PREFETCH_THREADS = 2  # Constants in uppercase by convention
-        with ThreadPoolExecutor(max_workers=PREFETCH_THREADS) as executor:
-            # Submit initial future
-            future = executor.submit(load_next_batch)
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    collate_fn=collate_patches,
+                    **config
+                )
+                print(f"Successfully created DataLoader with config: {config}")
+                # Try to get the first batch to verify it actually works
+                iter(dataloader).__next__()
+                break
+            except Exception as e:
+                error_message = f"DataLoader configuration failed: {str(e)}"
+                print(error_message)
+                continue
+        
+        if dataloader is None:
+            print("All DataLoader configurations failed, trying simple loop processing...")
             
-            while True:
-                current_batch = future.result()  # Get the current batch
-                if current_batch is None:
-                    break
-                
-                # Start loading next batch asynchronously
-                future = executor.submit(load_next_batch)
-                
-                # Process current batch while next batch is loading
-                if current_batch:
-                    processed_batch = torch.from_numpy(np.concatenate(current_batch, axis=0)).to(self.device)
-                    batch_embeddings = self.embed_batch(processed_batch)
-                    batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
+            # Complete fallback: manually process samples one by one
+            embeddings_list = []
+            total_start_time = time.time()
+            pbar = tqdm(total=len(dataset), desc="Generating embeddings")
+            
+            for idx in range(len(dataset)):
+                try:
+                    sample = dataset[idx]
+                    if sample is None:
+                        continue
+                        
+                    # Expand dimensions to simulate batching
+                    sample = np.expand_dims(sample, axis=0)
+                    sample_tensor = torch.from_numpy(sample).to(self.device)
                     
-                    embeddings_list.append(batch_embeddings)
+                    # Get embeddings
+                    embedding = self.embed_batch(sample_tensor)
+                    embedding = embedding / np.linalg.norm(embedding, axis=1, keepdims=True)
+                    
+                    embeddings_list.append(embedding)
                     
                     # Update progress
-                    processed_count += len(current_batch)
-                    pbar.update(len(current_batch))
-                    
-                    # Update progress callback
+                    pbar.update(1)
                     if self.progress_callback:
-                        progress = int((processed_count / len(dataset)) * 100)
+                        progress = int(((idx + 1) / len(dataset)) * 100)
                         self.progress_callback(progress)
+                        
+                    # Clean GPU cache every 100 samples
+                    if torch.cuda.is_available() and (idx + 1) % 100 == 0:
+                        torch.cuda.empty_cache()
+                        
+                except Exception as e:
+                    print(f"Error processing sample {idx}: {e}")
+                    continue
+            
+            pbar.close()
+            
+        else:
+            # Process using DataLoader
+            embeddings_list = []
+            total_start_time = time.time()
+            pbar = tqdm(total=len(dataset), desc="Generating embeddings")
+            processed_count = 0
+            
+            try:
+                for batch in dataloader:
+                    if not batch:
+                        continue
+                        
+                    try:
+                        processed_batch = torch.from_numpy(np.concatenate(batch, axis=0)).to(self.device)
+                        batch_embeddings = self.embed_batch(processed_batch)
+                        batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
+                        
+                        embeddings_list.append(batch_embeddings)
+                        
+                        # Update progress
+                        processed_count += len(batch)
+                        pbar.update(len(batch))
+                        
+                        if self.progress_callback:
+                            progress = int((processed_count / len(dataset)) * 100)
+                            self.progress_callback(progress)
+                            
+                        # Periodically clean GPU cache
+                        if torch.cuda.is_available() and processed_count % (batch_size * 5) == 0:
+                            torch.cuda.empty_cache()
+                            
+                    except Exception as e:
+                        print(f"Error processing batch: {e}")
+                        continue
+            except Exception as e:
+                print(f"Error during DataLoader iteration: {e}")
+                print("Switching to single sample processing mode...")
+                
+                # If DataLoader iteration fails, fall back to single sample processing
+                for idx in range(processed_count, len(dataset)):
+                    try:
+                        sample = dataset[idx]
+                        if sample is None:
+                            continue
+                            
+                        sample = np.expand_dims(sample, axis=0)
+                        sample_tensor = torch.from_numpy(sample).to(self.device)
+                        
+                        embedding = self.embed_batch(sample_tensor)
+                        embedding = embedding / np.linalg.norm(embedding, axis=1, keepdims=True)
+                        
+                        embeddings_list.append(embedding)
+                        
+                        pbar.update(1)
+                        if self.progress_callback:
+                            progress = int(((idx + 1) / len(dataset)) * 100)
+                            self.progress_callback(progress)
+                            
+                    except Exception as sample_error:
+                        print(f"Error processing sample {idx}: {sample_error}")
+                        continue
+            
+            pbar.close()
         
-        pbar.close()
         total_time = time.time() - total_start_time
         print(f"Total processing time: {total_time:.2f} seconds")
-                
+        
         if not embeddings_list:
-            raise RuntimeError("No valid patches were processed")
-            
+            raise RuntimeError("No valid samples were processed")
+        
+        # Combine all embeddings into a single numpy array
         embeddings = np.vstack(embeddings_list).astype(np.float16)
         return embeddings
