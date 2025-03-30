@@ -19,7 +19,7 @@ from nuc_stat import PILSlide, NumpySlide
 from torch.utils.data import Dataset, DataLoader
 import time
 import czifile
-
+import tiffslide
 
 """
 For this embedding, we use PLIP model from vinid/plip.
@@ -77,14 +77,7 @@ class NucleiPatchDataset(Dataset):
                 print(f"Error reading CZI file: {str(e)}")
                 self.magnification = magnification  # Use default value
         # Process other formats
-        elif read_image_method == 'openslide':
-            import openslide
-            with openslide.OpenSlide(slide_path) as slide:
-                mpp = float(slide.properties['openslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / mpp
         elif read_image_method == 'tiffslide':
-            import tiffslide
             with tiffslide.TiffSlide(slide_path) as slide:
                 mpp = float(slide.properties['tiffslide.mpp-x'])
                 reference_mpp_1x = 10  # objective magnification
@@ -106,6 +99,9 @@ class NucleiPatchDataset(Dataset):
         # First check file extension
         file_extension = os.path.splitext(self.slide_path)[1].lower()[1:]
         
+        # Record reading start time
+        read_start_time = time.time()
+        
         # Create appropriate slide object based on file extension and read method
         if file_extension == 'czi':
             # For CZI files, always use CziImageWrapper, regardless of read_image_method
@@ -113,11 +109,7 @@ class NucleiPatchDataset(Dataset):
             slide = CziImageWrapper(self.slide_path)
         else:
             # For non-CZI files, choose based on read_image_method
-            if self.read_image_method == 'openslide':
-                import openslide
-                slide = openslide.OpenSlide(self.slide_path)
-            elif self.read_image_method == 'tiffslide':
-                import tiffslide
+            if self.read_image_method == 'tiffslide':
                 slide = tiffslide.TiffSlide(self.slide_path)
             elif self.read_image_method == 'PIL':
                 slide = PILSlide(self.slide_path)
@@ -147,8 +139,12 @@ class NucleiPatchDataset(Dataset):
             # Preprocess the patch if processor is available
             if self.processor is not None:
                 patch = self.processor.image_processor(patch)['pixel_values']
+            
+            # Calculate and print reading time
+            read_time = time.time() - read_start_time
+            # print(f"Patch {idx} read time: {read_time:.4f} seconds")
                 
-            return patch
+            return patch, read_time  # Return reading time with patch
         except Exception as e:
             print(f"Error processing centroid {self.centroids[idx]}: {str(e)}")
             return None
@@ -160,17 +156,23 @@ def collate_patches(batch):
         batch: List of patches (some may be None)
         
     Returns:
-        List of valid patches
+        List of valid patches and their read times
     """
     # Filter out None values and return valid patches as a list
-    return [patch for patch in batch if patch is not None]
+    valid_batch = [item for item in batch if item is not None]
+    if not valid_batch:
+        return [], []
+    
+    # Separate patches and read times
+    patches, read_times = zip(*valid_batch)
+    return list(patches), list(read_times)
 
 class NucleiEmbedding:
     def __init__(self, args, centroids, progress_callback=None):
         """Initialize the NucleiEmbedding class."""
         self.args = args
         self.centroids = centroids
-        self.patch_size = 224  # Target size for 40x magnification
+        self.patch_size = 384  # Increased target size for 40x magnification (was 224)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.progress_callback = progress_callback  # Store the reference to progress callback
         print(f"Using device: {self.device}")
@@ -217,14 +219,7 @@ class NucleiEmbedding:
             except Exception as e:
                 print(f"Error reading CZI file: {str(e)}")
                 self.magnification = 40  # Use default value
-        elif args.read_image_method == 'openslide':
-            import openslide
-            with openslide.OpenSlide(args.slidepath) as slide:
-                mpp = float(slide.properties['openslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / mpp
         elif args.read_image_method == 'tiffslide':
-            import tiffslide
             with tiffslide.TiffSlide(args.slidepath) as slide:
                 mpp = float(slide.properties['tiffslide.mpp-x'])
                 reference_mpp_1x = 10  # objective magnification
@@ -270,6 +265,9 @@ class NucleiEmbedding:
 
     def embed_batch(self, processed_batch):
         """Embed a batch of preprocessed images."""
+        # Record processing start time
+        process_start_time = time.time()
+        
         if isinstance(processed_batch, list):
             processed_batch = torch.cat(processed_batch)
         processed_batch = processed_batch.to(self.device)
@@ -282,7 +280,11 @@ class NucleiEmbedding:
             embeddings = self.image_projection(image_embeds)
             embeddings = embeddings.detach().cpu().numpy()
 
-        return embeddings
+        # Calculate processing time
+        process_time = time.time() - process_start_time
+        print(f"Batch processing time: {process_time:.4f} seconds for {len(processed_batch)} patches")
+        
+        return embeddings, process_time
 
     def generate_embeddings(self, batch_size=None, num_workers=None):
         """Generate embeddings for all nuclei using PyTorch DataLoader."""
@@ -352,18 +354,26 @@ class NucleiEmbedding:
             total_start_time = time.time()
             pbar = tqdm(total=len(dataset), desc="Generating embeddings")
             
+            total_read_time = 0
+            total_process_time = 0
+            
             for idx in range(len(dataset)):
                 try:
-                    sample = dataset[idx]
-                    if sample is None:
+                    sample_data = dataset[idx]
+                    if sample_data is None:
                         continue
                         
+                    sample, read_time = sample_data
+                    total_read_time += read_time
+                    
                     # Expand dimensions to simulate batching
                     sample = np.expand_dims(sample, axis=0)
                     sample_tensor = torch.from_numpy(sample).to(self.device)
                     
                     # Get embeddings
-                    embedding = self.embed_batch(sample_tensor)
+                    embedding, process_time = self.embed_batch(sample_tensor)
+                    total_process_time += process_time
+                    
                     embedding = embedding / np.linalg.norm(embedding, axis=1, keepdims=True)
                     
                     embeddings_list.append(embedding)
@@ -383,6 +393,8 @@ class NucleiEmbedding:
                     continue
             
             pbar.close()
+            print(f"Average read time per patch: {total_read_time/idx:.4f} seconds")
+            print(f"Average process time per patch: {total_process_time/idx:.4f} seconds")
             
         else:
             # Process using DataLoader
@@ -391,14 +403,22 @@ class NucleiEmbedding:
             pbar = tqdm(total=len(dataset), desc="Generating embeddings")
             processed_count = 0
             
+            total_read_time = 0
+            total_process_time = 0
+            
             try:
-                for batch in dataloader:
-                    if not batch:
+                for batch_data in dataloader:
+                    if not batch_data[0]:  # Check if patches is empty
                         continue
                         
+                    batch, read_times = batch_data
+                    total_read_time += sum(read_times)
+                    
                     try:
                         processed_batch = torch.from_numpy(np.concatenate(batch, axis=0)).to(self.device)
-                        batch_embeddings = self.embed_batch(processed_batch)
+                        batch_embeddings, process_time = self.embed_batch(processed_batch)
+                        total_process_time += process_time
+                        
                         batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
                         
                         embeddings_list.append(batch_embeddings)
@@ -418,24 +438,40 @@ class NucleiEmbedding:
                     except Exception as e:
                         print(f"Error processing batch: {e}")
                         continue
+                        
+                if processed_count > 0:
+                    print(f"Average read time per patch: {total_read_time/processed_count:.4f} seconds")
+                    print(f"Average process time per patch: {total_process_time/processed_count:.4f} seconds")
+                    
             except Exception as e:
                 print(f"Error during DataLoader iteration: {e}")
                 print("Switching to single sample processing mode...")
                 
+                # Single sample processing mode statistics
+                single_total_read_time = 0
+                single_total_process_time = 0
+                single_processed_count = 0
+                
                 # If DataLoader iteration fails, fall back to single sample processing
                 for idx in range(processed_count, len(dataset)):
                     try:
-                        sample = dataset[idx]
-                        if sample is None:
+                        sample_data = dataset[idx]
+                        if sample_data is None:
                             continue
                             
+                        sample, read_time = sample_data
+                        single_total_read_time += read_time
+                        
                         sample = np.expand_dims(sample, axis=0)
                         sample_tensor = torch.from_numpy(sample).to(self.device)
                         
-                        embedding = self.embed_batch(sample_tensor)
+                        embedding, process_time = self.embed_batch(sample_tensor)
+                        single_total_process_time += process_time
+                        
                         embedding = embedding / np.linalg.norm(embedding, axis=1, keepdims=True)
                         
                         embeddings_list.append(embedding)
+                        single_processed_count += 1
                         
                         pbar.update(1)
                         if self.progress_callback:
@@ -445,6 +481,10 @@ class NucleiEmbedding:
                     except Exception as sample_error:
                         print(f"Error processing sample {idx}: {sample_error}")
                         continue
+                
+                if single_processed_count > 0:
+                    print(f"Single mode - Average read time per patch: {single_total_read_time/single_processed_count:.4f} seconds")
+                    print(f"Single mode - Average process time per patch: {single_total_process_time/single_processed_count:.4f} seconds")
             
             pbar.close()
         
