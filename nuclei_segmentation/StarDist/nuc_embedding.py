@@ -344,7 +344,7 @@ class NucleiEmbedding:
 
         return embeddings
 
-    def generate_embeddings(self, batch_size=None, num_workers=None):
+    def generate_embeddings(self, batch_size=None, num_workers=None, temp_h5_path=None):
         """Generate embeddings for all nuclei using PyTorch DataLoader."""
         if num_workers is None:
             num_workers = min(mp.cpu_count(), 4)
@@ -401,18 +401,21 @@ class NucleiEmbedding:
             pin_memory=True
         )
         
-        # 创建临时文件进行增量保存
-        temp_file_path = f"temp_embeddings_{int(time.time())}.h5"
+        # use the provided temp_h5_path or generate a new one
+        if temp_h5_path is None:
+            temp_h5_path = f"temp_embeddings_{int(time.time())}.h5"
+        
+        print(f"store embeddings to: {temp_h5_path}")
         total_processed = 0
         
-        with h5py.File(temp_file_path, 'w') as h5f:
-            # 创建可扩展数据集
+        with h5py.File(temp_h5_path, 'w') as h5f:
+            # create extendable dataset
             embeddings_dset = h5f.create_dataset(
-                'embeddings', 
-                shape=(0, 768),  # 初始化为空，但指定正确的列数
-                maxshape=(None, 768),  # 允许行数扩展
-                dtype=np.float16,  # 直接用float16存储
-                chunks=(min(1000, batch_size), 768)  # 合理的分块大小
+                'embedding',
+                shape=(0, 768),
+                maxshape=(None, 768),
+                dtype=np.float16,
+                chunks=(min(1000, batch_size), 768)
             )
             
             total_start_time = time.time()
@@ -424,27 +427,27 @@ class NucleiEmbedding:
                     batch_embeddings = self.embed_batch(processed_batch)
                     batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
                     
-                    # 转换为float16并增量保存到HDF5文件
+                    # convert to float16 and incrementally save to HDF5 file
                     batch_embeddings = batch_embeddings.astype(np.float16)
                     
-                    # 调整数据集大小以适应新数据
+                    # adjust the dataset size to fit the new data
                     current_size = embeddings_dset.shape[0]
                     new_size = current_size + batch_embeddings.shape[0]
                     embeddings_dset.resize(new_size, axis=0)
                     
-                    # 写入新数据
+                    # write new data
                     embeddings_dset[current_size:new_size] = batch_embeddings
                     
-                    # 更新进度
+                    # update progress
                     total_processed += len(batch)
                     pbar.update(len(batch))
                     
-                    # 更新进度回调
+                    # update progress callback
                     if self.progress_callback:
                         progress = int((total_processed / len(dataset)) * 100)
                         self.progress_callback(progress)
                     
-                    # 强制写入磁盘并清理内存
+                    # force write to disk and clean memory
                     h5f.flush()
                     del batch_embeddings
                     torch.cuda.empty_cache()
@@ -453,14 +456,8 @@ class NucleiEmbedding:
             total_time = time.time() - total_start_time
             print(f"Total processing time: {total_time:.2f} seconds")
         
-        # 读取保存的数据
-        with h5py.File(temp_file_path, 'r') as h5f:
-            embeddings = h5f['embeddings'][:]
+        # print completion info, but not delete the temp file
+        print(f"embeddings calculation completed, saved to file: {temp_h5_path}")
         
-        # 删除临时文件
-        try:
-            os.remove(temp_file_path)
-        except:
-            print(f"注意：未能删除临时文件 {temp_file_path}")
-        
-        return embeddings
+        # return the temp file path, let the caller decide how to use it
+        return temp_h5_path
