@@ -11,6 +11,7 @@ import numpy as np
 import requests
 from PIL import Image
 from fastapi import FastAPI, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from pathlib import Path
 from sse_starlette.sse import EventSourceResponse
@@ -234,6 +235,15 @@ def process_patch(svs, x, y, level, patch_size):
 
 # =========== global variable ===========
 app = FastAPI()
+
+# Add CORS middleware to allow cross-origin requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 MODEL = None
 NODE_NAME = None
