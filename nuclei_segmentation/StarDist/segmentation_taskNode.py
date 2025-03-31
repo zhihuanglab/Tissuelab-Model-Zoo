@@ -124,28 +124,43 @@ def run_segmentation(args):
         # Step C: generate embedding if dont have cached
         embedding_data = None
         if centroids is not None:
-            # check temp_{slide}.h5
+            # create a temp H5 file path
             h5_dir = os.path.dirname(H5_PATH)
             slide_basename = os.path.basename(args.slidepath)
             temp_h5_path = os.path.join(h5_dir, f"temp_{slide_basename}.h5")
 
             have_cached_embedding = False
             if os.path.exists(temp_h5_path):
-                with h5py.File(temp_h5_path, "r") as tf:
-                    if "embedding" in tf:
-                        e = tf["embedding"][()]
-                        if len(e) == len(centroids):
-                            have_cached_embedding = True
-                            embedding_data = e
-                            print("Found existing embedding in temp => skip embed calc")
+                try:
+                    with h5py.File(temp_h5_path, "r") as tf:
+                        if "embedding" in tf:
+                            e = tf["embedding"][()]
+                            if len(e) == len(centroids):
+                                have_cached_embedding = True
+                                embedding_data = e
+                                print(f"found existing embeddings cache => skip embedding calculation: {temp_h5_path}")
+                except Exception as e:
+                    print(f"error reading cached embeddings: {str(e)}")
+                    have_cached_embedding = False
 
             if not have_cached_embedding:
-                print("No cached embedding => generate new")
-                ne = NucleiEmbedding(args, centroids, progress_callback=update_progress)  # Pass the progress callback
-                embedding_data = ne.generate_embeddings()
-                # write out to temp
-                with h5py.File(temp_h5_path, "w") as tf:
-                    tf.create_dataset("embedding", data=embedding_data)
+                print("no cached embeddings => generate new embeddings")
+                ne = NucleiEmbedding(args, centroids, progress_callback=update_progress)
+                # pass the temp file path to the embedding generator
+                result_path = ne.generate_embeddings(temp_h5_path=temp_h5_path)
+                
+                # create a backup
+                backup_path = os.path.join(h5_dir, f"backup_{slide_basename}_embedding.h5")
+                try:
+                    import shutil
+                    shutil.copy2(result_path, backup_path)
+                    print(f"created embeddings backup: {backup_path}")
+                except Exception as e:
+                    print(f"warning: failed to create backup: {str(e)}")
+                
+                # read embeddings for later saving
+                with h5py.File(temp_h5_path, "r") as tf:
+                    embedding_data = tf["embedding"][()]
 
         # Step D:  copy segmentation + embedding to workflow_data.h5
         # write to h5
@@ -170,6 +185,8 @@ def run_segmentation(args):
                 hf.flush()  # force write to disk
             # sleep for a while to ensure h5 is written
             time.sleep(2)
+
+        # 临时文件保留，不删除，便于下次复用
 
         # Ensure progress is set to 100 after Step C and D are completed
         progress_complete = True
@@ -320,7 +337,7 @@ async def progress():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--port', type=int, default=8006, help='port')
+    parser.add_argument('--port', type=int, default=8005, help='port')
     parser.add_argument('--name', type=str, default='SegmentationNode', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args, unknown = parser.parse_known_args()
