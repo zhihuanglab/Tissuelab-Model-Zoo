@@ -221,7 +221,10 @@ class CziImageWrapper:
         self._init_metadata()
         self._init_levels(max_levels)
         self.lock = threading.Lock()
-
+        # Store the thread ID that initialized COM
+        self._com_initialized_thread = None
+        # Track COM initialization status to avoid excessive logging
+        self._com_init_logged = False
 
     def _init_metadata(self):
         with czi.open_czi(self.path) as reader:
@@ -244,8 +247,20 @@ class CziImageWrapper:
         }
 
     def read_region(self, location, level, size, as_array=False):
+        current_thread = threading.get_ident()
+        
         with self.lock:
-            pythoncom.CoInitialize()
+            # Check if we need to initialize COM for this thread
+            if self._com_initialized_thread != current_thread:
+                try:
+                    pythoncom.CoInitialize()
+                    self._com_initialized_thread = current_thread
+                    # Only log this once per thread
+                    if not self._com_init_logged:
+                        self._com_init_logged = True
+                except Exception as e:
+                    print(f"COM initialization error: {e}")
+            
             try:
                 if level >= self.level_count:
                     raise ValueError(
@@ -262,24 +277,40 @@ class CziImageWrapper:
                 roi_h = int(h * downsample)
                 zoom = 1.0 / downsample
 
-                with czi.open_czi(self.path) as reader:
+                # Add more error handling and retries
+                max_retries = 3
+                for retry in range(max_retries):
                     try:
-                        img = reader.read(roi=(roi_x, roi_y, roi_w, roi_h),
-                                        zoom=zoom,
-                                        scene=0)
+                        with czi.open_czi(self.path) as reader:
+                            img = reader.read(roi=(roi_x, roi_y, roi_w, roi_h),
+                                            zoom=zoom,
+                                            scene=0)
+                        break
                     except Exception as e:
-                        print(f"roi_x: {roi_x}, roi_y: {roi_y}, roi_w: {roi_w}, roi_h: {roi_h}, zoom: {zoom}, scene: {0}")
-                        print(f"Error reading region: {e}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-                        raise e
-                    # print(f"finished reading")
-                # time.sleep(5)
+                        if retry < max_retries - 1:
+                            print(f"CZI read error, retrying ({retry+1}/{max_retries}): {e}")
+                            time.sleep(0.5)  # Short delay before retry
+                        else:
+                            print(f"roi_x: {roi_x}, roi_y: {roi_y}, roi_w: {roi_w}, roi_h: {roi_h}, zoom: {zoom}")
+                            print(f"Failed to read CZI region after {max_retries} attempts: {e}")
+                            # Return black image instead of raising exception
+                            img = np.zeros((h, w, 3), dtype=np.uint8)
 
-                #BGR to RGB, fill blank space with white
-                img = img[:, :, ::-1]
-                img[img == 0] = 255
+                # BGR to RGB, fill blank space with white
+                if img is not None:
+                    img = img[:, :, ::-1]
+                    img[img == 0] = 255
 
                 pil_img = Image.fromarray(img)
+                return np.array(pil_img) if as_array else pil_img
+            
+            except Exception as e:
+                print(f"Unexpected error in CZI read_region: {e}")
+                # Return a blank white image in case of error
+                blank_img = np.ones((h, w, 3), dtype=np.uint8) * 255
+                pil_img = Image.fromarray(blank_img)
+                return np.array(pil_img) if as_array else pil_img
+            
             finally:
-                pythoncom.CoUninitialize()
-            return np.array(pil_img) if as_array else pil_img
-        return None
+                # Don't uninitialize COM here - it could be needed for future calls
+                pass

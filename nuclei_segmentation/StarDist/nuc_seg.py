@@ -515,7 +515,7 @@ class SlideSegmentation():
 
         print("---- Segmentation completed successfully ----")
         
-        print(f"并行处理完成后self.points_all状态: {self.points_all.shape if self.points_all is not None else 'None'}")
+        print(f"parallel segmentation results: {self.points_all.shape if self.points_all is not None else 'None'}")
         
 
     def run_WSI_segmentation_parallel(self):
