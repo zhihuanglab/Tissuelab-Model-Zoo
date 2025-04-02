@@ -22,9 +22,54 @@ from scipy.ndimage import zoom
 from skimage.feature import graycomatrix, graycoprops
 from skimage import draw
 import tensorflow as tf
-
+from wrappers import CziImageWrapper, SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+import xml.etree.ElementTree as ET
+import czifile
+import tiffslide
 
 opj = os.path.join
+
+def get_czi_scale(file_path):
+    """
+    Extract scaling information (microns/pixel) from CZI file
+    
+    Args:
+        file_path (str): Path to CZI file
+        
+    Returns:
+        float: Microns per pixel value, returns None if extraction fails
+    """
+    try:
+        # Open CZI file directly using czifile library
+        with czifile.CziFile(file_path) as czi:
+            # Get metadata
+            metadata = czi.metadata()
+            
+            # Parse XML metadata
+            metadata_root = ET.fromstring(metadata)
+            
+            # Try different possible metadata paths
+            possible_paths = [
+                './/Scaling/Items/Distance[@Id="X"]/Value',
+                './/ImageScaling/ImagePixelSize/X',
+                './/ImageDocument/Metadata/Information/Image/PixelSize/X',
+                './/Image/PixelSize/X'
+            ]
+            
+            for path in possible_paths:
+                element = metadata_root.find(path)
+                if element is not None:
+                    # Convert from meters to microns (multiply by 10^6)
+                    meters_per_pixel = float(element.text)
+                    microns_per_pixel = meters_per_pixel * 1e6
+                    print(f"Found pixel size from CZI metadata: {microns_per_pixel:.3f} microns/pixel")
+                    return microns_per_pixel
+            
+            print("Pixel size information not found in CZI metadata")
+            return None
+    except Exception as e:
+        print(f"Error reading CZI file: {str(e)}")
+        return None
 
 class SlideSegmentation():
 
@@ -77,7 +122,7 @@ class SlideSegmentation():
             self.dim = self.slide.level_dimensions[self.level]
         except:
             self.dim = self.slide.dimensions
-        self.downsample = self.slide.level_downsamples[self.level]
+        # self.downsample = self.slide.level_downsamples[self.level]
         
         self.mask_ratio_x = None
         self.mask_ratio_y = None
@@ -115,23 +160,51 @@ class SlideSegmentation():
         self.max_cache_size = 4  # Adjust based on memory constraints
         
     def read_data(self):
-        print("Read data ...", datetime.now().strftime("%H:%M:%S"))
+        print("Reading data ...", datetime.now().strftime("%H:%M:%S"))
 
         try:
-            import openslide
-            self.slide = openslide.OpenSlide(self.args.slidepath)
-            mpp = float(self.slide.properties['openslide.mpp-x'])
-
-        except:
-            print('OpenSlide failed. Try TiffSlide.')
-            import tiffslide
             self.slide = tiffslide.TiffSlide(self.args.slidepath)
             mpp = float(self.slide.properties['tiffslide.mpp-x'])
-
+            print("Successfully read file using TiffSlide")
+        except Exception as e:
+            print(f"TiffSlide failed: {str(e)}")
+            
+            # For other formats, use appropriate wrappers
+            file_extension = os.path.splitext(self.args.slidepath)[1].lower()[1:]
+            if file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
+                self.slide = SimpleImageWrapper(self.args.slidepath)
+                mpp = 0.25  # Default value
+            elif file_extension in ['dcm']:
+                self.slide = DicomImageWrapper(self.args.slidepath)
+                mpp = 0.25  # Default value
+            elif file_extension == 'czi':
+                print('CZI format detected, using CziImageWrapper')
+                self.slide = CziImageWrapper(self.args.slidepath)
+                
+                # Try to get actual mpp value
+                mpp = get_czi_scale(self.args.slidepath)
+                if mpp is None:
+                    print('Warning: Unable to get mpp value from CZI file, using default value 0.25')
+                    mpp = 0.25
+                else:
+                    print(f'Resolution obtained from CZI file: {mpp:.3f} microns/pixel')
+                
+                # Calculate magnification
+                reference_mpp_10x = 1.0  # At 10x, mpp is about 1.0 microns/pixel
+                magnification = reference_mpp_10x / mpp * 10
+                self.args.magnification = magnification
+                print(f'Calculated magnification: {magnification:.1f}x')
+            else:
+                self.slide = TiffSlideWrapper(self.args.slidepath)
+                mpp = 0.25  # Default value
         
-        reference_mpp_1x = 10  # objective magnification
-        self.args.magnification = reference_mpp_1x / mpp
-        print("Magnification: ", self.args.magnification)
+        # Add magnification attribute to self.args if not already set by CZI processing
+        if not hasattr(self.args, 'magnification') or self.args.magnification is None:
+            reference_mpp_1x = 10  # Target magnification
+            self.args.magnification = reference_mpp_1x / mpp
+            print("Magnification: ", self.args.magnification)
+        
+        # Set tile size based on magnification
         if self.args.magnification > 80+1:
             self.tile_size = 8192
         elif self.args.magnification > 40+1:
@@ -153,10 +226,12 @@ class SlideSegmentation():
 
         # temp_thumb = self.slide.get_thumbnail(size=(2000, 2000))
         try:
-            level = np.min([3, len(self.slide.level_dimensions)-1])
+            level = np.min([5, len(self.slide.level_dimensions)-1])
             #downsample=self.slide.level_downsamples[level]
+            print(self.slide.level_dimensions)
             dim = list(self.slide.level_dimensions)[level]
-            if (dim[0] > 10000) or (dim[1] > 10000):
+            print(dim)
+            if (dim[0] > 20000) or (dim[1] > 20000):
                 print('Thumb is too big. skip this.')
                 return None
             temp_thumb = self.slide.read_region((0,0), level, dim)
@@ -219,12 +294,7 @@ class SlideSegmentation():
     def preload_slides(self):
         """Background thread to preload slide regions"""
         # Create a new slide object for this process
-        try:
-            import openslide
-            slide = openslide.OpenSlide(self.args.slidepath)
-        except:
-            import tiffslide
-            slide = tiffslide.TiffSlide(self.args.slidepath)
+        slide = tiffslide.TiffSlide(self.args.slidepath)
         
         while True:
             coords = self.preload_queue.get()
@@ -275,6 +345,9 @@ class SlideSegmentation():
                         next_y1 = np.min((next_y0 + self.tile_size, self.dim[1]))
                         self.preload_queue.put((next_x0, next_y0, next_x1-next_x0, next_y1-next_y0))
 
+                    # Record image reading start time
+                    read_start_time = time.time()
+                    
                     # Try to get preloaded image
                     cache_key = (x_0, y_0)
                     if cache_key in self.preload_cache:
@@ -285,6 +358,11 @@ class SlideSegmentation():
                         img = self.slide.read_region((x_0, y_0), self.level, (w_col, h_row))
                         img_np = np.array(img)[:,:,:3]
 
+                    # Record image reading end time
+                    read_end_time = time.time()
+                    read_duration = read_end_time - read_start_time
+                    print(f"Block r{ir} c{ic} (x={x_0}, y={y_0}) reading time: {read_duration:.4f}s")
+
                     help_with_norm = True
                     if help_with_norm:
                         normalize_template2 = self.normalize_template[:img_np.shape[0],:img_np.shape[1],:]
@@ -294,7 +372,7 @@ class SlideSegmentation():
                     else:
                         img_norm = normalize(img_np)
 
-                    data = (ir, ic, x_0, y_0, img_norm)
+                    data = (ir, ic, x_0, y_0, img_norm, read_duration)  # Add reading time
                     self.data_queue.put(data)
         finally:
             self.preload_queue.put(None)  # Signal preloader to stop
@@ -303,19 +381,37 @@ class SlideSegmentation():
 
     def analyze_img_patch(self):
         
+        # Record overall start time
+        overall_start_time = time.time()
+        
         pbar = tqdm(total=self.n_row*self.n_col)
         pbar.update(1)
         last_idx = 0
+        
+        # Create directory for saving patches
+        patch_save_dir = os.path.join(os.path.dirname(self.args.slidepath), "patches")
+        os.makedirs(patch_save_dir, exist_ok=True)
+        
         while True:
             data = self.data_queue.get(block=True)
             if data is None:
                 pbar.update(1)
                 break
             else:
-                ir, ic, x_0, y_0, img_norm = data
+                # Record patch processing start time
+                patch_start_time = time.time()
+                
+                ir, ic, x_0, y_0, img_norm, read_duration = data  # Get reading time
                 curr_idx = ir * self.n_col + ic
                 pbar.update(curr_idx-last_idx)
                 last_idx = curr_idx
+                
+                # Save intermediate patch
+                patch_filename = f"patch_r{ir}_c{ic}_x{x_0}_y{y_0}.png"
+                patch_path = os.path.join(patch_save_dir, patch_filename)
+                # Convert normalized image back to 0-255 range
+                img_to_save = np.clip(img_norm * 255, 0, 255).astype(np.uint8)
+                Image.fromarray(img_to_save).save(patch_path)
                 
                 labels, dicts = self.model.predict_instances(img_norm,
                                                         prob_thresh=self.prob_thresh,
@@ -362,7 +458,7 @@ class SlideSegmentation():
                         self.points_all = self.points_all.loc[idx_all_keep,]
                         self.coord_all = self.coord_all[idx_all_keep, ...]
                         self.prob_all = self.prob_all[idx_all_keep]
-    
+        
                 if ir>0:
                     # discard the left part overlap from new tile
                     y_prev_0 = (ir-1)*(self.tile_size-self.overlap)
@@ -385,9 +481,9 @@ class SlideSegmentation():
                         self.points_all = self.points_all.loc[idx_all_keep,]
                         self.coord_all = self.coord_all[idx_all_keep, ...]
                         self.prob_all = self.prob_all[idx_all_keep]
-    
-    
-    
+        
+        
+        
                 if self.points_all is None:
                     self.points_all = points
                     self.coord_all = coord
@@ -399,6 +495,28 @@ class SlideSegmentation():
                     
                 # print(curr_idx, 'curr:', len(points), '\t total:', len(self.points_all))
 
+                # Record patch processing end time and duration
+                patch_end_time = time.time()
+                patch_duration = patch_end_time - patch_start_time
+                
+                # Print time information (including reading time)
+                print(f"Block r{ir} c{ic} (x={x_0}, y={y_0}) processing time: {patch_duration:.4f}s (reading: {read_duration:.4f}s, computation: {patch_duration-read_duration:.4f}s)")
+                print(f"Start: {datetime.fromtimestamp(patch_start_time).strftime('%H:%M:%S')} - End: {datetime.fromtimestamp(patch_end_time).strftime('%H:%M:%S')}")
+
+        # Record overall end time and duration
+        overall_end_time = time.time()
+        overall_duration = overall_end_time - overall_start_time
+        
+        print(f"\nTotal processing time: {overall_duration:.2f}s ({overall_duration/60:.2f}min)")
+        print(f"Start time: {datetime.fromtimestamp(overall_start_time).strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"End time: {datetime.fromtimestamp(overall_end_time).strftime('%Y-%m-%d %H:%M:%S')}")
+
+        pbar.close()
+
+        print("---- Segmentation completed successfully ----")
+        
+        print(f"parallel segmentation results: {self.points_all.shape if self.points_all is not None else 'None'}")
+        
 
     def run_WSI_segmentation_parallel(self):
         '''
@@ -442,11 +560,13 @@ class SlideSegmentation():
         Ideally, stardist can get us 2M nuclei in 1 hours?
         '''
         
+        # Record overall start time
+        overall_start_time = time.time()
+        
         self.normalize_template = self.get_normalized_template()
         
         n_col = int(np.ceil(self.dim[0]/(self.tile_size-self.overlap)))
         n_row = int(np.ceil(self.dim[1]/(self.tile_size-self.overlap)))
-        
         
         points_all = None
         coord_all = None
@@ -454,25 +574,36 @@ class SlideSegmentation():
         
         total_tiles = n_row * n_col
         processed_tiles = 0 
+        total_nuclei = 0
         iter = 0
 
         pbar = tqdm(total=total_tiles, mininterval=0.1)
+        
+        # Create directory to save tiles
+        patch_save_dir = os.path.join(os.path.dirname(self.args.slidepath), "patches")
+        os.makedirs(patch_save_dir, exist_ok=True)
 
+        # Print status before starting loop
+        print(f"Starting segmentation process - Total tiles: {n_row}x{n_col}={n_row*n_col}")
+        
         for ir in range(n_row):
             for ic in range(n_col):
+                # Update progress bar
                 iter += 1
                 pbar.update(1)
                 processed_tiles += 1
                 progress = int((processed_tiles / total_tiles) * 100)
                 if self.progress_callback:
                     self.progress_callback(progress)
-
-                # x: col direction (dim[0])
-                # y: row direction (dim[1])
                 
+                # Calculate current tile position
                 x_0 = ic*(self.tile_size-self.overlap)
                 y_0 = ir*(self.tile_size-self.overlap)
-                # print('x0: %d, y0: %d' % (x_0, y_0))
+                
+                print(f"Processing tile r{ir} c{ic} (x={x_0}, y={y_0}) - {processed_tiles}/{total_tiles}")
+                
+                # Record tile processing start time
+                patch_start_time = time.time()
                 
                 x_1 = np.min((x_0 + self.tile_size, self.dim[0]))
                 y_1 = np.min((y_0 + self.tile_size, self.dim[1]))
@@ -481,24 +612,25 @@ class SlideSegmentation():
                 h_row = y_1 - y_0
 
                 if self.wsi_mask is not None:
-                    # for efficiency sake.
+                    # Check mask for efficiency
                     mask = self.wsi_mask[int(y_0/self.mask_ratio_y):int(y_1/self.mask_ratio_y),
                                         int(x_0/self.mask_ratio_x):int(x_1/self.mask_ratio_x)]
                     
-                    # print(ir,ic,np.sum(mask))
-                    # Image.fromarray(mask)
-                    if np.sum(mask) == 0: continue
+                    if np.sum(mask) == 0: 
+                        print(f"Tile r{ir} c{ic} is empty in mask, skipping")
+                        continue
+                
+                # Record image reading start time
+                read_start_time = time.time()
                 img = self.slide.read_region((x_0, y_0), self.level, (w_col, h_row))
-                #print(self.slide.dimensions)
-                #self.slide.get_thumbnail((3000,3000)).save("/oak/stanford/groups/jamesz/zhi/202208_WSI_nuclei_feature_pipeline/thumb.png")
-                #img.save("/oak/stanford/groups/jamesz/zhi/202208_WSI_nuclei_feature_pipeline/roi.png")
+                # Record image reading end time
+                read_end_time = time.time()
+                read_duration = read_end_time - read_start_time
+                
                 if self.args.magnification is not None:
                     st = time.time()
                     resize_factor = self.reference_magnification / self.args.magnification
                     img = img.resize((int(np.round(w_col*resize_factor)), int(np.round(h_row*resize_factor))))
-                    # zoom_factors = (resize_factor, resize_factor, 1)
-                    # # img_norm = zoom(img_norm, zoom_factors, order=3)  # 'order=3' is for cubic interpolation
-                    # img_norm = cv2.resize(img_norm, None, fx=resize_factor, fy=resize_factor, interpolation=cv2.INTER_LINEAR)
                     et = time.time()
                     
                     x_0 = int(np.round(x_0*resize_factor)) 
@@ -513,7 +645,6 @@ class SlideSegmentation():
                     overlap = self.overlap*resize_factor
                     dim = (self.dim[0]*resize_factor, self.dim[1]*resize_factor)
                     normalize_template = np.array(Image.fromarray(self.normalize_template).resize(img.size))
-                    # print('zoom time:', et-st)
 
                 img_np = np.array(img)
                 if len(img_np.shape) == 3:
@@ -535,15 +666,14 @@ class SlideSegmentation():
                     img_norm = img_norm[:img_np.shape[0],:img_np.shape[1],:]
                 else:
                     img_norm = normalize(img_np)
-                    # Image.fromarray((img_norm*255).astype(np.uint8)).resize((400,400)).show()
 
-                # Skip if almost all pixels are white (>240) across all RGB channels
-                n_dark_pixels = np.sum(np.any(img_np < 240, axis=2))  # Count pixels where any RGB channel is < 240
+                # Skip if mostly white pixels (>240)
+                n_dark_pixels = np.sum(np.any(img_np < 240, axis=2))  # Count pixels with any RGB channel < 240
                 if n_dark_pixels < 50:
-                    # print(f"Only {n_dark_pixels} pixels have any RGB value < 240, suggesting a white background. Skipping this patch.")
+                    print(f"Tile r{ir} c{ic} is mostly white, skipping")
                     continue
                 elif np.min(img_norm) < -1e15 or np.max(img_norm) > 1e15:
-                    print("Value too big, skip this batch.")
+                    print("Values too large, skipping this batch")
                     continue
                 
                 
@@ -555,13 +685,6 @@ class SlideSegmentation():
                                                             return_predict=False
                                                             )
                                                             
-                # dicts['points'].shape
-                # result = Image.fromarray((labels>0).astype(np.uint8)*255)     
-                # img2 = copy.deepcopy(img)
-                # img2.paste(result, (0, 0), result)
-                # img2.save('/home/zhihuang/Desktop/temp_.png')
-                # img2.show()
-
                 points = dicts['points'] # y,x
                 points[:, [1, 0]] = points[:, [0, 1]] # x,y
 
@@ -575,116 +698,98 @@ class SlideSegmentation():
                 coord[:,1,:] += y_0
                 prob = dicts['prob']
                 
-
-                # Now, at here, compute features.
-                # if len(points) > 0:
-                #     features = self.compute_all_features(img_np, points, coord, x_0, y_0)
+                # Calculate tile processing time
+                patch_end_time = time.time()
+                patch_duration = patch_end_time - patch_start_time
+                compute_duration = patch_duration - read_duration
                 
-                # align overlapped index with its previous left and top tile.
-                if ic>0:
-                    # discard the left part overlap from new tile
-                    x_prev_0 = (ic-1)*(tile_size-overlap)
-                    x_prev_1 = np.min((x_prev_0 + tile_size, dim[0]))
-                    idx_keep = points['x'].values >= (x_0 + x_prev_1)/2
-                    points = points.loc[idx_keep]
-                    coord = coord[idx_keep, ...]
-                    prob = prob[idx_keep]
-                    # features = features[idx_keep, ...]
-                    
-                    if points_all is not None:
-                        # remove right half overlap from previous tile
-                        points_prev_l = points_all.loc[points_all['index'] == (ir, ic-1),]
-                        idx_rm_l = list(points_prev_l.index.values[points_prev_l['x'].values >= (x_0 + x_prev_1)/2])
-                        
-                        curr_keep = ~np.isin(points_prev_l.index.values, idx_rm_l)
-                        idx_all_keep = (points_all['index'] != (ir, ic-1)).values
-                        idx_all_keep[idx_all_keep == False] = curr_keep
-                        
-                        points_all = points_all.loc[idx_all_keep,]
-                        coord_all = coord_all[idx_all_keep, ...]
-                        prob_all = prob_all[idx_all_keep]
-                        # features_all = features_all[idx_all_keep, ...]
-    
-                if ir>0:
-                    # discard the left part overlap from new tile
-                    y_prev_0 = (ir-1)*(tile_size-overlap)
-                    y_prev_1 = np.min((y_prev_0 + tile_size, dim[1]))
-                    idx_keep = points['y'].values >= (y_0 + y_prev_1)/2
-                    points = points.loc[idx_keep]
-                    coord = coord[idx_keep, ...]
-                    prob = prob[idx_keep]
-                    # features = features[idx_keep, ...]
-                    if points_all is not None:
-                        # remove right half overlap from previous tile
-                        points_prev_t = points_all.loc[points_all['index'] == (ir-1, ic),]
-                        idx_rm_t = list(points_prev_t.index.values[points_prev_t['y'].values >= (y_0 + y_prev_1)/2])
-                        
-                        
-                        curr_keep = ~np.isin(points_prev_t.index.values, idx_rm_t)
-                        idx_all_keep = (points_all['index'] != (ir-1, ic)).values
-                        idx_all_keep[idx_all_keep == False] = curr_keep
-                        
-                        points_all = points_all.loc[idx_all_keep,]
-                        coord_all = coord_all[idx_all_keep, ...]
-                        prob_all = prob_all[idx_all_keep]
-                        # features_all = features_all[idx_all_keep, ...]
-    
-                # ### scale back to original size
-                # if self.args.magnification is not None:
-                #     if x_0 > 3000 and y_0 > 3000:
-                #         #quick verification
-                #         img = self.slide.read_region((x_0, y_0), self.level, (w_col, h_row))
-                #         draw = ImageDraw.Draw(img)
-                #         coord_local = coord - np.array([x_0, y_0]).reshape(1, 2, 1)
-                #         # since it was calculated in 20x, we need to scale back.
-                #         resize_factor = self.reference_magnification / self.args.magnification
-                #         coord_local = coord_local/resize_factor
-                #         # coord_local = coord_local[prob > 0.4, ...]
-                #         for i in range(len(coord_local)): draw.line([tuple(point) for point in coord_local[i, ...].T], fill="yellow", width=1)
-                #         os.makedirs(opj(self.args.stardist_dir, "contours_quicklook"), exist_ok=True)
-                #         img.save(opj(self.args.stardist_dir, "contours_quicklook", f"contour_x0={x_0}_y0={y_0}.png"))
-                #         breakpoint()
-
+                # Print nuclei detection results for each tile
+                print("\n========================================")
+                print(f"Tile r{ir} c{ic} (x={x_0}, y={y_0}) detected {len(points)} nuclei")
+                total_nuclei += len(points)
+                print(f"Current total nuclei: {total_nuclei}")
+                print("========================================\n")
+                
+                # Print processing time information
+                print(f"Tile r{ir} c{ic} processing time: {patch_duration:.4f}s (read: {read_duration:.4f}s, compute: {compute_duration:.4f}s)")
+                print(f"Start: {datetime.fromtimestamp(patch_start_time).strftime('%H:%M:%S')} - End: {datetime.fromtimestamp(patch_end_time).strftime('%H:%M:%S')}")
+                
+                # Note here: correctly accumulate results from all tiles instead of overwriting
                 if points_all is None:
                     points_all = points
                     coord_all = coord
                     prob_all = prob
-                    # features_all = features
                 else:
-                    points_all = pd.concat((points_all, points), axis=0)
+                    points_all = pd.concat((points_all, points), axis=0, ignore_index=True)
                     coord_all = np.concatenate((coord_all, coord), axis=0)
                     prob_all = np.concatenate((prob_all, prob), axis=0)
-                    # features_all = np.concatenate((features_all, features), axis=0)
-                
-                #print('curr:', len(points), '\t total:', len(points_all))
-                
-
-        final_points = points_all[['x','y']].values.astype(np.int32)
-        final_coord = coord_all.astype(np.int32)
-        final_coord = np.swapaxes(final_coord, 1, 2)
-        # final_features = features_all
-
-        if self.args.magnification is not None:
-            # since it was calculated in 20x, we need to scale back.
-            resize_factor = self.reference_magnification / self.args.magnification
-            final_points = (final_points/resize_factor).astype(np.int32)
-            final_coord = (final_coord/resize_factor).astype(np.int32)
-
         
-        self.final_points = final_points
-        self.final_coord = final_coord
-        self.prob_all = prob_all
-        # self.final_features = final_features
+        # Print clear information before generating final_points
+        if points_all is None or len(points_all) == 0:
+            print("Warning: points_all is empty or has length 0!")
+            self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
+            self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
+            self.prob_all = np.array([])
+        else:
+            print(f"Segmentation complete, total accumulated nuclei: {len(points_all)}")
+            
+            # Print first few rows of points_all to verify data
+            print(f"points_all first 5 rows sample: \n{points_all.head().to_string()}")
+            
+            # Add debug info when generating final_points
+            try:
+                self.final_points = points_all[['x','y']].values.astype(np.int32)
+                print(f"Successfully generated final_points, shape={self.final_points.shape}")
+                
+                self.final_coord = coord_all.astype(np.int32)
+                self.final_coord = np.swapaxes(self.final_coord, 1, 2)
+                
+                self.prob_all = prob_all
+                
+                if self.args.magnification is not None:
+                    # Need to scale back to original size since calculations were at 20x
+                    resize_factor = self.reference_magnification / self.args.magnification
+                    self.final_points = (self.final_points/resize_factor).astype(np.int32)
+                    self.final_coord = (self.final_coord/resize_factor).astype(np.int32)
+                
+                print(f"Completed saving {len(self.final_points)} detected nuclei")
+            except Exception as e:
+                print(f"Failed to generate final_points: {str(e)}")
+                import traceback
+                print(traceback.format_exc())
+                # Add more diagnostic information
+                if points_all is not None:
+                    print(f"points_all column names: {points_all.columns.tolist()}")
+                else:
+                    print("points_all is None")
+                self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
+                self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
+                self.prob_all = np.array([])
         
-        # 确保在完成后将进度设置为100%
+        # Ensure progress is set to 100%
         if self.progress_callback:
             self.progress_callback(100)
 
         pbar.close()
 
-        print("---- Segmentation ends successfully ----")
+        # Record overall end time and duration
+        overall_end_time = time.time()
+        overall_duration = overall_end_time - overall_start_time
         
+        print(f"\nTotal processing time: {overall_duration:.2f}s ({overall_duration/60:.2f}min)")
+        print(f"Start time: {datetime.fromtimestamp(overall_start_time).strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"End time: {datetime.fromtimestamp(overall_end_time).strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Total nuclei count: {total_nuclei}")
+
+        print("---- Segmentation successfully completed ----")
         
+        # Add final validation
+        print(f"Final self.final_points: shape={self.final_points.shape if self.final_points is not None else 'None'}")
+        if self.final_points is not None and len(self.final_points) > 0:
+            print(f"First 5 centroids: \n{self.final_points[:5]}")
+            
+            # Last validation
+            assert len(self.final_points) > 0, "Nuclei detection result is empty, please check"
 
     def rgb2gray(self, rgb):
         """Convert RGB image to grayscale"""
