@@ -18,6 +18,7 @@ from sse_starlette.sse import EventSourceResponse
 import asyncio
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from pathlib import Path
 
@@ -25,6 +26,15 @@ from nuc_seg import SlideSegmentation
 from nuc_embedding import NucleiEmbedding
 
 app = FastAPI()
+
+# Add CORS middleware to allow cross-origin requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 # Global variables
 ARGS = None
@@ -311,7 +321,10 @@ async def progress():
         global progress_value, progress_complete
         last_value = -1
         while True:
+            # Check if progress changed or if it's the final 100% update
             if progress_value != last_value or (progress_value == 100 and progress_complete):
+                if progress_value == 0 and last_value > 0:
+                    yield {"data": str(-1)}
                 yield {"data": str(progress_value)}
                 last_value = progress_value
                 # print(f"Progress updated to: {progress_value}%, {progress_complete}")
