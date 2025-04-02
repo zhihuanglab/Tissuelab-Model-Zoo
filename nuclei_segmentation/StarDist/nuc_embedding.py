@@ -18,21 +18,92 @@ import os
 from nuc_stat import PILSlide, NumpySlide
 from torch.utils.data import Dataset, DataLoader
 import time
+import xml.etree.ElementTree as ET
+import czifile
+from wrappers import CziImageWrapper, SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+import pathlib
 
 """
 For this embedding, we use PLIP model from vinid/plip.
 For 250K cells, it takes 10 mins to embed all cells with CUDA (NVIDIA 4060). Without GPU, it takes 1 hour.
 """
 
-class NucleiPatchDataset(Dataset):
-    def __init__(self, slide_path, read_image_method, centroids, patch_size, magnification=40, processor=None):
+def get_czi_scale(file_path):
+    """
+    Extract scaling information (microns/pixel) from CZI file
+    
+    Args:
+        file_path (str): Path to CZI file
+        
+    Returns:
+        float: Microns per pixel value, returns None if extraction fails
+    """
+    try:
+        # Open CZI file directly using czifile library
+        with czifile.CziFile(file_path) as czi:
+            # Get metadata
+            metadata = czi.metadata()
+            
+            # Parse XML metadata
+            metadata_root = ET.fromstring(metadata)
+            
+            # Try different possible metadata paths
+            possible_paths = [
+                './/Scaling/Items/Distance[@Id="X"]/Value',
+                './/ImageScaling/ImagePixelSize/X',
+                './/ImageDocument/Metadata/Information/Image/PixelSize/X',
+                './/Image/PixelSize/X'
+            ]
+            
+            for path in possible_paths:
+                element = metadata_root.find(path)
+                if element is not None:
+                    # Convert from meters to microns (multiply by 10^6)
+                    meters_per_pixel = float(element.text)
+                    microns_per_pixel = meters_per_pixel * 1e6
+                    print(f"Found pixel size from CZI metadata: {microns_per_pixel:.3f} microns/pixel")
+                    return microns_per_pixel
+            
+            print("Pixel size information not found in CZI metadata")
+            return None
+    except Exception as e:
+        print(f"Error reading CZI file: {str(e)}")
+        return None
 
-        # Instead of storing the slide object, store the parameters needed to create it
+class NucleiPatchDataset(Dataset):
+    def __init__(self, slide_path, read_image_method=None, centroids=None, patch_size=224, magnification=40, processor=None):
+
         self.slide_path = slide_path
-        self.read_image_method = read_image_method
         self.centroids = centroids
         self.patch_size = patch_size
         self.processor = processor
+        
+        # Detect file type by extension if read_image_method is not specified
+        if read_image_method is None:
+            file_extension = pathlib.Path(slide_path).suffix.lower()[1:]
+            if file_extension in ['svs', 'ndpi', 'vms', 'vmu', 'scn', 'mrxs', 'tif', 'tiff', 'bif']:
+                try:
+                    import openslide
+                    read_image_method = 'openslide'
+                except ImportError:
+                    try:
+                        import tiffslide
+                        read_image_method = 'tiffslide'
+                    except ImportError:
+                        read_image_method = 'PIL'
+            elif file_extension == 'czi':
+                read_image_method = 'czi'
+            elif file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
+                read_image_method = 'PIL'
+            elif file_extension in ['dcm']:
+                read_image_method = 'dicom'
+            elif file_extension in ['npy', 'npz']:
+                read_image_method = 'numpy'
+            else:
+                read_image_method = 'PIL'  # Default fallback
+                
+        self.read_image_method = read_image_method
+        print(f"Using read method: {self.read_image_method} for file: {slide_path}")
         
         # Get magnification from MPP
         if read_image_method == 'openslide':
@@ -47,6 +118,18 @@ class NucleiPatchDataset(Dataset):
                 mpp = float(slide.properties['tiffslide.mpp-x'])
                 reference_mpp_1x = 10  # objective magnification
                 self.magnification = reference_mpp_1x / mpp
+        elif read_image_method == 'czi':
+            # Get pixel scale from CZI file
+            mpp = get_czi_scale(slide_path)
+            if mpp is None:
+                print('Warning: Unable to get mpp value from CZI file, using default value 0.25')
+                mpp = 0.25
+                self.magnification = 40  # Default magnification
+            else:
+                # Calculate magnification - at 10x, mpp is about 1.0 microns/pixel
+                reference_mpp_10x = 1.0
+                self.magnification = reference_mpp_10x / mpp * 10
+                print(f'Calculated magnification from CZI: {self.magnification:.1f}x')
         else:
             # Default to provided magnification for PIL and numpy
             self.magnification = magnification
@@ -72,6 +155,17 @@ class NucleiPatchDataset(Dataset):
             slide = PILSlide(self.slide_path)
         elif self.read_image_method == 'numpy':
             slide = NumpySlide(self.slide_path)
+        elif self.read_image_method == 'czi':
+            slide = CziImageWrapper(self.slide_path)
+        elif self.read_image_method == 'dicom':
+            slide = DicomImageWrapper(self.slide_path)
+        else:
+            # Try to use appropriate wrapper based on extension
+            file_extension = pathlib.Path(self.slide_path).suffix.lower()[1:]
+            if file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
+                slide = SimpleImageWrapper(self.slide_path)
+            else:
+                slide = TiffSlideWrapper(self.slide_path)
 
         x, y = self.centroids[idx]
         x1 = max(0, x - self.extraction_size // 2)
@@ -83,7 +177,6 @@ class NucleiPatchDataset(Dataset):
                 level=0,
                 size=(self.extraction_size, self.extraction_size)
             )
-            # print("Reading patch at ", x1, y1, "with size", self.extraction_size, self.extraction_size)
             
             if patch.mode != 'RGB':
                 patch = patch.convert('RGB')
@@ -113,28 +206,92 @@ def collate_patches(batch):
     return [patch for patch in batch if patch is not None]
 
 class NucleiEmbedding:
-    def __init__(self, args, centroids, progress_callback=None):
-        """Initialize the NucleiEmbedding class."""
+    def __init__(self, args, centroids=None, progress_callback=None):
         self.args = args
-        self.centroids = centroids
-        self.patch_size = 224  # Target size for 40x magnification
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.progress_callback = progress_callback  # Store the reference to progress callback
-        print(f"Using device: {self.device}")
+        self.progress_callback = progress_callback
         
-        # Get magnification from a temporary slide object
         print("Getting slide magnification...")
-        if args.read_image_method == 'openslide':
-            import openslide
-            with openslide.OpenSlide(args.slidepath) as slide:
-                self.magnification = float(slide.properties['openslide.mpp-x'])
-        elif args.read_image_method == 'tiffslide':
-            import tiffslide
-            with tiffslide.TiffSlide(args.slidepath) as slide:
-                self.magnification = float(slide.properties['tiffslide.mpp-x'])
-        elif args.read_image_method in ['PIL', 'numpy']:
-            self.magnification = 40  # Assume 40x for PIL and numpy
-            
+        
+        # Determine file type by extension
+        file_extension = os.path.splitext(self.args.slidepath)[1].lower()[1:]
+        
+        # Handle different file types
+        try:
+            if file_extension == 'czi':
+                # Handle CZI files specifically
+                self.read_image_method = 'czi'
+                # Get pixel scale from CZI file
+                mpp = get_czi_scale(self.args.slidepath)
+                if mpp is None:
+                    print('Warning: Unable to get mpp value from CZI file, using default value 0.25')
+                    mpp = 0.25
+                    self.args.magnification = 40  # Default magnification
+                else:
+                    # Calculate magnification - at 10x, mpp is about 1.0 microns/pixel
+                    reference_mpp_10x = 1.0
+                    self.args.magnification = reference_mpp_10x / mpp * 10
+                    print(f'Calculated magnification from CZI: {self.args.magnification:.1f}x')
+            elif file_extension in ['svs', 'ndpi', 'vms', 'vmu', 'scn', 'mrxs', 'tif', 'tiff', 'bif']:
+                try:
+                    import openslide
+                    with openslide.OpenSlide(self.args.slidepath) as slide:
+                        mpp = float(slide.properties['openslide.mpp-x'])
+                        reference_mpp_1x = 10  # objective magnification
+                        self.args.magnification = reference_mpp_1x / mpp
+                        print("openslide success")
+                    self.read_image_method = 'openslide'
+                except (ImportError, Exception) as e:
+                    print(f"OpenSlide failed: {str(e)}")
+                    import tiffslide
+                    with tiffslide.TiffSlide(self.args.slidepath) as slide:
+                        mpp = float(slide.properties['tiffslide.mpp-x'])
+                        reference_mpp_1x = 10  # objective magnification
+                        self.args.magnification = reference_mpp_1x / mpp
+                    self.read_image_method = 'tiffslide'
+            elif file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
+                self.read_image_method = 'PIL'
+                # Use default magnification if provided in args
+                if not hasattr(self.args, 'magnification') or self.args.magnification is None:
+                    self.args.magnification = 40  # Default
+            elif file_extension in ['dcm']:
+                self.read_image_method = 'dicom'
+                if not hasattr(self.args, 'magnification') or self.args.magnification is None:
+                    self.args.magnification = 40  # Default for DICOM
+            elif file_extension in ['npy', 'npz']:
+                self.read_image_method = 'numpy'
+                if not hasattr(self.args, 'magnification') or self.args.magnification is None:
+                    self.args.magnification = 40  # Default for numpy arrays
+            else:
+                # Try TiffSlide as fallback
+                try:
+                    import tiffslide
+                    with tiffslide.TiffSlide(self.args.slidepath) as slide:
+                        mpp = float(slide.properties['tiffslide.mpp-x'])
+                        reference_mpp_1x = 10
+                        self.args.magnification = reference_mpp_1x / mpp
+                    self.read_image_method = 'tiffslide'
+                except Exception:
+                    # Last resort, use PIL
+                    self.read_image_method = 'PIL'
+                    if not hasattr(self.args, 'magnification') or self.args.magnification is None:
+                        self.args.magnification = 40  # Default
+        except Exception as e:
+            print(f"Error determining file type: {str(e)}")
+            # Fallback to default
+            self.read_image_method = 'PIL'
+            if not hasattr(self.args, 'magnification') or self.args.magnification is None:
+                self.args.magnification = 40
+        
+        print(f"Using read method: {self.read_image_method} for file: {self.args.slidepath}")
+        print(f"Magnification: {self.args.magnification}x")
+        
+        # Continue with the rest of initialization
+        self.model_key = getattr(self.args, 'model_key', 'plip')
+        self.patch_size = getattr(self.args, 'patch_size', 224)
+        self.centroids = centroids
+        self.init_model()
+
+    def init_model(self):
         # Initialize PLIP model components
         print("Loading PLIP model...")
         cache_dir = os.path.join(os.path.dirname(__file__), 'transformer_cache')
@@ -142,20 +299,20 @@ class NucleiEmbedding:
         
         self.processor = AutoProcessor.from_pretrained("vinid/plip", cache_dir=cache_dir, timeout=None)
         self.model = AutoModelForZeroShotImageClassification.from_pretrained("vinid/plip", cache_dir=cache_dir)
-        self.model = self.model.to(self.device)
+        self.model = self.model.to("cuda" if torch.cuda.is_available() else "cpu")
 
         # Load trained checkpoint if available
         checkpoint_path = os.path.join(os.path.dirname(__file__), 'checkpoints/contrastive_checkpoint_epoch_0.pt')
         if os.path.exists(checkpoint_path):
             print(f"Loading trained checkpoint from {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            checkpoint = torch.load(checkpoint_path, map_location="cuda" if torch.cuda.is_available() else "cpu", weights_only=False)
             
             # Load model state
             self.model.load_state_dict(checkpoint['model_state_dict'])
             
             # Initialize and load image projection layer
             vision_hidden_size = self.model.vision_model.config.hidden_size
-            self.image_projection = torch.nn.Linear(vision_hidden_size, vision_hidden_size).to(self.device)
+            self.image_projection = torch.nn.Linear(vision_hidden_size, vision_hidden_size).to("cuda" if torch.cuda.is_available() else "cpu")
             self.image_projection.load_state_dict(checkpoint['image_projection_state_dict'])
             print("Successfully loaded checkpoint")
         else:
@@ -175,7 +332,7 @@ class NucleiEmbedding:
         """Embed a batch of preprocessed images."""
         if isinstance(processed_batch, list):
             processed_batch = torch.cat(processed_batch)
-        processed_batch = processed_batch.to(self.device)
+        processed_batch = processed_batch.to("cuda" if torch.cuda.is_available() else "cpu")
         
         with torch.no_grad():
             # Get vision model outputs
@@ -187,7 +344,7 @@ class NucleiEmbedding:
 
         return embeddings
 
-    def generate_embeddings(self, batch_size=None, num_workers=None):
+    def generate_embeddings(self, batch_size=None, num_workers=None, temp_h5_path=None):
         """Generate embeddings for all nuclei using PyTorch DataLoader."""
         if num_workers is None:
             num_workers = min(mp.cpu_count(), 4)
@@ -226,7 +383,7 @@ class NucleiEmbedding:
         
         dataset = NucleiPatchDataset(
             slide_path=self.args.slidepath,
-            read_image_method=self.args.read_image_method,
+            read_image_method=self.read_image_method,
             centroids=self.centroids,
             patch_size=self.patch_size,
             magnification=getattr(self, 'magnification', 40),
@@ -244,61 +401,63 @@ class NucleiEmbedding:
             pin_memory=True
         )
         
-        embeddings_list = []
-        total_start_time = time.time()
+        # use the provided temp_h5_path or generate a new one
+        if temp_h5_path is None:
+            temp_h5_path = f"temp_embeddings_{int(time.time())}.h5"
         
-        # Create progress bar
-        pbar = tqdm(total=len(dataset), desc="Generating embeddings")
-        processed_count = 0
+        print(f"store embeddings to: {temp_h5_path}")
+        total_processed = 0
         
-        # Create iterator for prefetching
-        dataloader_iterator = iter(dataloader)
-        
-        from concurrent.futures import ThreadPoolExecutor
-        
-        def load_next_batch():
-            try:
-                return next(dataloader_iterator)
-            except StopIteration:
-                return None
-
-        # Use 2 threads: one for current batch, one for prefetching next batch
-        PREFETCH_THREADS = 2  # Constants in uppercase by convention
-        with ThreadPoolExecutor(max_workers=PREFETCH_THREADS) as executor:
-            # Submit initial future
-            future = executor.submit(load_next_batch)
+        with h5py.File(temp_h5_path, 'w') as h5f:
+            # create extendable dataset
+            embeddings_dset = h5f.create_dataset(
+                'embedding',
+                shape=(0, 768),
+                maxshape=(None, 768),
+                dtype=np.float16,
+                chunks=(min(1000, batch_size), 768)
+            )
             
-            while True:
-                current_batch = future.result()  # Get the current batch
-                if current_batch is None:
-                    break
-                
-                # Start loading next batch asynchronously
-                future = executor.submit(load_next_batch)
-                
-                # Process current batch while next batch is loading
-                if current_batch:
-                    processed_batch = torch.from_numpy(np.concatenate(current_batch, axis=0)).to(self.device)
+            total_start_time = time.time()
+            pbar = tqdm(total=len(dataset), desc="Generating embeddings")
+            
+            for batch in dataloader:
+                if batch:
+                    processed_batch = torch.from_numpy(np.concatenate(batch, axis=0)).to("cuda" if torch.cuda.is_available() else "cpu")
                     batch_embeddings = self.embed_batch(processed_batch)
                     batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
                     
-                    embeddings_list.append(batch_embeddings)
+                    # convert to float16 and incrementally save to HDF5 file
+                    batch_embeddings = batch_embeddings.astype(np.float16)
                     
-                    # Update progress
-                    processed_count += len(current_batch)
-                    pbar.update(len(current_batch))
+                    # adjust the dataset size to fit the new data
+                    current_size = embeddings_dset.shape[0]
+                    new_size = current_size + batch_embeddings.shape[0]
+                    embeddings_dset.resize(new_size, axis=0)
                     
-                    # Update progress callback
+                    # write new data
+                    embeddings_dset[current_size:new_size] = batch_embeddings
+                    
+                    # update progress
+                    total_processed += len(batch)
+                    pbar.update(len(batch))
+                    
+                    # update progress callback
                     if self.progress_callback:
-                        progress = int((processed_count / len(dataset)) * 100)
+                        progress = int((total_processed / len(dataset)) * 100)
                         self.progress_callback(progress)
-        
-        pbar.close()
-        total_time = time.time() - total_start_time
-        print(f"Total processing time: {total_time:.2f} seconds")
-                
-        if not embeddings_list:
-            raise RuntimeError("No valid patches were processed")
+                    
+                    # force write to disk and clean memory
+                    h5f.flush()
+                    del batch_embeddings
+                    torch.cuda.empty_cache()
             
-        embeddings = np.vstack(embeddings_list).astype(np.float16)
-        return embeddings
+            pbar.close()
+            total_time = time.time() - total_start_time
+            print(f"Total processing time: {total_time:.2f} seconds")
+        
+        # print completion info, but not delete the temp file
+        print(f"embeddings calculation completed, saved to file: {temp_h5_path}")
+        
+        # return the temp file path, let the caller decide how to use it
+        return temp_h5_path
