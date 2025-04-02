@@ -20,3 +20,8 @@ sse-starlette
 fastapi
 uvicorn
 transformers
+
+czifile
+pywin32
+pydicom
+pylibCZIrw
