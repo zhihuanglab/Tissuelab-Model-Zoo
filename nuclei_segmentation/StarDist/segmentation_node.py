@@ -63,7 +63,6 @@ def print_h5_structure(file_path):
 def update_progress(value):
     global progress_value
     progress_value = value
-    print(f"Global progress updated: {progress_value}%")  # 添加日志输出
 
 def run_segmentation(args):
     """
@@ -115,13 +114,21 @@ def run_segmentation(args):
             n_tiles=(2, 2, 1),
             stardist_pretrain=args.stardist_pretrain,
             isIHC=args.isIHC,
-            progress_callback=update_progress  # Use the update_progress function
+            progress_callback=update_progress
         )
         ss.run_WSI_segmentation()
 
+        if not hasattr(ss, 'final_points') or ss.final_points is None or len(ss.final_points) == 0:
+            raise ValueError("segmentation failed: no nuclei detected")
+            
         contours = ss.final_coord.astype(np.int32)
         centroids = ss.final_points.astype(np.int32)
         probability = ss.prob_all.astype(np.float32)
+        
+        print(f"segmentation completed, detected {len(centroids)} nuclei")
+
+        if len(centroids) == 0:
+            raise ValueError("segmentation failed: no nuclei detected")
 
         # Save results directly under SegmentationNode in workflow H5 file
         if H5_PATH:
@@ -142,7 +149,6 @@ def run_segmentation(args):
                     "nuclei_count": len(centroids)
                 }, ensure_ascii=False)
 
-            # 调用打印 H5 文件结构的函数
             print("H5 file structure after segmentation:")
             print_h5_structure(H5_PATH)
 
