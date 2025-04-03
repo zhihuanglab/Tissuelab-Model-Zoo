@@ -1,0 +1,19 @@
+以下需要这tissue lab上面根据你们task node输出的名称进行的修改:
+（在你们那边改便于理解，可以直接全局替换）
+
+1. h5文件存储时的变量名称，比如cell_embeddings，nuclei_classes，nuclei_colors。
+
+2. checkpoint的加载路径修改，
+
+classification_taskNode_musk.py  第94行中的    MUSK_MODEL = MUSK("path/to/your/musk/model")，需要修改为checkpoint的加载路径，比如/project/zhihuanglab/jialuyao/classification_models/checkpoints/musk/model.safetensors
+注意带上checkpoints文件夹下的model.safetensors
+
+
+musk_for_train.py  第117行中的    tokenizer = XLMRobertaTokenizer("./MUSK/musk/models/tokenizer.spm")，需要修改为checkpoint的加载路径。
+        这个路径是MUSK文件夹中的MUSK/musk/models/tokenizer.spm
+
+
+3. 文本prompt修改，
+
+classification_taskNode_musk.py  第117行和119行，修改文本prompt变为tissue相关的
+
