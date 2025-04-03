@@ -439,8 +439,10 @@ def read_node(data: Dict[str, Any]):
     global PATCHES, WSI_GRID_SIZE, WSI_ORIGINAL_WH, BBOX
     global DOWNSAMPLE_RATE, progress_value
 
-    # Reset progress to 0
+    # Reset and log it
+    old_value = progress_value
     progress_value = 0
+    print(f"[DEBUG] /read reset progress_value from {old_value} to {progress_value}")
 
     # 1) Extract node_name / dependencies / h5_path from request data
     NODE_NAME = data.get("node_name", "BiomedParseNode")
@@ -556,6 +558,14 @@ async def progress():
     """
     SSE endpoint to provide progress updates
     """
+    global progress_value
+    
+    # Reset progress_value to 0 at the start of each new connection
+    # This ensures every client gets a fresh progress tracking
+    old_value = progress_value
+    progress_value = 0
+    print(f"[DEBUG] New /progress connection: Reset from {old_value} to 0")
+    
     async def event_generator():
         global progress_value
         last_value = -1
@@ -574,6 +584,7 @@ async def progress():
 
         # Reset progress to 0 after sending the final update
         progress_value = 0
+        print("[DEBUG] Progress endpoint completed and reset to 0")
 
     return EventSourceResponse(
         event_generator(),
@@ -594,6 +605,11 @@ def execute_node(background_tasks: BackgroundTasks):
     """
     global MODEL, PROMPT, USE_WSI, PATCHES, WSI_GRID_SIZE, WSI_ORIGINAL_WH, IMAGE_ARR, BBOX
     global H5_PATH, progress_value
+    
+    # Reset and log it
+    old_value = progress_value
+    progress_value = 0
+    print(f"[DEBUG] /execute reset progress_value from {old_value} to {progress_value}")
 
     if MODEL is None:
         return {"status":"error","message":"Model not loaded. Please call /init first."}
@@ -827,6 +843,14 @@ def execute_node(background_tasks: BackgroundTasks):
             hf.create_dataset(out_path, data=out_str.encode("utf-8"))
 
     return {"status":"ok","output":result_value}
+
+@app.post("/reset_progress")
+def reset_progress():
+    global progress_value
+    old_value = progress_value
+    progress_value = 0
+    print(f"[DEBUG] Force reset progress from {old_value} to 0")
+    return {"status": "ok", "previous_value": old_value, "new_value": progress_value}
 
 # =========== main ===========
 def main():
