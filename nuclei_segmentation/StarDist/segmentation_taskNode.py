@@ -323,7 +323,6 @@ async def progress():
         while True:
             # Check if progress changed or if it's the final 100% update
             if progress_value != last_value or (progress_value == 100 and progress_complete):
-                print(f"Progress updated to: {progress_value}%, last_value: {last_value}")
                 if last_value > progress_value:
                     yield {"data": str(-1)}
                 yield {"data": str(progress_value)}
