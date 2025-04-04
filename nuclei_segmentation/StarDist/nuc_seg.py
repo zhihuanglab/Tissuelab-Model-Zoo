@@ -565,6 +565,90 @@ class SlideSegmentation():
         
         self.normalize_template = self.get_normalized_template()
         
+        # Check file extension, for PNG/JPG/JPEG formats directly process the entire image
+        file_extension = os.path.splitext(self.args.slidepath)[1].lower()
+        simple_image_formats = ['.png', '.jpg', '.jpeg', '.bmp']
+        
+        if file_extension in simple_image_formats and self.dim[0] * self.dim[1] < 25000000:  # Limit image size, e.g. 5000x5000
+            print(f"Detected simple image format: {file_extension}, processing the entire image without tiling")
+            
+            if self.progress_callback:
+                self.progress_callback(10)  # Initial progress
+                
+            try:
+                # Directly load the entire image
+                img = self.slide.read_region((0, 0), 0, self.dim)
+                img_np = np.array(img)[:,:,:3]  # Ensure RGB format
+                
+                if self.progress_callback:
+                    self.progress_callback(30)
+                    
+                # Normalize image
+                if self.normalize_template is not None:
+                    normalize_template2 = self.normalize_template[:img_np.shape[0],:img_np.shape[1],:]
+                    joint_normalize = np.concatenate((img_np, normalize_template2), axis=1)
+                    img_norm = normalize(joint_normalize)
+                    img_norm = img_norm[:img_np.shape[0],:img_np.shape[1],:]
+                else:
+                    img_norm = normalize(img_np)
+                
+                if self.progress_callback:
+                    self.progress_callback(50)
+                    
+                # Direct segmentation
+                labels, dicts = self.model.predict_instances(img_norm,
+                                                           prob_thresh=self.prob_thresh,
+                                                           nms_thresh=self.nms_thresh,
+                                                           n_tiles=self.n_tiles,
+                                                           show_tile_progress=False,
+                                                           return_predict=False)
+                                                            
+                if self.progress_callback:
+                    self.progress_callback(80)
+                    
+                # Process results
+                points = dicts['points']  # y,x
+                points[:, [1, 0]] = points[:, [0, 1]]  # x,y
+                
+                coord = dicts['coord']
+                coord[:, [1, 0], :] = coord[:, [0, 1], :]  # x,y
+                coord = np.round(coord).astype(np.int32)
+                
+                prob = dicts['prob']
+                
+                # Set final results - fix contours processing
+                self.final_points = points.astype(np.int32)
+                self.final_coord = coord.astype(np.int32)
+                # Ensure final_coord has dimensions (n, m, 2)
+                self.final_coord = np.swapaxes(self.final_coord, 1, 2)
+                self.prob_all = prob
+                
+                total_nuclei = len(self.final_points)
+                print(f"Total detected {total_nuclei} nuclei")
+                
+                if self.progress_callback:
+                    self.progress_callback(100)
+                
+                # Record overall end time and duration
+                overall_end_time = time.time()
+                overall_duration = overall_end_time - overall_start_time
+                
+                print(f"\nTotal processing time: {overall_duration:.2f}s ({overall_duration/60:.2f}min)")
+                print(f"Start time: {datetime.fromtimestamp(overall_start_time).strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"End time: {datetime.fromtimestamp(overall_end_time).strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"Total nuclei count: {total_nuclei}")
+                
+                print("---- Segmentation successfully completed ----")
+                
+                return
+                
+            except Exception as e:
+                print(f"Error processing image directly: {str(e)}")
+                import traceback
+                print(traceback.format_exc())
+                print("Falling back to standard tiling process")
+        
+        # Below is the original tiling processing code
         n_col = int(np.ceil(self.dim[0]/(self.tile_size-self.overlap)))
         n_row = int(np.ceil(self.dim[1]/(self.tile_size-self.overlap)))
         
