@@ -17,6 +17,9 @@ import cv2
 from sse_starlette.sse import EventSourceResponse
 import asyncio
 
+import multiprocessing
+import multiprocess
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
@@ -196,8 +199,6 @@ def run_segmentation(args):
             # sleep for a while to ensure h5 is written
             time.sleep(2)
 
-        # 临时文件保留，不删除，便于下次复用
-
         # Ensure progress is set to 100 after Step C and D are completed
         progress_complete = True
         update_progress(100)
@@ -349,6 +350,11 @@ async def progress():
 
 
 def main():
+    # 添加这一行来支持PyInstaller打包的可执行文件中的多进程
+    if __name__ == "__main__":
+        multiprocessing.freeze_support()
+        multiprocess.freeze_support()
+    
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8005, help='port')
     parser.add_argument('--name', type=str, default='SegmentationNode', help='node name')
