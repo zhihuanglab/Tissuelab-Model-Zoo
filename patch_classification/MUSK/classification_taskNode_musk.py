@@ -71,7 +71,7 @@ def load_checkpoint_at_init():
     """
     Download and load the model at /init stage, store in global MUSK_MODEL.
     """
-    global MUSK_MODEL
+    global MUSK_MODEL, NODE_NAME
     if MUSK_MODEL is not None:
         print("MUSK model already loaded in memory => skip")
         return
@@ -79,7 +79,7 @@ def load_checkpoint_at_init():
     base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
     checkpoint_path = os.path.join(base_path, "checkpoints", "model.safetensors")
     
-    print(f"[ClassificationNode] Looking for checkpoint at: {checkpoint_path}")
+    print(f"[{NODE_NAME}] Looking for checkpoint at: {checkpoint_path}")
     if not os.path.exists(checkpoint_path):
         print(f"Warning: Checkpoint not found at {checkpoint_path}, trying alternate locations...")
         alt_path = "checkpoints/contrastive_checkpoint_epoch_0.pt"
@@ -88,11 +88,11 @@ def load_checkpoint_at_init():
             print(f"Found checkpoint at: {checkpoint_path}")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[ClassificationNode] Loading MUSK model at init stage..., device={device}")
+    print(f"[{NODE_NAME}] Loading MUSK model at init stage..., device={device}")
     
     MUSK_MODEL = MUSK(checkpoint_path)
     
-    print("[ClassificationNode] MUSK model loaded successfully at /init stage.")
+    print(f"[{NODE_NAME}] MUSK model loaded successfully at /init stage.")
 
 def _generate_text_description(nuclei_classes: list[str]) -> list[np.ndarray]:
     """Generate text prompts for each nuclei_class and create their feature vectors."""
@@ -191,7 +191,7 @@ def run_classification(args) -> Dict[str, Any]:
     if H5_PATH is None:
         raise ValueError("H5_PATH not set => please ensure /read is called first.")
 
-    global MUSK_MODEL
+    global MUSK_MODEL, NODE_NAME
     global progress_value
 
     result = {"status": "success", "message": "", "classification_count": 0}
@@ -219,11 +219,11 @@ def run_classification(args) -> Dict[str, Any]:
         
         time.sleep(1)
 
-        # B) read embedding => "SegmentationNode/embedding"
+        # B) read embedding => "NODE_NAME/embedding"
         with h5py.File(h5_path, 'r') as hf:
-            if 'SegmentationNode' not in hf:
-                raise ValueError("no SegmentationNode group found in h5 file")
-            seg_grp = hf['SegmentationNode']
+            if NODE_NAME not in hf:
+                raise ValueError("no NODE_NAME group found in h5 file")
+            seg_grp = hf[NODE_NAME]
             if 'embedding' not in seg_grp:
                 raise ValueError("embedding dataset not found in h5 file => no cell_embeddings")
             cell_embeddings = seg_grp['embedding'][()]
@@ -265,8 +265,8 @@ def run_classification(args) -> Dict[str, Any]:
             # color
             final_class_colors = None
             with h5py.File(h5_path, 'r') as hf:
-                if 'ClassificationNode' in hf and 'nuclei_class_HEX_color' in hf['ClassificationNode']:
-                    old_colors = hf['ClassificationNode']['nuclei_class_HEX_color'][()]
+                if NODE_NAME in hf and 'nuclei_class_HEX_color' in hf[NODE_NAME]:
+                    old_colors = hf[NODE_NAME]['nuclei_class_HEX_color'][()]
                     if len(old_colors) == len(nuclei_classes):
                         final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
             if final_class_colors is None:
@@ -277,9 +277,17 @@ def run_classification(args) -> Dict[str, Any]:
             final_class_names = nuclei_classes
 
         # D) result => cell_classification
+        saved_datasets = {}
+        with h5py.File(h5_path, 'r') as hf:
+            if NODE_NAME in hf:
+                for name in ['coordinates', 'embedding']:
+                    if name in hf[NODE_NAME]:
+                        print(f"[{NODE_NAME}] Found {name}, will preserve it")
+                        saved_datasets[name] = hf[NODE_NAME][name][()]
+        
         with h5py.File(h5_path, 'a') as hf:
             if NODE_NAME in hf:
-               del hf[NODE_NAME]
+                del hf[NODE_NAME]
             grp_cls = hf.create_group(NODE_NAME)
 
             grp_cls.create_dataset('nuclei_class_id', data=predictions.astype(np.int32))
@@ -306,6 +314,15 @@ def run_classification(args) -> Dict[str, Any]:
             grp_cls.create_dataset('metadata', data=json.dumps(metadata).encode("utf-8"))
 
             hf.flush()
+            
+        # restore previous data
+        with h5py.File(h5_path, 'a') as hf:
+            for name, data in saved_datasets.items():
+                try:
+                    print(f"[{NODE_NAME}] Restoring {name}")
+                    hf[NODE_NAME].create_dataset(name, data=data)
+                except Exception as e:
+                    print(f"[{NODE_NAME}] Error restoring {name}: {e}")
 
         time.sleep(1)
 
@@ -345,24 +362,24 @@ def init_node():
     global IS_MODEL_INITED
     if not IS_MODEL_INITED:
         IS_MODEL_INITED = True
-        print("[ClassificationNode] /init => let's load HF big model now ...")
+        print("[MuskNode] /init => let's load HF big model now ...")
         load_checkpoint_at_init()
-        return {"status": "ok", "message": "ClassificationNode init done, big model loaded"}
+        return {"status": "ok", "message": "NODE_NAME init done, big model loaded"}
     else:
-        print("[ClassificationNode] /init => already done => skip re-loading model.")
+        print("[NODE_NAME] /init => already done => skip re-loading model.")
         return {"status": "ok", "message": "Already init."}
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
     global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS
-    NODE_NAME = data.get("node_name", "ClassificationNode")
+    NODE_NAME = data.get("node_name", "MuskNode")
     DEPENDENCIES = data.get("dependencies", [])
     H5_PATH = data.get("h5_path", None)
     # CLASS_COLORS = data.get("class_colors", [])
 
-    print(f"[ClassificationNode] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}")
+    print(f"[NODE_NAME] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}")
     if not H5_PATH or not os.path.exists(H5_PATH):
-        print("[ClassificationNode] no h5 => skip read.")
+        print(f"[{NODE_NAME}] no h5 => skip read.")
         return {"status": "ok", "message": "no H5 file found."}
 
     if ARGS is None:
@@ -381,20 +398,20 @@ def read_node(data: Dict[str, Any]):
                     val_json = json.loads(raw_str)
                 except:
                     val_json = raw_str
-                print(f"[ClassificationNode] user param {k} => {val_json}")
+                print(f"[{NODE_NAME}] user param {k} => {val_json}")
 
                 if k == "path":
                     ARGS.slidepath = val_json
                 elif k == "nuclei_classes":
                     if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.nuclei_classes = val_json
-                        print(f"[ClassificationNode] nuclei_classes: {ARGS.nuclei_classes}")
+                        print(f"[{NODE_NAME}] nuclei_classes: {ARGS.nuclei_classes}")
                 elif k == "nuclei_colors":
                     if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.nuclei_colors = val_json
-                        print(f"[ClassificationNode] nuclei_colors: {ARGS.nuclei_colors}")
+                        print(f"[{NODE_NAME}] nuclei_colors: {ARGS.nuclei_colors}")
 
-    return {"status": "ok", "message": "ClassificationNode read done"}
+    return {"status": "ok", "message": f"[{NODE_NAME}] read done"}
 
 @app.post("/execute")
 def execute_node():
@@ -404,7 +421,7 @@ def execute_node():
         return {"status": "error", "message": "Please /init first."}
 
     if not H5_PATH or not os.path.exists(H5_PATH):
-        print("[ClassificationNode] no H5 => skip classification.")
+        print(f"[{NODE_NAME}] no H5 => skip classification.")
         out_val = {
             "status": "ok",
             "message": "no H5 => skip classification",
@@ -412,13 +429,13 @@ def execute_node():
         }
         # Update progress to 100 when skipping
         progress_value = 100
-        print("Progress: 100%")
+        print(f"[{NODE_NAME}] Progress: 100%")
     else:
-        print(f"[ClassificationNode] /execute => run_classification with h5={H5_PATH}")
-        print(f"[ClassificationNode] ARGS: {ARGS}")
+        print(f"[{NODE_NAME}] /execute => run_classification with h5={H5_PATH}")
+        print(f"[{NODE_NAME}] ARGS: {ARGS}")
         out_val = run_classification(ARGS)
 
-    # write out to /ClassificationNode/output
+    # write out to /NODE_NAME/output
     if H5_PATH and os.path.exists(H5_PATH):
         with h5py.File(H5_PATH, "a") as hf:
             out_ds = f"{NODE_NAME}/output"
@@ -480,11 +497,11 @@ def main():
     import time
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8006, help='port')
-    parser.add_argument('--name', type=str, default='ClassificationNode', help='node name')
+    parser.add_argument('--name', type=str, default='MuskNode', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args = parser.parse_args()
 
-    print(f"Starting ClassificationNode at port={args.port}")
+    print(f"Starting {args.name} at port={args.port}")
 
     def run_uvicorn():
         uvicorn.run(app, host="0.0.0.0", port=args.port)
