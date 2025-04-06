@@ -93,7 +93,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='SegmentationNode',
+    name='TissueLab_Segmentation',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -105,6 +105,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     runtime_tmpdir=None,
+    icon='TissueLab_logo.ico'
 )
 
 coll = COLLECT(
@@ -115,5 +116,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='SegmentationNode',
+    name='TissueLab_Segmentation',
 )
