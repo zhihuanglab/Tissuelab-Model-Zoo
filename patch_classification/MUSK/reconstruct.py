@@ -19,7 +19,7 @@ def convert_h5_structure(input_file, output_file):
         # Create new file and add SegmentationNode group
         with h5py.File(output_file, 'w') as target:
             # Create SegmentationNode group
-            seg_node = target.create_group('SegmentationNode')
+            seg_node = target.create_group('MuskNode')
             
             # Read data and create datasets with new field names
             if 'coordinates' in source:
