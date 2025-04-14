@@ -9,8 +9,8 @@ payload = {
         "model": "MuskNode",
         "input": {
             "path": "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\CMU-1.svs",
-            "nuclei_classes": ["Negative control", "Tumor", "Gland"],
-            "nuclei_colors": [
+            "tissue_classes": ["Negative control", "Tumor", "Gland"],
+            "tissue_colors": [
                 "#aaaaaa",
                 "#7814db",
                 "#71e524"
