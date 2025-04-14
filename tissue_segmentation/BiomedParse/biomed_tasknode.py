@@ -34,6 +34,9 @@ from tiffslide import TiffSlide
 from tqdm import tqdm
 from skimage import transform
 
+# 导入NiftiImageWrapper
+from wrappers import NiftiImageWrapper
+
 def print_model_devices(model):
     """Device Information"""
     print("\n=== Model Device Information ===")
@@ -313,32 +316,70 @@ def read_wsi_to_patches(wsi_path, bbox, patch_size=1024):
 
     return processed_patches, (n_rows, n_cols), (scaled_width, scaled_height)
 
-def patch_concat_mask(masks_np: list[np.ndarray], original_wh: tuple[int,int], patch_size:int, grid_size: tuple[int,int]):
+def read_nii_to_patches(nii_path, patch_size=1024, save_patches=True):
     """
-    masks_np: list of (1024,1024) numpy, range=0/255
-    original_wh: (w,h) => region.width, region.height
-    grid_size: (n_rows, n_cols)
+    读取NII格式文件并分割成patches
+    
+    Args:
+        nii_path: NII文件路径
+        patch_size: patch大小
+        save_patches: 是否保存patches
+    
+    Returns:
+        processed_patches: 处理后的patches列表
+        grid_size: (行数, 列数)
+        original_size: 原始尺寸 (宽, 高)
     """
-    w,h = original_wh
-    # padded
-    new_w = ((w+patch_size-1)//patch_size)*patch_size
-    new_h = ((h+patch_size-1)//patch_size)*patch_size
-    bigmask=np.zeros((new_h, new_w), dtype=np.uint8)
-
-    idx=0
-    rows,cols=grid_size
-    for row in range(rows):
-        for col in range(cols):
-            if idx<len(masks_np):
-                pm = masks_np[idx]  # shape=(1024,1024)
-                x=col*patch_size
-                y=row*patch_size
-                bigmask[y:y+patch_size, x:x+patch_size]=pm
-                idx+=1
-    # crop back
-    bigmask=bigmask[:h, :w]
-    return bigmask
-
+    import nibabel as nib
+    import os
+    from datetime import datetime
+    
+    print(f"[BiomedParse] 正在读取NII文件: {nii_path}")
+    
+    # 创建NiftiImageWrapper
+    nii_wrapper = NiftiImageWrapper(nii_path)
+    
+    # 获取原始尺寸
+    width, height = nii_wrapper.dimensions
+    original_size = (width, height)
+    
+    # 计算需要多少行列的patches
+    n_cols = max(1, (width + patch_size - 1) // patch_size)
+    n_rows = max(1, (height + patch_size - 1) // patch_size)
+    grid_size = (n_rows, n_cols)
+    
+    print(f"[BiomedParse] NII维度: {original_size}, 将分割成 {n_rows}x{n_cols} 个patches")
+    
+    # 创建debug_output目录
+    if save_patches:
+        save_dir = "debug_output"
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"[BiomedParse] 将保存patches到目录: {save_dir}")
+    
+    # 读取并处理patches
+    processed_patches = []
+    for row in range(n_rows):
+        for col in range(n_cols):
+            # 计算patch位置
+            x = col * patch_size
+            y = row * patch_size
+            
+            # 读取patch区域
+            patch = nii_wrapper.read_region((x, y), 0, (patch_size, patch_size))
+            
+            # 处理patch
+            patch_array = process_pil_patch(patch)
+            processed_patches.append(patch_array)
+            
+            # 保存patch
+            if save_patches:
+                patch_filename = f"{save_dir}/nii_patch_r{row}_c{col}.png"
+                cv2.imwrite(patch_filename, cv2.cvtColor(patch_array, cv2.COLOR_RGB2BGR))
+                
+            print(f"[BiomedParse] 处理patch {len(processed_patches)}/{n_rows*n_cols}")
+    
+    print(f"[BiomedParse] NII文件处理完成，共{len(processed_patches)}个patches")
+    return processed_patches, grid_size, original_size
 
 # =========== global variable ===========
 app = FastAPI()
@@ -520,8 +561,26 @@ def read_node(data: Dict[str, Any]):
     if "path" in user_data_dict:
         path_str = user_data_dict["path"]
         print(path_str)
-        # If it's an SVS/TIF, treat it as a WSI
-        if path_str.lower().endswith(".svs") or path_str.lower().endswith(".tif"):
+        
+        # 添加对NII文件的支持
+        if path_str.lower().endswith(".nii") or path_str.lower().endswith(".nii.gz"):
+            print(f"[BiomedParse] 检测到NII文件: {path_str}")
+            USE_WSI = True
+            # 提供默认BBOX如果用户未设置
+            if not BBOX:
+                BBOX = [0, 0, 1024, 1024]  # 默认区域
+                
+            # 读取NII文件并分割成patches
+            save_patches = True  # 设置为True以保存patches
+            PATCHES, WSI_GRID_SIZE, WSI_ORIGINAL_WH = read_nii_to_patches(
+                path_str, 1024, save_patches
+            )
+            print(
+                f"[BiomedParse] 读取NII => patches={len(PATCHES)}, "
+                f"grid={WSI_GRID_SIZE}, wh={WSI_ORIGINAL_WH}"
+            )
+        # 如果是SVS/TIF，作为WSI处理
+        elif path_str.lower().endswith(".svs") or path_str.lower().endswith(".tif"):
             USE_WSI = True
             # Provide a default BBOX if not set by user
             if not BBOX:
@@ -813,6 +872,7 @@ def execute_node(background_tasks: BackgroundTasks):
                         "prompt": PROMPT,
                         "contours": polygons,
                     }
+                    print(polygons)
                 except Exception as e:
                     print("[BiomedParse] PNG inference error:", e)
                     result_value = {"status": "error", "message": str(e)}

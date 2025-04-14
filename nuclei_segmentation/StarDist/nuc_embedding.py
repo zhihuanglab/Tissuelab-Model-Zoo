@@ -363,7 +363,7 @@ class NucleiEmbedding:
                 print(f"Cached: {cached_memory:.2f} GB")
                 
                 # Reserve some memory for the model and system
-                available_memory = total_memory * 0.9  # Use 90% of total memory
+                available_memory = total_memory * 0.5  # Use 90% of total memory
                 print(f"Setting available memory to: {available_memory:.2f} GB")
                 # Estimate memory per sample (in GB) - PLIP model typically uses about 0.5GB for batch_size=1
                 memory_per_sample = 0.01

@@ -85,7 +85,7 @@ def read_h5_file(file_path):
         print(f"Error reading file: {e}")
 
 # File paths
-input_file = r"C:\Users\lsoho\Git\penn\Tissuelab-Model-Zoo\patch_classification\MUSK\patch_embeddings.h5"
+input_file = r"C:\Users\lsoho\Git\penn\Tissuelab-Model-Zoo\patch_classification\MUSK\patch_embeddings_128.h5"
 output_file = r"C:\Users\lsoho\Git\penn\Tissuelab-Model-Zoo\patch_classification\MUSK\patch_embeddings_restructured.h5"
 
 # Execute conversion
