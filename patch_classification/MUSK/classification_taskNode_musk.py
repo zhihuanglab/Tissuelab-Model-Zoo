@@ -94,14 +94,14 @@ def load_checkpoint_at_init():
     
     print(f"[{NODE_NAME}] MUSK model loaded successfully at /init stage.")
 
-def _generate_text_description(nuclei_classes: list[str]) -> list[np.ndarray]:
-    """Generate text prompts for each nuclei_class and create their feature vectors."""
+def _generate_text_description(tissue_classes: list[str]) -> list[np.ndarray]:
+    """Generate text prompts for each tissue_class and create their feature vectors."""
 
     
     # Build prompts
     prompts = []
-    for nuclei_class in nuclei_classes:
-        prompt = f"this is {nuclei_class} tissue"
+    for tissue_class in tissue_classes:
+        prompt = f"this is {tissue_class} tissue"
         prompts.append(prompt)
     
     # Batch encode all texts
@@ -109,12 +109,12 @@ def _generate_text_description(nuclei_classes: list[str]) -> list[np.ndarray]:
         embeddings = MUSK_MODEL.encode_text(prompts, batch_size=len(prompts))
     return [emb.unsqueeze(0).cpu().numpy() for emb in embeddings]
 
-def generate_distinct_colors(nuclei_classes: list[str]) -> list[str]:
-    # generate distinct colors for each nuclei_class
+def generate_distinct_colors(tissue_classes: list[str]) -> list[str]:
+    # generate distinct colors for each tissue_class
     colors = []
-    num_classes = len(nuclei_classes)
-    for i, nuclei_class in enumerate(nuclei_classes):
-        if nuclei_class.lower() == "other":
+    num_classes = len(tissue_classes)
+    for i, tissue_class in enumerate(tissue_classes):
+        if tissue_class.lower() == "other":
             colors.append("F3F4F5")
             continue
         golden_ratio = 0.618033988749895
@@ -231,8 +231,8 @@ def run_classification(args) -> Dict[str, Any]:
         time.sleep(1)
 
         # C) supervised or zero-shot
-        nuclei_classes = getattr(args, "nuclei_classes", [])
-        nuclei_colors = getattr(args, "nuclei_colors", [])
+        tissue_classes = getattr(args, "tissue_classes", [])
+        tissue_colors = getattr(args, "tissue_colors", [])
 
         if use_supervised and annotations_data is not None:
             clf, class_names, class_colors, predictions, prediction_probs, \
@@ -250,7 +250,7 @@ def run_classification(args) -> Dict[str, Any]:
                 raise ValueError("MUSK_MODEL not loaded => please ensure /init is called first.")
 
             # Build class_embeddings
-            class_embeddings = _generate_text_description(nuclei_classes)
+            class_embeddings = _generate_text_description(tissue_classes)
             sims = []
             for idx, ce in enumerate(class_embeddings):
                 sim = np.dot(cell_embeddings, ce.T)
@@ -265,16 +265,16 @@ def run_classification(args) -> Dict[str, Any]:
             # color
             final_class_colors = None
             with h5py.File(h5_path, 'r') as hf:
-                if NODE_NAME in hf and 'nuclei_class_HEX_color' in hf[NODE_NAME]:
-                    old_colors = hf[NODE_NAME]['nuclei_class_HEX_color'][()]
-                    if len(old_colors) == len(nuclei_classes):
+                if NODE_NAME in hf and 'tissue_class_HEX_color' in hf[NODE_NAME]:
+                    old_colors = hf[NODE_NAME]['tissue_class_HEX_color'][()]
+                    if len(old_colors) == len(tissue_classes):
                         final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
             if final_class_colors is None:
-                if nuclei_colors:
-                    final_class_colors = nuclei_colors
+                if tissue_colors:
+                    final_class_colors = tissue_colors
                 else:
-                    final_class_colors = generate_distinct_colors(nuclei_classes)
-            final_class_names = nuclei_classes
+                    final_class_colors = generate_distinct_colors(tissue_classes)
+            final_class_names = tissue_classes
 
         # D) result => cell_classification
         saved_datasets = {}
@@ -290,22 +290,22 @@ def run_classification(args) -> Dict[str, Any]:
                 del hf[NODE_NAME]
             grp_cls = hf.create_group(NODE_NAME)
 
-            grp_cls.create_dataset('nuclei_class_id', data=predictions.astype(np.int32))
+            grp_cls.create_dataset('tissue_class_id', data=predictions.astype(np.int32))
 
             class_names_ascii = [n.encode('utf-8') for n in final_class_names]
-            grp_cls.create_dataset('nuclei_class_name', (len(class_names_ascii),), dtype='S256', data=class_names_ascii)
+            grp_cls.create_dataset('tissue_class_name', (len(class_names_ascii),), dtype='S256', data=class_names_ascii)
 
             colors_ascii = [c.encode('utf-8') for c in final_class_colors]
-            grp_cls.create_dataset('nuclei_class_HEX_color', (len(colors_ascii),), dtype='S256', data=colors_ascii)
+            grp_cls.create_dataset('tissue_class_HEX_color', (len(colors_ascii),), dtype='S256', data=colors_ascii)
 
             print("================")
             print({
                 "predictions": set(predictions),
-                "nuclei_classes": set(final_class_names),
+                "tissue_classes": set(final_class_names),
                 "classification_method": classification_method
             })
             metadata = {
-                "nuclei_classes": final_class_names,
+                "tissue_classes": final_class_names,
                 "classification_method": classification_method
             }
             if use_supervised and annotations_data is not None:
@@ -385,7 +385,7 @@ def read_node(data: Dict[str, Any]):
     if ARGS is None:
         ARGS = argparse.Namespace(
             slidepath="",
-            nuclei_classes=["Negative control", "Tumor"]
+            tissue_classes=["Negative control", "Tumor"]
         )
 
     with h5py.File(H5_PATH, "r") as hf:
@@ -402,14 +402,14 @@ def read_node(data: Dict[str, Any]):
 
                 if k == "path":
                     ARGS.slidepath = val_json
-                elif k == "nuclei_classes":
+                elif k == "tissue_classes":
                     if isinstance(val_json, list) and len(val_json) > 0:
-                        ARGS.nuclei_classes = val_json
-                        print(f"[{NODE_NAME}] nuclei_classes: {ARGS.nuclei_classes}")
-                elif k == "nuclei_colors":
+                        ARGS.tissue_classes = val_json
+                        print(f"[{NODE_NAME}] tissue_classes: {ARGS.tissue_classes}")
+                elif k == "tissue_colors":
                     if isinstance(val_json, list) and len(val_json) > 0:
-                        ARGS.nuclei_colors = val_json
-                        print(f"[{NODE_NAME}] nuclei_colors: {ARGS.nuclei_colors}")
+                        ARGS.tissue_colors = val_json
+                        print(f"[{NODE_NAME}] tissue_colors: {ARGS.tissue_colors}")
 
     return {"status": "ok", "message": f"[{NODE_NAME}] read done"}
 
