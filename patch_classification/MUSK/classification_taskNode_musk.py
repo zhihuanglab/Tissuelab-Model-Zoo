@@ -55,6 +55,7 @@ progress_value = 0  # Global variable to store progress
 
 # Add new global variable
 CLASSIFIER_PATH = None  # Removed fixed path for saving classifier parameters
+SAVE_CLASSIFIER_PATH = None
 
 # --------------- utils functions ---------------
 
@@ -135,12 +136,12 @@ def generate_distinct_colors(tissue_classes: list[str]) -> list[str]:
 
 def save_classifier_params(clf, class_names, class_colors, h5_path):
     """Save classifier parameters to a fixed H5 file"""
-    global CLASSIFIER_PATH
-    if CLASSIFIER_PATH is None:
-        print("No classifier_path specified, skipping saving classifier parameters")
+    global SAVE_CLASSIFIER_PATH
+    if SAVE_CLASSIFIER_PATH is None:
+        print("No SAVE_CLASSIFIER_PATH specified, skipping saving classifier parameters")
         return
         
-    with h5py.File(CLASSIFIER_PATH, 'a') as hf:
+    with h5py.File(SAVE_CLASSIFIER_PATH, 'a') as hf:
         if 'classifier_params' in hf:
             del hf['classifier_params']
         params_grp = hf.create_group('classifier_params')
@@ -188,11 +189,50 @@ def load_classifier_params(h5_path):
 
 def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
     global CLASSIFIER_PATH
+    
+    # 首先尝试加载已有的分类器参数
     if CLASSIFIER_PATH is not None:
         loaded_params = load_classifier_params(H5_PATH)
         if loaded_params is not None:
             clf, class_names, class_colors = loaded_params
             print(f"Loaded existing classifier parameters, classes: {class_names}")
+            
+            # 检查是否有用户标注需要整合
+            if not annotations.empty:
+                existing_classes = set(class_names)
+                annotated_classes = set(annotations['tissue_class'].unique())
+                common_classes = existing_classes.intersection(annotated_classes)
+                
+                if common_classes:
+                    print(f"Found user annotations for classes: {common_classes}, updating classifier...")
+                    
+                    # 获取用户标注数据
+                    cell_indices = annotations['patch_ID'].astype(int).values
+                    X_update = cell_embeddings[cell_indices]
+                    y_update = pd.Categorical(annotations['tissue_class'], categories=class_names).codes
+                    
+                    # 创建新的分类器并使用组合数据进行训练
+                    new_clf = LogisticRegression(random_state=42, max_iter=1000, 
+                                               multi_class='multinomial', solver='lbfgs')
+                    
+                    # 使用原始分类器的预测作为其他样本的标签
+                    mask = np.ones(len(cell_embeddings), dtype=bool)
+                    mask[cell_indices] = False
+                    X_rest = cell_embeddings[mask]
+                    y_rest = clf.predict(X_rest)
+                    
+                    # 合并数据
+                    X_combined = np.vstack([X_rest, X_update])
+                    y_combined = np.concatenate([y_rest, y_update])
+                    
+                    # 训练新分类器
+                    new_clf.fit(X_combined, y_combined)
+                    clf = new_clf
+                    
+                    # 保存更新后的分类器参数
+                    save_classifier_params(clf, class_names, class_colors, H5_PATH)
+                    
+                    print("Classifier updated with user annotations and saved")
             
             predictions = clf.predict(cell_embeddings)
             prediction_probs = clf.predict_proba(cell_embeddings)
@@ -438,7 +478,7 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS, CLASSIFIER_PATH
+    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH
     NODE_NAME = data.get("node_name", "MuskNode")
     DEPENDENCIES = data.get("dependencies", [])
     H5_PATH = data.get("h5_path", None)
@@ -471,6 +511,8 @@ def read_node(data: Dict[str, Any]):
                     ARGS.slidepath = val_json
                 elif k == "classifier_path":
                     CLASSIFIER_PATH = val_json
+                elif k == "save_classifier_path":
+                    SAVE_CLASSIFIER_PATH = val_json
                 elif k == "tissue_classes":
                     if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.tissue_classes = val_json
