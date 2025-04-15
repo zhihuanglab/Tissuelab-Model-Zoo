@@ -190,14 +190,14 @@ def load_classifier_params(h5_path):
 def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
     global CLASSIFIER_PATH
     
-    # 首先尝试加载已有的分类器参数
+    # try to load existing classifier parameters
     if CLASSIFIER_PATH is not None:
         loaded_params = load_classifier_params(H5_PATH)
         if loaded_params is not None:
             clf, class_names, class_colors = loaded_params
             print(f"Loaded existing classifier parameters, classes: {class_names}")
             
-            # 检查是否有用户标注需要整合
+            # check if there are user annotations to integrate
             if not annotations.empty:
                 existing_classes = set(class_names)
                 annotated_classes = set(annotations['tissue_class'].unique())
@@ -206,30 +206,30 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 if common_classes:
                     print(f"Found user annotations for classes: {common_classes}, updating classifier...")
                     
-                    # 获取用户标注数据
+                    # get user annotations
                     cell_indices = annotations['patch_ID'].astype(int).values
                     X_update = cell_embeddings[cell_indices]
                     y_update = pd.Categorical(annotations['tissue_class'], categories=class_names).codes
                     
-                    # 创建新的分类器并使用组合数据进行训练
+                    # create new classifier and train with combined data
                     new_clf = LogisticRegression(random_state=42, max_iter=1000, 
                                                multi_class='multinomial', solver='lbfgs')
                     
-                    # 使用原始分类器的预测作为其他样本的标签
+                    # use predictions of original classifier as labels for other samples
                     mask = np.ones(len(cell_embeddings), dtype=bool)
                     mask[cell_indices] = False
                     X_rest = cell_embeddings[mask]
                     y_rest = clf.predict(X_rest)
                     
-                    # 合并数据
+                    # merge data
                     X_combined = np.vstack([X_rest, X_update])
                     y_combined = np.concatenate([y_rest, y_update])
                     
-                    # 训练新分类器
+                    # train new classifier
                     new_clf.fit(X_combined, y_combined)
                     clf = new_clf
                     
-                    # 保存更新后的分类器参数
+                    # save updated classifier parameters
                     save_classifier_params(clf, class_names, class_colors, H5_PATH)
                     
                     print("Classifier updated with user annotations and saved")
