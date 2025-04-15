@@ -53,6 +53,9 @@ MUSK_MODEL = None
 # new global variable for progress
 progress_value = 0  # Global variable to store progress
 
+# Add new global variable
+CLASSIFIER_PATH = None  # Removed fixed path for saving classifier parameters
+
 # --------------- utils functions ---------------
 
 def print_h5_structure(file_path):
@@ -130,13 +133,74 @@ def generate_distinct_colors(tissue_classes: list[str]) -> list[str]:
         colors.append(color)
     return colors
 
-def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
-    unique_classes = annotations['tissue_class'].unique().tolist()
-    # 1) must have "Negative control" class
-    # if "Negative control" not in unique_classes:
-    #     raise ValueError("No 'Negative control' => fallback to zero-shot")
+def save_classifier_params(clf, class_names, class_colors, h5_path):
+    """Save classifier parameters to a fixed H5 file"""
+    global CLASSIFIER_PATH
+    if CLASSIFIER_PATH is None:
+        print("No classifier_path specified, skipping saving classifier parameters")
+        return
+        
+    with h5py.File(CLASSIFIER_PATH, 'a') as hf:
+        if 'classifier_params' in hf:
+            del hf['classifier_params']
+        params_grp = hf.create_group('classifier_params')
+        
+        # Save model parameters
+        params_grp.create_dataset('coef', data=clf.coef_)
+        params_grp.create_dataset('intercept', data=clf.intercept_)
+        
+        # Save class information
+        class_names_ascii = [n.encode('utf-8') for n in class_names]
+        params_grp.create_dataset('class_names', (len(class_names_ascii),), dtype='S256', data=class_names_ascii)
+        
+        colors_ascii = [c.encode('utf-8') for c in class_colors]
+        params_grp.create_dataset('class_colors', (len(colors_ascii),), dtype='S256', data=colors_ascii)
 
-    # 2) must have at least 1 classes
+def load_classifier_params(h5_path):
+    """Load classifier parameters from H5 file"""
+    global CLASSIFIER_PATH
+    if CLASSIFIER_PATH is None:
+        print("No classifier_path specified, skipping loading classifier parameters")
+        return None
+        
+    try:
+        with h5py.File(CLASSIFIER_PATH, 'r') as hf:
+            if 'classifier_params' not in hf:
+                return None
+                
+            params_grp = hf['classifier_params']
+            coef = params_grp['coef'][()]
+            intercept = params_grp['intercept'][()]
+            
+            class_names = [n.decode('utf-8') for n in params_grp['class_names'][()]]
+            class_colors = [c.decode('utf-8') for c in params_grp['class_colors'][()]]
+            
+            # Create classifier and set parameters
+            clf = LogisticRegression(random_state=42)
+            clf.coef_ = coef
+            clf.intercept_ = intercept
+            clf.classes_ = np.arange(len(class_names))
+            
+            return clf, class_names, class_colors
+    except Exception as e:
+        print(f"Error loading classifier parameters: {e}")
+        return None
+
+def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
+    global CLASSIFIER_PATH
+    if CLASSIFIER_PATH is not None:
+        loaded_params = load_classifier_params(H5_PATH)
+        if loaded_params is not None:
+            clf, class_names, class_colors = loaded_params
+            print(f"Loaded existing classifier parameters, classes: {class_names}")
+            
+            predictions = clf.predict(cell_embeddings)
+            prediction_probs = clf.predict_proba(cell_embeddings)
+            
+            return (clf, class_names, class_colors, predictions, prediction_probs,
+                    clf.coef_, clf.intercept_, 0, 0)
+
+    unique_classes = annotations['tissue_class'].unique().tolist()
     if len(unique_classes) < 1:
         raise ValueError("Need at least 2 classes in annotation => fallback to zero-shot")
 
@@ -167,6 +231,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     import time
     start_time = time.time()
     clf = LogisticRegression(random_state=42, max_iter=1000, multi_class='multinomial', solver='lbfgs')
+    
     clf.fit(X_train, y_train)
     train_time = time.time() - start_time
 
@@ -184,6 +249,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     progress_value = 100
     print("Progress: 100%")
 
+    save_classifier_params(clf, class_names, class_colors, H5_PATH)
+    
     return (clf, class_names, class_colors, predictions, prediction_probs,
             clf.coef_, clf.intercept_, train_time, test_time)
 
@@ -371,7 +438,7 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS
+    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS, CLASSIFIER_PATH
     NODE_NAME = data.get("node_name", "MuskNode")
     DEPENDENCIES = data.get("dependencies", [])
     H5_PATH = data.get("h5_path", None)
@@ -402,6 +469,8 @@ def read_node(data: Dict[str, Any]):
 
                 if k == "path":
                     ARGS.slidepath = val_json
+                elif k == "classifier_path":
+                    CLASSIFIER_PATH = val_json
                 elif k == "tissue_classes":
                     if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.tissue_classes = val_json
