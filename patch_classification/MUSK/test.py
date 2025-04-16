@@ -10,12 +10,9 @@ payload = {
         "input": {
             "path": "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\CMU-1.svs",
             "classifier_path": "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\classifier_params.h5",
-            "tissue_classes": ["Negative control", "Tumor", "Gland"],
-            "tissue_colors": [
-                "#aaaaaa",
-                "#7814db",
-                "#71e524"
-            ]
+            "save_classifier_path": "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\classifier_params_new.h5",
+            "tissue_classes": ["Negative control", "Epithelial", "Lymphocytes"],
+            "tissue_colors": ["#aaaaaa", "#de1212", "#6311df"]
         }
     }
 }
