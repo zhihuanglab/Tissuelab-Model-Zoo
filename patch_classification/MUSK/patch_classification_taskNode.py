@@ -34,7 +34,7 @@ from timm.models import create_model
 import tiffslide
 
 # Import MUSK model class - adjust the import path as needed
-from musk_for_wsi_64 import MUSK
+from musk_embedding_generator import MUSK
 
 app = FastAPI()
 
