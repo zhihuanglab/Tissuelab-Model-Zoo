@@ -388,10 +388,6 @@ class SlideSegmentation():
         pbar.update(1)
         last_idx = 0
         
-        # Create directory for saving patches
-        patch_save_dir = os.path.join(os.path.dirname(self.args.slidepath), "patches")
-        os.makedirs(patch_save_dir, exist_ok=True)
-        
         while True:
             data = self.data_queue.get(block=True)
             if data is None:
@@ -405,13 +401,6 @@ class SlideSegmentation():
                 curr_idx = ir * self.n_col + ic
                 pbar.update(curr_idx-last_idx)
                 last_idx = curr_idx
-                
-                # Save intermediate patch
-                patch_filename = f"patch_r{ir}_c{ic}_x{x_0}_y{y_0}.png"
-                patch_path = os.path.join(patch_save_dir, patch_filename)
-                # Convert normalized image back to 0-255 range
-                img_to_save = np.clip(img_norm * 255, 0, 255).astype(np.uint8)
-                Image.fromarray(img_to_save).save(patch_path)
                 
                 labels, dicts = self.model.predict_instances(img_norm,
                                                         prob_thresh=self.prob_thresh,
@@ -663,10 +652,6 @@ class SlideSegmentation():
 
         pbar = tqdm(total=total_tiles, mininterval=0.1)
         
-        # Create directory to save tiles
-        patch_save_dir = os.path.join(os.path.dirname(self.args.slidepath), "patches")
-        os.makedirs(patch_save_dir, exist_ok=True)
-
         # Print status before starting loop
         print(f"Starting segmentation process - Total tiles: {n_row}x{n_col}={n_row*n_col}")
         
