@@ -23,7 +23,7 @@ from nuc_stat import SlideProperty
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--slidepath', default='C:\\Users\\lsoho\\Git\\penn\\TissueLab-AI-Service\\example_WSI\\CMU-1.svs', type=str)
+    parser.add_argument('--slidepath', default='C:\\Users\\lsoho\\Git\\penn\\TissueLab-AI-Service\\example_WSI\\2_levels_TCGA-2G-AALO-01A-01-TS1.AB6CD2CD-F7D3-4B85-A9FE-12953D3544C6.svs', type=str)
     parser.add_argument('--read_image_method', default='tiffslide', type=str, choices=['openslide','tiffslide','PIL','numpy'])
     parser.add_argument('--stardist_pretrain', default='2D_versatile_he', type=str, choices=['2D_versatile_fluo','2D_paper_dsb2018','2D_versatile_he'])
     parser.add_argument('--isIHC', default=False, type=bool)
@@ -56,7 +56,7 @@ def main(args):
 
         h5_path = args.slidepath + ".h5"
         
-        # Check if h5 file exists and has nuclei_segmentation
+        # Check if h5 file exists and has SegmentationNode
         ALREADY_HAVE_NUCLEI_SEGMENTATION = False
         APPEND_FEATURES = False
         APPEND_EMBEDDINGS = False
@@ -65,15 +65,15 @@ def main(args):
         
         if os.path.exists(h5_path):
             with h5py.File(h5_path, 'r') as hf:
-                if 'nuclei_segmentation' in hf:
+                if 'SegmentationNode' in hf:
                     try:
-                        centroids = hf['nuclei_segmentation']['centroids'][()].copy()  # Make copies of the data
-                        contours = hf['nuclei_segmentation']['contours'][()].copy()
+                        centroids = hf['SegmentationNode']['centroids'][()].copy()  # Make copies of the data
+                        contours = hf['SegmentationNode']['contours'][()].copy()
                         ALREADY_HAVE_NUCLEI_SEGMENTATION = True
                     except:
-                        print("Error: nuclei_segmentation group is corrupted.")
-                    has_features = 'features' in hf['nuclei_segmentation']
-                    has_embeddings = 'cell_embeddings' in hf['nuclei_segmentation']
+                        print("Error: SegmentationNode group is corrupted.")
+                    has_features = 'features' in hf['SegmentationNode']
+                    has_embeddings = 'cell_embeddings' in hf['SegmentationNode']
                     
 
                     if ALREADY_HAVE_NUCLEI_SEGMENTATION and has_features and has_embeddings:
@@ -96,7 +96,7 @@ def main(args):
             embeddings = ne.generate_embeddings()
             
             with h5py.File(h5_path, 'a') as hf_write:
-                nuclei_seg = hf_write['nuclei_segmentation']
+                nuclei_seg = hf_write['SegmentationNode']
                 if 'cell_embeddings' in nuclei_seg:
                     del nuclei_seg['cell_embeddings']
                 nuclei_seg.create_dataset('cell_embeddings', data=embeddings)
@@ -104,11 +104,11 @@ def main(args):
         if APPEND_FEATURES:
             # Add features to existing h5 file
             with h5py.File(h5_path, 'a') as hf_write:
-                hf_write['nuclei_segmentation'].create_dataset('features', data=features)
-                hf_write['nuclei_segmentation'].create_dataset('feature_names', data=feature_names)
-                hf_write['nuclei_segmentation'].create_dataset('class_vector', data=class_vector)
+                hf_write['SegmentationNode'].create_dataset('features', data=features)
+                hf_write['SegmentationNode'].create_dataset('feature_names', data=feature_names)
+                hf_write['SegmentationNode'].create_dataset('class_vector', data=class_vector)
                 class_names_json = json.dumps(class_names)
-                hf_write['nuclei_segmentation'].create_dataset('class_names', data=class_names_json, dtype=h5py.string_dtype())
+                hf_write['SegmentationNode'].create_dataset('class_names', data=class_names_json, dtype=h5py.string_dtype())
 
             result["nuclei_count"] = len(centroids)
             result["message"] = "Using existing nuclei segmentation, calculated new features."
@@ -143,7 +143,7 @@ def main(args):
                 print("Number of nuclei: %d" % len(ss.final_points))
                 print("=====final mask shape in main=====")
                 # Create a group for nuclei segmentation
-                nuclei_seg = hf.create_group('nuclei_segmentation')
+                nuclei_seg = hf.create_group('SegmentationNode')
                 dt = h5py.special_dtype(vlen=np.dtype('int32'))
                 nuclei_seg.create_dataset('contours', data=contours)
                 nuclei_seg.create_dataset('centroids', data=centroids)
@@ -152,23 +152,37 @@ def main(args):
             # After segmentation and before feature calculation, generate embeddings
             print("Generating nuclei embeddings...")
             from nuc_embedding import NucleiEmbedding
+
+            h5_dir = os.path.dirname(h5_path)
+            slide_basename = os.path.basename(args.slidepath)
+            temp_h5_path = os.path.join(h5_dir, f"temp_{slide_basename}.h5")
+
             ne = NucleiEmbedding(args, centroids)
-            embeddings = ne.generate_embeddings()
-            
-            # Save embeddings directly here
-            print(f"Saving embeddings to {h5_path}")
+            result_path = ne.generate_embeddings(temp_h5_path=temp_h5_path)
+
+            backup_path = os.path.join(h5_dir, f"backup_{slide_basename}_embedding.h5")
+            try:
+                import shutil
+                shutil.copy2(result_path, backup_path)
+                print(f"Created embeddings backup: {backup_path}")
+            except Exception as e:
+                print(f"Warning: failed to create backup: {str(e)}")
+
+            with h5py.File(temp_h5_path, "r") as tf:
+                embedding_data = tf["embedding"][()]
+                
             with h5py.File(h5_path, 'a') as hf:
-                nuclei_seg = hf['nuclei_segmentation']
-                if 'cell_embeddings' in nuclei_seg:
-                    del nuclei_seg['cell_embeddings']
-                nuclei_seg.create_dataset('cell_embeddings', data=embeddings)
+                nuclei_seg = hf['SegmentationNode']
+                if 'embedding' in nuclei_seg:
+                    del nuclei_seg['embedding']
+                nuclei_seg.create_dataset('embedding', data=embedding_data)
 
             # Calculate features after saving segmentation and embeddings
             if args.calculate_features:
                 features, feature_names, class_vector, class_names = calculate_features(args, centroids, contours)
                 # Append features to the h5 file
                 with h5py.File(h5_path, 'a') as hf:
-                    nuclei_seg = hf['nuclei_segmentation']
+                    nuclei_seg = hf['SegmentationNode']
                     nuclei_seg.create_dataset('features', data=features)
                     nuclei_seg.create_dataset('feature_names', data=feature_names)
                     nuclei_seg.create_dataset('class_vector', data=class_vector)
