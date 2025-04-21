@@ -18,57 +18,13 @@ import os
 from nuc_stat import PILSlide, NumpySlide
 from torch.utils.data import Dataset, DataLoader
 import time
-import xml.etree.ElementTree as ET
-import czifile
-from wrappers import CziImageWrapper, SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
 import pathlib
 
 """
 For this embedding, we use PLIP model from vinid/plip.
 For 250K cells, it takes 10 mins to embed all cells with CUDA (NVIDIA 4060). Without GPU, it takes 1 hour.
 """
-
-def get_czi_scale(file_path):
-    """
-    Extract scaling information (microns/pixel) from CZI file
-    
-    Args:
-        file_path (str): Path to CZI file
-        
-    Returns:
-        float: Microns per pixel value, returns None if extraction fails
-    """
-    try:
-        # Open CZI file directly using czifile library
-        with czifile.CziFile(file_path) as czi:
-            # Get metadata
-            metadata = czi.metadata()
-            
-            # Parse XML metadata
-            metadata_root = ET.fromstring(metadata)
-            
-            # Try different possible metadata paths
-            possible_paths = [
-                './/Scaling/Items/Distance[@Id="X"]/Value',
-                './/ImageScaling/ImagePixelSize/X',
-                './/ImageDocument/Metadata/Information/Image/PixelSize/X',
-                './/Image/PixelSize/X'
-            ]
-            
-            for path in possible_paths:
-                element = metadata_root.find(path)
-                if element is not None:
-                    # Convert from meters to microns (multiply by 10^6)
-                    meters_per_pixel = float(element.text)
-                    microns_per_pixel = meters_per_pixel * 1e6
-                    print(f"Found pixel size from CZI metadata: {microns_per_pixel:.3f} microns/pixel")
-                    return microns_per_pixel
-            
-            print("Pixel size information not found in CZI metadata")
-            return None
-    except Exception as e:
-        print(f"Error reading CZI file: {str(e)}")
-        return None
 
 class NucleiPatchDataset(Dataset):
     def __init__(self, slide_path, read_image_method=None, centroids=None, patch_size=224, magnification=40, processor=None):
@@ -91,8 +47,6 @@ class NucleiPatchDataset(Dataset):
                         read_image_method = 'tiffslide'
                     except ImportError:
                         read_image_method = 'PIL'
-            elif file_extension == 'czi':
-                read_image_method = 'czi'
             elif file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
                 read_image_method = 'PIL'
             elif file_extension in ['dcm']:
@@ -118,18 +72,6 @@ class NucleiPatchDataset(Dataset):
                 mpp = float(slide.properties['tiffslide.mpp-x'])
                 reference_mpp_1x = 10  # objective magnification
                 self.magnification = reference_mpp_1x / mpp
-        elif read_image_method == 'czi':
-            # Get pixel scale from CZI file
-            mpp = get_czi_scale(slide_path)
-            if mpp is None:
-                print('Warning: Unable to get mpp value from CZI file, using default value 0.25')
-                mpp = 0.25
-                self.magnification = 40  # Default magnification
-            else:
-                # Calculate magnification - at 10x, mpp is about 1.0 microns/pixel
-                reference_mpp_10x = 1.0
-                self.magnification = reference_mpp_10x / mpp * 10
-                print(f'Calculated magnification from CZI: {self.magnification:.1f}x')
         else:
             # Default to provided magnification for PIL and numpy
             self.magnification = magnification
@@ -155,8 +97,6 @@ class NucleiPatchDataset(Dataset):
             slide = PILSlide(self.slide_path)
         elif self.read_image_method == 'numpy':
             slide = NumpySlide(self.slide_path)
-        elif self.read_image_method == 'czi':
-            slide = CziImageWrapper(self.slide_path)
         elif self.read_image_method == 'dicom':
             slide = DicomImageWrapper(self.slide_path)
         else:
@@ -217,21 +157,7 @@ class NucleiEmbedding:
         
         # Handle different file types
         try:
-            if file_extension == 'czi':
-                # Handle CZI files specifically
-                self.read_image_method = 'czi'
-                # Get pixel scale from CZI file
-                mpp = get_czi_scale(self.args.slidepath)
-                if mpp is None:
-                    print('Warning: Unable to get mpp value from CZI file, using default value 0.25')
-                    mpp = 0.25
-                    self.args.magnification = 40  # Default magnification
-                else:
-                    # Calculate magnification - at 10x, mpp is about 1.0 microns/pixel
-                    reference_mpp_10x = 1.0
-                    self.args.magnification = reference_mpp_10x / mpp * 10
-                    print(f'Calculated magnification from CZI: {self.args.magnification:.1f}x')
-            elif file_extension in ['svs', 'ndpi', 'vms', 'vmu', 'scn', 'mrxs', 'tif', 'tiff', 'bif']:
+            if file_extension in ['svs', 'ndpi', 'vms', 'vmu', 'scn', 'mrxs', 'tif', 'tiff', 'bif']:
                 try:
                     import openslide
                     with openslide.OpenSlide(self.args.slidepath) as slide:

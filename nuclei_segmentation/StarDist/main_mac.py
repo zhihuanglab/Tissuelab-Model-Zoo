@@ -18,12 +18,12 @@ import h5py
 import multiprocess as mp
 import json
 
-from nuc_seg import SlideSegmentation
+from nuc_seg_mac import SlideSegmentation
 from nuc_stat import SlideProperty
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--slidepath', default='C:\\Users\\lsoho\\Git\\penn\\experiment\\TCGA-E2-A15T-01Z-00-DX1.23913E37-53A8-4E11-9B64-CDD016F6D87A.svs', type=str)
+    parser.add_argument('--slidepath', default='C:\\Users\\lsoho\\Git\\penn\\TissueLab-AI-Service\\example_WSI\\2_levels_TCGA-2G-AALO-01A-01-TS1.AB6CD2CD-F7D3-4B85-A9FE-12953D3544C6.svs', type=str)
     parser.add_argument('--read_image_method', default='tiffslide', type=str, choices=['openslide','tiffslide','PIL','numpy'])
     parser.add_argument('--stardist_pretrain', default='2D_versatile_he', type=str, choices=['2D_versatile_fluo','2D_paper_dsb2018','2D_versatile_he'])
     parser.add_argument('--isIHC', default=False, type=bool)
@@ -91,7 +91,7 @@ def main(args):
 
         # Handle embeddings calculation outside of the file read context
         if APPEND_EMBEDDINGS and centroids is not None:
-            from nuc_embedding import NucleiEmbedding
+            from nuc_embedding_mac import NucleiEmbedding
             ne = NucleiEmbedding(args, centroids)
             embeddings = ne.generate_embeddings()
             
@@ -151,7 +151,7 @@ def main(args):
 
             # After segmentation and before feature calculation, generate embeddings
             print("Generating nuclei embeddings...")
-            from nuc_embedding import NucleiEmbedding
+            from nuc_embedding_mac import NucleiEmbedding
 
             h5_dir = os.path.dirname(h5_path)
             slide_basename = os.path.basename(args.slidepath)
