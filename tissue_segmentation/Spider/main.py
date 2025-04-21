@@ -18,13 +18,11 @@ def main():
     slide = tiffslide.TiffSlide(wsi_path)
     mask = spider._get_tissue_mask(slide, level=1)
     
-    # 显示掩码
     plt.figure(figsize=(10, 10))
     plt.imshow(mask, cmap='gray')
     plt.title('Tissue Mask (White area is tissue)')
     plt.show()
     
-    # 处理WSI
     predictions, coordinates = spider.process_wsi(
         wsi_path=wsi_path,
         level=0,
