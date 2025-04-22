@@ -25,7 +25,7 @@ def main():
     
     predictions, coordinates = spider.process_wsi(
         wsi_path=wsi_path,
-        level=0,
+        level=1,
         patch_size=224,
         stride=224,
         batch_size=8  # Use smaller batch_size
