@@ -244,7 +244,12 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     if len(unique_classes) < 1:
         raise ValueError("Need at least 2 classes in annotation => fallback to zero-shot")
 
-    class_names = ["Negative control"] + [c for c in unique_classes if c != "Negative control"]
+    class_names = []
+    if "Negative control" in unique_classes:
+        class_names.append("Negative control")
+        unique_classes.remove("Negative control")
+    class_names.extend(unique_classes)
+
     class_colors_map = annotations.groupby('tissue_class')['tissue_color'].first().to_dict()
     class_colors = []
     for cn in class_names:
@@ -253,46 +258,32 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         else:
             class_colors.append("#F3F4F5")
 
-    print(f"class_names: {class_names}")
-    print(f"class_colors: {class_colors}")
-
     cell_indices = annotations['patch_ID'].astype(int).values
     X_train = cell_embeddings[cell_indices]
     y_train = pd.Categorical(annotations['tissue_class'], categories=class_names).codes
-    
-    if "Negative control" not in annotations["tissue_class"].values.astype(str):
-        print("Found annotations, but there is no 'Negative control' class, we will use negative_control_example_vectors.npy as negative control")
-        negative_control_vectors = np.load("negative_control_vectors_1024d.npy") # (N, 512)
-        print(f"negative_control_vectors: {negative_control_vectors.shape}")
-        X_train = np.concatenate([negative_control_vectors, X_train], axis=0)
-        y_train = np.concatenate([np.zeros(negative_control_vectors.shape[0]), y_train], axis=0).astype(int)
-    
 
-    import time
-    start_time = time.time()
-    clf = LogisticRegression(random_state=42, max_iter=1000, multi_class='multinomial', solver='lbfgs')
-    
+    if "Negative control" not in annotations["tissue_class"].values:
+        try:
+            negative_control_vectors = np.load("negative_control_vectors_1024d.npy")
+            X_train = np.concatenate([negative_control_vectors, X_train], axis=0)
+            y_train = np.concatenate([np.zeros(negative_control_vectors.shape[0]), y_train], axis=0)
+        except Exception as e:
+            print(f"unable to load negative control vectors: {e}")
+
+    # train classifier
+    clf = LogisticRegression(random_state=42, max_iter=1000, 
+                           multi_class='multinomial', solver='lbfgs')
     clf.fit(X_train, y_train)
-    train_time = time.time() - start_time
 
-    # Update progress after training
-    global progress_value
-    progress_value = 50
-    print("Progress: 50%")
-
-    start_time = time.time()
+    # predict
     predictions = clf.predict(cell_embeddings)
     prediction_probs = clf.predict_proba(cell_embeddings)
-    test_time = time.time() - start_time
 
-    # Update progress after prediction
-    progress_value = 100
-    print("Progress: 100%")
-
+    # save classifier parameters
     save_classifier_params(clf, class_names, class_colors, H5_PATH)
-    
+
     return (clf, class_names, class_colors, predictions, prediction_probs,
-            clf.coef_, clf.intercept_, train_time, test_time)
+            clf.coef_, clf.intercept_, 0, 0)
 
 def run_classification(args) -> Dict[str, Any]:
     if H5_PATH is None:
@@ -482,7 +473,9 @@ def read_node(data: Dict[str, Any]):
     NODE_NAME = data.get("node_name", "MuskNode")
     DEPENDENCIES = data.get("dependencies", [])
     H5_PATH = data.get("h5_path", None)
-    # CLASS_COLORS = data.get("class_colors", [])
+    
+    CLASSIFIER_PATH = None
+    SAVE_CLASSIFIER_PATH = None
 
     print(f"[NODE_NAME] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}")
     if not H5_PATH or not os.path.exists(H5_PATH):
