@@ -389,12 +389,10 @@ class Spider:
                         continue
                     
                     if self.wsi_mask[center_y, center_x] == 0:
-                        # 如果是背景区域，记录为background并跳过处理
                         all_predictions.append('background')
                         all_coordinates.append((x, y))
                         continue
                     
-                    # 读取patch并处理所有非背景区域
                     patch = slide.read_region(
                         (x * (2 ** level), y * (2 ** level)),
                         level,
