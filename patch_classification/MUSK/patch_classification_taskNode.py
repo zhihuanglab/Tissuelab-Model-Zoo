@@ -61,7 +61,7 @@ last_printed_progress = -1  # Added for the new update_progress function
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8007, help='port')
-    parser.add_argument('--name', type=str, default='PatchClassificationNode', help='node name')
+    parser.add_argument('--name', type=str, default='MuskNode', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
 
     # === patch classification parameters ===

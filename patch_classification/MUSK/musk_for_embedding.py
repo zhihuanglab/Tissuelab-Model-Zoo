@@ -21,6 +21,8 @@ import json
 import os
 import h5py
 import tiffslide
+from PIL import ImageOps
+from skimage import morphology
 
 
 class MUSK:
@@ -69,15 +71,6 @@ class MUSK:
         num_batches = (num_images + batch_size - 1) // batch_size
         image_embeddings = []
 
-        # Add progress bar
-        pbar = tqdm(
-            total=num_batches,
-            desc="Encoding images",
-            position=0,
-            leave=True,
-            dynamic_ncols=True
-        )
-
         for i in range(0, num_images, batch_size):
             # Clear GPU cache
             torch.cuda.empty_cache()
@@ -105,21 +98,18 @@ class MUSK:
             # Preprocess batch as float32
             processed_images = torch.stack([
                 self.preprocess(img) for img in batch_images
-            ]).to(self.device, dtype=torch.float32)  # Change to float32
+            ]).to(self.device, dtype=torch.float32)
 
             # Model with DataParallel processing
             batch_embeddings = self.model(
                 image=processed_images,
-                with_head=True,  # Retrieval head
-                out_norm=True,   # Normalization
-                ms_aug=False,      # Multi-scale augmentation for 2048-dim features
-                return_global=True # Only return [CLS] token
-            )[0]  # Only take vision_cls
+                with_head=True,
+                out_norm=True,
+                ms_aug=False,
+                return_global=True
+            )[0]
             image_embeddings.append(batch_embeddings)
-            pbar.update(1)
-
-        pbar.close()
-        
+            
         # Ensure final 100% progress callback
         if progress_callback:
             progress_callback("encode", 100)
@@ -183,7 +173,7 @@ class MUSK:
 
     def encode_wsi(self, wsi_path: str, patch_coordinates: List[Tuple[int, int, int, int]], 
                    level: int = 0, batch_size: int = 16, use_tiffslide: bool = True,
-                   save_patches: bool = False, output_dir: str = "q1_wsi_patches"):
+                   save_patches: bool = False, output_dir: str = None):
         """Process WSI (Whole Slide Image) with given patch coordinates
         
         Args:
@@ -309,155 +299,151 @@ class MUSK:
         
         return patch_embeddings
 
-    def process_whole_wsi(self, wsi_path: str, patch_size: int = 512, level: int = 0, 
-                          batch_size: int = 16, use_tiffslide: bool = True,
-                          save_patches: bool = False, output_dir: str = "q1_wsi_patches",
-                          tissue_threshold: float = 0.5, progress_callback=None):
-        """Process entire WSI by dividing it into patches of specified size and filtering out blank areas"""
-        slide_library = None
+    def get_tissue_mask(self, slide):
+        """Generate tissue mask from WSI
         
-        # Force using tiffslide
-        use_tiffslide = True
-        
-        if use_tiffslide:
-            try:
-                import tiffslide
-                slide_library = tiffslide
-                self.logger.info("Using tiffslide library to process WSI")
-            except ImportError:
-                self.logger.error("tiffslide library not installed")
-                raise
-                
-        if not use_tiffslide:
-            try:
-                import openslide
-                slide_library = openslide
-                self.logger.info("Using openslide library to process WSI")
-            except ImportError:
-                self.logger.error("Must install either tiffslide or openslide")
-                raise
-            
-        # Open WSI file
+        Args:
+            slide: TiffSlide object
+        Returns:
+            mask: Binary tissue mask where tissue=1, background=0
+        """
         try:
-            if use_tiffslide:
-                slide = slide_library.TiffSlide(wsi_path)
-            else:
-                slide = slide_library.OpenSlide(wsi_path)
-        except Exception as e:
-            self.logger.error(f"Cannot open WSI file {wsi_path}: {str(e)}")
-            raise
+            # Choose appropriate level for thumbnail
+            level = min(3, len(slide.level_dimensions) - 1)
+            dim = slide.level_dimensions[level]
             
-        # Get slide dimensions
+            # Check if thumbnail is too large
+            if dim[0] > 10000 or dim[1] > 10000:
+                print('Thumbnail too large, skipping mask generation')
+                return None
+                
+            # Read thumbnail
+            temp_thumb = slide.read_region((0, 0), level, dim)
+            
+            # Convert to grayscale
+            gray = np.array(ImageOps.grayscale(temp_thumb))
+            
+            # Fixed threshold instead of Otsu
+            threshold = 240
+            mask = (gray < threshold).astype(np.uint8)  # tissue = 1, background = 0
+            
+            # Morphological operations
+            mask = morphology.remove_small_objects(mask.astype(bool), min_size=16 * 16, connectivity=2)
+            mask = morphology.remove_small_holes(mask, area_threshold=128 * 128)
+            mask = morphology.binary_dilation(mask, morphology.disk(16))
+            
+            return mask.astype(np.uint8)
+            
+        except Exception as e:
+            print(f"Error generating tissue mask: {str(e)}")
+            return None
+
+    def process_whole_wsi(self, wsi_path: str, patch_size: int = 128, level: int = 0, 
+                          batch_size: int = 16, use_tiffslide: bool = True,
+                          save_patches: bool = False, output_dir: str = None,
+                          tissue_threshold: float = 0.5, progress_callback=None):
+        """Process entire WSI by dividing it into patches using streaming approach"""
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {device}")
+        
+        slide = tiffslide.TiffSlide(wsi_path)
         width, height = slide.dimensions
         
-        print(f"WSI dimensions at level {level}: {width}x{height}")
-        print(f"Processing with patch size: {patch_size}x{patch_size}")
-        
-        # Create output directory if needed
-        if save_patches:
-            os.makedirs(output_dir, exist_ok=True)
-            print(f"Will save patches to directory: {output_dir}")
+        print("Generating tissue mask...")
+        mask = self.get_tissue_mask(slide)
+        if mask is None:
+            print("Failed to generate tissue mask")
+            return None, []
             
-            # Save WSI information
-            wsi_info = {
-                "wsi_path": wsi_path,
-                "level": level,
-                "dimensions": slide.dimensions,
-                "level_dimensions": slide.level_dimensions,
-                "level_downsamples": slide.level_downsamples,
-                "patch_size": patch_size
-            }
-            with open(os.path.join(output_dir, "wsi_info.json"), "w") as f:
-                json.dump(wsi_info, f, indent=4)
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
         
-        # Calculate number of patches in each dimension
-        num_patches_x = width // patch_size
-        num_patches_y = height // patch_size
+        # calculate total patches number for progress bar
+        total_rows = (height - patch_size + 1) // patch_size
         
-        print(f"Total potential patches: {num_patches_x * num_patches_y}")
-        
-        # Function to check if a patch has enough tissue content (not blank)
-        def is_tissue_patch(patch_img, threshold=tissue_threshold):
-            # Convert to numpy array
-            patch_np = np.array(patch_img)
+        def patch_generator():
+            """Generator function, generate patches one by one"""
+            valid_patch_count = 0
+            total_patches = (width // patch_size) * (height // patch_size)
+            processed_count = 0
             
-            # Convert to grayscale if RGB
-            if len(patch_np.shape) == 3:
-                gray = cv2.cvtColor(patch_np, cv2.COLOR_RGB2GRAY)
-            else:
-                gray = patch_np
+            # use tqdm to show row processing progress
+            for y in tqdm(range(0, height - patch_size + 1, patch_size), 
+                         total=total_rows,
+                         desc="Processing WSI rows",
+                         position=0):
+                patch_batch = []
+                coord_batch = []
                 
-            # Apply Otsu's thresholding to separate tissue from background
-            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
-            
-            # Calculate percentage of tissue pixels
-            tissue_ratio = np.sum(binary > 0) / (patch_size * patch_size)
-            
-            return tissue_ratio > threshold
-        
-        # Extract and filter patches
-        patch_images = []
-        patch_coordinates = []
-        valid_patch_count = 0
-        
-        print("Starting patch extraction with tissue filtering...")
-        
-        # Process patches in a grid pattern
-        total_patches = num_patches_x * num_patches_y
-        processed_count = 0
-        
-        # Use tqdm progress bar
-        for y in tqdm(range(0, height - patch_size + 1, patch_size), desc="Processing WSI rows"):
-            for x in range(0, width - patch_size + 1, patch_size):
-                # Extract patch
-                patch_img = slide.read_region(
-                    (x, y), level, (patch_size, patch_size)
-                ).convert("RGB")
-                
-                # Check if patch has enough tissue
-                if is_tissue_patch(patch_img, tissue_threshold):
+                for x in range(0, width - patch_size + 1, patch_size):
+                    center_x = x + patch_size // 2
+                    center_y = y + patch_size // 2
+                    
+                    if center_x >= width or center_y >= height:
+                        continue
+                        
+                    if mask[center_y, center_x] == 0:
+                        continue
+                    
+                    patch_img = slide.read_region(
+                        (x, y), level, (patch_size, patch_size)
+                    ).convert("RGB")
+                    
                     valid_patch_count += 1
+                    patch_batch.append(patch_img)
+                    coord_batch.append((x, y, x + patch_size, y + patch_size))
                     
-                    # Store coordinates as (x1, y1, x2, y2)
-                    patch_coordinates.append((x, y, x + patch_size, y + patch_size))
-                    patch_images.append(patch_img)
-                    
-                    # Save patch if requested
                     if save_patches:
                         patch_path = os.path.join(output_dir, f"patch_{valid_patch_count:05d}.png")
                         patch_img.save(patch_path)
+                    
+                    if len(patch_batch) >= batch_size:
+                        yield patch_batch, coord_batch
+                        patch_batch = []
+                        coord_batch = []
+                    
+                    processed_count += 1
+                    if progress_callback and processed_count % max(1, total_patches // 50) == 0:
+                        progress_callback("extract", int((processed_count / total_patches) * 100))
                 
-                # Update progress
-                processed_count += 1
-                if progress_callback and processed_count % max(1, total_patches // 50) == 0:
-                    progress_percent = int((processed_count / total_patches) * 100)
-                    progress_callback("extract", progress_percent)
+                if patch_batch:
+                    yield patch_batch, coord_batch
         
-        # Ensure final 100% progress callback
-        if progress_callback:
-            progress_callback("extract", 100)
+        all_embeddings = []
+        all_coordinates = []
+        
+        # use generator to process patches
+        print("Starting streaming processing of patches...")
+        batch_count = 0
+        with torch.no_grad():
+            self.model = self.model.to(device)
             
-        print(f"Extracted {valid_patch_count} non-blank patches out of {num_patches_x * num_patches_y} potential patches")
+            # use tqdm to show batch processing progress
+            for patch_batch, coord_batch in tqdm(patch_generator(),
+                                               desc="Processing patch batches",
+                                               position=1,
+                                               leave=True):
+                batch_count += 1
+                # encode current batch
+                batch_embeddings = self.encode_images(patch_batch, batch_size, progress_callback)
+                if device.type == 'cuda':
+                    batch_embeddings = batch_embeddings.cpu()
+                
+                all_embeddings.append(batch_embeddings)
+                all_coordinates.extend(coord_batch)
         
-        # Close slide
-        slide.close()
-        
-        # If no valid patches were found
-        if valid_patch_count == 0:
-            print("No valid tissue patches found in the WSI")
+        # merge all results
+        if all_embeddings:
+            final_embeddings = torch.cat(all_embeddings, dim=0)
+            print(f"Encoding completed, processed {batch_count} batches, feature dimension: {final_embeddings.shape}")
+        else:
+            print("No valid tissue patches found")
             return None, []
         
-        # Encode all patches if there are any
-        print(f"Starting encoding of {len(patch_images)} patches...")
-        with torch.no_grad():
-            patch_embeddings = self.encode_images(patch_images, batch_size, progress_callback)
-        
-        # Save patch coordinates if saving patches
         if save_patches:
             with open(os.path.join(output_dir, "patch_coordinates.json"), "w") as f:
                 json.dump({
-                    "coordinates": patch_coordinates,
-                    "count": valid_patch_count
+                    "coordinates": all_coordinates,
+                    "count": len(all_coordinates)
                 }, f, indent=4)
         
-        return patch_embeddings, patch_coordinates
+        return final_embeddings, all_coordinates

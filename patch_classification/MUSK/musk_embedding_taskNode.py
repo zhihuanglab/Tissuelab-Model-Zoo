@@ -61,7 +61,7 @@ last_printed_progress = -1  # Added for the new update_progress function
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8007, help='port')
-    parser.add_argument('--name', type=str, default='PatchClassificationNode', help='node name')
+    parser.add_argument('--name', type=str, default='MuskNode', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
 
     # === patch classification parameters ===
@@ -294,7 +294,7 @@ def init_node():
 def read_node(data: Dict[str, Any]):
     global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS
     
-    NODE_NAME = data.get("node_name", "PatchClassificationNode")
+    NODE_NAME = data.get("node_name", "MuskNode")
     DEPENDENCIES = data.get("dependencies", [])
     H5_PATH = data.get("h5_path", None)
     
