@@ -137,7 +137,7 @@ def generate_distinct_colors(tissue_classes: list[str]) -> list[str]:
         colors.append(color)
     return colors
 
-def save_classifier_params(clf, class_names, class_colors, train_data, max_samples_per_class=20):
+def save_classifier_params(clf, class_names, class_colors, train_data, max_samples_per_class=100000000000000):
     """Save classifier parameters and training data to XGBoost model file"""
     global SAVE_CLASSIFIER_PATH
     if SAVE_CLASSIFIER_PATH is None:
