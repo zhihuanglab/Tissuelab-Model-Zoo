@@ -4,15 +4,25 @@ import json
 url = "http://localhost:5001/api/tasks/v1/start_workflow"
 
 payload = {
-    "h5_path": "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\CMU-1.svs.h5",
+    "h5_path": "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\TCGA-A6-6648-01Z-00-DX1.88b9a490-0bed-43f3-bd74-1bf2810f6884.svs.h5",
     "step1": {
         "model": "MuskNode",
         "input": {
-            "path": "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\CMU-1.svs",
-            "classifier_path": "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\classifier_params.h5",
-            "save_classifier_path": "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\classifier_params_new.h5",
-            "tissue_classes": ["Negative control", "Epithelial", "Lymphocytes"],
-            "tissue_colors": ["#aaaaaa", "#de1212", "#6311df"]
+            "path": "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\TCGA-A6-6648-01Z-00-DX1.88b9a490-0bed-43f3-bd74-1bf2810f6884.svs",
+            "classifier_path": "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\classifier.xgb",
+            "save_classifier_path": "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\classifier_new.xgb",
+            "tissue_classes": [
+                "Negative control",
+                "Neurons",
+                "Tumor",
+                "Microglia"
+            ],
+            "tissue_colors": [
+                "#aaaaaa",
+                "#7012e2",
+                "#de1212",
+                "#1be90c"
+            ]
         }
     }
 }

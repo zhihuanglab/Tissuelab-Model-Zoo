@@ -223,34 +223,74 @@ class SlideSegmentation():
     
 
     def simple_get_mask(self):
-
-        # temp_thumb = self.slide.get_thumbnail(size=(2000, 2000))
         try:
+            # choose the best level
             level = np.min([5, len(self.slide.level_dimensions)-1])
-            #downsample=self.slide.level_downsamples[level]
             print(self.slide.level_dimensions)
             dim = list(self.slide.level_dimensions)[level]
-            print(dim)
-            if (dim[0] > 20000) or (dim[1] > 20000):
-                print('Thumb is too big. skip this.')
-                return None
-            temp_thumb = self.slide.read_region((0,0), level, dim)
-            # temp_thumb = self.slide.get_thumbnail(size=(2000, 2000))
-            #wsi_thumb_rgb = np.array(temp_thumb)
-            #gray = cv2.cvtColor(wsi_thumb_rgb, cv2.COLOR_RGB2GRAY)
-            #_, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU)
-            gray = np.array(ImageOps.grayscale(temp_thumb))
-            threshold = skimage.filters.threshold_otsu(gray)
-            threshold = 240
-            mask = np.array(gray > threshold).astype(np.uint8)*255
-            mask = morphology.remove_small_objects(mask == 0, min_size=16 * 16, connectivity=2)
-            mask = morphology.remove_small_holes(mask, area_threshold=128 * 128)
-            mask = morphology.binary_dilation(mask, morphology.disk(16))
+            print(f"Using level {level} with dimensions {dim}")
             
-            self.wsi_mask = mask
+            # check thumbnail size
+            if (dim[0] > 10000) or (dim[1] > 10000):
+                print('Thumbnail too large, using higher level')
+                level = min(level + 1, len(self.slide.level_dimensions) - 1)
+                dim = list(self.slide.level_dimensions)[level]
+                print(f"Adjusted to level {level} with dimensions {dim}")
+            
+            # read thumbnail and convert to RGB
+            temp_thumb = self.slide.read_region((0,0), level, dim).convert('RGB')
+            
+            # convert to grayscale
+            gray = np.array(ImageOps.grayscale(temp_thumb))
+            
+            # use adaptive threshold
+            block_size = 51  # must be odd
+            C = 2  # constant adjustment value
+            binary_mask = cv2.adaptiveThreshold(
+                gray,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV,
+                block_size,
+                C
+            )
+            
+            # convert to binary image
+            mask = (binary_mask > 0).astype(np.uint8) * 255
+            
+            # morphological processing
+            mask = morphology.remove_small_objects(mask > 0, min_size=16 * 16, connectivity=2)
+            mask = morphology.remove_small_holes(mask, area_threshold=128 * 128)
+            
+            # use the correct morphological dilation parameters
+            struct_element = morphology.disk(16)
+            mask = morphology.binary_dilation(mask, struct_element)
+            mask = mask.astype(np.uint8) * 255  # ensure uint8 type and values are 0 or 255
+            
+            # only save mask image in debug mode
+            if hasattr(self.args, 'debug') and self.args.debug:
+                mask_filename = os.path.splitext(self.args.slidepath)[0] + '_mask.png'
+                cv2.imwrite(mask_filename, mask)
+                print(f"Saved mask to: {mask_filename}")
+                
+                # save the original image with contours for verification
+                temp_thumb_np = np.array(temp_thumb)
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                overlay = temp_thumb_np.copy()
+                cv2.drawContours(overlay, contours, -1, (0,255,0), 2)
+                overlay_filename = os.path.splitext(self.args.slidepath)[0] + '_mask_overlay.png'
+                cv2.imwrite(overlay_filename, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+                print(f"Saved overlay image to: {overlay_filename}")
+            
+            self.wsi_mask = (mask > 0).astype(np.uint8)  # store as binary mask
             return self.wsi_mask
-        except:
-            return None
+        
+        except Exception as e:
+            print(f"Error in mask generation: {str(e)}")
+            import traceback
+            print(traceback.format_exc())
+            # return a mask of all 1s when there is an error
+            return np.ones(dim[::-1], dtype=np.uint8)
     
     
     def get_normalized_template(self):
