@@ -23,11 +23,12 @@ from nuc_stat import SlideProperty
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--slidepath', default='C:\\Users\\lsoho\\Git\\penn\\experiment\\TCGA-E2-A15T-01Z-00-DX1.23913E37-53A8-4E11-9B64-CDD016F6D87A.svs', type=str)
+    parser.add_argument('--slidepath', default='C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\ana.jpg', type=str)
     parser.add_argument('--read_image_method', default='tiffslide', type=str, choices=['openslide','tiffslide','PIL','numpy'])
     parser.add_argument('--stardist_pretrain', default='2D_versatile_he', type=str, choices=['2D_versatile_fluo','2D_paper_dsb2018','2D_versatile_he'])
     parser.add_argument('--isIHC', default=False, type=bool)
     parser.add_argument('--calculate_features', default=False, type=bool)
+    parser.add_argument('--debug', default=False, action='store_true', help='Enable debug mode to save mask images')
     return parser.parse_args()
 
 def calculate_features(args, centroids, contours):

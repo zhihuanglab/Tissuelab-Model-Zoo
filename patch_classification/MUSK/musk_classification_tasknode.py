@@ -20,6 +20,9 @@ import torch.nn as nn
 import colorsys
 import asyncio
 from sse_starlette.sse import EventSourceResponse
+import xgboost as xgb  # 添加XGBoost导入
+import io
+import base64
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -134,55 +137,96 @@ def generate_distinct_colors(tissue_classes: list[str]) -> list[str]:
         colors.append(color)
     return colors
 
-def save_classifier_params(clf, class_names, class_colors, h5_path):
-    """Save classifier parameters to a fixed H5 file"""
+def save_classifier_params(clf, class_names, class_colors, train_data, max_samples_per_class=20):
+    """Save classifier parameters and training data to XGBoost model file"""
     global SAVE_CLASSIFIER_PATH
     if SAVE_CLASSIFIER_PATH is None:
         print("No SAVE_CLASSIFIER_PATH specified, skipping saving classifier parameters")
         return
         
-    with h5py.File(SAVE_CLASSIFIER_PATH, 'a') as hf:
-        if 'classifier_params' in hf:
-            del hf['classifier_params']
-        params_grp = hf.create_group('classifier_params')
+    # limit the number of samples per class
+    embeddings = train_data['embeddings']
+    labels = train_data['labels']
+    
+    final_embeddings = []
+    final_labels = []
+    
+    for class_idx in range(len(class_names)):
+        class_mask = (labels == class_idx)
+        class_embeddings = embeddings[class_mask]
+        class_labels = labels[class_mask]
         
-        # Save model parameters
-        params_grp.create_dataset('coef', data=clf.coef_)
-        params_grp.create_dataset('intercept', data=clf.intercept_)
-        
-        # Save class information
-        class_names_ascii = [n.encode('utf-8') for n in class_names]
-        params_grp.create_dataset('class_names', (len(class_names_ascii),), dtype='S256', data=class_names_ascii)
-        
-        colors_ascii = [c.encode('utf-8') for c in class_colors]
-        params_grp.create_dataset('class_colors', (len(colors_ascii),), dtype='S256', data=colors_ascii)
+        if len(class_embeddings) > max_samples_per_class:
+            class_embeddings = class_embeddings[-max_samples_per_class:]
+            class_labels = class_labels[-max_samples_per_class:]
+            
+        final_embeddings.append(class_embeddings)
+        final_labels.append(class_labels)
+    
+
+    final_embeddings = np.vstack(final_embeddings)
+    final_labels = np.concatenate(final_labels)
+    
+    print(f"Saving {len(final_embeddings)} samples (max {max_samples_per_class} per class)")
+    
+    # get the underlying Booster object and set attributes
+    booster = clf.get_booster()
+    booster.set_attr(class_names=json.dumps(class_names))
+    booster.set_attr(class_colors=json.dumps(class_colors))
+
+    train_data_bytes = io.BytesIO()
+    np.savez_compressed(train_data_bytes, 
+                       embeddings=final_embeddings, 
+                       labels=final_labels)
+    train_data_str = base64.b64encode(train_data_bytes.getvalue()).decode('utf-8')
+    booster.set_attr(train_data=train_data_str)
+    
+    # save XGBoost model
+    clf.save_model(SAVE_CLASSIFIER_PATH)
+    print(f"Saved classifier with parameters and training data to: {SAVE_CLASSIFIER_PATH}")
 
 def load_classifier_params(h5_path):
-    """Load classifier parameters from H5 file"""
+    """Load classifier parameters and training data from XGBoost model file"""
     global CLASSIFIER_PATH
     if CLASSIFIER_PATH is None:
         print("No classifier_path specified, skipping loading classifier parameters")
         return None
         
     try:
-        with h5py.File(CLASSIFIER_PATH, 'r') as hf:
-            if 'classifier_params' not in hf:
-                return None
-                
-            params_grp = hf['classifier_params']
-            coef = params_grp['coef'][()]
-            intercept = params_grp['intercept'][()]
+        # load XGBoost model
+        if not os.path.exists(CLASSIFIER_PATH):
+            print(f"XGBoost model file not found at: {CLASSIFIER_PATH}")
+            return None
             
-            class_names = [n.decode('utf-8') for n in params_grp['class_names'][()]]
-            class_colors = [c.decode('utf-8') for c in params_grp['class_colors'][()]]
+        clf = xgb.XGBClassifier()
+        clf.load_model(CLASSIFIER_PATH)
+        
+        # get class information and training data from model attributes
+        booster = clf.get_booster()
+        class_names = json.loads(booster.attr('class_names'))
+        class_colors = json.loads(booster.attr('class_colors'))
+        
+        # decode training data from base64 string
+        train_data_str = booster.attr('train_data')
+        if train_data_str:
+            train_data_bytes = io.BytesIO(base64.b64decode(train_data_str))
+            train_data = np.load(train_data_bytes)
+            train_embeddings = train_data['embeddings']
+            train_labels = train_data['labels']
             
-            # Create classifier and set parameters
-            clf = LogisticRegression(random_state=42)
-            clf.coef_ = coef
-            clf.intercept_ = intercept
-            clf.classes_ = np.arange(len(class_names))
-            
-            return clf, class_names, class_colors
+            # print the number of samples for each class
+            print("\nloaded training data:")
+            print(f"total samples: {len(train_labels)}")
+            for i, class_name in enumerate(class_names):
+                class_count = np.sum(train_labels == i)
+                print(f"class '{class_name}': {class_count} samples")
+            print()
+        else:
+            train_embeddings = None
+            train_labels = None
+            print("No saved training data found")
+        
+        return clf, class_names, class_colors, train_embeddings, train_labels
     except Exception as e:
         print(f"Error loading classifier parameters: {e}")
         return None
@@ -190,56 +234,66 @@ def load_classifier_params(h5_path):
 def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
     global CLASSIFIER_PATH
     
+    # update XGBoost parameter settings
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    xgb_params = {
+        'max_depth': 8,
+        'tree_method': 'hist',
+        'device': device,
+        'eval_metric': 'mlogloss',
+        'random_state': 42
+    }
+
+    if annotations is None:
+        print("No annotations provided")
+        annotations = pd.DataFrame()
+    
     # try to load existing classifier parameters
     if CLASSIFIER_PATH is not None:
-        loaded_params = load_classifier_params(H5_PATH)
-        if loaded_params is not None:
-            clf, class_names, class_colors = loaded_params
-            print(f"Loaded existing classifier parameters, classes: {class_names}")
-            
-            # check if there are user annotations to integrate
-            if not annotations.empty:
-                existing_classes = set(class_names)
-                annotated_classes = set(annotations['tissue_class'].unique())
-                common_classes = existing_classes.intersection(annotated_classes)
+        try:
+            loaded_params = load_classifier_params(CLASSIFIER_PATH)
+            if loaded_params is not None:
+                clf, class_names, class_colors, prev_embeddings, prev_labels = loaded_params
+                print(f"Loaded existing classifier parameters, classes: {class_names}")
                 
-                if common_classes:
-                    print(f"Found user annotations for classes: {common_classes}, updating classifier...")
+                if not annotations.empty:
+                    existing_classes = set(class_names)
+                    annotated_classes = set(annotations['tissue_class'].unique())
+                    common_classes = existing_classes.intersection(annotated_classes)
                     
-                    # get user annotations
-                    cell_indices = annotations['patch_ID'].astype(int).values
-                    X_update = cell_embeddings[cell_indices]
-                    y_update = pd.Categorical(annotations['tissue_class'], categories=class_names).codes
-                    
-                    # create new classifier and train with combined data
-                    new_clf = LogisticRegression(random_state=42, max_iter=1000, 
-                                               multi_class='multinomial', solver='lbfgs')
-                    
-                    # use predictions of original classifier as labels for other samples
-                    mask = np.ones(len(cell_embeddings), dtype=bool)
-                    mask[cell_indices] = False
-                    X_rest = cell_embeddings[mask]
-                    y_rest = clf.predict(X_rest)
-                    
-                    # merge data
-                    X_combined = np.vstack([X_rest, X_update])
-                    y_combined = np.concatenate([y_rest, y_update])
-                    
-                    # train new classifier
-                    new_clf.fit(X_combined, y_combined)
-                    clf = new_clf
-                    
-                    # save updated classifier parameters
-                    save_classifier_params(clf, class_names, class_colors, H5_PATH)
-                    
-                    print("Classifier updated with user annotations and saved")
-            
-            predictions = clf.predict(cell_embeddings)
-            prediction_probs = clf.predict_proba(cell_embeddings)
-            
-            return (clf, class_names, class_colors, predictions, prediction_probs,
-                    clf.coef_, clf.intercept_, 0, 0)
+                    if common_classes:
+                        print(f"Found user annotations for classes: {common_classes}, updating classifier...")
+                        
+                        cell_indices = annotations['patch_ID'].astype(int).values
+                        X_update = cell_embeddings[cell_indices]
+                        y_update = pd.Categorical(annotations['tissue_class'], categories=class_names).codes
+                        
+                        # Combine new and previous training data if available
+                        if prev_embeddings is not None and prev_labels is not None:
+                            X_train = np.vstack([prev_embeddings, X_update])
+                            y_train = np.concatenate([prev_labels, y_update])
+                        else:
+                            X_train = X_update
+                            y_train = y_update
 
+                        clf.fit(X_train, y_train)
+                        
+                        # Save updated classifier with new training data
+                        train_data = {
+                            'embeddings': X_train,
+                            'labels': y_train
+                        }
+                        save_classifier_params(clf, class_names, class_colors, train_data)
+                        print("Classifier updated with user annotations and saved")
+                
+                predictions = clf.predict(cell_embeddings)
+                prediction_probs = clf.predict_proba(cell_embeddings)
+                
+                return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
+        except Exception as e:
+            print(f"Error loading or updating classifier: {e}")
+            # continue to create a new classifier
+    
     unique_classes = annotations['tissue_class'].unique().tolist()
     if len(unique_classes) < 1:
         raise ValueError("Need at least 2 classes in annotation => fallback to zero-shot")
@@ -270,9 +324,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         except Exception as e:
             print(f"unable to load negative control vectors: {e}")
 
-    # train classifier
-    clf = LogisticRegression(random_state=42, max_iter=1000, 
-                           multi_class='multinomial', solver='lbfgs')
+    # train new classifier
+    clf = xgb.XGBClassifier(**xgb_params)
     clf.fit(X_train, y_train)
 
     # predict
@@ -280,10 +333,13 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     prediction_probs = clf.predict_proba(cell_embeddings)
 
     # save classifier parameters
-    save_classifier_params(clf, class_names, class_colors, H5_PATH)
+    train_data = {
+        'embeddings': X_train,
+        'labels': y_train
+    }
+    save_classifier_params(clf, class_names, class_colors, train_data)
 
-    return (clf, class_names, class_colors, predictions, prediction_probs,
-            clf.coef_, clf.intercept_, 0, 0)
+    return (clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0)
 
 def run_classification(args) -> Dict[str, Any]:
     if H5_PATH is None:
@@ -332,7 +388,7 @@ def run_classification(args) -> Dict[str, Any]:
         tissue_classes = getattr(args, "tissue_classes", [])
         tissue_colors = getattr(args, "tissue_colors", [])
 
-        if use_supervised and annotations_data is not None:
+        if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
             clf, class_names, class_colors, predictions, prediction_probs, \
                 coef_, intercept_, train_time, test_time = train_linear_classifier(cell_embeddings, annotations_data)
             final_class_names = class_names

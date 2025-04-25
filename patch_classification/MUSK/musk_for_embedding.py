@@ -308,35 +308,50 @@ class MUSK:
             mask: Binary tissue mask where tissue=1, background=0
         """
         try:
-            # Choose appropriate level for thumbnail
+            # choose appropriate level
             level = min(3, len(slide.level_dimensions) - 1)
             dim = slide.level_dimensions[level]
             
-            # Check if thumbnail is too large
+            # check thumbnail size
             if dim[0] > 10000 or dim[1] > 10000:
-                print('Thumbnail too large, skipping mask generation')
-                return None
+                self.logger.warning('Thumbnail too large, using higher level')
+                level = min(level + 1, len(slide.level_dimensions) - 1)
+                dim = slide.level_dimensions[level]
                 
-            # Read thumbnail
-            temp_thumb = slide.read_region((0, 0), level, dim)
+            # read thumbnail and convert to RGB
+            temp_thumb = slide.read_region((0,0), level, dim).convert('RGB')
             
-            # Convert to grayscale
+            # convert to grayscale
             gray = np.array(ImageOps.grayscale(temp_thumb))
             
-            # Fixed threshold instead of Otsu
-            threshold = 240
-            mask = (gray < threshold).astype(np.uint8)  # tissue = 1, background = 0
+            # use adaptive threshold
+            block_size = 51  # must be odd
+            C = 2  # constant adjustment value
+            mask = cv2.adaptiveThreshold(
+                gray,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV,
+                block_size,
+                C
+            )
             
-            # Morphological operations
+            # convert to binary image
+            mask = (mask > 0).astype(np.uint8)
+            
+            # morphological processing
             mask = morphology.remove_small_objects(mask.astype(bool), min_size=16 * 16, connectivity=2)
             mask = morphology.remove_small_holes(mask, area_threshold=128 * 128)
-            mask = morphology.binary_dilation(mask, morphology.disk(16))
             
-            return mask.astype(np.uint8)
+            # use correct morphological dilation parameters
+            struct_element = morphology.disk(16)
+            mask = morphology.binary_dilation(mask, struct_element)
+            
+            return mask.astype(np.uint8)  # return binary mask, tissue=1, background=0
             
         except Exception as e:
             print(f"Error generating tissue mask: {str(e)}")
-            return None
+            return np.ones(dim[::-1], dtype=np.uint8)  # return full white mask when error
 
     def process_whole_wsi(self, wsi_path: str, patch_size: int = 128, level: int = 0, 
                           batch_size: int = 16, use_tiffslide: bool = True,
