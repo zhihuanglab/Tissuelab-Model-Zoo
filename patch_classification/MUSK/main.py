@@ -13,7 +13,7 @@ model_path = "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classifica
 musk = MUSK(model_path=model_path)
 
 # WSI file path
-wsi_path = "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\CMU-1.svs"
+wsi_path = "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\TCGA-A6-6648-01Z-00-DX1.88b9a490-0bed-43f3-bd74-1bf2810f6884.svs"
 output_dir = "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\result_h5"
 
 # Open WSI and get mask
@@ -37,7 +37,7 @@ else:
 print(f"Starting to process entire WSI with patch size {patch_size}x{patch_size}, results will be saved to {output_dir}...")
 start_time = time.time()
 
-# 处理整个WSI
+# process the entire WSI
 patch_embeddings, patch_coordinates = musk.process_whole_wsi(
     wsi_path=wsi_path,
     patch_size=patch_size,
@@ -52,31 +52,31 @@ print(f"WSI processing complete, time elapsed: {end_time - start_time:.2f} secon
 print(f"Processed {len(patch_coordinates)} tissue patches")
 print(f"Feature vector shape: {patch_embeddings.shape}")
 
-# 将嵌入向量和坐标保存到h5文件
+# save embeddings and coordinates to h5 file
 if patch_embeddings is not None and len(patch_coordinates) > 0:
-    # 获取WSI文件名并构建h5文件路径
+    # get the WSI file name and build the h5 file path
     wsi_filename = os.path.basename(wsi_path)
     h5_path = os.path.join("C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\result_h5", f"{wsi_filename}.h5")
     print(f"Saving embeddings to {h5_path}")
     
     with h5py.File(h5_path, 'w') as f:
-        # 创建MuskNode组
+        # create MuskNode group
         musk_node = f.create_group('MuskNode')
         
-        # 保存嵌入向量
+        # save embeddings
         musk_node.create_dataset('embedding', data=patch_embeddings.cpu().numpy())
         
-        # 保存坐标信息
+        # save coordinates
         coord_data = np.array(patch_coordinates)
         musk_node.create_dataset('coordinates', data=coord_data)
         
-        # 创建空的output数据集
+        # create empty output dataset
         musk_node.create_dataset('output', shape=(), dtype=h5py.string_dtype())
         
-        # 创建probability数据集
+        # create probability dataset
         musk_node.create_dataset('probability', data=np.ones(len(patch_coordinates), dtype=np.float32))
         
-        # 保存元数据
+        # save metadata
         musk_node.attrs['wsi_path'] = wsi_path
         musk_node.attrs['patch_size'] = patch_size
         musk_node.attrs['level'] = 1
