@@ -10,6 +10,9 @@ from utilities.arguments import load_opt_from_config_files
 from utilities.constants import BIOMED_CLASSES
 from inference_utils.inference import interactive_infer_image
 import platform
+import nibabel as nib
+import os
+import matplotlib.pyplot as plt
 
 conf_files = "configs/biomedparse_inference.yaml"
 opt = load_opt_from_config_files([conf_files])
@@ -26,19 +29,52 @@ with torch.no_grad():
 
 """# Run Inference"""
 
-# RGB image input of shape (H, W, 3). Currently only batch size 1 is supported.
-image = Image.open('lung.png', formats=['png'])
-image = image.convert('RGB')
+def load_image_data(image_path):
+    """Load image data and get pixel spacing based on file format"""
+    file_extension = os.path.splitext(image_path)[1].lower()
+    
+    if file_extension == '.nii' or file_extension == '.gz':
+        # Process NIFTI file
+        nii_img = nib.load(image_path)
+        pixel_spacing = nii_img.header.get_zooms()[:2]
+        scale_factor = pixel_spacing[0]
+        
+        # Get NIFTI data
+        nii_data = nii_img.get_fdata()
+        if len(nii_data.shape) == 3:
+            middle_slice = nii_data.shape[2] // 2
+            slice_data = nii_data[:, :, middle_slice]
+        else:
+            slice_data = nii_data
+            
+        # Normalize to 0-255 range
+        slice_data = ((slice_data - slice_data.min()) / (slice_data.max() - slice_data.min()) * 255).astype(np.uint8)
+        image = Image.fromarray(slice_data).convert('RGB')
+        
+    elif file_extension in ['.png', '.jpg', '.jpeg']:
+        # Process regular image files
+        image = Image.open(image_path).convert('RGB')
+        # Use default pixel spacing for regular images
+        scale_factor = 0.1  # default value in mm/pixel
+        print("Warning: Using default pixel spacing (0.1 mm/pixel) for regular image file")
+    
+    else:
+        raise ValueError(f"Unsupported file format: {file_extension}")
+        
+    return image, scale_factor
 
-# Detect tumor cells specifically
+# input image path
+input_image_path = 'lung.png'
+original_image, scale_factor = load_image_data(input_image_path)
+print(f"Image loaded from {input_image_path}")
+print(f"Pixel spacing: {scale_factor:.3f} mm/pixel")
+
 prompts = ['lung nodule']
-pred_mask = interactive_infer_image(model, image, prompts)
+pred_mask = interactive_infer_image(model, original_image, prompts)
 print(f"Prediction mask shape: {pred_mask.shape}")
 
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-
 def overlay_masks(image, masks, colors):
+    """Overlay masks on the original image"""
     overlay = image.copy()
     overlay = np.array(overlay, dtype=np.uint8)
     for mask, color in zip(masks, colors):
@@ -46,88 +82,61 @@ def overlay_masks(image, masks, colors):
     return Image.fromarray(overlay)
 
 def generate_colors(n):
+    """Generate n distinct colors"""
     cmap = plt.get_cmap('tab10')
     colors = [tuple(int(255 * val) for val in cmap(i)[:3]) for i in range(n)]
     return colors
 
-original_image = Image.open('lung.png').convert('RGB')
 colors = generate_colors(len(prompts))
 
-# Create visualization of predicted masks
-pred_overlay = overlay_masks(original_image, [1*(pred_mask[i] > 0.5) for i in range(len(prompts))], colors)
+# Create a large figure to show all results
+fig = plt.figure(figsize=(15, 10))
+gs = plt.GridSpec(2, 2, figure=fig)  # 2x2 grid
 
-# Create legend
-legend_patches = [mpatches.Patch(color=np.array(color) / 255, label=prompt) for color, prompt in zip(colors, prompts)]
+# Original image
+ax1 = fig.add_subplot(gs[0, 0])
+ax1.imshow(original_image)
+ax1.set_title("Original Image")
+ax1.axis('off')
 
-# Display original image and prediction results
-fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-axes[0].imshow(original_image)
-axes[0].set_title("Original Image")
-axes[0].axis('off')
+# Threshold 0.5 result
+ax2 = fig.add_subplot(gs[0, 1])
+pred_overlay = overlay_masks(original_image, [1*(pred_mask[j] > 0.5) for j in range(len(prompts))], colors)
+ax2.imshow(pred_overlay)
+ax2.set_title(f"Threshold = 0.5")
+ax2.axis('off')
 
-axes[1].imshow(pred_overlay)
-axes[1].set_title("Detection Results")
-axes[1].axis('off')
-axes[1].legend(handles=legend_patches, loc='upper right', fontsize='small')
+# Statistics
+ax_text = fig.add_subplot(gs[1, :])
+ax_text.axis('off')
 
-plt.tight_layout()
-plt.show()
-
-# Print prediction score statistics
+stats_text = ""
 for i, prompt in enumerate(prompts):
     scores = pred_mask[i]
-    print(f"Prediction stats for '{prompt}':")
-    print(f"  Min score: {scores.min():.4f}")
-    print(f"  Max score: {scores.max():.4f}")
-    print(f"  Mean score: {scores.mean():.4f}")
-    print(f"  Median score: {np.median(scores):.4f}")
+    binary_mask = scores > 0.5
+    pixel_count = np.sum(binary_mask)
+    area = pixel_count
+    diameter_pixels = 2 * np.sqrt(area / np.pi)
+    diameter_mm = diameter_pixels * scale_factor
+    area_mm2 = area * (scale_factor ** 2)
     
-    # Count pixels above different thresholds
-    thresholds = [0.1, 0.3, 0.5, 0.7, 0.9]
+    stats_text += f"\n{'='*40}\n"
+    stats_text += f"Analysis Results - '{prompt}':\n"
+    stats_text += f"{'='*40}\n"
+    stats_text += f"Image Resolution: {scale_factor:.3f} mm/pixel\n"
+    stats_text += f"Prediction Scores: Min={scores.min():.3f}, Max={scores.max():.3f}, Mean={scores.mean():.3f}\n"
+    stats_text += f"Pixel Analysis: Total Count={pixel_count}, Approx. Diameter={diameter_pixels:.2f} pixels\n"
+    stats_text += f"Physical Size: Diameter={diameter_mm:.2f}mm, Area={area_mm2:.2f}mm²\n"
+    
+    # Multiple thresholds analysis
+    thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     for threshold in thresholds:
-        pixel_count = np.sum(scores > threshold)
-        percentage = 100 * pixel_count / scores.size
-        print(f"  Pixels > {threshold}: {pixel_count} ({percentage:.2f}%)")
+        count = np.sum(scores > threshold)
+        percentage = 100 * count / scores.size
+        stats_text += f"Threshold {threshold}: {count} pixels ({percentage:.2f}%)\n"
 
-# Function to create visualizations with different thresholds
-def visualize_with_threshold(image, pred_mask, prompts, threshold):
-    colors = generate_colors(len(prompts))
-    pred_overlay = overlay_masks(image, [1*(pred_mask[i] > threshold) for i in range(len(prompts))], colors)
-    
-    # Create legend
-    legend_patches = [mpatches.Patch(color=np.array(color) / 255, label=f"{prompt} (t={threshold})") 
-                     for color, prompt in zip(colors, prompts)]
-    
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.imshow(pred_overlay)
-    ax.set_title(f"Detection Results (threshold={threshold})")
-    ax.axis('off')
-    ax.legend(handles=legend_patches, loc='upper right', fontsize='small')
-    
-    return fig
-
-# Try different thresholds
-thresholds_to_try = [0.3, 0.5, 0.7]
-for threshold in thresholds_to_try:
-    fig = visualize_with_threshold(original_image, pred_mask, prompts, threshold)
-    plt.figure(fig.number)
-    plt.savefig(f"detection_threshold_{threshold}.png")
-    plt.show()
-
-# Original visualization with multiple thresholds side by side
-fig, axes = plt.subplots(1, len(thresholds_to_try) + 1, figsize=(4 * (len(thresholds_to_try) + 1), 5))
-axes[0].imshow(original_image)
-axes[0].set_title("Original Image")
-axes[0].axis('off')
-
-for i, threshold in enumerate(thresholds_to_try):
-    pred_overlay = overlay_masks(original_image, [1*(pred_mask[j] > threshold) for j in range(len(prompts))], colors)
-    axes[i+1].imshow(pred_overlay)
-    axes[i+1].set_title(f"Threshold = {threshold}")
-    axes[i+1].axis('off')
-    if i == len(thresholds_to_try) - 1:  # Only add legend to the last plot
-        axes[i+1].legend(handles=legend_patches, loc='upper right', fontsize='small')
+ax_text.text(0.02, 0.98, stats_text, fontsize=10, va='top', fontfamily='monospace')
 
 plt.tight_layout()
-plt.savefig("threshold_comparison.png")
+plt.savefig("complete_analysis.png", dpi=300, bbox_inches='tight')
 plt.show()
