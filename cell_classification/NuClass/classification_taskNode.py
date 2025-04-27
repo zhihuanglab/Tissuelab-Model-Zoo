@@ -110,12 +110,12 @@ def load_checkpoint_at_init():
         return
 
     base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
-    checkpoint_path = os.path.join(base_path, "checkpoints", "contrastive_checkpoint_epoch_0.pt")
+    checkpoint_path = os.path.join(base_path, "checkpoints", "checkpoint_step_10000.pt")
     
     print(f"[ClassificationNode] Looking for checkpoint at: {checkpoint_path}")
     if not os.path.exists(checkpoint_path):
         print(f"Warning: Checkpoint not found at {checkpoint_path}, trying alternate locations...")
-        alt_path = "checkpoints/contrastive_checkpoint_epoch_0.pt"
+        alt_path = "checkpoints/checkpoint_step_10000.pt"
         if os.path.exists(alt_path):
             checkpoint_path = alt_path
             print(f"Found checkpoint at: {checkpoint_path}")

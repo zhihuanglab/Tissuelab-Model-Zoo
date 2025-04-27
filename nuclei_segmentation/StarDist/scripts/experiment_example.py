@@ -23,7 +23,8 @@ from nuc_stat import SlideProperty
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--slidepath', default='C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\TCGA-A6-6648-01Z-00-DX1.88b9a490-0bed-43f3-bd74-1bf2810f6884.svs', type=str)
+    parser.add_argument('--username', default='default', type=str, help='Username for result directory prefix')
+    parser.add_argument('--slidepath', default='/project/zhihuanglab/common/datasets/TCGA/data_gdc_manifest_20220928_data_release_35.0_active/TCGA-COAD/dd4e7430-4e6a-4f87-b857-bab4438051ff/TCGA-CM-5348-01Z-00-DX1.2ad0b8f6-684a-41a7-b568-26e97675cce9.svs', type=str)
     parser.add_argument('--read_image_method', default='tiffslide', type=str, choices=['openslide','tiffslide','PIL','numpy'])
     parser.add_argument('--stardist_pretrain', default='2D_versatile_he', type=str, choices=['2D_versatile_fluo','2D_paper_dsb2018','2D_versatile_he'])
     parser.add_argument('--isIHC', default=False, type=bool)
@@ -55,9 +56,9 @@ def main(args):
         
         start_time = time.time()
 
-        # Create result directory
+        # Create result directory with username prefix
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        result_dir = os.path.join(script_dir, 'result')
+        result_dir = os.path.join(script_dir, f'{args.username}_result')
         os.makedirs(result_dir, exist_ok=True)
         
         # Use svs filename (without path) as base name

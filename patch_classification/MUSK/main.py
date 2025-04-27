@@ -13,7 +13,7 @@ model_path = "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classifica
 musk = MUSK(model_path=model_path)
 
 # WSI file path
-wsi_path = "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\TCGA-A6-6648-01Z-00-DX1.88b9a490-0bed-43f3-bd74-1bf2810f6884.svs"
+wsi_path = "C:\\Users\\lsoho\\Git\\penn\\TissueLab-Agent-Experiments\\experiments\\pathology\\LAMINA-base\\q1\\TCGA-AN-A0FY-01Z-00-DX1.25F5E2A1-F92C-4FE1-BD90-0CDDE50DC066\\TCGA-AN-A0FY-01Z-00-DX1.25F5E2A1-F92C-4FE1-BD90-0CDDE50DC066.svs"
 output_dir = "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\result_h5"
 
 # Open WSI and get mask
@@ -21,9 +21,11 @@ slide = tiffslide.TiffSlide(wsi_path)
 mask = musk.get_tissue_mask(slide)
 
 if mask is not None:
+    # Get WSI filename without extension
+    wsi_filename = os.path.splitext(os.path.basename(wsi_path))[0]
     # Save mask image for viewing
     mask_image = Image.fromarray(mask * 255)  # Convert to 0-255 range
-    mask_path = os.path.join(output_dir, "tissue_mask.png")
+    mask_path = os.path.join(output_dir, f"{wsi_filename}_tissue_mask.png")
     mask_image.save(mask_path)
     print(f"Tissue mask saved to: {mask_path}")
     
