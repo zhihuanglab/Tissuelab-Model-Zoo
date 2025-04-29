@@ -657,7 +657,7 @@ def main():
     import time
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8006, help='port')
-    parser.add_argument('--name', type=str, default='MuskNode', help='node name')
+    parser.add_argument('--name', type=str, default='MuskClassificationNode', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args = parser.parse_args()
 
