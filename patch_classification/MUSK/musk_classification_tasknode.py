@@ -373,15 +373,48 @@ def run_classification(args) -> Dict[str, Any]:
         
         time.sleep(1)
 
-        # B) read embedding => "NODE_NAME/embedding"
-        with h5py.File(h5_path, 'r') as hf:
-            if NODE_NAME not in hf:
-                raise ValueError("no NODE_NAME group found in h5 file")
-            seg_grp = hf[NODE_NAME]
-            if 'embedding' not in seg_grp:
-                raise ValueError("embedding dataset not found in h5 file => no cell_embeddings")
-            cell_embeddings = seg_grp['embedding'][()]
-        
+        # B) read embedding - Try dependency first, then self
+        cell_embeddings = None
+        embedding_source_group = None
+
+        if DEPENDENCIES:
+            embedding_node_name = DEPENDENCIES[0]
+            print(f"[{NODE_NAME}] Attempting to read embeddings from dependency node group: {embedding_node_name}")
+            try:
+                with h5py.File(h5_path, 'r') as hf:
+                    if embedding_node_name in hf and 'embedding' in hf[embedding_node_name]:
+                        cell_embeddings = hf[embedding_node_name]['embedding'][()]
+                        embedding_source_group = embedding_node_name
+                        print(f"[{NODE_NAME}] Successfully loaded embeddings from dependency group '{embedding_source_group}', shape: {cell_embeddings.shape}")
+                    else:
+                        print(f"[{NODE_NAME}] Embedding not found in dependency group '{embedding_node_name}'. Will try reading from own group.")
+            except Exception as e:
+                print(f"[{NODE_NAME}] Error reading from dependency group '{embedding_node_name}': {e}. Will try reading from own group.")
+
+        if cell_embeddings is None:
+            print(f"[{NODE_NAME}] Attempting to read embeddings from own node group: {NODE_NAME}")
+            try:
+                with h5py.File(h5_path, 'r') as hf:
+                    if NODE_NAME in hf and 'embedding' in hf[NODE_NAME]:
+                        cell_embeddings = hf[NODE_NAME]['embedding'][()]
+                        embedding_source_group = NODE_NAME
+                        print(f"[{NODE_NAME}] Successfully loaded embeddings from own group '{embedding_source_group}', shape: {cell_embeddings.shape}")
+                    else:
+                        print(f"[{NODE_NAME}] Embedding not found in own group '{NODE_NAME}'.")
+            except Exception as e:
+                print(f"[{NODE_NAME}] Error reading from own group '{NODE_NAME}': {e}")
+
+        if cell_embeddings is None:
+            error_msg = f"Embedding dataset not found in expected locations: "
+            expected_locations = []
+            if DEPENDENCIES:
+                expected_locations.append(f"dependency group '{DEPENDENCIES[0]}'")
+            # Always mention own group as a possible location
+            expected_locations.append(f"own group '{NODE_NAME}'") 
+            # Remove duplicates if dependency name == node name
+            error_msg += " or ".join(sorted(list(set(expected_locations))))
+            raise ValueError(error_msg + " => no cell_embeddings")
+
         time.sleep(1)
 
         # C) supervised or zero-shot
