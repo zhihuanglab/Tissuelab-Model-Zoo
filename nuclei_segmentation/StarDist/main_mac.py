@@ -23,7 +23,7 @@ from nuc_stat import SlideProperty
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--slidepath', default='C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\TCGA-A6-6648-01Z-00-DX1.88b9a490-0bed-43f3-bd74-1bf2810f6884.svs', type=str)
+    parser.add_argument('--slidepath', default='C:\\Users\\lsoho\Git\\penn\\TissueLab-Agent-Experiments\\experiments\\pathology\\LAMINA-base\\q0\\TCGA-AO-A0J5-01Z-00-DX1.20C14D0C-1A74-4FE9-A5E6-BDDCB8DE7714\\TCGA-AO-A0J5-01Z-00-DX1.20C14D0C-1A74-4FE9-A5E6-BDDCB8DE7714.svs', type=str)
     parser.add_argument('--read_image_method', default='tiffslide', type=str, choices=['openslide','tiffslide','PIL','numpy'])
     parser.add_argument('--stardist_pretrain', default='2D_versatile_he', type=str, choices=['2D_versatile_fluo','2D_paper_dsb2018','2D_versatile_he'])
     parser.add_argument('--isIHC', default=False, type=bool)
