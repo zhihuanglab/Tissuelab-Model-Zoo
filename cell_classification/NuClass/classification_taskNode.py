@@ -20,6 +20,9 @@ import torch.nn as nn
 import colorsys
 import asyncio
 from sse_starlette.sse import EventSourceResponse
+import xgboost as xgb
+import io
+import base64
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,6 +51,8 @@ DEPENDENCIES = []
 
 # new global variable for PLIP model
 PLIP_MODELS = None  # tuple: (processor, model, text_projection, device)
+CLASSIFIER_PATH = None
+SAVE_CLASSIFIER_PATH = None
 
 # new global variable for progress
 progress_value = 0  # Global variable to store progress
@@ -124,6 +129,7 @@ def load_checkpoint_at_init():
     print(f"[ClassificationNode] Loading big model at init stage..., device={device}")
     # Note: weights_only=False to allow pickle
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    print(f"checkpoint: {checkpoint}")
     processor = AutoProcessor.from_pretrained("vinid/plip")
     model = AutoModelForZeroShotImageClassification.from_pretrained("vinid/plip").to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -158,17 +164,174 @@ def generate_distinct_colors(nuclei_classes: list[str]) -> list[str]:
         colors.append(color)
     return colors
 
-def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
-    unique_classes = annotations['cell_class'].unique().tolist()
-    # 1) must have "Negative control" class
-    # if "Negative control" not in unique_classes:
-    #     raise ValueError("No 'Negative control' => fallback to zero-shot")
+def save_classifier_params(clf, class_names, class_colors, train_data, max_samples_per_class=100000000000000):
+    """Save classifier parameters and training data to XGBoost model file"""
+    global SAVE_CLASSIFIER_PATH
+    if SAVE_CLASSIFIER_PATH is None:
+        print("No SAVE_CLASSIFIER_PATH specified, skipping saving classifier parameters")
+        return
+        
+    # limit the number of samples per class
+    embeddings = train_data['embeddings']
+    labels = train_data['labels']
+    
+    final_embeddings = []
+    final_labels = []
+    
+    for class_idx in range(len(class_names)):
+        class_mask = (labels == class_idx)
+        class_embeddings = embeddings[class_mask]
+        class_labels = labels[class_mask]
+        
+        if len(class_embeddings) > max_samples_per_class:
+            class_embeddings = class_embeddings[-max_samples_per_class:]
+            class_labels = class_labels[-max_samples_per_class:]
+            
+        final_embeddings.append(class_embeddings)
+        final_labels.append(class_labels)
+    
 
-    # 2) must have at least 1 classes
+    final_embeddings = np.vstack(final_embeddings)
+    final_labels = np.concatenate(final_labels)
+    
+    print(f"Saving {len(final_embeddings)} samples (max {max_samples_per_class} per class)")
+    
+    # get the underlying Booster object and set attributes
+    booster = clf.get_booster()
+    booster.set_attr(class_names=json.dumps(class_names))
+    booster.set_attr(class_colors=json.dumps(class_colors))
+
+    train_data_bytes = io.BytesIO()
+    np.savez_compressed(train_data_bytes, 
+                       embeddings=final_embeddings, 
+                       labels=final_labels)
+    train_data_str = base64.b64encode(train_data_bytes.getvalue()).decode('utf-8')
+    booster.set_attr(train_data=train_data_str)
+    
+    # save XGBoost model
+    clf.save_model(SAVE_CLASSIFIER_PATH)
+    print(f"Saved classifier with parameters and training data to: {SAVE_CLASSIFIER_PATH}")
+
+def load_classifier_params(h5_path):
+    """Load classifier parameters and training data from XGBoost model file"""
+    global CLASSIFIER_PATH
+    if CLASSIFIER_PATH is None:
+        print("No classifier_path specified, skipping loading classifier parameters")
+        return None
+        
+    try:
+        # load XGBoost model
+        if not os.path.exists(CLASSIFIER_PATH):
+            print(f"XGBoost model file not found at: {CLASSIFIER_PATH}")
+            return None
+            
+        clf = xgb.XGBClassifier()
+        clf.load_model(CLASSIFIER_PATH)
+        
+        # get class information and training data from model attributes
+        booster = clf.get_booster()
+        class_names = json.loads(booster.attr('class_names'))
+        class_colors = json.loads(booster.attr('class_colors'))
+        
+        # decode training data from base64 string
+        train_data_str = booster.attr('train_data')
+        if train_data_str:
+            train_data_bytes = io.BytesIO(base64.b64decode(train_data_str))
+            train_data = np.load(train_data_bytes)
+            train_embeddings = train_data['embeddings']
+            train_labels = train_data['labels']
+            
+            # print the number of samples for each class
+            print("\nloaded training data:")
+            print(f"total samples: {len(train_labels)}")
+            for i, class_name in enumerate(class_names):
+                class_count = np.sum(train_labels == i)
+                print(f"class '{class_name}': {class_count} samples")
+            print()
+        else:
+            train_embeddings = None
+            train_labels = None
+            print("No saved training data found")
+        
+        return clf, class_names, class_colors, train_embeddings, train_labels
+    except Exception as e:
+        print(f"Error loading classifier parameters: {e}")
+        return None
+
+        
+def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
+    global CLASSIFIER_PATH
+    
+    # update XGBoost parameter settings
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    xgb_params = {
+        'max_depth': 8,
+        'tree_method': 'hist',
+        'device': device,
+        'eval_metric': 'mlogloss',
+        'random_state': 42
+    }
+
+    if annotations is None:
+        print("No annotations provided")
+        annotations = pd.DataFrame()
+    
+    # try to load existing classifier parameters
+    if CLASSIFIER_PATH is not None:
+        try:
+            loaded_params = load_classifier_params(CLASSIFIER_PATH)
+            if loaded_params is not None:
+                clf, class_names, class_colors, prev_embeddings, prev_labels = loaded_params
+                print(f"Loaded existing classifier parameters, classes: {class_names}")
+                
+                if not annotations.empty:
+                    existing_classes = set(class_names)
+                    annotated_classes = set(annotations['cell_class'].unique())
+                    common_classes = existing_classes.intersection(annotated_classes)
+                    
+                    if common_classes:
+                        print(f"Found user annotations for classes: {common_classes}, updating classifier...")
+                        
+                        cell_indices = annotations['cell_ID'].astype(int).values
+                        X_update = cell_embeddings[cell_indices]
+                        y_update = pd.Categorical(annotations['cell_class'], categories=class_names).codes
+                        
+                        # Combine new and previous training data if available
+                        if prev_embeddings is not None and prev_labels is not None:
+                            X_train = np.vstack([prev_embeddings, X_update])
+                            y_train = np.concatenate([prev_labels, y_update])
+                        else:
+                            X_train = X_update
+                            y_train = y_update
+
+                        clf.fit(X_train, y_train)
+                        
+                        # Save updated classifier with new training data
+                        train_data = {
+                            'embeddings': X_train,
+                            'labels': y_train
+                        }
+                        save_classifier_params(clf, class_names, class_colors, train_data)
+                        print("Classifier updated with user annotations and saved")
+                
+                predictions = clf.predict(cell_embeddings)
+                prediction_probs = clf.predict_proba(cell_embeddings)
+                
+                return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
+        except Exception as e:
+            print(f"Error loading or updating classifier: {e}")
+            # continue to create a new classifier
+    
+    unique_classes = annotations['cell_class'].unique().tolist()
     if len(unique_classes) < 1:
         raise ValueError("Need at least 2 classes in annotation => fallback to zero-shot")
 
-    class_names = ["Negative control"] + [c for c in unique_classes if c != "Negative control"]
+    class_names = []
+    if "Negative control" in unique_classes:
+        class_names.append("Negative control")
+        unique_classes.remove("Negative control")
+    class_names.extend(unique_classes)
+
     class_colors_map = annotations.groupby('cell_class')['cell_color'].first().to_dict()
     class_colors = []
     for cn in class_names:
@@ -177,58 +340,40 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         else:
             class_colors.append("#F3F4F5")
 
-    print(f"class_names: {class_names}")
-    print(f"class_colors: {class_colors}")
-
     cell_indices = annotations['cell_ID'].astype(int).values
     X_train = cell_embeddings[cell_indices]
     y_train = pd.Categorical(annotations['cell_class'], categories=class_names).codes
-    
-    if "Negative control" not in annotations["cell_class"].values.astype(str):
-        print("Found annotations, but there is no 'Negative control' class, we will use negative_control_example_vectors.npy as negative control")
-        
-        base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
-        neg_control_path = os.path.join(base_path, "negative_control_example_vectors.npy")
-        print(f"Looking for negative control vectors at: {neg_control_path}")
-        
+
+    if "Negative control" not in annotations["cell_class"].values:
         try:
-            negative_control_vectors = np.load(neg_control_path)
-            print(f"negative_control_vectors: {negative_control_vectors.shape}")
+            negative_control_vectors = np.load("negative_control_vectors_1024d.npy")
             X_train = np.concatenate([negative_control_vectors, X_train], axis=0)
-            y_train = np.concatenate([np.zeros(negative_control_vectors.shape[0]), y_train], axis=0).astype(int)
+            y_train = np.concatenate([np.zeros(negative_control_vectors.shape[0]), y_train], axis=0)
         except Exception as e:
-            print(f"Warning: Could not load negative control vectors: {e}")
-            print("Proceeding without negative control vectors")
-    
+            print(f"unable to load negative control vectors: {e}")
 
-    import time
-    start_time = time.time()
-    clf = LogisticRegression(random_state=42, max_iter=1000, multi_class='multinomial', solver='lbfgs')
+    # train new classifier
+    clf = xgb.XGBClassifier(**xgb_params)
     clf.fit(X_train, y_train)
-    train_time = time.time() - start_time
 
-    # Update progress after training
-    global progress_value
-    progress_value = 50
-    print("Progress: 50%")
-
-    start_time = time.time()
+    # predict
     predictions = clf.predict(cell_embeddings)
     prediction_probs = clf.predict_proba(cell_embeddings)
-    test_time = time.time() - start_time
 
-    # Update progress after prediction
-    progress_value = 100
-    print("Progress: 100%")
+    # save classifier parameters
+    train_data = {
+        'embeddings': X_train,
+        'labels': y_train
+    }
+    save_classifier_params(clf, class_names, class_colors, train_data)
 
-    return (clf, class_names, class_colors, predictions, prediction_probs,
-            clf.coef_, clf.intercept_, train_time, test_time)
+    return (clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0)
 
 def run_classification(args) -> Dict[str, Any]:
     if H5_PATH is None:
         raise ValueError("H5_PATH not set => please ensure /read is called first.")
 
-    global PLIP_MODELS
+    global PLIP_MODELS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH
     global progress_value  # Declare the global variable
 
     result = {"status": "success", "message": "", "classification_count": 0}
@@ -272,7 +417,7 @@ def run_classification(args) -> Dict[str, Any]:
         nuclei_classes = getattr(args, "nuclei_classes", [])
         nuclei_colors = getattr(args, "nuclei_colors", [])
 
-        if use_supervised and annotations_data is not None:
+        if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
             clf, class_names, class_colors, predictions, prediction_probs, \
                 coef_, intercept_, train_time, test_time = train_linear_classifier(cell_embeddings, annotations_data)
             final_class_names = class_names
@@ -292,14 +437,19 @@ def run_classification(args) -> Dict[str, Any]:
             class_embeddings = _generate_text_description(processor, text_encoder, text_projection,
                                                           nuclei_classes, organ, device)
             sims = []
+            print(f"size of class_embeddings: {len(class_embeddings)}")
             for idx, ce in enumerate(class_embeddings):
+                print(f"size of ce: {ce.shape}")
                 sim = np.dot(cell_embeddings, ce.T)
+                print(f"size of sim: {sim.shape}")
                 sims.append(sim)
                 # Update progress
                 progress_value = int((idx + 1) / len(class_embeddings) * 100)
                 print(f"Progress: {progress_value}%")
             sims_arr = np.array(sims).squeeze(axis=2).T
+            print(f"size of sims_arr: {sims_arr.shape}")
             predictions = np.argmax(sims_arr, axis=1)
+            print(f"size of predictions: {predictions.shape}")
             prediction_probs = None
 
             # color
@@ -396,7 +546,7 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS
+    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH
     NODE_NAME = data.get("node_name", "ClassificationNode")
     DEPENDENCIES = data.get("dependencies", [])
     H5_PATH = data.get("h5_path", None)
@@ -431,6 +581,12 @@ def read_node(data: Dict[str, Any]):
                     ARGS.slidepath = val_json
                 elif k == "organ":
                     ARGS.organ = val_json
+                elif k == "classifier_path":
+                    CLASSIFIER_PATH = val_json
+                    print(f"[ClassificationNode] classifier_path: {CLASSIFIER_PATH}")
+                elif k == "save_classifier_path":
+                    SAVE_CLASSIFIER_PATH = val_json
+                    print(f"[ClassificationNode] save_classifier_path: {SAVE_CLASSIFIER_PATH}")
                 elif k == "nuclei_classes":
                     if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.nuclei_classes = val_json
