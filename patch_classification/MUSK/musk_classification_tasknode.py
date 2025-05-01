@@ -20,7 +20,7 @@ import torch.nn as nn
 import colorsys
 import asyncio
 from sse_starlette.sse import EventSourceResponse
-import xgboost as xgb  # 添加XGBoost导入
+import xgboost as xgb
 import io
 import base64
 
@@ -57,7 +57,7 @@ MUSK_MODEL = None
 progress_value = 0  # Global variable to store progress
 
 # Add new global variable
-CLASSIFIER_PATH = None  # Removed fixed path for saving classifier parameters
+CLASSIFIER_PATH = None
 SAVE_CLASSIFIER_PATH = None
 
 # --------------- utils functions ---------------
