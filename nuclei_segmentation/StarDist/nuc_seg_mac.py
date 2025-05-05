@@ -208,16 +208,26 @@ class SlideSegmentation():
             
             # only save mask image in debug mode
             if hasattr(self.args, 'debug') and self.args.debug:
-                mask_filename = os.path.splitext(self.args.slidepath)[0] + '_mask.png'
+                # Get result directory from args
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                result_dir = os.path.join(script_dir, f'{self.args.username}_result')
+                os.makedirs(result_dir, exist_ok=True)
+                
+                # Use basename of the slide file
+                slide_basename = os.path.basename(self.args.slidepath)
+                base_name = os.path.splitext(slide_basename)[0]
+                
+                # Save mask to result directory
+                mask_filename = os.path.join(result_dir, f'{base_name}_mask.png')
                 cv2.imwrite(mask_filename, mask)
                 print(f"Saved mask to: {mask_filename}")
                 
-                # save the original image with contours for verification
+                # Save overlay to result directory
                 temp_thumb_np = np.array(temp_thumb)
                 contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 overlay = temp_thumb_np.copy()
                 cv2.drawContours(overlay, contours, -1, (0,255,0), 2)
-                overlay_filename = os.path.splitext(self.args.slidepath)[0] + '_mask_overlay.png'
+                overlay_filename = os.path.join(result_dir, f'{base_name}_mask_overlay.png')
                 cv2.imwrite(overlay_filename, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
                 print(f"Saved overlay image to: {overlay_filename}")
             
