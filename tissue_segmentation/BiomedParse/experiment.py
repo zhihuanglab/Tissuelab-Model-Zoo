@@ -66,8 +66,8 @@ def load_image_data(image_path):
     return image, scale_factor
 
 # Set input and mask directories
-input_dir = r"C:\Users\lsoho\Git\penn\Tissuelab-Model-Zoo\tissue_segmentation\BiomedParse\LIDC-IDRI\LIDC-IDRI\train"
-mask_dir = r"C:\Users\lsoho\Git\penn\Tissuelab-Model-Zoo\tissue_segmentation\BiomedParse\LIDC-IDRI\LIDC-IDRI\train_mask"
+input_dir = r"C:\Users\lsoho\Git\penn\Tissuelab-Model-Zoo\tissue_segmentation\BiomedParse\LIDC-IDRI\test"
+mask_dir = r"C:\Users\lsoho\Git\penn\Tissuelab-Model-Zoo\tissue_segmentation\BiomedParse\LIDC-IDRI\test_mask"
 result_dir = "./result"
 data_dir = os.path.join(result_dir, "data")
 
