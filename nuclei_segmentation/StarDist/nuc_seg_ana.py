@@ -538,6 +538,14 @@ class SlideSegmentation():
         Ideally, stardist can get us 2M nuclei in 1 hours?
         '''
         
+        # Add debug image directory setup
+        if hasattr(self.args, 'debug') and self.args.debug:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            result_dir = os.path.join(script_dir, f'{self.args.username}_result')
+            debug_img_dir = os.path.join(result_dir, 'debug_images')
+            os.makedirs(debug_img_dir, exist_ok=True)
+            print(f"Debug images will be saved to: {debug_img_dir}")
+
         # Record overall start time
         overall_start_time = time.time()
         
@@ -547,16 +555,25 @@ class SlideSegmentation():
         file_extension = os.path.splitext(self.args.slidepath)[1].lower()
         simple_image_formats = ['.png', '.jpg', '.jpeg', '.bmp']
         
-        if file_extension in simple_image_formats and self.dim[0] * self.dim[1] < 25000000:  # Limit image size, e.g. 5000x5000
+        if file_extension in simple_image_formats and self.dim[0] * self.dim[1] < 25000000:  # Limit image size
             print(f"Detected simple image format: {file_extension}, processing the entire image without tiling")
             
             if self.progress_callback:
-                self.progress_callback(10)  # Initial progress
+                self.progress_callback(10)
                 
             try:
                 # Directly load the entire image
                 img = self.slide.read_region((0, 0), 0, self.dim)
                 img_np = np.array(img)[:,:,:3]  # Ensure RGB format
+                
+                # Add downsampling for high magnification images
+                if self.args.magnification is not None and self.args.magnification > self.reference_magnification:
+                    resize_factor = self.reference_magnification / self.args.magnification
+                    new_size = (int(np.round(self.dim[0]*resize_factor)), 
+                               int(np.round(self.dim[1]*resize_factor)))
+                    img = img.resize(new_size)
+                    img_np = np.array(img)[:,:,:3]
+                    print(f"Resized image from {self.dim} to {new_size} to match {self.reference_magnification}x magnification")
                 
                 if self.progress_callback:
                     self.progress_callback(30)
@@ -573,6 +590,20 @@ class SlideSegmentation():
                 if self.progress_callback:
                     self.progress_callback(50)
                     
+                # Save debug images before prediction
+                if hasattr(self.args, 'debug') and self.args.debug:
+                    # Save original patch
+                    orig_img_filename = os.path.join(debug_img_dir, f'tile_r{0}_c{0}_orig.png')
+                    Image.fromarray(img_np).save(orig_img_filename)
+                    
+                    # Save normalized patch
+                    # Scale normalized image to 0-255 range for visualization
+                    norm_img = ((img_norm - img_norm.min()) * 255 / (img_norm.max() - img_norm.min())).astype(np.uint8)
+                    norm_img_filename = os.path.join(debug_img_dir, f'tile_r{0}_c{0}_norm.png')
+                    Image.fromarray(norm_img).save(norm_img_filename)
+                    
+                    print(f"Saved debug images for tile r{0} c{0}")
+
                 # Direct segmentation
                 labels, dicts = self.model.predict_instances(img_norm,
                                                            prob_thresh=self.prob_thresh,
@@ -607,6 +638,12 @@ class SlideSegmentation():
                 if self.progress_callback:
                     self.progress_callback(100)
                 
+                # Scale back points and coordinates to original size if downsampled
+                if self.args.magnification is not None and self.args.magnification > self.reference_magnification:
+                    resize_factor = self.args.magnification / self.reference_magnification
+                    self.final_points = (self.final_points * resize_factor).astype(np.int32)
+                    self.final_coord = (self.final_coord * resize_factor).astype(np.int32)
+                
                 # Record overall end time and duration
                 overall_end_time = time.time()
                 overall_duration = overall_end_time - overall_start_time
@@ -617,6 +654,40 @@ class SlideSegmentation():
                 print(f"Total nuclei count: {total_nuclei}")
                 
                 print("---- Segmentation successfully completed ----")
+                
+                # 在run_WSI_segmentation中，预测之前添加
+                print(f"Normalized image shape: {img_norm.shape}, dtype: {img_norm.dtype}")
+                print(f"Normalized value range: [{img_norm.min()}, {img_norm.max()}]")
+
+                # 保存归一化后的图像用于检查
+                if hasattr(self.args, 'debug') and self.args.debug:
+                    norm_check = ((img_norm - img_norm.min()) * 255 / (img_norm.max() - img_norm.min())).astype(np.uint8)
+                    norm_check_path = os.path.join(debug_img_dir, 'normalized_image.png')
+                    cv2.imwrite(norm_check_path, cv2.cvtColor(norm_check, cv2.COLOR_RGB2BGR))
+                    print(f"Saved normalized image to: {norm_check_path}")
+                
+                # 在预测之前添加
+                if hasattr(img, 'size'):  # PIL Image对象
+                    img_array = np.array(img)
+                    print(f"Image statistics before prediction:")
+                    print(f"Shape: {img_array.shape}")
+                    print(f"Value range: [{img_array.min()}, {img_array.max()}]")
+                    print(f"Mean: {img_array.mean():.2f}, Std: {img_array.std():.2f}")
+                else:  # numpy array
+                    print(f"Image statistics before prediction:")
+                    print(f"Shape: {img.shape}")
+                    print(f"Value range: [{img.min()}, {img.max()}]")
+                    print(f"Mean: {img.mean():.2f}, Std: {img.std():.2f}")
+                
+                # 保存预处理后的图像
+                if isinstance(img, Image.Image):
+                    img_np = np.array(img)
+                else:
+                    img_np = img
+                
+                debug_img_path = os.path.join(os.path.dirname(self.args.slidepath), 'preprocessed_debug.png')
+                cv2.imwrite(debug_img_path, cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR))
+                print(f"Saved preprocessed debug image to: {debug_img_path}")
                 
                 return
                 
@@ -725,16 +796,20 @@ class SlideSegmentation():
                 else:
                     img_norm = normalize(img_np)
 
-                # Skip if mostly white pixels (>240)
-                n_dark_pixels = np.sum(np.any(img_np < 240, axis=2))  # Count pixels with any RGB channel < 240
-                if n_dark_pixels < 50:
-                    print(f"Tile r{ir} c{ic} is mostly white, skipping")
-                    continue
-                elif np.min(img_norm) < -1e15 or np.max(img_norm) > 1e15:
-                    print("Values too large, skipping this batch")
-                    continue
-                
-                
+                # Save debug images before prediction
+                if hasattr(self.args, 'debug') and self.args.debug:
+                    # Save original patch
+                    orig_img_filename = os.path.join(debug_img_dir, f'tile_r{ir}_c{ic}_orig.png')
+                    Image.fromarray(img_np).save(orig_img_filename)
+                    
+                    # Save normalized patch
+                    # Scale normalized image to 0-255 range for visualization
+                    norm_img = ((img_norm - img_norm.min()) * 255 / (img_norm.max() - img_norm.min())).astype(np.uint8)
+                    norm_img_filename = os.path.join(debug_img_dir, f'tile_r{ir}_c{ic}_norm.png')
+                    Image.fromarray(norm_img).save(norm_img_filename)
+                    
+                    print(f"Saved debug images for tile r{ir} c{ic}")
+
                 labels, dicts = self.model.predict_instances(img_norm,
                                                             prob_thresh=self.prob_thresh,
                                                             nms_thresh=self.nms_thresh,
@@ -854,159 +929,4 @@ class SlideSegmentation():
         r, g, b = rgb[:,:,0], rgb[:,:,1], rgb[:,:,2]
         gray = 0.2989 * r + 0.5870 * g + 0.1140 * b
         return gray.astype(np.uint8)
-
-    # def _get_haralick_features(self, nuclei_img_object, resolution, quantization=10):
-    #     """Compute Haralick texture features for a nucleus"""
-    #     # Convert to grayscale if needed
-    #     if len(nuclei_img_object.shape) == 3:
-    #         nuclei_img_2 = self.rgb2gray(nuclei_img_object)
-    #     else:
-    #         nuclei_img_2 = nuclei_img_object.copy()
-            
-    #     # Quantize to reduce computation time
-    #     level = np.int16(255/quantization)+1
-    #     nuclei_img_2 = (nuclei_img_2/quantization).astype(np.uint8)
-        
-    #     # Compute GLCM
-    #     glcm = graycomatrix(nuclei_img_2, 
-    #                        distances=[resolution],
-    #                        angles=[0, np.pi/4, np.pi/2, 3*np.pi/4],
-    #                        levels=level,
-    #                        symmetric=False, 
-    #                        normed=True)
-        
-    #     # Remove background
-    #     glcm = glcm[0:level-1,0:level-1,:,:]
-        
-    #     # Compute Haralick properties
-    #     stat_haralick = {}
-    #     for v in ['contrast', 'homogeneity', 'dissimilarity', 'ASM', 'energy', 'correlation']:
-    #         stat_haralick[v] = np.mean(graycoprops(glcm, v))
-    #     stat_haralick['heterogeneity'] = 1-stat_haralick['homogeneity']
-        
-    #     return stat_haralick
-
-    # def _get_morphological_features(self, mask):
-    #     """Compute morphological features for a nucleus"""
-    #     stat = skimage.measure.regionprops(mask)[0]
-        
-    #     # Initialize dictionary for morphological features
-    #     morph_features = {}
-    #     morph_features['major_axis_length'] = stat.axis_major_length
-    #     morph_features['minor_axis_length'] = stat.axis_minor_length
-    #     morph_features['major_minor_ratio'] = stat.axis_major_length/stat.axis_minor_length
-    #     morph_features['orientation'] = stat.orientation
-    #     morph_features['orientation_degree'] = stat.orientation * (180/np.pi) + 90
-    #     morph_features['area'] = stat.area
-    #     morph_features['extent'] = stat.extent
-    #     morph_features['solidity'] = stat.solidity
-    #     morph_features['convex_area'] = stat.convex_area
-    #     morph_features['eccentricity'] = stat.eccentricity
-    #     morph_features['equivalent_diameter'] = stat.equivalent_diameter
-    #     morph_features['perimeter'] = stat.perimeter
-    #     morph_features['perimeter_crofton'] = stat.perimeter_crofton
-        
-    #     return list(morph_features.keys()), list(morph_features.values())
-
-    # @staticmethod
-    # def _process_nucleus_features_static(nucleus_data):
-    #     """Static method to process features for a single nucleus"""
-    #     img_np, img_gray, contour, x_0, y_0 = nucleus_data
-        
-    #     # Create nucleus mask more efficiently using cv2
-    #     nuc_mask = np.zeros(img_gray.shape, dtype=np.uint8)
-    #     contour = contour - np.array([x_0, y_0]).reshape(2, -1)
-    #     # Convert to format expected by cv2.fillPoly
-    #     contour = np.expand_dims(contour.T, axis=0).astype(np.int32)
-    #     cv2.fillPoly(nuc_mask, contour, 1)
-        
-    #     # Pre-compute mask indices once
-    #     mask_indices = nuc_mask > 0
-        
-    #     # Get morphological features - use pre-computed regionprops
-    #     stat = skimage.measure.regionprops(nuc_mask)[0]
-    #     major_minor_ratio = 99 if stat.axis_minor_length == 0 else stat.axis_major_length/stat.axis_minor_length
-    #     curr_morph = [
-    #         stat.axis_major_length,
-    #         stat.axis_minor_length,
-    #         major_minor_ratio,
-    #         stat.orientation,
-    #         stat.orientation * (180/np.pi) + 90,
-    #         stat.area,
-    #         stat.extent,
-    #         stat.solidity,
-    #         stat.convex_area,
-    #         stat.eccentricity,
-    #         stat.equivalent_diameter,
-    #         stat.perimeter,
-    #         stat.perimeter_crofton
-    #     ]
-        
-    #     # Get color features more efficiently
-    #     nucleus_img = img_np * np.expand_dims(nuc_mask, axis=2)  # Faster than copy + masking
-        
-    #     # Convert to grayscale using dot product instead of individual multiplications
-    #     nucleus_img_grey = np.dot(nucleus_img[mask_indices], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
-        
-    #     # Compute statistics using masked arrays for better performance
-    #     curr_color = [
-    #         np.mean(nucleus_img_grey),
-    #         np.std(nucleus_img_grey),
-    #         np.min(nucleus_img_grey),
-    #         np.max(nucleus_img_grey)
-    #     ]
-        
-    #     # RGB features using masked arrays
-    #     for i in range(3):
-    #         channel_values = nucleus_img[mask_indices, i]
-    #         curr_color.extend([
-    #             np.mean(channel_values),
-    #             np.std(channel_values),
-    #             np.min(channel_values),
-    #             np.max(channel_values)
-    #         ])
-        
-    #     # Optimize Haralick features computation
-    #     nuclei_img_2 = (np.dot(nucleus_img, [0.2989, 0.5870, 0.1140])/10).astype(np.uint8)
-        
-    #     # Use smaller GLCM matrix and fewer angles if precision is not critical
-    #     glcm = graycomatrix(nuclei_img_2,
-    #                        distances=[1],
-    #                        angles=[0, np.pi/2],  # Reduced angles
-    #                        levels=26,  # Reduced levels
-    #                        symmetric=True,  # Use symmetric to reduce computation
-    #                        normed=True)
-        
-    #     glcm = glcm[0:25,0:25,:,:]
-        
-    #     # Compute Haralick properties
-    #     curr_haralick = []
-    #     for v in ['contrast', 'homogeneity', 'dissimilarity', 'ASM', 'energy', 'correlation']:
-    #         curr_haralick.append(np.mean(graycoprops(glcm, v)))
-    #     curr_haralick.append(1-curr_haralick[1])
-        
-    #     return np.concatenate([curr_haralick, curr_morph, curr_color])
-
-    # def compute_all_features(self, img_np, points, coord, x_0, y_0):
-    #     """Compute all features (Haralick, morphological, and color) for nuclei in parallel"""
-    #     img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)  # Faster than manual conversion
-        
-    #     # Prepare data for parallel processing
-    #     nucleus_data_list = [(img_np, img_gray, contour, x_0, y_0) for contour in coord]
-        
-    #     # Use process pool with optimal number of workers
-    #     n_workers = min(len(points), os.cpu_count())
-        
-    #     if len(points) < 10:
-    #         all_features = [self._process_nucleus_features_static(data) for data in nucleus_data_list]
-    #     else:
-    #         # Use context manager with explicit number of workers
-    #         with Pool(processes=n_workers) as pool:
-    #             # Use larger chunksize for better performance
-    #             chunksize = max(1, len(points) // (n_workers * 4))
-    #             all_features = list(pool.imap(self._process_nucleus_features_static, 
-    #                                         nucleus_data_list,
-    #                                         chunksize=chunksize))
-        
-    #     return np.array(all_features)
         
