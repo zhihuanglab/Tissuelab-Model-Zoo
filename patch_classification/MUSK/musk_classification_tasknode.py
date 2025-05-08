@@ -23,6 +23,7 @@ from sse_starlette.sse import EventSourceResponse
 import xgboost as xgb
 import io
 import base64
+import tiffslide
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -231,8 +232,40 @@ def load_classifier_params(h5_path):
         print(f"Error loading classifier parameters: {e}")
         return None
 
+def save_patch_image(slide_path, coords, output_dir, index, label):
+    """
+    保存patch图像
+    Args:
+        slide_path: WSI图像路径
+        coords: patch坐标 [x_start, y_start, x_end, y_end]
+        output_dir: 输出目录
+        index: 样本索引
+        label: 类别标签
+    """
+    try:
+        with tiffslide.open_slide(slide_path) as slide:
+            x_start, y_start, x_end, y_end = [int(c) for c in coords]
+            width = x_end - x_start
+            height = y_end - y_start
+            
+            # 从slide中读取patch
+            patch = slide.read_region((x_start, y_start), 0, (width, height))
+            patch = patch.convert('RGB')
+            
+            # 创建输出目录
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # 保存图像
+            output_path = os.path.join(output_dir, 
+                f"patch_{index}_x{x_start}_y{y_start}_{width}x{height}_{label}.png")
+            patch.save(output_path)
+            return output_path
+    except Exception as e:
+        print(f"保存patch图像时出错: {e}")
+        return None
+
 def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
-    global CLASSIFIER_PATH
+    global CLASSIFIER_PATH, H5_PATH, ARGS
     
     # update XGBoost parameter settings
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -315,6 +348,40 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     cell_indices = annotations['patch_ID'].astype(int).values
     X_train = cell_embeddings[cell_indices]
     y_train = pd.Categorical(annotations['tissue_class'], categories=class_names).codes
+    
+    # for debugging
+    # # create patch save directory
+    # output_dir = os.path.join(os.path.dirname(H5_PATH), "training_patches")
+    
+    # print("\ntraining patches:")
+    # print(f"total training samples: {len(cell_indices)}")
+    # for i in range(len(cell_indices)):
+    #     print(f"sample {i}:")
+    #     print(f"  - index: {cell_indices[i]}")
+    #     print(f"  - label: {class_names[y_train[i]]}")
+        
+    #     # read coordinates and save patch
+    #     with h5py.File(H5_PATH, 'r') as hf:
+    #         if f'{NODE_NAME}/coordinates' in hf:
+    #             coords = hf[f'{NODE_NAME}/coordinates'][cell_indices[i]]
+    #             print(f"  - coordinates: {coords}")
+                
+    #             # save patch image
+    #             if hasattr(ARGS, 'slidepath') and ARGS.slidepath:
+    #                 saved_path = save_patch_image(
+    #                     ARGS.slidepath,
+    #                     coords,
+    #                     output_dir,
+    #                     i,
+    #                     class_names[y_train[i]]
+    #                 )
+    #                 if saved_path:
+    #                     print(f"  - patch image saved: {saved_path}")
+    #                 else:
+    #                     print("  - failed to save patch image")
+    #             else:
+    #                 print("  - no slide path, skip saving patch image")
+    # print("\n")
 
     if "Negative control" not in annotations["tissue_class"].values:
         try:
