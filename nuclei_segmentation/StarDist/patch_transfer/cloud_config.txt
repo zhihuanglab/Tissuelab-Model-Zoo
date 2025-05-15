@@ -1,0 +1,112 @@
+# Cloud Function Configuration for Google Cloud Functions
+
+runtime: python39
+entry_point: process_patch
+
+# Environment variables
+env_variables:
+  DEBUG: "False"
+  MAX_MEMORY_MB: "2048"
+
+# Dependencies
+# These will be installed via requirements.txt
+
+# Timeout and memory settings
+timeout: 540s  # 9 minutes
+memory_limit: 2048MB
+
+# HTTPS trigger (for Google Cloud Functions)
+# Use the following in requirements.txt:
+"""
+numpy>=1.20.0
+opencv-python-headless>=4.5.0
+h5py>=3.1.0
+Pillow>=8.0.0
+tensorflow>=2.4.0  # Assuming you need this for the model
+scipy>=1.6.0
+"""
+
+# For AWS Lambda, use the following in serverless.yml:
+"""
+service: nuclei-segmentation
+
+provider:
+  name: aws
+  runtime: python3.9
+  memorySize: 2048
+  timeout: 900  # 15 minutes
+
+functions:
+  processPatch:
+    handler: main.process_patch
+    events:
+      - http:
+          path: process-patch
+          method: post
+          cors: true
+"""
+
+# For Azure Functions, use the following in function.json:
+"""
+{
+  "bindings": [
+    {
+      "authLevel": "function",
+      "type": "httpTrigger",
+      "direction": "in",
+      "name": "req",
+      "methods": ["post"]
+    },
+    {
+      "type": "http",
+      "direction": "out",
+      "name": "$return"
+    }
+  ]
+}
+"""
+
+# Docker deployment (example Dockerfile):
+"""
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy function code
+COPY cloud_function.py .
+COPY nuc_seg_mac.py .
+COPY nuc_stat_mac1.py .
+COPY nuc_embedding.py .
+
+# Copy model files if needed
+COPY models/ ./models/
+
+# Set the entrypoint
+CMD ["python", "cloud_function_server.py"]
+"""
+
+# Example cloud_function_server.py for Docker deployment:
+"""
+from flask import Flask, request, jsonify
+import cloud_function
+
+app = Flask(__name__)
+
+@app.route('/process-patch', methods=['POST'])
+def handle_request():
+    result = cloud_function.process_patch(request)
+    return result
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
+"""
