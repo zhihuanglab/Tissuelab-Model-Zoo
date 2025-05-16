@@ -92,17 +92,29 @@ def _generate_text_description(processor,
                                nuclei_classes: list[str],
                                organ: str = None,
                                device: str = "cuda"
-                               ) -> list[np.ndarray]:
+                               ) -> np.ndarray:
     """Generate text prompts for each nuclei_class and create their feature vectors."""
-    embeddings = []
-    for nuclei_class in nuclei_classes:
-        if organ:
-            prompt = f"{nuclei_class} cell in {organ} organ"
-        else:
-            prompt = f"{nuclei_class} cell"
-        embedding = encode_text(processor, text_encoder, text_projection, prompt, device)
-        embeddings.append(embedding)
-    return embeddings
+    prompts = [f"{nuclei_class} cell in {organ} organ" if organ else f"{nuclei_class} cell" 
+              for nuclei_class in nuclei_classes]
+    
+    inputs = processor(text=prompts, return_tensors="pt", padding=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    with torch.no_grad():
+        text_outputs = text_encoder(**inputs, return_dict=True) # Use **inputs
+        text_features = text_outputs.last_hidden_state.mean(dim=1)
+        projected_features = text_projection(text_features)
+        normalized_features = torch.nn.functional.normalize(projected_features, dim=1)
+    
+    # Update progress after text embedding generation (once)
+    global progress_value
+    # Set progress to a value that indicates text embeddings are done, e.g., 50%
+    # This might need adjustment if supervised path also updates progress_value
+    # For now, assuming zero-shot is independent or its progress is tracked separately until this point.
+    progress_value = 50 
+    print("Progress: 50% (Text embeddings generated for zero-shot)")
+
+    return normalized_features.cpu().numpy()
 
 def load_checkpoint_at_init():
     """
@@ -344,15 +356,27 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     X_train = cell_embeddings[cell_indices]
     y_train = pd.Categorical(annotations['cell_class'], categories=class_names).codes
 
-    if "Negative control" not in annotations["cell_class"].values:
-        try:
-            negative_control_vectors = np.load("negative_control_vectors_1024d.npy")
-            X_train = np.concatenate([negative_control_vectors, X_train], axis=0)
-            y_train = np.concatenate([np.zeros(negative_control_vectors.shape[0]), y_train], axis=0)
-        except Exception as e:
-            print(f"unable to load negative control vectors: {e}")
+    if "Negative control" not in annotations["cell_class"].values.astype(str):
+        print("Found annotations, but there is no 'Negative control' class, we will use negative_control_example_vectors.npy as negative control")
+        # Cache negative control vectors in memory
+        if not hasattr(train_linear_classifier, '_negative_control_vectors'):
+            base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
+            neg_control_path = os.path.join(base_path, "negative_control_example_vectors.npy")
+            print(f"Loading negative control vectors from: {neg_control_path}")
+            try:
+                train_linear_classifier._negative_control_vectors = np.load(neg_control_path)
+            except Exception as e:
+                print(f"Warning: Could not load negative control vectors: {e}")
+                train_linear_classifier._negative_control_vectors = None # Set to None if loading fails
 
-    # train new classifier
+        if train_linear_classifier._negative_control_vectors is not None:
+            negative_control_vectors = train_linear_classifier._negative_control_vectors
+            print(f"negative_control_vectors: {negative_control_vectors.shape}")
+            X_train = np.concatenate([negative_control_vectors, X_train], axis=0)
+            y_train = np.concatenate([np.zeros(negative_control_vectors.shape[0]), y_train], axis=0).astype(int)
+        else:
+            print("Proceeding without negative control vectors as they could not be loaded.")
+
     clf = xgb.XGBClassifier(**xgb_params)
     clf.fit(X_train, y_train)
 
@@ -377,14 +401,19 @@ def run_classification(args) -> Dict[str, Any]:
     global progress_value  # Declare the global variable
 
     result = {"status": "success", "message": "", "classification_count": 0}
+    cell_embeddings = None # Ensure it's defined for the finally block
+    class_embeddings_arr = None # Ensure it's defined for the finally block
+    sims_arr = None # Ensure it's defined for the finally block
+
     try:
-        start_time = time.time()
+        overall_start_time = time.time() # Overall timer
         h5_path = H5_PATH
 
-        # A) check annotation
-        annotations_data = None
-        use_supervised = False
-        with h5py.File(h5_path, 'r') as hf:
+        with h5py.File(h5_path, 'a') as hf:  # Open in append mode for read/write
+            # A) check annotation
+            read_annotations_start = time.time()
+            annotations_data = None
+            use_supervised = False
             if 'user_annotation' in hf and 'nuclei_annotations' in hf['user_annotation']:
                 raw_bytes = hf['user_annotation/nuclei_annotations'][()]
                 ann_dict = json.loads(raw_bytes.decode("utf-8"))
@@ -398,78 +427,80 @@ def run_classification(args) -> Dict[str, Any]:
             else:
                 annotations_data = None
                 use_supervised = False
-        
-        time.sleep(1)
-
-        # B) read embedding => "SegmentationNode/embedding"
-        with h5py.File(h5_path, 'r') as hf:
+            print(f"[Timing] Reading annotations: {time.time() - read_annotations_start:.2f}s")
+            
+            # B) read embedding => "SegmentationNode/embedding"
+            read_embeddings_start = time.time()
             if 'SegmentationNode' not in hf:
                 raise ValueError("no SegmentationNode group found in h5 file")
             seg_grp = hf['SegmentationNode']
             if 'embedding' not in seg_grp:
                 raise ValueError("embedding dataset not found in h5 file => no cell_embeddings")
             cell_embeddings = seg_grp['embedding'][()]
+            print(f"[Timing] Reading embeddings: {time.time() - read_embeddings_start:.2f}s")
         
-        time.sleep(1)
+            # C) supervised or zero-shot
+            organ = getattr(args, "organ", None)
+            nuclei_classes = getattr(args, "nuclei_classes", [])
+            nuclei_colors = getattr(args, "nuclei_colors", [])
 
-        # C) supervised or zero-shot
-        organ = getattr(args, "organ", None)
-        nuclei_classes = getattr(args, "nuclei_classes", [])
-        nuclei_colors = getattr(args, "nuclei_colors", [])
+            if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
+                supervised_classification_start_time = time.time()
+                clf, class_names, class_colors, predictions, prediction_probs, \
+                    coef_, intercept_, train_time, test_time = train_linear_classifier(cell_embeddings, annotations_data)
+                print(f"[Timing] Supervised classification (train+predict): {time.time() - supervised_classification_start_time:.2f}s")
+                # train_time and test_time are already captured by train_linear_classifier
+                final_class_names = class_names
+                final_class_colors = class_colors
+                classification_method = "supervised"
+                print(f"Supervised classification completed using {classification_method}")
+                # Progress for supervised is handled in train_linear_classifier
+            else:
+                classification_method = "zero-shot"
+                print(f"Zero-shot classification completed using {classification_method}")
+                if PLIP_MODELS is None:
+                    raise ValueError("PLIP_MODELS not loaded => please ensure /init is called first.")
+                processor, model, text_projection, device = PLIP_MODELS
+                text_encoder = model.text_model
 
-        if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
-            clf, class_names, class_colors, predictions, prediction_probs, \
-                coef_, intercept_, train_time, test_time = train_linear_classifier(cell_embeddings, annotations_data)
-            final_class_names = class_names
-            final_class_colors = class_colors
-            classification_method = "supervised"
-            print(f"Supervised classification completed using {classification_method}")
-        else:
-            classification_method = "zero-shot"
-            print(f"Zero-shot classification completed using {classification_method}")
-            # use PLIP model to encode text
-            if PLIP_MODELS is None:
-                raise ValueError("PLIP_MODELS not loaded => please ensure /init is called first.")
-            processor, model, text_projection, device = PLIP_MODELS
-            text_encoder = model.text_model
+                zero_shot_classification_start_time = time.time()
+                # Batch process all class embeddings at once
+                text_desc_start_time = time.time()
+                class_embeddings_arr = _generate_text_description(processor, text_encoder, text_projection,
+                                                              nuclei_classes, organ, device)
+                print(f"[Timing] Zero-shot text description generation: {time.time() - text_desc_start_time:.2f}s")
+                
+                # Compute all similarities at once
+                similarity_computation_start_time = time.time()
+                sims_arr = np.dot(cell_embeddings, class_embeddings_arr.T)
+                predictions = np.argmax(sims_arr, axis=1)
+                prediction_probs = None # For zero-shot, raw similarity scores might be more informative
+                print(f"[Timing] Zero-shot similarity computation & prediction: {time.time() - similarity_computation_start_time:.2f}s")
+                print(f"[Timing] Total zero-shot classification: {time.time() - zero_shot_classification_start_time:.2f}s")
 
-            # construct class_embeddings
-            class_embeddings = _generate_text_description(processor, text_encoder, text_projection,
-                                                          nuclei_classes, organ, device)
-            sims = []
-            print(f"size of class_embeddings: {len(class_embeddings)}")
-            for idx, ce in enumerate(class_embeddings):
-                print(f"size of ce: {ce.shape}")
-                sim = np.dot(cell_embeddings, ce.T)
-                print(f"size of sim: {sim.shape}")
-                sims.append(sim)
-                # Update progress
-                progress_value = int((idx + 1) / len(class_embeddings) * 100)
-                print(f"Progress: {progress_value}%")
-            sims_arr = np.array(sims).squeeze(axis=2).T
-            print(f"size of sims_arr: {sims_arr.shape}")
-            predictions = np.argmax(sims_arr, axis=1)
-            print(f"size of predictions: {predictions.shape}")
-            prediction_probs = None
+                # Update progress after similarity computation (once for zero-shot)
+                progress_value = 100 
+                print("Progress: 100% (Similarities computed for zero-shot)")
 
-            # color
-            final_class_colors = None
-            with h5py.File(h5_path, 'r') as hf:
-                if 'ClassificationNode' in hf and 'nuclei_class_HEX_color' in hf['ClassificationNode']:
-                    old_colors = hf['ClassificationNode']['nuclei_class_HEX_color'][()]
+                final_class_colors = None
+                # Check for existing colors within the same hf handle
+                if NODE_NAME in hf and 'nuclei_class_HEX_color' in hf[NODE_NAME]: 
+                    old_colors = hf[NODE_NAME]['nuclei_class_HEX_color'][()] 
                     if len(old_colors) == len(nuclei_classes):
                         final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
-            if final_class_colors is None:
-                if nuclei_colors:
-                    final_class_colors = nuclei_colors
-                else:
-                    final_class_colors = generate_distinct_colors(nuclei_classes)
-            final_class_names = nuclei_classes
+                
+                if final_class_colors is None:
+                    if nuclei_colors:
+                        final_class_colors = nuclei_colors
+                    else:
+                        final_class_colors = generate_distinct_colors(nuclei_classes)
+                final_class_names = nuclei_classes
 
-        # D) result => cell_classification
-        with h5py.File(h5_path, 'a') as hf:
+            # D) result => cell_classification
+            write_results_start_time = time.time()
+            # Ensure operations are within the 'with hf ...' block
             if NODE_NAME in hf:
-               del hf[NODE_NAME]
+                del hf[NODE_NAME]
             grp_cls = hf.create_group(NODE_NAME)
 
             grp_cls.create_dataset('nuclei_class_id', data=predictions.astype(np.int32))
@@ -482,8 +513,8 @@ def run_classification(args) -> Dict[str, Any]:
 
             print("================")
             print({
-                "predictions": set(predictions),
-                "nuclei_classes": set(final_class_names),
+                "predictions": list(set(predictions)), 
+                "nuclei_classes": list(set(final_class_names)), 
                 "classification_method": classification_method,
                 "organ": organ
             })
@@ -492,18 +523,20 @@ def run_classification(args) -> Dict[str, Any]:
                 "classification_method": classification_method,
                 "organ": organ
             }
-            if use_supervised and annotations_data is not None:
+            if use_supervised and annotations_data is not None and 'train_time' in locals() and 'test_time' in locals(): 
                 metadata["training_time"] = train_time
                 metadata["testing_time"] = test_time
             grp_cls.create_dataset('metadata', data=json.dumps(metadata).encode("utf-8"))
 
             hf.flush()
+            print(f"[Timing] Writing results to H5: {time.time() - write_results_start_time:.2f}s")
 
-        time.sleep(1)
-
-        end_time = time.time()
+        overall_end_time = time.time()
+        total_execution_time = overall_end_time - overall_start_time
+        print(f"[Timing] Total run_classification execution time: {total_execution_time:.2f}s")
+        
         result["classification_count"] = len(predictions)
-        result["message"] = f"Classification completed using {classification_method} in {end_time - start_time:.2f}s"
+        result["message"] = f"Classification completed using {classification_method} in {total_execution_time:.2f}s"
 
         # print H5 structure
         print("H5 structure after classification:")
@@ -513,13 +546,25 @@ def run_classification(args) -> Dict[str, Any]:
 
     except Exception as e:
         import traceback
-        err_msg = f"{str(e)}\n{traceback.format_exc()}"
+        err_msg = f"{str(e)}\\n{traceback.format_exc()}"
         print("Error:", err_msg)
         return {
             "status": "error",
             "message": str(e),
             "classification_count": 0
         }
+    finally:
+        # Clear GPU memory after processing
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        # Clear unnecessary data
+        if cell_embeddings is not None:
+            del cell_embeddings
+        if class_embeddings_arr is not None:
+            del class_embeddings_arr
+        if sims_arr is not None:
+            del sims_arr
 
 # ========== FastAPI  ==========
 
