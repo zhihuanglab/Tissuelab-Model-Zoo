@@ -108,9 +108,7 @@ def _generate_text_description(processor,
     
     # Update progress after text embedding generation (once)
     global progress_value
-    # Set progress to a value that indicates text embeddings are done, e.g., 50%
-    # This might need adjustment if supervised path also updates progress_value
-    # For now, assuming zero-shot is independent or its progress is tracked separately until this point.
+    # Set progress to a value that indicates text embeddings are done, ex. 50%
     progress_value = 50 
     print("Progress: 50% (Text embeddings generated for zero-shot)")
 
@@ -401,17 +399,16 @@ def run_classification(args) -> Dict[str, Any]:
     global progress_value  # Declare the global variable
 
     result = {"status": "success", "message": "", "classification_count": 0}
-    cell_embeddings = None # Ensure it's defined for the finally block
-    class_embeddings_arr = None # Ensure it's defined for the finally block
-    sims_arr = None # Ensure it's defined for the finally block
+    cell_embeddings = None
+    class_embeddings_arr = None
+    sims_arr = None
 
     try:
-        overall_start_time = time.time() # Overall timer
+        start_time = time.time()
         h5_path = H5_PATH
 
         with h5py.File(h5_path, 'a') as hf:  # Open in append mode for read/write
             # A) check annotation
-            read_annotations_start = time.time()
             annotations_data = None
             use_supervised = False
             if 'user_annotation' in hf and 'nuclei_annotations' in hf['user_annotation']:
@@ -427,17 +424,14 @@ def run_classification(args) -> Dict[str, Any]:
             else:
                 annotations_data = None
                 use_supervised = False
-            print(f"[Timing] Reading annotations: {time.time() - read_annotations_start:.2f}s")
             
             # B) read embedding => "SegmentationNode/embedding"
-            read_embeddings_start = time.time()
             if 'SegmentationNode' not in hf:
                 raise ValueError("no SegmentationNode group found in h5 file")
             seg_grp = hf['SegmentationNode']
             if 'embedding' not in seg_grp:
                 raise ValueError("embedding dataset not found in h5 file => no cell_embeddings")
             cell_embeddings = seg_grp['embedding'][()]
-            print(f"[Timing] Reading embeddings: {time.time() - read_embeddings_start:.2f}s")
         
             # C) supervised or zero-shot
             organ = getattr(args, "organ", None)
@@ -445,11 +439,8 @@ def run_classification(args) -> Dict[str, Any]:
             nuclei_colors = getattr(args, "nuclei_colors", [])
 
             if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
-                supervised_classification_start_time = time.time()
                 clf, class_names, class_colors, predictions, prediction_probs, \
                     coef_, intercept_, train_time, test_time = train_linear_classifier(cell_embeddings, annotations_data)
-                print(f"[Timing] Supervised classification (train+predict): {time.time() - supervised_classification_start_time:.2f}s")
-                # train_time and test_time are already captured by train_linear_classifier
                 final_class_names = class_names
                 final_class_colors = class_colors
                 classification_method = "supervised"
@@ -463,20 +454,14 @@ def run_classification(args) -> Dict[str, Any]:
                 processor, model, text_projection, device = PLIP_MODELS
                 text_encoder = model.text_model
 
-                zero_shot_classification_start_time = time.time()
                 # Batch process all class embeddings at once
-                text_desc_start_time = time.time()
                 class_embeddings_arr = _generate_text_description(processor, text_encoder, text_projection,
                                                               nuclei_classes, organ, device)
-                print(f"[Timing] Zero-shot text description generation: {time.time() - text_desc_start_time:.2f}s")
                 
                 # Compute all similarities at once
-                similarity_computation_start_time = time.time()
                 sims_arr = np.dot(cell_embeddings, class_embeddings_arr.T)
                 predictions = np.argmax(sims_arr, axis=1)
                 prediction_probs = None # For zero-shot, raw similarity scores might be more informative
-                print(f"[Timing] Zero-shot similarity computation & prediction: {time.time() - similarity_computation_start_time:.2f}s")
-                print(f"[Timing] Total zero-shot classification: {time.time() - zero_shot_classification_start_time:.2f}s")
 
                 # Update progress after similarity computation (once for zero-shot)
                 progress_value = 100 
@@ -497,8 +482,6 @@ def run_classification(args) -> Dict[str, Any]:
                 final_class_names = nuclei_classes
 
             # D) result => cell_classification
-            write_results_start_time = time.time()
-            # Ensure operations are within the 'with hf ...' block
             if NODE_NAME in hf:
                 del hf[NODE_NAME]
             grp_cls = hf.create_group(NODE_NAME)
@@ -529,14 +512,10 @@ def run_classification(args) -> Dict[str, Any]:
             grp_cls.create_dataset('metadata', data=json.dumps(metadata).encode("utf-8"))
 
             hf.flush()
-            print(f"[Timing] Writing results to H5: {time.time() - write_results_start_time:.2f}s")
-
-        overall_end_time = time.time()
-        total_execution_time = overall_end_time - overall_start_time
-        print(f"[Timing] Total run_classification execution time: {total_execution_time:.2f}s")
-        
+            
+        end_time = time.time()
         result["classification_count"] = len(predictions)
-        result["message"] = f"Classification completed using {classification_method} in {total_execution_time:.2f}s"
+        result["message"] = f"Classification completed using {classification_method} in {end_time - start_time:.2f}s"
 
         # print H5 structure
         print("H5 structure after classification:")
