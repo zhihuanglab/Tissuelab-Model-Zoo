@@ -338,12 +338,17 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     class_names.extend(unique_classes)
 
     class_colors_map = annotations.groupby('tissue_class')['tissue_color'].first().to_dict()
+    NEG_COLOR = "#aaaaaa"
+    if "Negative control" not in class_names:
+        class_names.insert(0, "Negative control") 
+
+    class_colors_map["Negative control"] = NEG_COLOR
+
     class_colors = []
     for cn in class_names:
-        if cn in class_colors_map:
-            class_colors.append(class_colors_map[cn])
-        else:
-            class_colors.append("#F3F4F5")
+        class_colors.append(
+            class_colors_map.get(cn, NEG_COLOR if cn == "Negative control" else "#F3F4F5")
+        )
 
     cell_indices = annotations['patch_ID'].astype(int).values
     X_train = cell_embeddings[cell_indices]
@@ -472,12 +477,20 @@ def run_classification(args) -> Dict[str, Any]:
                 print(f"[{NODE_NAME}] Error reading from own group '{NODE_NAME}': {e}")
 
         if cell_embeddings is None:
+            with h5py.File(h5_path, 'r') as hf:
+                if 'MuskEmbeddingNode' in hf and 'embedding' in hf['MuskEmbeddingNode']:
+                    cell_embeddings = hf['MuskEmbeddingNode']['embedding'][()]
+                    embedding_source_group = 'MuskEmbeddingNode'
+                    print(f"[{NODE_NAME}] Fallback: loaded embeddings from MuskEmbeddingNode, shape: {cell_embeddings.shape}")
+        
+        if cell_embeddings is None:
             error_msg = f"Embedding dataset not found in expected locations: "
             expected_locations = []
             if DEPENDENCIES:
                 expected_locations.append(f"dependency group '{DEPENDENCIES[0]}'")
             # Always mention own group as a possible location
-            expected_locations.append(f"own group '{NODE_NAME}'") 
+            expected_locations.append(f"own group '{NODE_NAME}'")
+            expected_locations.append("group 'MuskEmbeddingNode'")
             # Remove duplicates if dependency name == node name
             error_msg += " or ".join(sorted(list(set(expected_locations))))
             raise ValueError(error_msg + " => no cell_embeddings")
@@ -616,7 +629,7 @@ def init_node():
     global IS_MODEL_INITED
     if not IS_MODEL_INITED:
         IS_MODEL_INITED = True
-        print("[MuskNode] /init => let's load HF big model now ...")
+        print("[MuskClassificationNode] /init => let's load HF big model now ...")
         load_checkpoint_at_init()
         return {"status": "ok", "message": "NODE_NAME init done, big model loaded"}
     else:
@@ -626,7 +639,7 @@ def init_node():
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
     global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH
-    NODE_NAME = data.get("node_name", "MuskNode")
+    NODE_NAME = data.get("node_name", "MuskClassificationNode")
     DEPENDENCIES = data.get("dependencies", [])
     H5_PATH = data.get("h5_path", None)
     
@@ -757,7 +770,7 @@ def main():
     import time
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8006, help='port')
-    parser.add_argument('--name', type=str, default='MuskNode', help='node name')
+    parser.add_argument('--name', type=str, default='MuskClassificationNode', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args = parser.parse_args()
 
