@@ -29,8 +29,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from pathlib import Path
-from sklearn.linear_model import LogisticRegression
-from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
 from musk_for_train import MUSK
 
 app = FastAPI()
@@ -186,7 +184,7 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
     clf.save_model(SAVE_CLASSIFIER_PATH)
     print(f"Saved classifier with parameters and training data to: {SAVE_CLASSIFIER_PATH}")
 
-def load_classifier_params(h5_path):
+def load_classifier_params():
     """Load classifier parameters and training data from XGBoost model file"""
     global CLASSIFIER_PATH
     if CLASSIFIER_PATH is None:
@@ -284,7 +282,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     # try to load existing classifier parameters
     if CLASSIFIER_PATH is not None:
         try:
-            loaded_params = load_classifier_params(CLASSIFIER_PATH)
+            loaded_params = load_classifier_params()
             if loaded_params is not None:
                 clf, class_names, class_colors, prev_embeddings, prev_labels = loaded_params
                 print(f"Loaded existing classifier parameters, classes: {class_names}")
@@ -349,47 +347,25 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     X_train = cell_embeddings[cell_indices]
     y_train = pd.Categorical(annotations['tissue_class'], categories=class_names).codes
     
-    # for debugging
-    # # create patch save directory
-    # output_dir = os.path.join(os.path.dirname(H5_PATH), "training_patches")
-    
-    # print("\ntraining patches:")
-    # print(f"total training samples: {len(cell_indices)}")
-    # for i in range(len(cell_indices)):
-    #     print(f"sample {i}:")
-    #     print(f"  - index: {cell_indices[i]}")
-    #     print(f"  - label: {class_names[y_train[i]]}")
-        
-    #     # read coordinates and save patch
-    #     with h5py.File(H5_PATH, 'r') as hf:
-    #         if f'{NODE_NAME}/coordinates' in hf:
-    #             coords = hf[f'{NODE_NAME}/coordinates'][cell_indices[i]]
-    #             print(f"  - coordinates: {coords}")
-                
-    #             # save patch image
-    #             if hasattr(ARGS, 'slidepath') and ARGS.slidepath:
-    #                 saved_path = save_patch_image(
-    #                     ARGS.slidepath,
-    #                     coords,
-    #                     output_dir,
-    #                     i,
-    #                     class_names[y_train[i]]
-    #                 )
-    #                 if saved_path:
-    #                     print(f"  - patch image saved: {saved_path}")
-    #                 else:
-    #                     print("  - failed to save patch image")
-    #             else:
-    #                 print("  - no slide path, skip saving patch image")
-    # print("\n")
+    if "Negative control" not in annotations["tissue_class"].values.astype(str):
+        # Cache negative control vectors in memory
+        if not hasattr(train_linear_classifier, '_negative_control_vectors'):
+            base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
+            neg_control_path = os.path.join(base_path, "negative_control_vectors_1024d.npy")
+            print(f"Loading negative control vectors from: {neg_control_path}")
+            try:
+                train_linear_classifier._negative_control_vectors = np.load(neg_control_path)
+            except Exception as e:
+                print(f"Warning: Could not load negative control vectors: {e}")
+                train_linear_classifier._negative_control_vectors = None # Set to None if loading fails
 
-    if "Negative control" not in annotations["tissue_class"].values:
-        try:
-            negative_control_vectors = np.load("negative_control_vectors_1024d.npy")
+        if train_linear_classifier._negative_control_vectors is not None:
+            negative_control_vectors = train_linear_classifier._negative_control_vectors
+            print(f"negative_control_vectors shape: {negative_control_vectors.shape}")
             X_train = np.concatenate([negative_control_vectors, X_train], axis=0)
-            y_train = np.concatenate([np.zeros(negative_control_vectors.shape[0]), y_train], axis=0)
-        except Exception as e:
-            print(f"unable to load negative control vectors: {e}")
+            y_train = np.concatenate([np.zeros(negative_control_vectors.shape[0]), y_train], axis=0).astype(int)
+        else:
+            print("Proceeding without negative control vectors as they could not be loaded.")
 
     # train new classifier
     clf = xgb.XGBClassifier(**xgb_params)
@@ -416,130 +392,116 @@ def run_classification(args) -> Dict[str, Any]:
     global progress_value
 
     result = {"status": "success", "message": "", "classification_count": 0}
+    cell_embeddings = None
+    class_embeddings = None # Renamed from class_embeddings_arr for clarity if it's a list of arrays
+    sims_arr = None # Or sims if it's a list before converting to numpy array
+
     try:
         start_time = time.time()
         h5_path = H5_PATH
 
-        # A) check annotation
-        annotations_data = None
-        use_supervised = False
-        with h5py.File(h5_path, 'r') as hf:
+        # Open H5 file once for all operations
+        with h5py.File(h5_path, 'a') as hf: # Open in append mode for read/write
+            # A) check annotation
+            annotations_data = None
+            use_supervised = False
             if 'user_annotation' in hf and 'tissue_annotations' in hf['user_annotation']:
                 raw_bytes = hf['user_annotation/tissue_annotations'][()]
                 ann_dict = json.loads(raw_bytes.decode("utf-8"))
                 annotations_data = pd.DataFrame(ann_dict).T
-
-                # unique_classes = annotations_data["tissue_class"].unique().tolist()
-                # if ("Negative control" in unique_classes) and (len(unique_classes) >= 2):
                 use_supervised = True
-                # else:
-                #     use_supervised = False
             else:
                 annotations_data = None
                 use_supervised = False
-        
-        time.sleep(1)
-
-        # B) read embedding - Try dependency first, then self
-        cell_embeddings = None
-        embedding_source_group = None
-
-        if DEPENDENCIES:
-            embedding_node_name = DEPENDENCIES[0]
-            print(f"[{NODE_NAME}] Attempting to read embeddings from dependency node group: {embedding_node_name}")
-            try:
-                with h5py.File(h5_path, 'r') as hf:
-                    if embedding_node_name in hf and 'embedding' in hf[embedding_node_name]:
-                        cell_embeddings = hf[embedding_node_name]['embedding'][()]
-                        embedding_source_group = embedding_node_name
-                        print(f"[{NODE_NAME}] Successfully loaded embeddings from dependency group '{embedding_source_group}', shape: {cell_embeddings.shape}")
-                    else:
-                        print(f"[{NODE_NAME}] Embedding not found in dependency group '{embedding_node_name}'. Will try reading from own group.")
-            except Exception as e:
-                print(f"[{NODE_NAME}] Error reading from dependency group '{embedding_node_name}': {e}. Will try reading from own group.")
-
-        if cell_embeddings is None:
-            print(f"[{NODE_NAME}] Attempting to read embeddings from own node group: {NODE_NAME}")
-            try:
-                with h5py.File(h5_path, 'r') as hf:
-                    if NODE_NAME in hf and 'embedding' in hf[NODE_NAME]:
-                        cell_embeddings = hf[NODE_NAME]['embedding'][()]
-                        embedding_source_group = NODE_NAME
-                        print(f"[{NODE_NAME}] Successfully loaded embeddings from own group '{embedding_source_group}', shape: {cell_embeddings.shape}")
-                    else:
-                        print(f"[{NODE_NAME}] Embedding not found in own group '{NODE_NAME}'.")
-            except Exception as e:
-                print(f"[{NODE_NAME}] Error reading from own group '{NODE_NAME}': {e}")
-
-        if cell_embeddings is None:
-            error_msg = f"Embedding dataset not found in expected locations: "
-            expected_locations = []
-            if DEPENDENCIES:
-                expected_locations.append(f"dependency group '{DEPENDENCIES[0]}'")
-            # Always mention own group as a possible location
-            expected_locations.append(f"own group '{NODE_NAME}'") 
-            # Remove duplicates if dependency name == node name
-            error_msg += " or ".join(sorted(list(set(expected_locations))))
-            raise ValueError(error_msg + " => no cell_embeddings")
-
-        time.sleep(1)
-
-        # C) supervised or zero-shot
-        tissue_classes = getattr(args, "tissue_classes", [])
-        tissue_colors = getattr(args, "tissue_colors", [])
-
-        if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
-            clf, class_names, class_colors, predictions, prediction_probs, \
-                coef_, intercept_, train_time, test_time = train_linear_classifier(cell_embeddings, annotations_data)
-            final_class_names = class_names
-            final_class_colors = class_colors
-            classification_method = "supervised"
-            print(f"Supervised classification completed using {classification_method}")
-        else:
-            classification_method = "zero-shot"
-            print(f"Zero-shot classification completed using {classification_method}")
             
-            # use MUSK model to encode text
-            if MUSK_MODEL is None:
-                raise ValueError("MUSK_MODEL not loaded => please ensure /init is called first.")
+            # B) read embedding - Try dependency first, then self
+            embedding_source_group = None
 
-            # Build class_embeddings
-            class_embeddings = _generate_text_description(tissue_classes)
-            sims = []
-            for idx, ce in enumerate(class_embeddings):
-                sim = np.dot(cell_embeddings, ce.T)
-                sims.append(sim)
-                # Update progress
-                progress_value = int((idx + 1) / len(class_embeddings) * 100)
-                print(f"Progress: {progress_value}%")
-            sims_arr = np.array(sims).squeeze(axis=2).T
-            predictions = np.argmax(sims_arr, axis=1)
-            prediction_probs = None
+            if DEPENDENCIES:
+                embedding_node_name = DEPENDENCIES[0]
+                print(f"[{NODE_NAME}] Attempting to read embeddings from dependency node group: {embedding_node_name}")
+                if embedding_node_name in hf and 'embedding' in hf[embedding_node_name]:
+                    cell_embeddings = hf[embedding_node_name]['embedding'][()]
+                    embedding_source_group = embedding_node_name
+                    print(f"[{NODE_NAME}] Successfully loaded embeddings from dependency group '{embedding_source_group}', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
+                else:
+                    print(f"[{NODE_NAME}] Embedding not found in dependency group '{embedding_node_name}'. Will try reading from own group.")
 
-            # color
-            final_class_colors = None
-            with h5py.File(h5_path, 'r') as hf:
+            if cell_embeddings is None:
+                print(f"[{NODE_NAME}] Attempting to read embeddings from own node group: {NODE_NAME}")
+                if NODE_NAME in hf and 'embedding' in hf[NODE_NAME]:
+                    cell_embeddings = hf[NODE_NAME]['embedding'][()]
+                    embedding_source_group = NODE_NAME
+                    print(f"[{NODE_NAME}] Successfully loaded embeddings from own group '{embedding_source_group}', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
+                else:
+                    print(f"[{NODE_NAME}] Embedding not found in own group '{NODE_NAME}'.")
+
+            if cell_embeddings is None:
+                error_msg = f"Embedding dataset not found in expected locations: "
+                expected_locations = []
+                if DEPENDENCIES:
+                    expected_locations.append(f"dependency group '{DEPENDENCIES[0]}'")
+                expected_locations.append(f"own group '{NODE_NAME}'")
+                error_msg += " or ".join(sorted(list(set(expected_locations))))
+                raise ValueError(error_msg + " => no cell_embeddings")
+
+            # C) supervised or zero-shot
+            tissue_classes = getattr(args, "tissue_classes", [])
+            tissue_colors = getattr(args, "tissue_colors", [])
+
+            if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
+                clf, class_names, class_colors, predictions, prediction_probs, \
+                    coef_, intercept_, train_time, test_time = train_linear_classifier(cell_embeddings, annotations_data)
+                final_class_names = class_names
+                final_class_colors = class_colors
+                classification_method = "supervised"
+                print(f"Supervised classification completed using {classification_method}")
+            else:
+                classification_method = "zero-shot"
+                print(f"Zero-shot classification completed using {classification_method}")
+                
+                if MUSK_MODEL is None:
+                    raise ValueError("MUSK_MODEL not loaded => please ensure /init is called first.")
+
+                class_embeddings = _generate_text_description(tissue_classes) # list of np.ndarray
+                
+                # Compute similarities
+                # Assuming cell_embeddings is (N, D) and each element in class_embeddings is (1, D)
+                # We want sims_arr to be (N, C) where C is number of classes
+                sim_list = []
+                for idx, ce_single_class in enumerate(class_embeddings): # ce_single_class is (1,D)
+                    # ce_single_class.T would be (D,1)
+                    # np.dot(cell_embeddings (N,D), ce_single_class.T (D,1)) -> (N,1)
+                    sim = np.dot(cell_embeddings, ce_single_class.T) 
+                    sim_list.append(sim)
+                    progress_value = int((idx + 1) / len(class_embeddings) * 100)
+                    print(f"Progress: {progress_value}%")
+                
+                sims_arr = np.concatenate(sim_list, axis=1) # Concatenate along class dimension
+                predictions = np.argmax(sims_arr, axis=1)
+                prediction_probs = None # For zero-shot
+
+                final_class_colors = None
                 if NODE_NAME in hf and 'tissue_class_HEX_color' in hf[NODE_NAME]:
                     old_colors = hf[NODE_NAME]['tissue_class_HEX_color'][()]
                     if len(old_colors) == len(tissue_classes):
                         final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
-            if final_class_colors is None:
-                if tissue_colors:
-                    final_class_colors = tissue_colors
-                else:
-                    final_class_colors = generate_distinct_colors(tissue_classes)
-            final_class_names = tissue_classes
+                
+                if final_class_colors is None:
+                    if tissue_colors:
+                        final_class_colors = tissue_colors
+                    else:
+                        final_class_colors = generate_distinct_colors(tissue_classes)
+                final_class_names = tissue_classes
 
-        # D) result => cell_classification
-        saved_datasets = {}
-        with h5py.File(h5_path, 'r') as hf:
+            # D) result => cell_classification
+            saved_datasets = {}
             if NODE_NAME in hf:
-                for name in ['coordinates', 'embedding']:
+                for name in ['coordinates', 'embedding']: # Preserve these if they exist under NODE_NAME
                     if name in hf[NODE_NAME]:
-                        print(f"[{NODE_NAME}] Found {name}, will preserve it")
+                        print(f"[{NODE_NAME}] Found {name} in existing group, will preserve it")
                         saved_datasets[name] = hf[NODE_NAME][name][()]
-        
-        with h5py.File(h5_path, 'a') as hf:
+            
             if NODE_NAME in hf:
                 del hf[NODE_NAME]
             grp_cls = hf.create_group(NODE_NAME)
@@ -554,37 +516,33 @@ def run_classification(args) -> Dict[str, Any]:
 
             print("================")
             print({
-                "predictions": set(predictions),
-                "tissue_classes": set(final_class_names),
+                "predictions": list(set(predictions.tolist())), # Convert to list for set
+                "tissue_classes": list(set(final_class_names)), 
                 "classification_method": classification_method
             })
-            metadata = {
+            metadata_dict = {
                 "tissue_classes": final_class_names,
                 "classification_method": classification_method
             }
-            if use_supervised and annotations_data is not None:
-                metadata["training_time"] = train_time
-                metadata["testing_time"] = test_time
-            grp_cls.create_dataset('metadata', data=json.dumps(metadata).encode("utf-8"))
+            if use_supervised and annotations_data is not None and 'train_time' in locals() and 'test_time' in locals():
+                metadata_dict["training_time"] = train_time
+                metadata_dict["testing_time"] = test_time
+            grp_cls.create_dataset('metadata', data=json.dumps(metadata_dict).encode("utf-8"))
+            
+            # Restore previously saved datasets under the new NODE_NAME group
+            for name, data in saved_datasets.items():
+                try:
+                    print(f"[{NODE_NAME}] Restoring {name} to new group")
+                    grp_cls.create_dataset(name, data=data)
+                except Exception as e:
+                    print(f"[{NODE_NAME}] Error restoring {name} to new group: {e}")
 
             hf.flush()
             
-        # restore previous data
-        with h5py.File(h5_path, 'a') as hf:
-            for name, data in saved_datasets.items():
-                try:
-                    print(f"[{NODE_NAME}] Restoring {name}")
-                    hf[NODE_NAME].create_dataset(name, data=data)
-                except Exception as e:
-                    print(f"[{NODE_NAME}] Error restoring {name}: {e}")
-
-        time.sleep(1)
-
         end_time = time.time()
         result["classification_count"] = len(predictions)
         result["message"] = f"Classification completed using {classification_method} in {end_time - start_time:.2f}s"
 
-        # print H5 structure
         print("H5 structure after classification:")
         print_h5_structure(h5_path)
 
@@ -599,6 +557,18 @@ def run_classification(args) -> Dict[str, Any]:
             "message": str(e),
             "classification_count": 0
         }
+    finally:
+        # Clear GPU memory and variables after processing
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Explicitly delete large variables
+        if cell_embeddings is not None:
+            del cell_embeddings
+        if class_embeddings is not None: # This was a list of numpy arrays
+            del class_embeddings
+        if sims_arr is not None:
+            del sims_arr
 
 # ========== FastAPI  ==========
 
@@ -704,8 +674,6 @@ def execute_node():
             out_str = json.dumps(out_val, ensure_ascii=False)
             hf.create_dataset(out_ds, data=out_str.encode("utf-8"))
             hf.flush()
-        time.sleep(1)
-
 
     return {"status": "ok", "output": out_val}
 
