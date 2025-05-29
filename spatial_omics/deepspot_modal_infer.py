@@ -15,24 +15,17 @@ OUTPUT_PATH = BASE_PATH + "outputs/zen38_infer.h5ad"
 
 image = (
     modal.Image.debian_slim()
+    .pip_install("-r", "/root/DeepSpot/requirements.txt")
     .pip_install(
-        "torch",
-        "scanpy",
-        "squidpy",
-        "anndata",
-        "matplotlib",
-        "pandas",
-        "numpy",
-        "pyvips",
+        "PyYAML",
         "tqdm",
         "Pillow",
         "openslide-python",
-        "PyYAML",
         "huggingface_hub",
         "transformers",
         "timm",
-        "scikit-learn",
-        "plotnine",
+        "lightning",
+        "pyvips",
     )
     .apt_install("libvips-dev", "libglib2.0-0", "libopenslide0")
     .add_local_dir("DeepSpot", BASE_PATH)
@@ -60,7 +53,7 @@ def run_inference():
     import PIL
     from tqdm import tqdm
 
-    from deepspot.utils.utils_image import predict_spatial_transcriptomics_from_image_path, get_morphology_model_and_preprocess, crop_tile
+    from deepspot.utils.utils_image import predict_spot_spatial_transcriptomics_from_image_path, get_morphology_model_and_preprocess, crop_tile
     from deepspot.spot.model import DeepSpot
 
     # Load model config
@@ -122,7 +115,7 @@ def run_inference():
     morphology_model.eval()
 
     # Run inference
-    counts = predict_spatial_transcriptomics_from_image_path(
+    counts = predict_spot_spatial_transcriptomics_from_image_path(
         image_path,
         adata,
         spot_diameter,
