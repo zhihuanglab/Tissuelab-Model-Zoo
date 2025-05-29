@@ -292,9 +292,18 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     if common_classes:
                         print(f"Found user annotations for classes: {common_classes}, updating classifier...")
                         
-                        cell_indices = annotations['cell_ID'].astype(int).values
+                        # Ensure index is numeric and handle potential NaNs before converting to int
+                        valid_indices = pd.to_numeric(annotations.index, errors='coerce').dropna()
+                        cell_indices = valid_indices.astype(int).values
+                        
+                        # Filter annotations DataFrame to only include rows with valid (numeric, non-NaN) indices
+                        # This ensures that an annotation with a non-numeric ID (which became NaN) doesn't cause a mismatch
+                        # when indexing cell_embeddings later.
+                        annotations_for_update = annotations.loc[valid_indices.astype(str)] # Use string version of valid_indices to loc original index
+
                         X_update = cell_embeddings[cell_indices]
-                        y_update = pd.Categorical(annotations['cell_class'], categories=class_names).codes
+                        # Use the filtered annotations_for_update for getting y_update
+                        y_update = pd.Categorical(annotations_for_update['cell_class'], categories=class_names).codes
                         
                         # Combine new and previous training data if available
                         if prev_embeddings is not None and prev_labels is not None:
@@ -340,9 +349,14 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         else:
             class_colors.append("#F3F4F5")
 
-    cell_indices = annotations['cell_ID'].astype(int).values
+    # Ensure index is numeric and handle potential NaNs before converting to int
+    valid_indices = pd.to_numeric(annotations.index, errors='coerce').dropna()
+    cell_indices = valid_indices.astype(int).values
+    # Filter annotations to only those with valid indices for training
+    annotations_for_training = annotations.loc[valid_indices.astype(str)]
+
     X_train = cell_embeddings[cell_indices]
-    y_train = pd.Categorical(annotations['cell_class'], categories=class_names).codes
+    y_train = pd.Categorical(annotations_for_training['cell_class'], categories=class_names).codes
 
     if "Negative control" not in annotations["cell_class"].values:
         try:
