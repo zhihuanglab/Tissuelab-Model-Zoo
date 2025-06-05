@@ -245,12 +245,6 @@ class SlideSegmentation():
         else:
             self.tile_size = 2048
 
-        print("-"*100)
-        print(f"Tile size: {self.tile_size}")
-        print("-"*100)
-
-    
-
     def simple_get_mask(self):
         try:
             # choose the best level
@@ -471,26 +465,21 @@ class SlideSegmentation():
                 pbar.update(curr_idx-last_idx)
                 last_idx = curr_idx
                 
-                # Adjust n_tiles strategy based on whether a BBox is used and patch size
                 current_n_tiles_for_prediction = self.n_tiles # Default
 
-                # --- Start Detailed Debug Logging for n_tiles condition ---
                 cond_bbox_coords_present = bool(self.bbox_coords)
                 cond_w_col_lt_tile_size = (w_col < self.tile_size)
                 cond_h_row_lt_tile_size = (h_row < self.tile_size)
                 cond_size_check = (cond_w_col_lt_tile_size or cond_h_row_lt_tile_size)
                 final_condition_for_none = cond_bbox_coords_present and cond_size_check
-                
-                print(f"DEBUG N_TILES: self.bbox_coords raw: {self.bbox_coords}")
-                print(f"DEBUG N_TILES: self.bbox_coords is present (boolean): {cond_bbox_coords_present}")
-                print(f"DEBUG N_TILES: w_col ({w_col}) < self.tile_size ({self.tile_size}): {cond_w_col_lt_tile_size}")
-                print(f"DEBUG N_TILES: h_row ({h_row}) < self.tile_size ({self.tile_size}): {cond_h_row_lt_tile_size}")
-                print(f"DEBUG N_TILES: Combined size check (w_col < tile OR h_row < tile): {cond_size_check}")
-                print(f"DEBUG N_TILES: Final condition for using n_tiles=None (bbox_present AND size_check): {final_condition_for_none}")
-                # --- End Detailed Debug Logging ---
 
                 if final_condition_for_none: # Use the explicitly calculated final_condition
                     current_n_tiles_for_prediction = None 
+                    current_n_tiles_for_prediction = None 
+                    print(f"Tile r{ir} c{ic} is small due to BBox ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (IF BRANCH TAKEN)")
+                else:
+                    print(f"Tile r{ir} c{ic} ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (ELSE BRANCH TAKEN)")
+                    current_n_tiles_for_prediction = None
                     print(f"Tile r{ir} c{ic} is small due to BBox ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (IF BRANCH TAKEN)")
                 else:
                     print(f"Tile r{ir} c{ic} ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (ELSE BRANCH TAKEN)")
@@ -583,17 +572,6 @@ class SlideSegmentation():
                 patch_duration = patch_end_time - patch_start_time
                 compute_duration = patch_duration - read_duration
                 
-                # Print nuclei detection results for each tile
-                print("\n========================================")
-                print(f"Tile r{ir} c{ic} (x={x_0}, y={y_0}) detected {len(points_df)} nuclei")
-                total_nuclei = len(points_df)
-                print(f"Current total nuclei: {total_nuclei}")
-                print("========================================\n")
-                
-                # Print processing time information
-                print(f"Tile r{ir} c{ic} processing time: {patch_duration:.4f}s (read: {read_duration:.4f}s, compute: {compute_duration:.4f}s)")
-                print(f"Start: {datetime.fromtimestamp(patch_start_time).strftime('%H:%M:%S')} - End: {datetime.fromtimestamp(patch_end_time).strftime('%H:%M:%S')}")
-                
                 # Note here: correctly accumulate results from all tiles instead of overwriting
                 if self.points_all is None:
                     self.points_all = points_df
@@ -606,60 +584,19 @@ class SlideSegmentation():
                     
         # Print clear information before generating final_points
         if self.points_all is None or len(self.points_all) == 0:
-            print("Warning: points_all is empty or has length 0!")
             self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
             self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
             self.prob_all = np.array([])
         else:
-            print(f"Segmentation complete, total accumulated nuclei: {len(self.points_all)}")
-            
-            # Print first few rows of points_all to verify data
-            print(f"points_all first 5 rows sample: \n{self.points_all.head().to_string()}")
-            
             # Add debug info when generating final_points
             try:
                 self.final_points = self.points_all[['x','y']].values.astype(np.int32)
-                print(f"Successfully generated final_points, shape={self.final_points.shape}")
-                
                 self.final_coord = self.coord_all.astype(np.int32)
-                
                 self.prob_all = self.prob_all
                 
-                # Conditional final scaling for tiled path
-                should_apply_ref_mag_scaling_tiled = True
-                if hasattr(self.args, 'target_mpp') and self.args.target_mpp is not None:
-                    print("[Tiled Path] Skipping final reference magnification scaling because target_mpp was specified.")
-                    should_apply_ref_mag_scaling_tiled = False
-                
-                if should_apply_ref_mag_scaling_tiled and self.args.magnification is not None:
-                    print(f"[Tiled Path] Applying final reference magnification scaling logic. Ref Mag: {self.reference_magnification}, Slide Mag: {self.args.magnification}")
-                    resize_factor = self.reference_magnification / self.args.magnification
-                    if abs(resize_factor) > 1e-6: # Avoid division by zero or tiny number
-                        if self.final_points is not None and len(self.final_points) > 0:
-                            # print(f"[Tiled Path] Before final scaling, self.final_points[0]: {self.final_points[0]}")
-                            pass # Original coordinates will be kept
-                        # self.final_points = (self.final_points / resize_factor).astype(np.int32)
-                        # self.final_coord = (self.final_coord / resize_factor).astype(np.int32)
-                        if self.final_points is not None and len(self.final_points) > 0:
-                            # print(f"[Tiled Path] After final scaling, self.final_points[0]: {self.final_points[0]}")
-                            print(f"[Tiled Path] Final coordinate scaling by resize_factor {resize_factor:.4f} was SKIPPED to preserve level 0 coordinates.")
-                    else:
-                        print("[Tiled Path] Warning: resize_factor is too small, skipping final scaling.")
-                elif not should_apply_ref_mag_scaling_tiled:
-                    pass # Reason already logged (target_mpp was specified)
-                elif self.args.magnification is None:
-                    print("[Tiled Path] Skipping final reference magnification scaling because self.args.magnification is None.")
-                
-                print(f"Completed saving {len(self.final_points) if self.final_points is not None else 0} detected nuclei")
             except Exception as e:
-                print(f"Failed to generate final_points: {str(e)}")
                 import traceback
                 print(traceback.format_exc())
-                # Add more diagnostic information
-                if self.points_all is not None:
-                    print(f"points_all column names: {self.points_all.columns.tolist()}")
-                else:
-                    print("points_all is None")
                 self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
                 self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
                 self.prob_all = np.array([])
@@ -681,11 +618,21 @@ class SlideSegmentation():
 
         print("---- Segmentation successfully completed ----")
 
+
         # Add final validation
         print(f"Final self.final_points: shape={self.final_points.shape if self.final_points is not None else 'None'}")
         if self.final_points is not None and len(self.final_points) > 0:
             print(f"First 5 centroids: \n{self.final_points[:5]}")
         
+        # Add final validation
+        print(f"Final self.final_points: shape={self.final_points.shape if self.final_points is not None else 'None'}")
+        if self.final_points is not None and len(self.final_points) > 0:
+            print(f"First 5 centroids: \n{self.final_points[:5]}")
+        
+        
+            # Last validation
+            assert len(self.final_points) > 0, "Nuclei detection result is empty, please check"
+
             # Last validation
             assert len(self.final_points) > 0, "Nuclei detection result is empty, please check"
 
@@ -866,33 +813,7 @@ class SlideSegmentation():
 
                 self.prob_all = prob
                 
-                # Conditional final scaling for simple image format path
-                should_apply_ref_mag_scaling_simple = True
-                if hasattr(self.args, 'target_mpp') and self.args.target_mpp is not None:
-                    print("[Simple Image Path] Skipping final reference magnification scaling because target_mpp was specified.")
-                    should_apply_ref_mag_scaling_simple = False
-                
-                if should_apply_ref_mag_scaling_simple and self.args.magnification is not None:
-                    print(f"[Simple Image Path] Applying final reference magnification scaling logic. Ref Mag: {self.reference_magnification}, Slide Mag: {self.args.magnification}")
-                    resize_factor = self.reference_magnification / self.args.magnification
-                    if abs(resize_factor) > 1e-6: # Avoid division by zero or tiny number
-                        if self.final_points is not None and len(self.final_points) > 0:
-                            # print(f"[Simple Image Path] Before final scaling, self.final_points[0]: {self.final_points[0]}")
-                            pass # Original coordinates will be kept
-                        # self.final_points = (self.final_points / resize_factor).astype(np.int32)
-                        # self.final_coord = (self.final_coord / resize_factor).astype(np.int32)
-                        if self.final_points is not None and len(self.final_points) > 0:
-                            # print(f"[Simple Image Path] After final scaling, self.final_points[0]: {self.final_points[0]}")
-                            print(f"[Simple Image Path] Final coordinate scaling by resize_factor {resize_factor:.4f} was SKIPPED to preserve level 0 coordinates.")
-                    else:
-                        print("[Simple Image Path] Warning: resize_factor is too small, skipping final scaling.")
-                elif not should_apply_ref_mag_scaling_simple:
-                    pass # Reason already logged (target_mpp was specified)
-                elif self.args.magnification is None:
-                    print("[Simple Image Path] Skipping final reference magnification scaling because self.args.magnification is None.")
-
                 total_nuclei = len(self.final_points) if self.final_points is not None else 0
-                print(f"Total detected {total_nuclei} nuclei")
                 
                 if self.progress_callback:
                     self.progress_callback(100)
@@ -985,13 +906,22 @@ class SlideSegmentation():
                 # Adjust n_tiles strategy based on whether a BBox is used and patch size
                 current_n_tiles_for_prediction = self.n_tiles # Default
 
-                # --- Start Detailed Debug Logging for n_tiles condition ---
                 cond_bbox_coords_present = bool(self.bbox_coords)
                 cond_w_col_lt_tile_size = (w_col < self.tile_size)
                 cond_h_row_lt_tile_size = (h_row < self.tile_size)
                 cond_size_check = (cond_w_col_lt_tile_size or cond_h_row_lt_tile_size)
                 final_condition_for_none = cond_bbox_coords_present and cond_size_check
                 
+                
+                print(f"DEBUG N_TILES: self.bbox_coords raw: {self.bbox_coords}")
+                print(f"DEBUG N_TILES: self.bbox_coords is present (boolean): {cond_bbox_coords_present}")
+                print(f"DEBUG N_TILES: w_col ({w_col}) < self.tile_size ({self.tile_size}): {cond_w_col_lt_tile_size}")
+                print(f"DEBUG N_TILES: h_row ({h_row}) < self.tile_size ({self.tile_size}): {cond_h_row_lt_tile_size}")
+                print(f"DEBUG N_TILES: Combined size check (w_col < tile OR h_row < tile): {cond_size_check}")
+                print(f"DEBUG N_TILES: Final condition for using n_tiles=None (bbox_present AND size_check): {final_condition_for_none}")
+                # --- End Detailed Debug Logging ---
+
+
                 print(f"DEBUG N_TILES: self.bbox_coords raw: {self.bbox_coords}")
                 print(f"DEBUG N_TILES: self.bbox_coords is present (boolean): {cond_bbox_coords_present}")
                 print(f"DEBUG N_TILES: w_col ({w_col}) < self.tile_size ({self.tile_size}): {cond_w_col_lt_tile_size}")
@@ -1002,6 +932,11 @@ class SlideSegmentation():
 
                 if final_condition_for_none: # Use the explicitly calculated final_condition
                     current_n_tiles_for_prediction = None 
+                    current_n_tiles_for_prediction = None 
+                    print(f"Tile r{ir} c{ic} is small due to BBox ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (IF BRANCH TAKEN)")
+                else:
+                    print(f"Tile r{ir} c{ic} ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (ELSE BRANCH TAKEN)")
+                    current_n_tiles_for_prediction = None
                     print(f"Tile r{ir} c{ic} is small due to BBox ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (IF BRANCH TAKEN)")
                 else:
                     print(f"Tile r{ir} c{ic} ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (ELSE BRANCH TAKEN)")
@@ -1255,17 +1190,6 @@ class SlideSegmentation():
                 patch_duration = patch_end_time - patch_start_time
                 compute_duration = patch_duration - read_duration
                 
-                # Print nuclei detection results for each tile
-                print("\n========================================")
-                print(f"Tile r{ir} c{ic} (x={x_0}, y={y_0}) detected {len(points_df)} nuclei")
-                total_nuclei += len(points_df)
-                print(f"Current total nuclei: {total_nuclei}")
-                print("========================================\n")
-                
-                # Print processing time information
-                print(f"Tile r{ir} c{ic} processing time: {patch_duration:.4f}s (read: {read_duration:.4f}s, compute: {compute_duration:.4f}s)")
-                print(f"Start: {datetime.fromtimestamp(patch_start_time).strftime('%H:%M:%S')} - End: {datetime.fromtimestamp(patch_end_time).strftime('%H:%M:%S')}")
-                
                 # Note here: correctly accumulate results from all tiles instead of overwriting
                 if points_all is None:
                     points_all = points_df
@@ -1278,57 +1202,19 @@ class SlideSegmentation():
         
         # Print clear information before generating final_points
         if points_all is None or len(points_all) == 0:
-            print("Warning: points_all is empty or has length 0!")
             self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
             self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
             self.prob_all = np.array([])
         else:
-            print(f"Segmentation complete, total accumulated nuclei: {len(points_all)}")
-            
-            # Print first few rows of points_all to verify data
-            print(f"points_all first 5 rows sample: \n{points_all.head().to_string()}")
-            
             # Add debug info when generating final_points
             try:
                 self.final_points = points_all[['x','y']].values.astype(np.int32)
                 self.final_coord = coord_all.astype(np.int32)
                 self.prob_all = prob_all
                 
-                # Conditional final scaling for tiled path
-                should_apply_ref_mag_scaling_tiled = True
-                if hasattr(self.args, 'target_mpp') and self.args.target_mpp is not None:
-                    print("[Tiled Path] Skipping final reference magnification scaling because target_mpp was specified.")
-                    should_apply_ref_mag_scaling_tiled = False
-                
-                if should_apply_ref_mag_scaling_tiled and self.args.magnification is not None:
-                    print(f"[Tiled Path] Applying final reference magnification scaling logic. Ref Mag: {self.reference_magnification}, Slide Mag: {self.args.magnification}")
-                    resize_factor = self.reference_magnification / self.args.magnification
-                    if abs(resize_factor) > 1e-6: # Avoid division by zero or tiny number
-                        if self.final_points is not None and len(self.final_points) > 0:
-                            # print(f"[Tiled Path] Before final scaling, self.final_points[0]: {self.final_points[0]}")
-                            pass # Original coordinates will be kept
-                        # self.final_points = (self.final_points / resize_factor).astype(np.int32)
-                        # self.final_coord = (self.final_coord / resize_factor).astype(np.int32)
-                        if self.final_points is not None and len(self.final_points) > 0:
-                            # print(f"[Tiled Path] After final scaling, self.final_points[0]: {self.final_points[0]}")
-                            print(f"[Tiled Path] Final coordinate scaling by resize_factor {resize_factor:.4f} was SKIPPED to preserve level 0 coordinates.")
-                    else:
-                        print("[Tiled Path] Warning: resize_factor is too small, skipping final scaling.")
-                elif not should_apply_ref_mag_scaling_tiled:
-                    pass # Reason already logged (target_mpp was specified)
-                elif self.args.magnification is None:
-                    print("[Tiled Path] Skipping final reference magnification scaling because self.args.magnification is None.")
-                
-                print(f"Completed saving {len(self.final_points) if self.final_points is not None else 0} detected nuclei")
             except Exception as e:
-                print(f"Failed to generate final_points: {str(e)}")
                 import traceback
                 print(traceback.format_exc())
-                # Add more diagnostic information
-                if points_all is not None:
-                    print(f"points_all column names: {points_all.columns.tolist()}")
-                else:
-                    print("points_all is None")
                 self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
                 self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
                 self.prob_all = np.array([])
@@ -1343,179 +1229,6 @@ class SlideSegmentation():
         overall_end_time = time.time()
         overall_duration = overall_end_time - overall_start_time
         
-        print(f"\nTotal processing time: {overall_duration:.2f}s ({overall_duration/60:.2f}min)")
-        print(f"Start time: {datetime.fromtimestamp(overall_start_time).strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"End time: {datetime.fromtimestamp(overall_end_time).strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Total nuclei count: {total_nuclei}")
-
         print("---- Segmentation successfully completed ----")
         
-        # Add final validation
-        print(f"Final self.final_points: shape={self.final_points.shape if self.final_points is not None else 'None'}")
-        if self.final_points is not None and len(self.final_points) > 0:
-            print(f"First 5 centroids: \n{self.final_points[:5]}")
-            
-            # Last validation
-            assert len(self.final_points) > 0, "Nuclei detection result is empty, please check"
 
-    def rgb2gray(self, rgb):
-        """Convert RGB image to grayscale"""
-        r, g, b = rgb[:,:,0], rgb[:,:,1], rgb[:,:,2]
-        gray = 0.2989 * r + 0.5870 * g + 0.1140 * b
-        return gray.astype(np.uint8)
-
-    # def _get_haralick_features(self, nuclei_img_object, resolution, quantization=10):
-    #     """Compute Haralick texture features for a nucleus"""
-    #     # Convert to grayscale if needed
-    #     if len(nuclei_img_object.shape) == 3:
-    #         nuclei_img_2 = self.rgb2gray(nuclei_img_object)
-    #     else:
-    #         nuclei_img_2 = nuclei_img_object.copy()
-            
-    #     # Quantize to reduce computation time
-    #     level = np.int16(255/quantization)+1
-    #     nuclei_img_2 = (nuclei_img_2/quantization).astype(np.uint8)
-        
-    #     # Compute GLCM
-    #     glcm = graycomatrix(nuclei_img_2, 
-    #                        distances=[resolution],
-    #                        angles=[0, np.pi/4, np.pi/2, 3*np.pi/4],
-    #                        levels=level,
-    #                        symmetric=False, 
-    #                        normed=True)
-        
-    #     # Remove background
-    #     glcm = glcm[0:level-1,0:level-1,:,:]
-        
-    #     # Compute Haralick properties
-    #     stat_haralick = {}
-    #     for v in ['contrast', 'homogeneity', 'dissimilarity', 'ASM', 'energy', 'correlation']:
-    #         stat_haralick[v] = np.mean(graycoprops(glcm, v))
-    #     stat_haralick['heterogeneity'] = 1-stat_haralick['homogeneity']
-        
-    #     return stat_haralick
-
-    # def _get_morphological_features(self, mask):
-    #     """Compute morphological features for a nucleus"""
-    #     stat = skimage.measure.regionprops(mask)[0]
-        
-    #     # Initialize dictionary for morphological features
-    #     morph_features = {}
-    #     morph_features['major_axis_length'] = stat.axis_major_length
-    #     morph_features['minor_axis_length'] = stat.axis_minor_length
-    #     morph_features['major_minor_ratio'] = stat.axis_major_length/stat.axis_minor_length
-    #     morph_features['orientation'] = stat.orientation
-    #     morph_features['orientation_degree'] = stat.orientation * (180/np.pi) + 90
-    #     morph_features['area'] = stat.area
-    #     morph_features['extent'] = stat.extent
-    #     morph_features['solidity'] = stat.solidity
-    #     morph_features['convex_area'] = stat.convex_area
-    #     morph_features['eccentricity'] = stat.eccentricity
-    #     morph_features['equivalent_diameter'] = stat.equivalent_diameter
-    #     morph_features['perimeter'] = stat.perimeter
-    #     morph_features['perimeter_crofton'] = stat.perimeter_crofton
-        
-    #     return list(morph_features.keys()), list(morph_features.values())
-
-    # @staticmethod
-    # def _process_nucleus_features_static(nucleus_data):
-    #     """Static method to process features for a single nucleus"""
-    #     img_np, img_gray, contour, x_0, y_0 = nucleus_data
-        
-    #     # Create nucleus mask more efficiently using cv2
-    #     nuc_mask = np.zeros(img_gray.shape, dtype=np.uint8)
-    #     contour = contour - np.array([x_0, y_0]).reshape(2, -1)
-    #     # Convert to format expected by cv2.fillPoly
-    #     contour = np.expand_dims(contour.T, axis=0).astype(np.int32)
-    #     cv2.fillPoly(nuc_mask, contour, 1)
-        
-    #     # Pre-compute mask indices once
-    #     mask_indices = nuc_mask > 0
-        
-    #     # Get morphological features - use pre-computed regionprops
-    #     stat = skimage.measure.regionprops(nuc_mask)[0]
-    #     major_minor_ratio = 99 if stat.axis_minor_length == 0 else stat.axis_major_length/stat.axis_minor_length
-    #     curr_morph = [
-    #         stat.axis_major_length,
-    #         stat.axis_minor_length,
-    #         major_minor_ratio,
-    #         stat.orientation,
-    #         stat.orientation * (180/np.pi) + 90,
-    #         stat.area,
-    #         stat.extent,
-    #         stat.solidity,
-    #         stat.convex_area,
-    #         stat.eccentricity,
-    #         stat.equivalent_diameter,
-    #         stat.perimeter,
-    #         stat.perimeter_crofton
-    #     ]
-        
-    #     # Get color features more efficiently
-    #     nucleus_img = img_np * np.expand_dims(nuc_mask, axis=2)  # Faster than copy + masking
-        
-    #     # Convert to grayscale using dot product instead of individual multiplications
-    #     nucleus_img_grey = np.dot(nucleus_img[mask_indices], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
-        
-    #     # Compute statistics using masked arrays for better performance
-    #     curr_color = [
-    #         np.mean(nucleus_img_grey),
-    #         np.std(nucleus_img_grey),
-    #         np.min(nucleus_img_grey),
-    #         np.max(nucleus_img_grey)
-    #     ]
-        
-    #     # RGB features using masked arrays
-    #     for i in range(3):
-    #         channel_values = nucleus_img[mask_indices, i]
-    #         curr_color.extend([
-    #             np.mean(channel_values),
-    #             np.std(channel_values),
-    #             np.min(channel_values),
-    #             np.max(channel_values)
-    #         ])
-        
-    #     # Optimize Haralick features computation
-    #     nuclei_img_2 = (np.dot(nucleus_img, [0.2989, 0.5870, 0.1140])/10).astype(np.uint8)
-        
-    #     # Use smaller GLCM matrix and fewer angles if precision is not critical
-    #     glcm = graycomatrix(nuclei_img_2,
-    #                        distances=[1],
-    #                        angles=[0, np.pi/2],  # Reduced angles
-    #                        levels=26,  # Reduced levels
-    #                        symmetric=True,  # Use symmetric to reduce computation
-    #                        normed=True)
-        
-    #     glcm = glcm[0:25,0:25,:,:]
-        
-    #     # Compute Haralick properties
-    #     curr_haralick = []
-    #     for v in ['contrast', 'homogeneity', 'dissimilarity', 'ASM', 'energy', 'correlation']:
-    #         curr_haralick.append(np.mean(graycoprops(glcm, v)))
-    #     curr_haralick.append(1-curr_haralick[1])
-        
-    #     return np.concatenate([curr_haralick, curr_morph, curr_color])
-
-    # def compute_all_features(self, img_np, points, coord, x_0, y_0):
-    #     """Compute all features (Haralick, morphological, and color) for nuclei in parallel"""
-    #     img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)  # Faster than manual conversion
-        
-    #     # Prepare data for parallel processing
-    #     nucleus_data_list = [(img_np, img_gray, contour, x_0, y_0) for contour in coord]
-        
-    #     # Use process pool with optimal number of workers
-    #     n_workers = min(len(points), os.cpu_count())
-        
-    #     if len(points) < 10:
-    #         all_features = [self._process_nucleus_features_static(data) for data in nucleus_data_list]
-    #     else:
-    #         # Use context manager with explicit number of workers
-    #         with Pool(processes=n_workers) as pool:
-    #             # Use larger chunksize for better performance
-    #             chunksize = max(1, len(points) // (n_workers * 4))
-    #             all_features = list(pool.imap(self._process_nucleus_features_static, 
-    #                                         nucleus_data_list,
-    #                                         chunksize=chunksize))
-        
-    #     return np.array(all_features)
-        
