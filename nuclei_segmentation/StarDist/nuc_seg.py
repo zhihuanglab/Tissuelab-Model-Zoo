@@ -163,6 +163,21 @@ class SlideSegmentation():
         self.preload_cache = {}
         self.preload_queue = Queue()
         self.max_cache_size = 4  # Adjust based on memory constraints
+
+        # Store and parse bbox if provided
+        self.bbox_coords = None
+        if hasattr(args, 'bbox') and args.bbox:
+            try:
+                # Parse as float first, then convert to int, as coordinates can be floats from OSD
+                parts_float = [float(p.strip()) for p in args.bbox.split(',')]
+                parts_int = [int(round(pf)) for pf in parts_float] # Round before converting to int
+                if len(parts_int) == 4:
+                    self.bbox_coords = parts_int # [x, y, width, height]
+                    print(f"Using bounding box (parsed as int): x={self.bbox_coords[0]}, y={self.bbox_coords[1]}, width={self.bbox_coords[2]}, height={self.bbox_coords[3]}")
+                else:
+                    print(f"Warning: Bounding box string '{args.bbox}' not in 'x,y,width,height' format after parsing. Ignoring.")
+            except ValueError:
+                print(f"Warning: Could not parse bounding box string '{args.bbox}' as numbers. Ignoring.")
         
     def read_data(self):
         print("Reading data ...", datetime.now().strftime("%H:%M:%S"))
@@ -203,11 +218,20 @@ class SlideSegmentation():
                 self.slide = TiffSlideWrapper(self.args.slidepath)
                 mpp = 0.25  # Default value
         
+        self.actual_slide_mpp = mpp # Store the determined MPP
+        
         # Add magnification attribute to self.args if not already set by CZI processing
         if not hasattr(self.args, 'magnification') or self.args.magnification is None:
-            reference_mpp_1x = 10  # Target magnification
-            self.args.magnification = reference_mpp_1x / mpp
-            print("Magnification: ", self.args.magnification)
+            # Use self.actual_slide_mpp for consistent magnification calculation
+            if self.actual_slide_mpp and self.actual_slide_mpp > 0:
+                reference_mpp_10x = 1.0  # MPP for 10x magnification
+                calculated_magnification = (reference_mpp_10x / self.actual_slide_mpp) * 10
+            else:
+                calculated_magnification = 20.0 # Default if MPP is not available
+            self.args.magnification = calculated_magnification
+            print(f"Calculated/Defaulted Magnification: {self.args.magnification:.1f}x (Actual Slide MPP: {self.actual_slide_mpp})")
+        elif self.actual_slide_mpp: # If magnification was already set (e.g. CZI) but we want to log actual_slide_mpp
+             print(f"Using pre-set Magnification: {self.args.magnification:.1f}x (Actual Slide MPP: {self.actual_slide_mpp})")
         
         # Set tile size based on magnification
         if self.args.magnification > 80+1:
@@ -447,95 +471,222 @@ class SlideSegmentation():
                 pbar.update(curr_idx-last_idx)
                 last_idx = curr_idx
                 
+                # Adjust n_tiles strategy based on whether a BBox is used and patch size
+                current_n_tiles_for_prediction = self.n_tiles # Default
+
+                # --- Start Detailed Debug Logging for n_tiles condition ---
+                cond_bbox_coords_present = bool(self.bbox_coords)
+                cond_w_col_lt_tile_size = (w_col < self.tile_size)
+                cond_h_row_lt_tile_size = (h_row < self.tile_size)
+                cond_size_check = (cond_w_col_lt_tile_size or cond_h_row_lt_tile_size)
+                final_condition_for_none = cond_bbox_coords_present and cond_size_check
+                
+                print(f"DEBUG N_TILES: self.bbox_coords raw: {self.bbox_coords}")
+                print(f"DEBUG N_TILES: self.bbox_coords is present (boolean): {cond_bbox_coords_present}")
+                print(f"DEBUG N_TILES: w_col ({w_col}) < self.tile_size ({self.tile_size}): {cond_w_col_lt_tile_size}")
+                print(f"DEBUG N_TILES: h_row ({h_row}) < self.tile_size ({self.tile_size}): {cond_h_row_lt_tile_size}")
+                print(f"DEBUG N_TILES: Combined size check (w_col < tile OR h_row < tile): {cond_size_check}")
+                print(f"DEBUG N_TILES: Final condition for using n_tiles=None (bbox_present AND size_check): {final_condition_for_none}")
+                # --- End Detailed Debug Logging ---
+
+                if final_condition_for_none: # Use the explicitly calculated final_condition
+                    current_n_tiles_for_prediction = None 
+                    print(f"Tile r{ir} c{ic} is small due to BBox ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (IF BRANCH TAKEN)")
+                else:
+                    print(f"Tile r{ir} c{ic} ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (ELSE BRANCH TAKEN)")
+
                 labels, dicts = self.model.predict_instances(img_norm,
                                                         prob_thresh=self.prob_thresh,
                                                         nms_thresh=self.nms_thresh,
-                                                        n_tiles=self.n_tiles,
+                                                        n_tiles=current_n_tiles_for_prediction, # Use adjusted n_tiles
                                                         show_tile_progress=False,
                                                         return_predict=False
                                                         )
-                
-                points = dicts['points'] # y,x
-                points[:, [1, 0]] = points[:, [0, 1]] # x,y
+                print(f"StarDist dicts['coord'] shape: {dicts['coord'].shape if 'coord' in dicts and dicts['coord'] is not None else 'Not found or None'}, Number of points: {dicts['points'].shape if 'points' in dicts and dicts['points'] is not None else 'Not found or None'}")
 
-                points[:,0] += x_0
-                points[:,1] += y_0
-                points = pd.DataFrame(points, index=[(ir, ic)]*len(points), columns=['x','y']).reset_index()
-                coord = dicts['coord']
-                coord[:, [1, 0], :] = coord[:, [0, 1], :] # x,y
+                points_local_scaled_yx = dicts['points'] 
+                raw_coords_from_stardist = dicts['coord']
+                
+                n_rays_from_model = 32 
+                if hasattr(self.model, 'config') and hasattr(self.model.config, 'n_rays'):
+                    n_rays_from_model = self.model.config.n_rays
+
+                _processed_coord_yx = None # This should become (N, K, 2) yx-ordered
+                path_context = "[analyze_img_patch]" # Context for logging
+                if raw_coords_from_stardist is not None and raw_coords_from_stardist.ndim == 3:
+                    N_objects = raw_coords_from_stardist.shape[0]
+                    dim1 = raw_coords_from_stardist.shape[1]
+                    dim2 = raw_coords_from_stardist.shape[2]
+
+                    if dim1 == 2 and dim2 == n_rays_from_model: # Input is (N, 2, K) yx
+                        print(f"{path_context} StarDist coord is (N, 2, K) yx. Transposing to (N, K, 2) yx for _processed_coord_yx. Shape: {raw_coords_from_stardist.shape}")
+                        # y_coords are raw_coords_from_stardist[:, 0, :]
+                        # x_coords are raw_coords_from_stardist[:, 1, :]
+                        # Stack them to be (N, K, 2) where last dim is [y,x]
+                        _processed_coord_yx = np.stack((raw_coords_from_stardist[:, 0, :], raw_coords_from_stardist[:, 1, :]), axis=-1)
+                        # Example: if raw is (N,2,32), y is (N,32), x is (N,32). stack makes it (N,32,2)
+                        print(f"{path_context} _processed_coord_yx shape after processing (N,2,K) input: {_processed_coord_yx.shape}")
+                    elif dim1 == n_rays_from_model and dim2 == 2: # Input is (N, K, 2) yx
+                        print(f"{path_context} StarDist coord is (N, K, 2) yx. Using directly for _processed_coord_yx. Shape: {raw_coords_from_stardist.shape}")
+                        _processed_coord_yx = raw_coords_from_stardist
+                    else:
+                        print(f"{path_context} Warning: Unexpected StarDist coord shape: {raw_coords_from_stardist.shape}. Model n_rays: {n_rays_from_model}. Attempting to use as is for _processed_coord_yx.")
+                        _processed_coord_yx = raw_coords_from_stardist # Pass through
+                
+                num_detected_points = 0
+                if points_local_scaled_yx is not None and hasattr(points_local_scaled_yx, 'shape') and points_local_scaled_yx.ndim > 0:
+                    num_detected_points = points_local_scaled_yx.shape[0]
+
+                if _processed_coord_yx is None or \
+                   not isinstance(_processed_coord_yx, np.ndarray) or \
+                   _processed_coord_yx.ndim != 3 or \
+                   _processed_coord_yx.shape[0] != num_detected_points or \
+                   (_processed_coord_yx.shape[0] > 0 and (_processed_coord_yx.shape[1] != n_rays_from_model or _processed_coord_yx.shape[2] != 2)):
+                    
+                    original_shape_info = raw_coords_from_stardist.shape if raw_coords_from_stardist is not None and hasattr(raw_coords_from_stardist, 'shape') else 'None or no shape'
+                    processed_shape_info = _processed_coord_yx.shape if _processed_coord_yx is not None and hasattr(_processed_coord_yx, 'shape') else 'None or no shape'
+                    print(f"{path_context} Warning: Contour data (_processed_coord_yx) is invalid, missing, or mismatched after processing. Original StarDist: {original_shape_info}, Processed: {processed_shape_info}, Points: {num_detected_points}, Expected K: {n_rays_from_model}. Using empty contours for coord_local_scaled_yx.")
+                    coord_local_scaled_yx = np.empty((num_detected_points, n_rays_from_model, 2), dtype=np.int32) # Ensure (N,K,2) yx structure
+                else:
+                    coord_local_scaled_yx = _processed_coord_yx.astype(np.int32) # Should be (N,K,2) yx
+
+
+                points_xy_local_scaled = points_local_scaled_yx.copy()
+                points_xy_local_scaled[:, [0, 1]] = points_xy_local_scaled[:, [1, 0]] # x,y local (potentially scaled content)
+
+                coord_xy_local_scaled = coord_local_scaled_yx.copy()
+                coord_xy_local_scaled[:, :, [0, 1]] = coord_xy_local_scaled[:, :, [1, 0]] # x,y local for contours
+
+                # Scale local coordinates back to original patch dimensions (before global offset)
+                points_xy_local_original_scale_content = points_xy_local_scaled.copy()
+                points_xy_local_original_scale_content[:, 0] = points_xy_local_scaled[:, 0] * coord_scale_x
+                points_xy_local_original_scale_content[:, 1] = points_xy_local_scaled[:, 1] * coord_scale_y
+
+                coord_xy_local_original_scale_content = coord_xy_local_scaled.copy()
+                coord_xy_local_original_scale_content[:, :, 0] = coord_xy_local_scaled[:, :, 0] * coord_scale_x
+                coord_xy_local_original_scale_content[:, :, 1] = coord_xy_local_scaled[:, :, 1] * coord_scale_y
+
+                # Add global offsets (x_0, y_0 are top-left of the TILE in original slide coordinates)
+                points_global_x = points_xy_local_original_scale_content[:, 0] + x_0
+                points_global_y = points_xy_local_original_scale_content[:, 1] + y_0
+                points_df = pd.DataFrame({'x': points_global_x, 'y': points_global_y}, index=[(ir, ic)]*len(points_global_x)).reset_index()
+
+                coord_global_x = coord_xy_local_original_scale_content[:, :, 0] + x_0
+                coord_global_y = coord_xy_local_original_scale_content[:, :, 1] + y_0
+                coord = np.stack((coord_global_x, coord_global_y), axis=-1)
                 coord = np.round(coord).astype(np.int32)
-                coord[:,0,:] += x_0
-                coord[:,1,:] += y_0
+
                 prob = dicts['prob']
                 
+                # Calculate tile processing time
+                patch_end_time = time.time()
+                patch_duration = patch_end_time - patch_start_time
+                compute_duration = patch_duration - read_duration
                 
+                # Print nuclei detection results for each tile
+                print("\n========================================")
+                print(f"Tile r{ir} c{ic} (x={x_0}, y={y_0}) detected {len(points_df)} nuclei")
+                total_nuclei = len(points_df)
+                print(f"Current total nuclei: {total_nuclei}")
+                print("========================================\n")
                 
-                # align overlapped index with its previous left and top tile.
-                if ic>0:
-                    # discard the left part overlap from new tile
-                    x_prev_0 = (ic-1)*(self.tile_size-self.overlap)
-                    x_prev_1 = np.min((x_prev_0 + self.tile_size, self.dim[0]))
-                    idx_keep = points['x'].values >= (x_0 + x_prev_1)/2
-                    points = points.loc[idx_keep]
-                    coord = coord[idx_keep, ...]
-                    prob = prob[idx_keep]
-                    
-                    if self.points_all is not None:
-                        # remove right half overlap from previous tile
-                        points_prev_l = self.points_all.loc[self.points_all['index'] == (ir, ic-1),]
-                        idx_rm_l = list(points_prev_l.index.values[points_prev_l['x'].values >= (x_0 + x_prev_1)/2])
-                        
-                        curr_keep = ~np.isin(points_prev_l.index.values, idx_rm_l)
-                        idx_all_keep = (self.points_all['index'] != (ir, ic-1)).values
-                        idx_all_keep[idx_all_keep == False] = curr_keep
-                        
-                        self.points_all = self.points_all.loc[idx_all_keep,]
-                        self.coord_all = self.coord_all[idx_all_keep, ...]
-                        self.prob_all = self.prob_all[idx_all_keep]
-        
-                if ir>0:
-                    # discard the left part overlap from new tile
-                    y_prev_0 = (ir-1)*(self.tile_size-self.overlap)
-                    y_prev_1 = np.min((y_prev_0 + self.tile_size, self.dim[1]))
-                    idx_keep = points['y'].values >= (y_0 + y_prev_1)/2
-                    points = points.loc[idx_keep]
-                    coord = coord[idx_keep, ...]
-                    prob = prob[idx_keep]
-                    
-                    if self.points_all is not None:
-                        # remove right half overlap from previous tile
-                        points_prev_t = self.points_all.loc[self.points_all['index'] == (ir-1, ic),]
-                        idx_rm_t = list(points_prev_t.index.values[points_prev_t['y'].values >= (y_0 + y_prev_1)/2])
-                        
-                        
-                        curr_keep = ~np.isin(points_prev_t.index.values, idx_rm_t)
-                        idx_all_keep = (self.points_all['index'] != (ir-1, ic)).values
-                        idx_all_keep[idx_all_keep == False] = curr_keep
-                        
-                        self.points_all = self.points_all.loc[idx_all_keep,]
-                        self.coord_all = self.coord_all[idx_all_keep, ...]
-                        self.prob_all = self.prob_all[idx_all_keep]
-        
-        
-        
+                # Print processing time information
+                print(f"Tile r{ir} c{ic} processing time: {patch_duration:.4f}s (read: {read_duration:.4f}s, compute: {compute_duration:.4f}s)")
+                print(f"Start: {datetime.fromtimestamp(patch_start_time).strftime('%H:%M:%S')} - End: {datetime.fromtimestamp(patch_end_time).strftime('%H:%M:%S')}")
+                
+                # Note here: correctly accumulate results from all tiles instead of overwriting
                 if self.points_all is None:
-                    self.points_all = points
+                    self.points_all = points_df
                     self.coord_all = coord
                     self.prob_all = prob
                 else:
-                    self.points_all = pd.concat((self.points_all, points), axis=0)
+                    self.points_all = pd.concat((self.points_all, points_df), axis=0, ignore_index=True)
                     self.coord_all = np.concatenate((self.coord_all, coord), axis=0)
                     self.prob_all = np.concatenate((self.prob_all, prob), axis=0)
                     
-                # print(curr_idx, 'curr:', len(points), '\t total:', len(self.points_all))
-
-                # Record patch processing end time and duration
-                patch_end_time = time.time()
-                patch_duration = patch_end_time - patch_start_time
+        # Print clear information before generating final_points
+        if self.points_all is None or len(self.points_all) == 0:
+            print("Warning: points_all is empty or has length 0!")
+            self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
+            self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
+            self.prob_all = np.array([])
+        else:
+            print(f"Segmentation complete, total accumulated nuclei: {len(self.points_all)}")
+            
+            # Print first few rows of points_all to verify data
+            print(f"points_all first 5 rows sample: \n{self.points_all.head().to_string()}")
+            
+            # Add debug info when generating final_points
+            try:
+                self.final_points = self.points_all[['x','y']].values.astype(np.int32)
+                print(f"Successfully generated final_points, shape={self.final_points.shape}")
                 
-                # Print time information (including reading time)
-                print(f"Block r{ir} c{ic} (x={x_0}, y={y_0}) processing time: {patch_duration:.4f}s (reading: {read_duration:.4f}s, computation: {patch_duration-read_duration:.4f}s)")
-                print(f"Start: {datetime.fromtimestamp(patch_start_time).strftime('%H:%M:%S')} - End: {datetime.fromtimestamp(patch_end_time).strftime('%H:%M:%S')}")
+                self.final_coord = self.coord_all.astype(np.int32)
+                self.final_coord = np.swapaxes(self.final_coord, 1, 2) # self.final_coord is now (N, 2, K) XY
+                
+                # Convert self.final_coord from (N, 2, K) XY numpy array to a list of (K, 2) XY numpy arrays
+                if self.final_coord is not None and self.final_coord.ndim == 3 and self.final_coord.shape[1] == 2:
+                    num_nuclei = self.final_coord.shape[0]
+                    # k_points = self.final_coord.shape[2] # Not directly used in loop but good for context
+                    processed_coords_list = []
+                    for i in range(num_nuclei):
+                        # self.final_coord[i, 0, :] are X coords (K_points,)
+                        # self.final_coord[i, 1, :] are Y coords (K_points,)
+                        # We stack them to be (K_points, 2) XY
+                        xy_contour = np.stack((self.final_coord[i, 0, :], self.final_coord[i, 1, :]), axis=-1)
+                        processed_coords_list.append(xy_contour)
+                    self.final_coord = processed_coords_list
+                    print(f"[analyze_img_patch] Converted self.final_coord to list of (K,2) XY arrays. Num contours: {len(self.final_coord)}. Example shape of first element: {self.final_coord[0].shape if len(self.final_coord) > 0 else 'N/A'}")
+                elif self.final_coord is not None: # Log if it's not the expected (N,2,K) shape
+                     print(f"[analyze_img_patch] Warning: self.final_coord was not in the expected (N,2,K) XY shape for conversion. Shape: {self.final_coord.shape}. Skipping list conversion.")
+
+
+                self.prob_all = self.prob_all
+                
+                # Conditional final scaling for tiled path
+                should_apply_ref_mag_scaling_tiled = True
+                if hasattr(self.args, 'target_mpp') and self.args.target_mpp is not None:
+                    print("[Tiled Path] Skipping final reference magnification scaling because target_mpp was specified.")
+                    should_apply_ref_mag_scaling_tiled = False
+                
+                if should_apply_ref_mag_scaling_tiled and self.args.magnification is not None:
+                    print(f"[Tiled Path] Applying final reference magnification scaling logic. Ref Mag: {self.reference_magnification}, Slide Mag: {self.args.magnification}")
+                    resize_factor = self.reference_magnification / self.args.magnification
+                    if abs(resize_factor) > 1e-6: # Avoid division by zero or tiny number
+                        if self.final_points is not None and len(self.final_points) > 0:
+                            # print(f"[Tiled Path] Before final scaling, self.final_points[0]: {self.final_points[0]}")
+                            pass # Original coordinates will be kept
+                        # self.final_points = (self.final_points / resize_factor).astype(np.int32)
+                        # self.final_coord = (self.final_coord / resize_factor).astype(np.int32)
+                        if self.final_points is not None and len(self.final_points) > 0:
+                            # print(f"[Tiled Path] After final scaling, self.final_points[0]: {self.final_points[0]}")
+                            print(f"[Tiled Path] Final coordinate scaling by resize_factor {resize_factor:.4f} was SKIPPED to preserve level 0 coordinates.")
+                    else:
+                        print("[Tiled Path] Warning: resize_factor is too small, skipping final scaling.")
+                elif not should_apply_ref_mag_scaling_tiled:
+                    pass # Reason already logged (target_mpp was specified)
+                elif self.args.magnification is None:
+                    print("[Tiled Path] Skipping final reference magnification scaling because self.args.magnification is None.")
+                
+                print(f"Completed saving {len(self.final_points) if self.final_points is not None else 0} detected nuclei")
+            except Exception as e:
+                print(f"Failed to generate final_points: {str(e)}")
+                import traceback
+                print(traceback.format_exc())
+                # Add more diagnostic information
+                if self.points_all is not None:
+                    print(f"points_all column names: {self.points_all.columns.tolist()}")
+                else:
+                    print("points_all is None")
+                self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
+                self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
+                self.prob_all = np.array([])
+        
+        # Ensure progress is set to 100%
+        if self.progress_callback:
+            self.progress_callback(100)
+
+        pbar.close()
 
         # Record overall end time and duration
         overall_end_time = time.time()
@@ -544,13 +695,17 @@ class SlideSegmentation():
         print(f"\nTotal processing time: {overall_duration:.2f}s ({overall_duration/60:.2f}min)")
         print(f"Start time: {datetime.fromtimestamp(overall_start_time).strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"End time: {datetime.fromtimestamp(overall_end_time).strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Total nuclei count: {total_nuclei}")
 
-        pbar.close()
+        print("---- Segmentation successfully completed ----")
 
-        print("---- Segmentation completed successfully ----")
+        # Add final validation
+        print(f"Final self.final_points: shape={self.final_points.shape if self.final_points is not None else 'None'}")
+        if self.final_points is not None and len(self.final_points) > 0:
+            print(f"First 5 centroids: \n{self.final_points[:5]}")
         
-        print(f"parallel segmentation results: {self.points_all.shape if self.points_all is not None else 'None'}")
-        
+            # Last validation
+            assert len(self.final_points) > 0, "Nuclei detection result is empty, please check"
 
     def run_WSI_segmentation_parallel(self):
         '''
@@ -599,6 +754,18 @@ class SlideSegmentation():
         
         self.normalize_template = self.get_normalized_template()
         
+        # Determine iteration range based on self.dim or bbox_coords
+        iter_x_min, iter_y_min = 0, 0
+        iter_x_max, iter_y_max = self.dim[0], self.dim[1] # Full slide dimensions
+
+        if self.bbox_coords:
+            bx, by, bw, bh = self.bbox_coords
+            iter_x_min = max(0, bx)
+            iter_y_min = max(0, by)
+            iter_x_max = min(self.dim[0], bx + bw)
+            iter_y_max = min(self.dim[1], by + bh)
+            print(f"Constraining WSI iteration to bbox: x_range=({iter_x_min}-{iter_x_max}), y_range=({iter_y_min}-{iter_y_max})")
+        
         # Check file extension, for PNG/JPG/JPEG formats directly process the entire image
         file_extension = os.path.splitext(self.args.slidepath)[1].lower()
         simple_image_formats = ['.png', '.jpg', '.jpeg', '.bmp']
@@ -641,23 +808,126 @@ class SlideSegmentation():
                     self.progress_callback(80)
                     
                 # Process results
-                points = dicts['points']  # y,x
-                points[:, [1, 0]] = points[:, [0, 1]]  # x,y
+                points_local_scaled_yx = dicts['points'] 
+                raw_coords_from_stardist = dicts['coord'] # This is what StarDist gives
+                print(f"StarDist dicts['coord'] shape: {dicts['coord'].shape if 'coord' in dicts and dicts['coord'] is not None else 'Not found or None'}, Number of points: {dicts['points'].shape if 'points' in dicts and dicts['points'] is not None else 'Not found or None'}")
+
+                n_rays_from_model = 32
+                if hasattr(self.model, 'config') and hasattr(self.model.config, 'n_rays'):
+                    n_rays_from_model = self.model.config.n_rays
+
+                _processed_coord_yx = None # This should become (N, K, 2) yx-ordered
+                path_context = "[Simple Image Path]" # Context for logging
+                if raw_coords_from_stardist is not None and raw_coords_from_stardist.ndim == 3:
+                    N_objects = raw_coords_from_stardist.shape[0]
+                    dim1 = raw_coords_from_stardist.shape[1]
+                    dim2 = raw_coords_from_stardist.shape[2]
+
+                    if dim1 == 2 and dim2 == n_rays_from_model: # Input is (N, 2, K) yx
+                        print(f"{path_context} StarDist coord is (N, 2, K) yx. Transposing to (N, K, 2) yx for _processed_coord_yx. Shape: {raw_coords_from_stardist.shape}")
+                        _processed_coord_yx = np.stack((raw_coords_from_stardist[:, 0, :], raw_coords_from_stardist[:, 1, :]), axis=-1)
+                        print(f"{path_context} _processed_coord_yx shape after processing (N,2,K) input: {_processed_coord_yx.shape}")
+                    elif dim1 == n_rays_from_model and dim2 == 2: # Input is (N, K, 2) yx
+                        print(f"{path_context} StarDist coord is (N, K, 2) yx. Using directly for _processed_coord_yx. Shape: {raw_coords_from_stardist.shape}")
+                        _processed_coord_yx = raw_coords_from_stardist
+                    else:
+                        print(f"{path_context} Warning: Unexpected StarDist coord shape: {raw_coords_from_stardist.shape}. Model n_rays: {n_rays_from_model}. Attempting to use as is for _processed_coord_yx.")
+                        _processed_coord_yx = raw_coords_from_stardist
                 
-                coord = dicts['coord']
-                coord[:, [1, 0], :] = coord[:, [0, 1], :]  # x,y
+                num_detected_points = 0
+                if points_local_scaled_yx is not None and hasattr(points_local_scaled_yx, 'shape') and points_local_scaled_yx.ndim > 0:
+                    num_detected_points = points_local_scaled_yx.shape[0]
+                
+                if _processed_coord_yx is None or \
+                   not isinstance(_processed_coord_yx, np.ndarray) or \
+                   _processed_coord_yx.ndim != 3 or \
+                   _processed_coord_yx.shape[0] != num_detected_points or \
+                   (_processed_coord_yx.shape[0] > 0 and (_processed_coord_yx.shape[1] != n_rays_from_model or _processed_coord_yx.shape[2] != 2)):
+                    original_shape_info = raw_coords_from_stardist.shape if raw_coords_from_stardist is not None and hasattr(raw_coords_from_stardist, 'shape') else 'None or no shape'
+                    processed_shape_info = _processed_coord_yx.shape if _processed_coord_yx is not None and hasattr(_processed_coord_yx, 'shape') else 'None or no shape'
+                    print(f"{path_context} Warning: Contour data (_processed_coord_yx) is invalid, missing, or mismatched after processing. Original StarDist: {original_shape_info}, Processed: {processed_shape_info}, Points: {num_detected_points}, Expected K: {n_rays_from_model}. Using empty contours for coord_local_scaled_yx.")
+                    coord_local_scaled_yx = np.empty((num_detected_points, n_rays_from_model, 2), dtype=np.int32) # Ensure (N,K,2) yx structure
+                else:
+                    coord_local_scaled_yx = _processed_coord_yx.astype(np.int32) # Should be (N,K,2) yx
+
+
+                points_xy_local_scaled = points_local_scaled_yx.copy()
+                points_xy_local_scaled[:, [0, 1]] = points_xy_local_scaled[:, [1, 0]] # x,y local (potentially scaled content)
+
+                coord_xy_local_scaled = coord_local_scaled_yx.copy()
+                coord_xy_local_scaled[:, :, [0, 1]] = coord_xy_local_scaled[:, :, [1, 0]] # x,y local for contours
+
+                # Scale local coordinates back to original patch dimensions (before global offset)
+                points_xy_local_original_scale_content = points_xy_local_scaled.copy()
+                points_xy_local_original_scale_content[:, 0] = points_xy_local_scaled[:, 0] * coord_scale_x
+                points_xy_local_original_scale_content[:, 1] = points_xy_local_scaled[:, 1] * coord_scale_y
+
+                coord_xy_local_original_scale_content = coord_xy_local_scaled.copy()
+                coord_xy_local_original_scale_content[:, :, 0] = coord_xy_local_scaled[:, :, 0] * coord_scale_x
+                coord_xy_local_original_scale_content[:, :, 1] = coord_xy_local_scaled[:, :, 1] * coord_scale_y
+
+                # Add global offsets (x_0, y_0 are top-left of the TILE in original slide coordinates)
+                points_global_x = points_xy_local_original_scale_content[:, 0] + iter_x_min
+                points_global_y = points_xy_local_original_scale_content[:, 1] + iter_y_min
+                points_df = pd.DataFrame({'x': points_global_x, 'y': points_global_y}, index=[(ir, ic)]*len(points_global_x)).reset_index()
+
+                coord_global_x = coord_xy_local_original_scale_content[:, :, 0] + iter_x_min
+                coord_global_y = coord_xy_local_original_scale_content[:, :, 1] + iter_y_min
+                coord = np.stack((coord_global_x, coord_global_y), axis=-1)
                 coord = np.round(coord).astype(np.int32)
                 
                 prob = dicts['prob']
                 
                 # Set final results - fix contours processing
-                self.final_points = points.astype(np.int32)
+                self.final_points = points_df[['x','y']].values.astype(np.int32)
                 self.final_coord = coord.astype(np.int32)
                 # Ensure final_coord has dimensions (n, m, 2)
-                self.final_coord = np.swapaxes(self.final_coord, 1, 2)
+                self.final_coord = np.swapaxes(self.final_coord, 1, 2) # self.final_coord is now (N, 2, K) XY
+
+                # Convert self.final_coord from (N, 2, K) XY numpy array to a list of (K, 2) XY numpy arrays
+                if self.final_coord is not None and self.final_coord.ndim == 3 and self.final_coord.shape[1] == 2:
+                    num_nuclei = self.final_coord.shape[0]
+                    # k_points = self.final_coord.shape[2] # Not directly used in loop but good for context
+                    processed_coords_list = []
+                    for i in range(num_nuclei):
+                        # self.final_coord[i, 0, :] are X coords (K_points,)
+                        # self.final_coord[i, 1, :] are Y coords (K_points,)
+                        # We stack them to be (K_points, 2) XY
+                        xy_contour = np.stack((self.final_coord[i, 0, :], self.final_coord[i, 1, :]), axis=-1)
+                        processed_coords_list.append(xy_contour)
+                    self.final_coord = processed_coords_list
+                    print(f"[run_WSI_segmentation - Simple Path] Converted self.final_coord to list of (K,2) XY arrays. Num contours: {len(self.final_coord)}. Example shape of first element: {self.final_coord[0].shape if len(self.final_coord) > 0 else 'N/A'}")
+                elif self.final_coord is not None: # Log if it's not the expected (N,2,K) shape
+                    print(f"[run_WSI_segmentation - Simple Path] Warning: self.final_coord was not in the expected (N,2,K) XY shape for conversion. Shape: {self.final_coord.shape}. Skipping list conversion.")
+
                 self.prob_all = prob
                 
-                total_nuclei = len(self.final_points)
+                # Conditional final scaling for simple image format path
+                should_apply_ref_mag_scaling_simple = True
+                if hasattr(self.args, 'target_mpp') and self.args.target_mpp is not None:
+                    print("[Simple Image Path] Skipping final reference magnification scaling because target_mpp was specified.")
+                    should_apply_ref_mag_scaling_simple = False
+                
+                if should_apply_ref_mag_scaling_simple and self.args.magnification is not None:
+                    print(f"[Simple Image Path] Applying final reference magnification scaling logic. Ref Mag: {self.reference_magnification}, Slide Mag: {self.args.magnification}")
+                    resize_factor = self.reference_magnification / self.args.magnification
+                    if abs(resize_factor) > 1e-6: # Avoid division by zero or tiny number
+                        if self.final_points is not None and len(self.final_points) > 0:
+                            # print(f"[Simple Image Path] Before final scaling, self.final_points[0]: {self.final_points[0]}")
+                            pass # Original coordinates will be kept
+                        # self.final_points = (self.final_points / resize_factor).astype(np.int32)
+                        # self.final_coord = (self.final_coord / resize_factor).astype(np.int32)
+                        if self.final_points is not None and len(self.final_points) > 0:
+                            # print(f"[Simple Image Path] After final scaling, self.final_points[0]: {self.final_points[0]}")
+                            print(f"[Simple Image Path] Final coordinate scaling by resize_factor {resize_factor:.4f} was SKIPPED to preserve level 0 coordinates.")
+                    else:
+                        print("[Simple Image Path] Warning: resize_factor is too small, skipping final scaling.")
+                elif not should_apply_ref_mag_scaling_simple:
+                    pass # Reason already logged (target_mpp was specified)
+                elif self.args.magnification is None:
+                    print("[Simple Image Path] Skipping final reference magnification scaling because self.args.magnification is None.")
+
+                total_nuclei = len(self.final_points) if self.final_points is not None else 0
                 print(f"Total detected {total_nuclei} nuclei")
                 
                 if self.progress_callback:
@@ -682,9 +952,22 @@ class SlideSegmentation():
                 print(traceback.format_exc())
                 print("Falling back to standard tiling process")
         
+        # Calculate effective dimensions for tiling based on ROI
+        effective_width = iter_x_max - iter_x_min
+        effective_height = iter_y_max - iter_y_min
+
+        if effective_width <= 0 or effective_height <= 0:
+            print("Bounding box results in zero or negative processing area. Skipping tiling.")
+            self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
+            self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
+            self.prob_all = np.array([])
+            if self.progress_callback:
+                self.progress_callback(100)
+            return
+        
         # Below is the original tiling processing code
-        n_col = int(np.ceil(self.dim[0]/(self.tile_size-self.overlap)))
-        n_row = int(np.ceil(self.dim[1]/(self.tile_size-self.overlap)))
+        n_col = int(np.ceil(effective_width / (self.tile_size - self.overlap)))
+        n_row = int(np.ceil(effective_height / (self.tile_size - self.overlap)))
         
         points_all = None
         coord_all = None
@@ -710,20 +993,54 @@ class SlideSegmentation():
                 if self.progress_callback:
                     self.progress_callback(progress)
                 
-                # Calculate current tile position
-                x_0 = ic*(self.tile_size-self.overlap)
-                y_0 = ir*(self.tile_size-self.overlap)
+                # Calculate current tile position relative to the ROI start
+                # x_tile_in_roi = ic * (self.tile_size - self.overlap)
+                # y_tile_in_roi = ir * (self.tile_size - self.overlap)
+
+                # Absolute coordinates on the slide
+                x_0 = ic * (self.tile_size - self.overlap) + iter_x_min
+                y_0 = ir * (self.tile_size - self.overlap) + iter_y_min
                 
                 print(f"Processing tile r{ir} c{ic} (x={x_0}, y={y_0}) - {processed_tiles}/{total_tiles}")
                 
                 # Record tile processing start time
                 patch_start_time = time.time()
                 
-                x_1 = np.min((x_0 + self.tile_size, self.dim[0]))
-                y_1 = np.min((y_0 + self.tile_size, self.dim[1]))
+                # x_1 = np.min((x_0 + self.tile_size, self.dim[0])) # Original, based on full dim
+                # y_1 = np.min((y_0 + self.tile_size, self.dim[1])) # Original, based on full dim
+                x_1 = np.min((x_0 + self.tile_size, iter_x_max)) # Cap at ROI boundary
+                y_1 = np.min((y_0 + self.tile_size, iter_y_max)) # Cap at ROI boundary
                 
                 w_col = x_1 - x_0
                 h_row = y_1 - y_0
+
+                if w_col <= 0 or h_row <= 0: # Skip if tile has no dimensions (e.g., at the very edge of a tight bbox)
+                    print(f"Tile r{ir} c{ic} has zero width/height after bbox constraint, skipping.")
+                    continue
+
+                # Adjust n_tiles strategy based on whether a BBox is used and patch size
+                current_n_tiles_for_prediction = self.n_tiles # Default
+
+                # --- Start Detailed Debug Logging for n_tiles condition ---
+                cond_bbox_coords_present = bool(self.bbox_coords)
+                cond_w_col_lt_tile_size = (w_col < self.tile_size)
+                cond_h_row_lt_tile_size = (h_row < self.tile_size)
+                cond_size_check = (cond_w_col_lt_tile_size or cond_h_row_lt_tile_size)
+                final_condition_for_none = cond_bbox_coords_present and cond_size_check
+                
+                print(f"DEBUG N_TILES: self.bbox_coords raw: {self.bbox_coords}")
+                print(f"DEBUG N_TILES: self.bbox_coords is present (boolean): {cond_bbox_coords_present}")
+                print(f"DEBUG N_TILES: w_col ({w_col}) < self.tile_size ({self.tile_size}): {cond_w_col_lt_tile_size}")
+                print(f"DEBUG N_TILES: h_row ({h_row}) < self.tile_size ({self.tile_size}): {cond_h_row_lt_tile_size}")
+                print(f"DEBUG N_TILES: Combined size check (w_col < tile OR h_row < tile): {cond_size_check}")
+                print(f"DEBUG N_TILES: Final condition for using n_tiles=None (bbox_present AND size_check): {final_condition_for_none}")
+                # --- End Detailed Debug Logging ---
+
+                if final_condition_for_none: # Use the explicitly calculated final_condition
+                    current_n_tiles_for_prediction = None 
+                    print(f"Tile r{ir} c{ic} is small due to BBox ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (IF BRANCH TAKEN)")
+                else:
+                    print(f"Tile r{ir} c{ic} ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (ELSE BRANCH TAKEN)")
 
                 if self.wsi_mask is not None:
                     # Check mask for efficiency
@@ -741,48 +1058,148 @@ class SlideSegmentation():
                 read_end_time = time.time()
                 read_duration = read_end_time - read_start_time
                 
-                if self.args.magnification is not None:
+                img_pil = img # Work with PIL image for potential resizing
+                original_patch_width = img_pil.width
+                original_patch_height = img_pil.height
+
+                scale_factor_content = None
+                coord_scale_x = 1.0 # Scale factor for x-coordinates (local patch -> original local patch)
+                coord_scale_y = 1.0 # Scale factor for y-coordinates
+                scaled_by_target_mpp = False
+
+                if hasattr(self.args, 'target_mpp') and self.args.target_mpp is not None and \
+                   hasattr(self, 'actual_slide_mpp') and self.actual_slide_mpp is not None and self.actual_slide_mpp > 0:
+                    scale_factor_content = self.actual_slide_mpp / self.args.target_mpp
+                    print(f"Using target_mpp: {self.args.target_mpp}. Actual slide mpp: {self.actual_slide_mpp}. Calculated content scale_factor: {scale_factor_content:.4f}")
+
+                    if abs(scale_factor_content - 1.0) > 1e-3: # Apply scaling if significantly different
+                        new_width = int(original_patch_width * scale_factor_content)
+                        new_height = int(original_patch_height * scale_factor_content)
+
+                        if new_width > 0 and new_height > 0:
+                            print(f"Rescaling patch from {original_patch_width}x{original_patch_height} to {new_width}x{new_height} for target_mpp")
+                            try:
+                                img_pil = img_pil.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                                coord_scale_x = original_patch_width / new_width
+                                coord_scale_y = original_patch_height / new_height
+                                scaled_by_target_mpp = True
+                            except Exception as e:
+                                print(f"Error during target_mpp patch resize: {e}. Using original patch dimensions for this tile.")
+                                # img_pil remains original, coord_scale factors remain 1.0
+                        else:
+                            print(f"Warning: Invalid new dimensions for target_mpp scaling: {new_width}x{new_height}. Using original patch dimensions.")
+                    else:
+                        print("Target MPP is close to actual MPP, no scaling needed.")
+                
+                # Conditional existing magnification-based scaling (only if target_mpp was NOT used for scaling)
+                if not scaled_by_target_mpp and self.args.magnification is not None:
+                    # This is the user's existing block, now conditional
                     st = time.time()
                     resize_factor = self.reference_magnification / self.args.magnification
-                    img = img.resize((int(np.round(w_col*resize_factor)), int(np.round(h_row*resize_factor))))
-                    et = time.time()
-                    
-                    x_0 = int(np.round(x_0*resize_factor)) 
-                    x_1 = int(np.round(x_1*resize_factor))
-                    y_0 = int(np.round(y_0*resize_factor))
-                    y_1 = int(np.round(y_1*resize_factor))
-                    
-                    w_col = x_1 - x_0
-                    h_row = y_1 - y_0
-                    
-                    tile_size = self.tile_size*resize_factor
-                    overlap = self.overlap*resize_factor
-                    dim = (self.dim[0]*resize_factor, self.dim[1]*resize_factor)
-                    normalize_template = np.array(Image.fromarray(self.normalize_template).resize(img.size))
+                    # Important: this resize_factor might be different from scale_factor_content
+                    # We need to decide if this scaling also needs coord_scale_x/y if it happens.
+                    # For now, assume this block does its own thing if target_mpp isn't used.
+                    # This will make coordinate handling complex if both can happen and have different coord_scales.
+                    # Simplification: If this block runs, it resizes `img_pil`. We should also update coord_scale_x/y here.
+                    if abs(resize_factor - 1.0) > 1e-3:
+                       current_width = img_pil.width
+                       current_height = img_pil.height
+                       new_mag_width = int(np.round(current_width * resize_factor))
+                       new_mag_height = int(np.round(current_height * resize_factor))
+                       if new_mag_width > 0 and new_mag_height > 0:
+                           print(f"Applying reference magnification scaling from {current_width}x{current_height} to {new_mag_width}x{new_mag_height}")
+                           img_pil = img_pil.resize((new_mag_width, new_mag_height), Image.Resampling.LANCZOS)
+                           coord_scale_x = coord_scale_x * (current_width / new_mag_width) # Chain scaling factors
+                           coord_scale_y = coord_scale_y * (current_height / new_mag_height)
+                           # The following coordinate/dimension updates from user code might be problematic if target_mpp also ran
+                           # x_0 = int(np.round(x_0*resize_factor)) 
+                           # x_1 = int(np.round(x_1*resize_factor))
+                           # y_0 = int(np.round(y_0*resize_factor))
+                           # y_1 = int(np.round(y_1*resize_factor))
+                           # w_col = x_1 - x_0
+                           # h_row = y_1 - y_0
+                           # tile_size = self.tile_size*resize_factor
+                           # overlap = self.overlap*resize_factor
+                           # dim = (self.dim[0]*resize_factor, self.dim[1]*resize_factor)
+                           # normalize_template = np.array(Image.fromarray(self.normalize_template).resize(img_pil.size))
+                       et = time.time()
+                       print(f"Reference magnification scaling took {et-st:.4f}s")
 
-                img_np = np.array(img)
-                if len(img_np.shape) == 3:
-                    #RGB
-                    img_np = img_np[:,:,:3]
+                # Convert PIL image (now potentially rescaled by target_mpp or reference_magnification) to numpy array
+                img_np = np.array(img_pil)
+                # Ensure img_np is 3-channel RGB before normalization
+                if img_np.ndim == 2: # Grayscale
+                    img_np = np.stack((img_np,)*3, axis=-1)
+                elif img_np.ndim == 3 and img_np.shape[2] == 1: # Single channel (e.g. grayscale with dim)
+                    img_np = np.concatenate([img_np]*3, axis=2)
+                elif img_np.ndim == 3 and img_np.shape[2] == 4: # RGBA
+                    img_np = img_np[:,:,:3] # Keep only RGB
+                elif img_np.ndim == 3 and img_np.shape[2] == 3: # Already 3-channel RGB
+                    pass # Correctly shaped
                 else:
-                    #greyscale
-                    img_np = img_np[:, :, np.newaxis]
-                
-                if self.wsi_mask is not None:
-                    help_with_norm = True
-                else:
-                    help_with_norm = False
+                    print(f"ERROR: img_np has unexpected shape {img_np.shape} for tile r{ir} c{ic}. Skipping normalization and this tile.")
+                    continue # Skip this tile if shape is problematic for normalization
 
-                if help_with_norm:
-                    normalize_template2 = normalize_template[:img_np.shape[0],:img_np.shape[1],:]
-                    joint_normalize = np.concatenate((img_np, normalize_template2), axis=1)
-                    img_norm = normalize(joint_normalize)
-                    img_norm = img_norm[:img_np.shape[0],:img_np.shape[1],:]
-                else:
+                # Determine if joint normalization should be attempted
+                use_joint_normalization = self.wsi_mask is not None and self.normalize_template is not None
+
+                if use_joint_normalization:
+                    current_img_h, current_img_w = img_np.shape[0], img_np.shape[1]
+                    normalize_template2 = None
+
+                    # Check if the loaded self.normalize_template matches current img_np dimensions
+                    if self.normalize_template.shape[0] == current_img_h and \
+                       self.normalize_template.shape[1] == current_img_w:
+                        normalize_template2 = self.normalize_template
+                    else:
+                        # Resize self.normalize_template to match img_np's current dimensions
+                        print(f"DEBUG: Resizing normalize_template from {self.normalize_template.shape[:2]} to {img_np.shape[:2]} for joint normalization on tile r{ir}c{ic}.")
+                        try:
+                            # self.normalize_template is already a 3-channel uint8 numpy array from __init__
+                            pil_template_to_resize = Image.fromarray(self.normalize_template)
+                            pil_resized_template = pil_template_to_resize.resize((current_img_w, current_img_h), Image.Resampling.LANCZOS)
+                            normalize_template2 = np.array(pil_resized_template)
+                            
+                            # Ensure resized template is also 3-channel RGB
+                            if normalize_template2.ndim == 2:
+                                normalize_template2 = np.stack((normalize_template2,)*3, axis=-1)
+                            elif normalize_template2.ndim == 3 and normalize_template2.shape[2] == 1:
+                                normalize_template2 = np.concatenate([normalize_template2]*3, axis=2)
+                            elif normalize_template2.ndim == 3 and normalize_template2.shape[2] == 4: # RGBA
+                                normalize_template2 = normalize_template2[:,:,:3]
+                            
+                            if not (normalize_template2.ndim == 3 and normalize_template2.shape[2] == 3):
+                                print(f"ERROR: Resized normalize_template2 is not 3-channel (shape: {normalize_template2.shape}). Will fallback.")
+                                normalize_template2 = None # Force fallback
+
+                        except Exception as e_resize:
+                            print(f"ERROR: Failed to resize normalize_template for tile r{ir}c{ic}: {e_resize}. Falling back to direct normalization.")
+                            normalize_template2 = None # Force fallback
+                            
+                    if normalize_template2 is not None:
+                        try:
+                            # Final check for compatibility before concatenation
+                            if not (img_np.ndim == 3 and img_np.shape[2] == 3 and \
+                                    normalize_template2.ndim == 3 and normalize_template2.shape[2] == 3 and \
+                                    img_np.shape[0] == normalize_template2.shape[0]):
+                                raise ValueError(f"Pre-concat check failed: img_np {img_np.shape}, tpl {normalize_template2.shape}")
+
+                            joint_normalize_input = np.concatenate((img_np, normalize_template2), axis=1)
+                            normalized_concatenated = normalize(joint_normalize_input)
+                            img_norm = normalized_concatenated[:current_img_h, :current_img_w, :] # Slice back
+                            print(f"DEBUG: Joint normalization used for tile r{ir}c{ic}. img_norm shape: {img_norm.shape}")
+                        except ValueError as e_concat:
+                            print(f"ERROR during joint normalization concatenation for tile r{ir}c{ic} ({img_np.shape} vs {normalize_template2.shape}): {e_concat}. Falling back to direct normalization.")
+                            img_norm = normalize(img_np) # Fallback
+                    else: # Fallback if template prep failed
+                        print(f"DEBUG: Falling back to direct normalization for tile r{ir}c{ic} due to template processing issue.")
+                        img_norm = normalize(img_np)
+                else: # Direct normalization (no mask or no template)
                     img_norm = normalize(img_np)
+                    print(f"DEBUG: Direct normalization used for tile r{ir}c{ic}. img_norm shape: {img_norm.shape}")
 
                 # Skip if mostly white pixels (>240)
-                n_dark_pixels = np.sum(np.any(img_np < 240, axis=2))  # Count pixels with any RGB channel < 240
+                n_dark_pixels = np.sum(np.any(img_norm < 240, axis=2))  # Count pixels with any RGB channel < 240
                 if n_dark_pixels < 50:
                     print(f"Tile r{ir} c{ic} is mostly white, skipping")
                     continue
@@ -794,22 +1211,79 @@ class SlideSegmentation():
                 labels, dicts = self.model.predict_instances(img_norm,
                                                             prob_thresh=self.prob_thresh,
                                                             nms_thresh=self.nms_thresh,
-                                                            n_tiles=self.n_tiles,
+                                                            n_tiles=current_n_tiles_for_prediction, # Use adjusted n_tiles
                                                             show_tile_progress=False,
                                                             return_predict=False
                                                             )
-                                                            
-                points = dicts['points'] # y,x
-                points[:, [1, 0]] = points[:, [0, 1]] # x,y
+                print(f"StarDist dicts['coord'] shape: {dicts['coord'].shape if 'coord' in dicts and dicts['coord'] is not None else 'Not found or None'}, Number of points: {dicts['points'].shape if 'points' in dicts and dicts['points'] is not None else 'Not found or None'}")
 
-                points[:,0] += x_0
-                points[:,1] += y_0
-                points = pd.DataFrame(points, index=[(ir, ic)]*len(points), columns=['x','y']).reset_index()
-                coord = dicts['coord']
-                coord[:, [1, 0], :] = coord[:, [0, 1], :] # x,y
+                points_local_scaled_yx = dicts['points'] 
+                raw_coords_from_stardist = dicts['coord'] # This is what StarDist gives
+                
+                n_rays_from_model = 32
+                if hasattr(self.model, 'config') and hasattr(self.model.config, 'n_rays'):
+                    n_rays_from_model = self.model.config.n_rays
+
+                _processed_coord_yx = None # This should become (N, K, 2) yx-ordered
+                path_context = "[Tiled Path]" # Context for logging
+                if raw_coords_from_stardist is not None and raw_coords_from_stardist.ndim == 3:
+                    N_objects = raw_coords_from_stardist.shape[0]
+                    dim1 = raw_coords_from_stardist.shape[1]
+                    dim2 = raw_coords_from_stardist.shape[2]
+                    
+                    if dim1 == 2 and dim2 == n_rays_from_model: # Input is (N, 2, K) yx
+                        print(f"{path_context} StarDist coord is (N, 2, K) yx. Transposing to (N, K, 2) yx for _processed_coord_yx. Shape: {raw_coords_from_stardist.shape}")
+                        _processed_coord_yx = np.stack((raw_coords_from_stardist[:, 0, :], raw_coords_from_stardist[:, 1, :]), axis=-1)
+                        print(f"{path_context} _processed_coord_yx shape after processing (N,2,K) input: {_processed_coord_yx.shape}")
+                    elif dim1 == n_rays_from_model and dim2 == 2: # Input is (N, K, 2) yx
+                        print(f"{path_context} StarDist coord is (N, K, 2) yx. Using directly for _processed_coord_yx. Shape: {raw_coords_from_stardist.shape}")
+                        _processed_coord_yx = raw_coords_from_stardist
+                    else:
+                        print(f"{path_context} Warning: Unexpected StarDist coord shape: {raw_coords_from_stardist.shape}. Model n_rays: {n_rays_from_model}. Attempting to use as is for _processed_coord_yx.")
+                        _processed_coord_yx = raw_coords_from_stardist 
+                
+                num_detected_points = 0
+                if points_local_scaled_yx is not None and hasattr(points_local_scaled_yx, 'shape') and points_local_scaled_yx.ndim > 0:
+                    num_detected_points = points_local_scaled_yx.shape[0]
+
+                if _processed_coord_yx is None or \
+                   not isinstance(_processed_coord_yx, np.ndarray) or \
+                   _processed_coord_yx.ndim != 3 or \
+                   _processed_coord_yx.shape[0] != num_detected_points or \
+                   (_processed_coord_yx.shape[0] > 0 and (_processed_coord_yx.shape[1] != n_rays_from_model or _processed_coord_yx.shape[2] != 2)):
+                    original_shape_info = raw_coords_from_stardist.shape if raw_coords_from_stardist is not None and hasattr(raw_coords_from_stardist, 'shape') else 'None or no shape'
+                    processed_shape_info = _processed_coord_yx.shape if _processed_coord_yx is not None and hasattr(_processed_coord_yx, 'shape') else 'None or no shape'
+                    print(f"{path_context} Warning: Contour data (_processed_coord_yx) is invalid, missing, or mismatched after processing. Original StarDist: {original_shape_info}, Processed: {processed_shape_info}, Points: {num_detected_points}, Expected K: {n_rays_from_model}. Using empty contours for coord_local_scaled_yx.")
+                    coord_local_scaled_yx = np.empty((num_detected_points, n_rays_from_model, 2), dtype=np.int32) # Ensure (N,K,2) yx structure
+                else:
+                    coord_local_scaled_yx = _processed_coord_yx.astype(np.int32) # Should be (N,K,2) yx
+
+
+                points_xy_local_scaled = points_local_scaled_yx.copy()
+                points_xy_local_scaled[:, [0, 1]] = points_xy_local_scaled[:, [1, 0]] # x,y local (potentially scaled content)
+
+                coord_xy_local_scaled = coord_local_scaled_yx.copy()
+                coord_xy_local_scaled[:, :, [0, 1]] = coord_xy_local_scaled[:, :, [1, 0]] # x,y local for contours
+
+                # Scale local coordinates back to original patch dimensions (before global offset)
+                points_xy_local_original_scale_content = points_xy_local_scaled.copy()
+                points_xy_local_original_scale_content[:, 0] = points_xy_local_scaled[:, 0] * coord_scale_x
+                points_xy_local_original_scale_content[:, 1] = points_xy_local_scaled[:, 1] * coord_scale_y
+
+                coord_xy_local_original_scale_content = coord_xy_local_scaled.copy()
+                coord_xy_local_original_scale_content[:, :, 0] = coord_xy_local_scaled[:, :, 0] * coord_scale_x
+                coord_xy_local_original_scale_content[:, :, 1] = coord_xy_local_scaled[:, :, 1] * coord_scale_y
+
+                # Add global offsets (x_0, y_0 are top-left of the TILE in original slide coordinates)
+                points_global_x = points_xy_local_original_scale_content[:, 0] + x_0
+                points_global_y = points_xy_local_original_scale_content[:, 1] + y_0
+                points_df = pd.DataFrame({'x': points_global_x, 'y': points_global_y}, index=[(ir, ic)]*len(points_global_x)).reset_index()
+
+                coord_global_x = coord_xy_local_original_scale_content[:, :, 0] + x_0
+                coord_global_y = coord_xy_local_original_scale_content[:, :, 1] + y_0
+                coord = np.stack((coord_global_x, coord_global_y), axis=-1)
                 coord = np.round(coord).astype(np.int32)
-                coord[:,0,:] += x_0
-                coord[:,1,:] += y_0
+
                 prob = dicts['prob']
                 
                 # Calculate tile processing time
@@ -819,8 +1293,8 @@ class SlideSegmentation():
                 
                 # Print nuclei detection results for each tile
                 print("\n========================================")
-                print(f"Tile r{ir} c{ic} (x={x_0}, y={y_0}) detected {len(points)} nuclei")
-                total_nuclei += len(points)
+                print(f"Tile r{ir} c{ic} (x={x_0}, y={y_0}) detected {len(points_df)} nuclei")
+                total_nuclei += len(points_df)
                 print(f"Current total nuclei: {total_nuclei}")
                 print("========================================\n")
                 
@@ -830,11 +1304,11 @@ class SlideSegmentation():
                 
                 # Note here: correctly accumulate results from all tiles instead of overwriting
                 if points_all is None:
-                    points_all = points
+                    points_all = points_df
                     coord_all = coord
                     prob_all = prob
                 else:
-                    points_all = pd.concat((points_all, points), axis=0, ignore_index=True)
+                    points_all = pd.concat((points_all, points_df), axis=0, ignore_index=True)
                     coord_all = np.concatenate((coord_all, coord), axis=0)
                     prob_all = np.concatenate((prob_all, prob), axis=0)
         
@@ -860,13 +1334,32 @@ class SlideSegmentation():
                 
                 self.prob_all = prob_all
                 
-                if self.args.magnification is not None:
-                    # Need to scale back to original size since calculations were at 20x
-                    resize_factor = self.reference_magnification / self.args.magnification
-                    self.final_points = (self.final_points/resize_factor).astype(np.int32)
-                    self.final_coord = (self.final_coord/resize_factor).astype(np.int32)
+                # Conditional final scaling for tiled path
+                should_apply_ref_mag_scaling_tiled = True
+                if hasattr(self.args, 'target_mpp') and self.args.target_mpp is not None:
+                    print("[Tiled Path] Skipping final reference magnification scaling because target_mpp was specified.")
+                    should_apply_ref_mag_scaling_tiled = False
                 
-                print(f"Completed saving {len(self.final_points)} detected nuclei")
+                if should_apply_ref_mag_scaling_tiled and self.args.magnification is not None:
+                    print(f"[Tiled Path] Applying final reference magnification scaling logic. Ref Mag: {self.reference_magnification}, Slide Mag: {self.args.magnification}")
+                    resize_factor = self.reference_magnification / self.args.magnification
+                    if abs(resize_factor) > 1e-6: # Avoid division by zero or tiny number
+                        if self.final_points is not None and len(self.final_points) > 0:
+                            # print(f"[Tiled Path] Before final scaling, self.final_points[0]: {self.final_points[0]}")
+                            pass # Original coordinates will be kept
+                        # self.final_points = (self.final_points / resize_factor).astype(np.int32)
+                        # self.final_coord = (self.final_coord / resize_factor).astype(np.int32)
+                        if self.final_points is not None and len(self.final_points) > 0:
+                            # print(f"[Tiled Path] After final scaling, self.final_points[0]: {self.final_points[0]}")
+                            print(f"[Tiled Path] Final coordinate scaling by resize_factor {resize_factor:.4f} was SKIPPED to preserve level 0 coordinates.")
+                    else:
+                        print("[Tiled Path] Warning: resize_factor is too small, skipping final scaling.")
+                elif not should_apply_ref_mag_scaling_tiled:
+                    pass # Reason already logged (target_mpp was specified)
+                elif self.args.magnification is None:
+                    print("[Tiled Path] Skipping final reference magnification scaling because self.args.magnification is None.")
+                
+                print(f"Completed saving {len(self.final_points) if self.final_points is not None else 0} detected nuclei")
             except Exception as e:
                 print(f"Failed to generate final_points: {str(e)}")
                 import traceback
