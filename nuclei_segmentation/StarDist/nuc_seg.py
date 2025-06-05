@@ -622,25 +622,7 @@ class SlideSegmentation():
                 print(f"Successfully generated final_points, shape={self.final_points.shape}")
                 
                 self.final_coord = self.coord_all.astype(np.int32)
-                self.final_coord = np.swapaxes(self.final_coord, 1, 2) # self.final_coord is now (N, 2, K) XY
                 
-                # Convert self.final_coord from (N, 2, K) XY numpy array to a list of (K, 2) XY numpy arrays
-                if self.final_coord is not None and self.final_coord.ndim == 3 and self.final_coord.shape[1] == 2:
-                    num_nuclei = self.final_coord.shape[0]
-                    # k_points = self.final_coord.shape[2] # Not directly used in loop but good for context
-                    processed_coords_list = []
-                    for i in range(num_nuclei):
-                        # self.final_coord[i, 0, :] are X coords (K_points,)
-                        # self.final_coord[i, 1, :] are Y coords (K_points,)
-                        # We stack them to be (K_points, 2) XY
-                        xy_contour = np.stack((self.final_coord[i, 0, :], self.final_coord[i, 1, :]), axis=-1)
-                        processed_coords_list.append(xy_contour)
-                    self.final_coord = processed_coords_list
-                    print(f"[analyze_img_patch] Converted self.final_coord to list of (K,2) XY arrays. Num contours: {len(self.final_coord)}. Example shape of first element: {self.final_coord[0].shape if len(self.final_coord) > 0 else 'N/A'}")
-                elif self.final_coord is not None: # Log if it's not the expected (N,2,K) shape
-                     print(f"[analyze_img_patch] Warning: self.final_coord was not in the expected (N,2,K) XY shape for conversion. Shape: {self.final_coord.shape}. Skipping list conversion.")
-
-
                 self.prob_all = self.prob_all
                 
                 # Conditional final scaling for tiled path
@@ -881,24 +863,6 @@ class SlideSegmentation():
                 # Set final results - fix contours processing
                 self.final_points = points_df[['x','y']].values.astype(np.int32)
                 self.final_coord = coord.astype(np.int32)
-                # Ensure final_coord has dimensions (n, m, 2)
-                self.final_coord = np.swapaxes(self.final_coord, 1, 2) # self.final_coord is now (N, 2, K) XY
-
-                # Convert self.final_coord from (N, 2, K) XY numpy array to a list of (K, 2) XY numpy arrays
-                if self.final_coord is not None and self.final_coord.ndim == 3 and self.final_coord.shape[1] == 2:
-                    num_nuclei = self.final_coord.shape[0]
-                    # k_points = self.final_coord.shape[2] # Not directly used in loop but good for context
-                    processed_coords_list = []
-                    for i in range(num_nuclei):
-                        # self.final_coord[i, 0, :] are X coords (K_points,)
-                        # self.final_coord[i, 1, :] are Y coords (K_points,)
-                        # We stack them to be (K_points, 2) XY
-                        xy_contour = np.stack((self.final_coord[i, 0, :], self.final_coord[i, 1, :]), axis=-1)
-                        processed_coords_list.append(xy_contour)
-                    self.final_coord = processed_coords_list
-                    print(f"[run_WSI_segmentation - Simple Path] Converted self.final_coord to list of (K,2) XY arrays. Num contours: {len(self.final_coord)}. Example shape of first element: {self.final_coord[0].shape if len(self.final_coord) > 0 else 'N/A'}")
-                elif self.final_coord is not None: # Log if it's not the expected (N,2,K) shape
-                    print(f"[run_WSI_segmentation - Simple Path] Warning: self.final_coord was not in the expected (N,2,K) XY shape for conversion. Shape: {self.final_coord.shape}. Skipping list conversion.")
 
                 self.prob_all = prob
                 
@@ -1327,11 +1291,7 @@ class SlideSegmentation():
             # Add debug info when generating final_points
             try:
                 self.final_points = points_all[['x','y']].values.astype(np.int32)
-                print(f"Successfully generated final_points, shape={self.final_points.shape}")
-                
                 self.final_coord = coord_all.astype(np.int32)
-                self.final_coord = np.swapaxes(self.final_coord, 1, 2)
-                
                 self.prob_all = prob_all
                 
                 # Conditional final scaling for tiled path
