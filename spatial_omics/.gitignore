@@ -1,0 +1,25 @@
+# Python bytecode and environment files
+__pycache__/
+*.pyc
+.venv/
+.conda/
+env/
+
+# macOS specific files
+.DS_Store
+
+# Generated InstructCell setup folders (can be re-generated if needed)
+data/
+gene_vocab/
+
+# Downloaded large model files
+downloaded_models/
+
+# All generated data outputs
+data_outputs/
+
+# All generated visualizations
+visualizations/
+
+# (Optional, if figures/ only contains auto-generated temporary plots)
+# figures/ 

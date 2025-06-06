@@ -3,6 +3,7 @@ import os
 import shutil
 
 app = modal.App("deepspot-infer-app")
+volume = modal.Volume.from_name("deepspot-output-vol", create_if_missing=True)
 
 # Define the image and model paths (use /root/DeepSpot/ as base)
 BASE_PATH = "/root/DeepSpot/"
@@ -11,7 +12,8 @@ MODEL_WEIGHTS = BASE_PATH + "pretrained_model_weights/Colon_HEST1K/final_model.p
 MODEL_HPARAM = BASE_PATH + "pretrained_model_weights/Colon_HEST1K/top_param_overall.yaml"
 GENE_PATH = BASE_PATH + "pretrained_model_weights/Colon_HEST1K/info_highly_variable_genes.csv"
 IMAGE_FEATURE_MODEL_PATH = None  # Set if needed by config
-OUTPUT_PATH = BASE_PATH + "outputs/zen38_infer.h5ad"
+OUTPUT_PATH = "/output/data_outputs/zen38_infer.h5ad"
+DOWNSAMPLE_FACTOR = 10 # downsampling the image used for visualisation in squidpy
 
 image = (
     modal.Image.debian_slim()
@@ -26,8 +28,8 @@ image = (
         "matplotlib==3.8.2",
         "torchvision==0.15.1",
         "scikit-learn==1.2.2",
-        "numba==0.56.4",
-        "llvmlite==0.39.1",
+        "numba>=0.57.0",
+        "llvmlite>=0.40.0",
         "dask-image==2022.9.0",
         "plotnine",
         "PyYAML",
@@ -48,6 +50,8 @@ image = (
     image=image,
     timeout=60*30,
     gpu="any",
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    volumes={"/output": volume}
 )
 def run_inference():
     import sys
@@ -65,9 +69,13 @@ def run_inference():
     import math
     import PIL
     from tqdm import tqdm
+    from huggingface_hub import hf_hub_download, login
 
     from deepspot.utils.utils_image import predict_spot_spatial_transcriptomics_from_image_path, get_morphology_model_and_preprocess, crop_tile
     from deepspot.spot.model import DeepSpot
+
+    # Login to Hugging Face
+    login(token=os.environ["HF_TOKEN"])
 
     # Load model config
     with open(MODEL_HPARAM, "r") as stream:
@@ -79,6 +87,14 @@ def run_inference():
     global IMAGE_FEATURE_MODEL_PATH
     if IMAGE_FEATURE_MODEL_PATH is None:
         IMAGE_FEATURE_MODEL_PATH = config.get('image_feature_model_path', None)
+
+    if image_feature_model == 'uni' and IMAGE_FEATURE_MODEL_PATH is None:
+        print("Downloading UNI model weights from Hugging Face Hub...")
+        IMAGE_FEATURE_MODEL_PATH = hf_hub_download(
+            repo_id="MahmoodLab/UNI",
+            filename="pytorch_model.bin"
+        )
+        print(f"Downloaded UNI model weights to {IMAGE_FEATURE_MODEL_PATH}")
 
     # Load gene info
     genes = pd.read_csv(GENE_PATH)
@@ -117,6 +133,31 @@ def run_inference():
     adata.obs['barcode'] = adata.obs.index
     adata = adata[adata.obs.is_white_bool == 0, ]
 
+    # Create spatial image and coordinates for visualization
+    img_original = open_slide(image_path)
+    n_level = len(img_original.level_dimensions) - 1 # 0 based
+    large_w, large_h = img_original.dimensions
+    new_w = math.floor(large_w / DOWNSAMPLE_FACTOR)
+    new_h = math.floor(large_h / DOWNSAMPLE_FACTOR)
+
+    whole_slide_image = img_original.read_region((0, 0), n_level, img_original.level_dimensions[-1])
+    whole_slide_image = whole_slide_image.convert("RGB")
+    img_downsample = whole_slide_image.resize((new_w, new_h), PIL.Image.BILINEAR)
+
+    adata.obsm['spatial'] = adata.obs[["y_pixel", "x_pixel"]].values
+    # adjust coordinates to new image dimensions
+    adata.obsm['spatial'] = adata.obsm['spatial'] / DOWNSAMPLE_FACTOR
+    # create 'spatial' entries in the standard format
+    adata.uns['spatial'] = {
+        sample: {
+            "images": {"hires": np.array(img_downsample)},
+            "scalefactors": {
+                "tissue_hires_scalef": 1.0,
+                "spot_diameter_fullres": spot_diameter,
+            },
+        }
+    }
+
     # Load models
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model_expression = torch.load(MODEL_WEIGHTS, map_location=device)
@@ -146,6 +187,7 @@ def run_inference():
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     adata.write_h5ad(OUTPUT_PATH)
     print(f"Saved output to {OUTPUT_PATH}")
+    volume.commit()
 
 if __name__ == "__main__":
     app.run(run_inference) 
