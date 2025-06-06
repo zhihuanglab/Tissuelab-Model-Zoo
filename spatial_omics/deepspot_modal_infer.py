@@ -15,8 +15,21 @@ OUTPUT_PATH = BASE_PATH + "outputs/zen38_infer.h5ad"
 
 image = (
     modal.Image.debian_slim()
-    .pip_install("-r", "/root/DeepSpot/requirements.txt")
     .pip_install(
+        "torch==2.0.0",
+        "numpy==1.23.5",
+        "pandas==1.5.3",
+        "scipy==1.11.4",
+        "anndata==0.8.0",
+        "scanpy==1.9.3",
+        "squidpy==1.2.2",
+        "matplotlib==3.8.2",
+        "torchvision==0.15.1",
+        "scikit-learn==1.2.2",
+        "numba==0.56.4",
+        "llvmlite==0.39.1",
+        "dask-image==2022.9.0",
+        "plotnine",
         "PyYAML",
         "tqdm",
         "Pillow",
@@ -28,7 +41,7 @@ image = (
         "pyvips",
     )
     .apt_install("libvips-dev", "libglib2.0-0", "libopenslide0")
-    .add_local_dir("DeepSpot", BASE_PATH)
+    .add_local_dir("DeepSpot", BASE_PATH, copy=True)
 )
 
 @app.function(
