@@ -61,6 +61,9 @@ def parse_args():
     parser.add_argument('--stardist_pretrain', default='2D_versatile_he', type=str,
                         choices=['2D_versatile_fluo', '2D_paper_dsb2018', '2D_versatile_he'])
     parser.add_argument('--isIHC', default=False, type=bool)
+    # New arguments for downsampling and bounding box
+    parser.add_argument('--target_mpp', default=None, type=float, help='Target microns per pixel for processing')
+    parser.add_argument('--bbox', default=None, type=str, help='Bounding box for segmentation in format "x,y,width,height"')
 
     return parser.parse_args()
 
@@ -100,20 +103,48 @@ def run_segmentation(args):
         ALREADY_HAVE_SEG = False
         centroids = None
         contours = None
+        probability = None # Initialize probability
 
         if os.path.exists(H5_PATH):
             with h5py.File(H5_PATH, 'r') as hf:
                 if NODE_NAME in hf:
-                    # if already have segmentation => skip stardist
                     try:
                         centroids = hf[f"{NODE_NAME}/centroids"][()]
-                        contours = hf[f"{NODE_NAME}/contours"][()]
-                        ALREADY_HAVE_SEG = True
-                        print("Using existing nuclei segmentation => skip stardist.")
-                        result["message"] = "Using existing nuclei segmentation"
-                        result["nuclei_count"] = len(centroids)
-                    except:
-                        print("Warning: segmentation data is corrupted. Will re-run stardist.")
+                        # Attempt to load contours and probability, but don't fail if not present initially
+                        if f"{NODE_NAME}/contours" in hf:
+                            contours = hf[f"{NODE_NAME}/contours"][()]
+                        if f"{NODE_NAME}/probability" in hf:
+                             probability = hf[f"{NODE_NAME}/probability"][()]
+                        
+                        # Check if essential data (centroids) is valid
+                        if centroids is not None and centroids.size > 0 : # Basic check for non-empty centroids
+                            ALREADY_HAVE_SEG = True
+                            print("Using existing nuclei segmentation => skip stardist.")
+                            result["message"] = "Using existing nuclei segmentation"
+                            result["nuclei_count"] = len(centroids)
+                        else:
+                            print("Warning: Existing centroids are missing or empty. Will re-run stardist.")
+                            ALREADY_HAVE_SEG = False
+                            centroids = None # Ensure cleared
+                            contours = None
+                            probability = None
+
+                    except KeyError as e:
+                        print(f"Warning: Existing segmentation data missing key {e}. Will re-run stardist.")
+                        ALREADY_HAVE_SEG = False 
+                        centroids = None 
+                        contours = None
+                        probability = None
+                    except Exception as e:
+                        print(f"Warning: Error reading existing segmentation data: {e}. Will re-run stardist.")
+                        ALREADY_HAVE_SEG = False
+                        centroids = None
+                        contours = None
+                        probability = None
+                else: # NODE_NAME not in hf
+                    print(f"Group '{NODE_NAME}' not found in H5 file. Will run stardist.")
+                    ALREADY_HAVE_SEG = False
+
 
         # Step B: if not have segmentation => run stardist
         if not ALREADY_HAVE_SEG:
@@ -128,15 +159,35 @@ def run_segmentation(args):
                                    isIHC=args.isIHC,
                                    progress_callback=update_progress)
             ss.run_WSI_segmentation()
-            contours = ss.final_coord.astype(np.int32)
-            centroids = ss.final_points.astype(np.int32)
-            probability = ss.prob_all.astype(np.float32)
-            result["nuclei_count"] = len(centroids)
+            
+            # Retrieve results from ss object, with checks
+            if hasattr(ss, 'final_points') and ss.final_points is not None:
+                centroids = ss.final_points.astype(np.int32)
+                print(f"[SEG LOG] ss.final_points (centroids) generated. Shape: {centroids.shape}, Dtype: {centroids.dtype}")
+            else:
+                print("[SEG LOG] ss.final_points (centroids) is None or not generated. Setting to empty.")
+                centroids = np.array([]).reshape(0, 2).astype(np.int32)
+
+            if hasattr(ss, 'final_coord') and ss.final_coord is not None:
+                contours = ss.final_coord.astype(np.int32)
+                print(f"[SEG LOG] ss.final_coord (contours) generated. Shape: {contours.shape}, Dtype: {contours.dtype}")
+            else:
+                print("[SEG LOG] ss.final_coord (contours) is None or not generated. Setting to None.")
+                contours = None 
+
+            if hasattr(ss, 'prob_all') and ss.prob_all is not None:
+                probability = ss.prob_all.astype(np.float32)
+                print(f"[SEG LOG] ss.prob_all (probability) generated. Shape: {probability.shape}, Dtype: {probability.dtype}")
+            else:
+                print("[SEG LOG] ss.prob_all (probability) is None or not generated. Setting to empty.")
+                probability = np.array([]).astype(np.float32)
+
+            result["nuclei_count"] = len(centroids) # Based on centroids
             result["message"] = "Segmentation completed successfully"
 
         # Step C: generate embedding if dont have cached
         embedding_data = None
-        if centroids is not None:
+        if centroids is not None and len(centroids) > 0: # Ensure centroids exist and are not empty
             # create a temp H5 file path
             h5_dir = os.path.dirname(H5_PATH)
             slide_basename = os.path.basename(args.slidepath)
@@ -174,32 +225,46 @@ def run_segmentation(args):
                 # read embeddings for later saving
                 with h5py.File(temp_h5_path, "r") as tf:
                     embedding_data = tf["embedding"][()]
+        elif centroids is not None and len(centroids) == 0:
+            print("[EMBED LOG] No centroids detected from segmentation, skipping embedding generation.")
+        else: # centroids is None
+            print("[EMBED LOG] Centroids are None, skipping embedding generation.")
+
 
         # Step D:  copy segmentation + embedding to workflow_data.h5
         # write to h5
-        if centroids is not None:
+        if centroids is not None: # Only proceed if centroids were processed (even if empty from seg)
             with h5py.File(H5_PATH, "a") as hf:
-                # if already have segmentation => delete old
-                if NODE_NAME in hf:
+                if NODE_NAME in hf: # if group already exists, delete it to ensure fresh write
                     del hf[NODE_NAME]
                 node_grp = hf.create_group(NODE_NAME)
 
-                # write segmentation
+                print(f"[H5 WRITE] Writing centroids. Shape: {centroids.shape if centroids is not None else 'None'}")
                 node_grp.create_dataset('centroids', data=centroids)
+                
                 if contours is not None:
+                    print(f"[H5 WRITE] Writing contours. Shape: {contours.shape}")
                     node_grp.create_dataset('contours', data=contours)
-                if not ALREADY_HAVE_SEG and 'probability' in locals():
+                else:
+                    print("[H5 WRITE] Contours are None, not writing to H5.")
+                
+                if probability is not None: # Save probability if it was generated or loaded
+                    print(f"[H5 WRITE] Writing probability. Shape: {probability.shape}")
                     node_grp.create_dataset('probability', data=probability)
+                else: # This case should be less common if prob is always attempted
+                    print("[H5 WRITE] Probability is None, not writing to H5.")
 
-                # write embedding
                 if embedding_data is not None:
+                    print(f"[H5 WRITE] Writing embedding. Shape: {embedding_data.shape}")
                     node_grp.create_dataset('embedding', data=embedding_data)
+                else:
+                    print("[H5 WRITE] Embedding data is None, not writing to H5.")
 
-                hf.flush()  # force write to disk
-            # sleep for a while to ensure h5 is written
-            time.sleep(2)
+                hf.flush()
+            time.sleep(0.5) # Reduced sleep time
+        else:
+            print("[H5 WRITE] Centroids are None after segmentation step, nothing to write to H5 for this node.")
 
-        # Ensure progress is set to 100 after Step C and D are completed
         progress_complete = True
         update_progress(100)
 
@@ -273,6 +338,18 @@ def read_node(data: Dict[str, Any]):
                     ARGS.stardist_pretrain = val_json
                 elif k == "isIHC":
                     ARGS.isIHC = (val_json in [True, "true", "True"])
+                elif k == "target_mpp":
+                    try:
+                        ARGS.target_mpp = float(val_json)
+                    except ValueError:
+                        print(f"Warning: Could not parse target_mpp value '{val_json}' as float.")
+                        ARGS.target_mpp = None
+                elif k == "bbox":
+                    if isinstance(val_json, str) and len(val_json.split(',')) == 4:
+                        ARGS.bbox = val_json
+                    else:
+                        print(f"Warning: bbox value '{val_json}' is not in 'x,y,width,height' format.")
+                        ARGS.bbox = None
 
     return {"status": "ok", "message": "SegmentationNode read done"}
 
