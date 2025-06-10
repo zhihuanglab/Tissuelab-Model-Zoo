@@ -444,36 +444,38 @@ def analyze_tissue(image_bytes: bytes, query: str):
 
 
 @app.local_entrypoint()
-def main():
+def main(
+    image_path: str = str(
+        Path(__file__).resolve().parent
+        / "DeepSpot/example_data/data/image/ZEN38_without_fud.jpg"
+    ),
+    query: str = "What are the primary cell types and their spatial arrangement in this colon tissue sample? Describe any interesting features you observe.",
+):
     """
     A local entrypoint function to run a test of the full pipeline.
-    This function will be executed when you run `modal run main.py`.
+    This function will be executed when you run `modal run main_modal.py`.
+
+    You can specify a different image or query from the command line, e.g.:
+    modal run Tissuelab-Model-Zoo/spatial_omics/main_modal.py --image-path /path/to/your/image.jpg --query "Your custom query"
     """
     # --- Configuration ---
-    # Build the path to the image relative to the script's location
-    IMAGE_PATH = (
-        Path(__file__).resolve().parent.parent
-        / "DeepSpot/example_data/data/image/ZEN38_without_fud.jpg"
-    )
+    image_path_obj = Path(image_path)
 
-    # The question to ask the model about the tissue
-    QUERY = "What are the primary cell types and their spatial arrangement in this colon tissue sample? Describe any interesting features you observe."
-
-    print(f"🔬 Using image: {IMAGE_PATH}")
-    if not IMAGE_PATH.exists():
-        print(f"Error: Image file not found at '{IMAGE_PATH}'.")
+    print(f"🔬 Using image: {image_path_obj}")
+    if not image_path_obj.exists():
+        print(f"Error: Image file not found at '{image_path_obj}'.")
         return
 
-    print(f"❓ Query: {QUERY}\n")
+    print(f"❓ Query: {query}\n")
 
     # --- Load Image Data ---
-    with open(IMAGE_PATH, "rb") as f:
+    with open(image_path_obj, "rb") as f:
         image_bytes = f.read()
 
     # --- Run Modal Pipeline ---
     print("🚀 Calling remote Modal function... (This may take a few minutes)")
     try:
-        answer = analyze_tissue.remote(image_bytes=image_bytes, query=QUERY)
+        answer = analyze_tissue.remote(image_bytes=image_bytes, query=query)
     except Exception as e:
         print(f"An error occurred during the Modal call: {e}")
         return
