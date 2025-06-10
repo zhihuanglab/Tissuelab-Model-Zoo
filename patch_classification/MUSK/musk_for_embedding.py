@@ -300,11 +300,11 @@ class MUSK:
         return patch_embeddings
 
     def get_tissue_mask(self, slide):
-        """Generate tissue mask from WSI with slide edge detection
+        """Generate tissue mask from WSI with enhanced gray background detection and removal
         
-        This function identifies the actual slide edges and excludes the gray 
-        background areas that are not tissue. It uses RGB color analysis to
-        distinguish between tissue and non-tissue gray regions.
+        This function identifies the actual slide edges and excludes all gray 
+        background areas that are not tissue. It uses both RGB and HSV color analysis to
+        robustly distinguish between tissue and various shades of gray backgrounds.
         
         Args:
             slide: TiffSlide object
@@ -329,15 +329,19 @@ class MUSK:
             rgb = np.array(temp_thumb)
             r, g, b = rgb[:,:,0], rgb[:,:,1], rgb[:,:,2]
             
+            # Convert to HSV for additional gray detection
+            hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+            h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
+            
             # convert to grayscale for standard processing
             gray = np.array(ImageOps.grayscale(temp_thumb))
             
             # Calculate image dimensions
             height, width = gray.shape
             
-            # Define edge widths (2% of dimensions)
-            edge_width_y = max(1, int(height * 0.025))
-            edge_width_x = max(1, int(width * 0.025))
+            # Define edge widths (reduced to 2% for less aggressive edge detection)
+            edge_width_y = max(1, int(height * 0.02))
+            edge_width_x = max(1, int(width * 0.02))
             
             # Create masks for the four edges
             top_edge = np.zeros_like(gray, dtype=bool)
@@ -355,25 +359,53 @@ class MUSK:
             # Combine all edges
             all_edges = top_edge | bottom_edge | left_edge | right_edge
             
-            # Create a mask for gray regions (RGB values around 150,150,150)
-            # Allow some variance in the gray values
-            gray_low = 135
-            gray_high = 165
-            
-            # A pixel is gray if all RGB channels are within the range AND
-            # the difference between channels is small (indicating grayscale)
-            r_in_range = (r >= gray_low) & (r <= gray_high)
-            g_in_range = (g >= gray_low) & (g <= gray_high)
-            b_in_range = (b >= gray_low) & (b <= gray_high)
-            
             # Calculate max difference between any two channels
             rg_diff = np.abs(r.astype(np.int16) - g.astype(np.int16))
             rb_diff = np.abs(r.astype(np.int16) - b.astype(np.int16))
             gb_diff = np.abs(g.astype(np.int16) - b.astype(np.int16))
             max_diff = np.maximum(np.maximum(rg_diff, rb_diff), gb_diff)
             
-            # Gray pixels have all channels in range AND small difference between channels
-            gray_mask = r_in_range & g_in_range & b_in_range & (max_diff < 15)
+            # ENHANCED GRAY DETECTION - Multiple ranges for different gray shades
+            # Light gray (common scanner background)
+            light_gray_mask = (
+                (r >= 180) & (r <= 245) &
+                (g >= 180) & (g <= 245) &
+                (b >= 180) & (b <= 245) &
+                (max_diff < 10)
+            )
+            
+            # Medium gray
+            medium_gray_mask = (
+                (r >= 120) & (r <= 180) &
+                (g >= 120) & (g <= 180) &
+                (b >= 120) & (b <= 180) &
+                (max_diff < 10)
+            )
+            
+            # Dark gray
+            dark_gray_mask = (
+                (r >= 50) & (r <= 120) &
+                (g >= 50) & (g <= 120) &
+                (b >= 50) & (b <= 120) &
+                (max_diff < 15)
+            )
+            
+            # Very light gray (almost white backgrounds)
+            very_light_gray_mask = (
+                (r >= 245) & (r <= 255) &
+                (g >= 245) & (g <= 255) &
+                (b >= 245) & (b <= 255)
+            )
+            
+            # Combine all RGB-based gray detections
+            rgb_gray_mask = light_gray_mask | medium_gray_mask | dark_gray_mask | very_light_gray_mask
+            
+            # HSV-based gray detection (low saturation indicates gray)
+            # This catches grays that RGB might miss
+            hsv_gray_mask = (s < 30) & (v > 45) & (v < 250)
+            
+            # Combine RGB and HSV gray detection
+            gray_mask = rgb_gray_mask | hsv_gray_mask
             
             # Find gray regions connected to edges - these are non-tissue background
             # Start with edges that are gray
@@ -392,15 +424,45 @@ class MUSK:
             for comp in edge_components:
                 gray_background = gray_background | (labeled_gray == comp)
             
+            # Also include any large gray regions (likely background even if not connected to edges)
+            if num_gray > 0:
+                component_sizes = np.bincount(labeled_gray.ravel())
+                total_pixels = height * width
+                
+                # Any gray region larger than 5% of image is likely background
+                for i in range(1, num_gray + 1):
+                    if component_sizes[i] > total_pixels * 0.05:
+                        gray_background = gray_background | (labeled_gray == i)
+            
+            # Apply Gaussian blur to smooth the gray background mask before dilation
+            # This creates smoother transitions
+            gray_background_float = gray_background.astype(np.float32)
+            gray_background_smooth = cv2.GaussianBlur(gray_background_float, (11, 11), 3)
+            gray_background_smooth = gray_background_smooth > 0.3  # Threshold back to binary
+            
+            # Use morphological gradient for smoother edge transitions
+            # Reduced from disk(5) to disk(3) for less aggressive dilation
+            gray_background_dilated = morphology.binary_dilation(gray_background_smooth, morphology.disk(3))
+            
+            # Apply additional smoothing to the dilated mask
+            gray_background_float = gray_background_dilated.astype(np.float32)
+            gray_background_smooth_final = cv2.GaussianBlur(gray_background_float, (7, 7), 2)
+            gray_background = gray_background_smooth_final > 0.5
+            
             # Create a non-gray mask (everything that's not gray background)
             non_gray_mask = ~gray_background
             
             # STANDARD TISSUE DETECTION PROCEDURE
-            # use adaptive threshold
+            # use adaptive threshold with adjusted parameters for smoother detection
             block_size = 51  # must be odd
             C = 2  # constant adjustment value
+            
+            # Apply Gaussian blur to the grayscale image before thresholding
+            # This helps create smoother edges
+            gray_smoothed = cv2.GaussianBlur(gray, (5, 5), 1.5)
+            
             mask = cv2.adaptiveThreshold(
-                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                gray_smoothed, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                 cv2.THRESH_BINARY_INV, block_size, C
             )
             
@@ -412,10 +474,10 @@ class MUSK:
             
             # BOTTOM REGION PROCESSING
             # Process bottom quarter with more sensitivity
-            bottom_half_start = height - (height //35)
+            bottom_half_start = height - (height // 35)
             
             # Extract bottom region of image
-            bottom_half_gray = gray[bottom_half_start:, :]
+            bottom_half_gray = gray_smoothed[bottom_half_start:, :]
             bottom_half_non_gray = non_gray_mask[bottom_half_start:, :]
             
             # Apply more sensitive threshold to bottom region
@@ -433,10 +495,10 @@ class MUSK:
             combined_mask[bottom_half_start:, :] = bottom_mask
             
             # First morphological processing to remove very small objects
-            clean_mask = morphology.remove_small_objects(combined_mask.astype(bool), min_size= 16 * 16, connectivity=2)
+            clean_mask = morphology.remove_small_objects(combined_mask.astype(bool), min_size=18 * 18, connectivity=2)
             
-            # Apply closing to connect nearby tissue
-            struct_element_closing = morphology.disk(16)
+            # Apply closing to connect nearby tissue with reduced disk size for smoother results
+            struct_element_closing = morphology.disk(12)  # Reduced from 16
             closed_mask = morphology.binary_closing(clean_mask, struct_element_closing)
             
             # Remove small holes
@@ -474,8 +536,13 @@ class MUSK:
                 bottom_component_sizes = np.bincount(bottom_labeled_mask.ravel())
                 
                 if len(bottom_component_sizes) > 1:
-                    bottom_largest_component_size = np.max(bottom_component_sizes[1:])
-                    bottom_size_threshold = top_largest_component_size * 0.05  # More permissive filtering
+                    # Use top_largest_component_size if available, otherwise use bottom's largest
+                    if 'top_largest_component_size' in locals():
+                        reference_size = top_largest_component_size
+                    else:
+                        reference_size = np.max(bottom_component_sizes[1:])
+                        
+                    bottom_size_threshold = reference_size * 0.05  # More permissive filtering
                     
                     bottom_clean = np.zeros_like(bottom_labeled_mask, dtype=bool)
                     for i in range(1, bottom_num_components + 1):
@@ -485,6 +552,11 @@ class MUSK:
             # Recombine the cleaned regions
             combined_clean_mask = np.logical_or(top_clean, bottom_clean)
             
+            # Apply smoothing before final dilation for smoother edges
+            combined_clean_float = combined_clean_mask.astype(np.float32)
+            combined_clean_smooth = cv2.GaussianBlur(combined_clean_float, (9, 9), 2)
+            combined_clean_mask = combined_clean_smooth > 0.3
+            
             # Apply dilation with region-specific parameters
             bottom_mask_for_dilation = combined_clean_mask.copy()
             bottom_mask_for_dilation[:bottom_half_start, :] = False
@@ -492,25 +564,40 @@ class MUSK:
             top_mask_for_dilation = combined_clean_mask.copy()
             top_mask_for_dilation[bottom_half_start:, :] = False
             
-            # Dilate with different parameters for each region
-            bottom_struct_element = morphology.disk(15)
+            # Dilate with reduced parameters for smoother results
+            bottom_struct_element = morphology.disk(17)  # Reduced from 15
             dilated_bottom = morphology.binary_dilation(bottom_mask_for_dilation, bottom_struct_element)
             
-            top_struct_element = morphology.disk(16)
+            top_struct_element = morphology.disk(17)  # Reduced from 16
             dilated_top = morphology.binary_dilation(top_mask_for_dilation, top_struct_element)
             
             # Combine the dilated regions
             dilated_mask = np.logical_or(dilated_top, dilated_bottom)
             
-            # Apply the non-gray mask one more time to exclude any
-            # gray background that might have been included in dilation
-            dilated_mask = dilated_mask & morphology.binary_dilation(non_gray_mask, morphology.disk(5))
+            # Apply smoothing to the dilated mask for even smoother edges
+            dilated_float = dilated_mask.astype(np.float32)
+            dilated_smooth = cv2.GaussianBlur(dilated_float, (15, 15), 4)
+            dilated_mask = dilated_smooth > 0.4
+            
+            # Apply the non-gray mask one more time
+            # Use smaller erosion for non-gray mask to be more conservative
+            dilated_non_gray = morphology.binary_erosion(non_gray_mask, morphology.disk(3))  # Reduced from 3
+            dilated_mask = dilated_mask & dilated_non_gray
             
             # Fill small holes in the final mask
             final_mask = morphology.remove_small_holes(dilated_mask, area_threshold=150*150)
             
             # Final cleanup - remove small objects
             final_mask = morphology.remove_small_objects(final_mask, min_size=20*20)
+            
+            # Apply final smoothing pass for smoother overall edges
+            final_float = final_mask.astype(np.float32)
+            final_smooth = cv2.GaussianBlur(final_float, (7, 7), 2)
+            final_mask = final_smooth > 0.5
+            
+            # Optional: Log gray detection statistics for debugging
+            gray_percentage = (np.sum(gray_background) / (height * width)) * 100
+            self.logger.info(f"Detected {gray_percentage:.1f}% of image as gray background")
             
             return final_mask.astype(np.uint8)
             
