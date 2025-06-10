@@ -151,7 +151,7 @@ deepspot_image = (
         "pyvips",
     )
     .add_local_dir(
-        local_path="spatial_omics/DeepSpot", remote_path=str(REMOTE_DEEPSPOT_DIR)
+        local_path="Tissuelab-Model-Zoo/spatial_omics/DeepSpot", remote_path=str(REMOTE_DEEPSPOT_DIR)
     )
 )
 
@@ -329,7 +329,7 @@ def run_cell2sentence(adata, user_query: str):
     _download_c2s_models()
 
     import torch
-    from cell2sentence.data import csdata
+    from cell2sentence import CSData
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     # Define paths to the model files within the container
@@ -348,13 +348,32 @@ def run_cell2sentence(adata, user_query: str):
     # --- 2. Convert Expression Data to Cell Sentences ---
     print("Converting gene expression to cell sentences...")
     # The modern cell2sentence library uses an object-oriented approach.
-    # 1. Create a csdata object from the AnnData object.
-    sentence_data = csdata(adata, use_highly_variable=False)
-    # 2. Call the .create_sentence_lists() method.
-    sentence_data.create_sentence_lists()
-    ranked_genes = sentence_data.sentence_lists
+    # We must first convert the anndata object to the library's required format.
+    arrow_ds, vocabulary = CSData.adata_to_arrow(
+        adata=adata,
+        sentence_delimiter=' ',
+        # No specific labels needed for this task, so we pass an empty list.
+        label_col_names=[] 
+    )
 
-    tissue_context = " ".join([" ".join(cell) for cell in ranked_genes])
+    # Now, create the CSData object from the arrow dataset. 
+    # This doesn't require saving to disk; it can be done in-memory,
+    # but the function still requires placeholder paths.
+    import tempfile
+    with tempfile.TemporaryDirectory() as temp_dir:
+        sentence_data = CSData.csdata_from_arrow(
+            arrow_dataset=arrow_ds,
+            vocabulary=vocabulary,
+            save_dir=temp_dir,
+            save_name="temp_csdata",
+            dataset_backend="arrow", # Specify in-memory processing
+        )
+    
+        # The sentences are created during the object's initialization.
+        # We can access them by calling the get_sentence_strings() method.
+        ranked_genes = sentence_data.get_sentence_strings()
+
+    tissue_context = " ".join(ranked_genes)
     max_tokens_for_context = 3000
     tissue_context = " ".join(tissue_context.split()[:max_tokens_for_context])
 
@@ -400,13 +419,22 @@ def analyze_tissue(image_bytes: bytes, query: str):
     Main pipeline function that orchestrates the two-step analysis.
     It calls the DeepSpot function, then the Cell2Sentence function.
     """
+    import numpy as np
+    
     # 1. Run DeepSpot to get spatial gene expression from the image.
     #    This call runs in the `deepspot_image` container.
     print("Step 1: Calling DeepSpot to predict gene expression...")
     adata = run_deepspot.remote(image_bytes)
     print("DeepSpot analysis complete.")
 
-    # 2. Run Cell2Sentence to answer the query based on the expression data.
+    # 2. Transpose the AnnData object to be (observations, variables) as expected by cell2sentence.
+    print("Transposing AnnData object for Cell2Sentence compatibility...")
+    adata = adata.T
+
+    # Explicitly convert the expression matrix to float32 to ensure compatibility with scipy sparse matrix conversion.
+    adata.X = adata.X.astype(np.float32)
+
+    # 3. Run Cell2Sentence to answer the query based on the expression data.
     #    This call runs in the `cell2sentence_image` container.
     print("Step 2: Calling Cell2Sentence to answer the query...")
     answer = run_cell2sentence.remote(adata, query)
