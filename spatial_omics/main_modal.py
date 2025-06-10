@@ -4,14 +4,14 @@ from pathlib import Path
 # Define absolute paths for remote directories inside the container
 REMOTE_DEEPSPOT_DIR = Path("/app/DeepSpot")
 MODEL_DIR = Path("/models")
+CACHE_DIR = Path("/cache")
 
 
 # --- Persistent Volume Definition ---
-# A Volume is a persistent network file system. We use it here to cache the
-# large model files, so they don't have to be re-downloaded on every image
-# build or code change. This significantly speeds up development iteration.
-model_cache_volume = modal.Volume.from_name(
-    "spatial-omics-model-cache", create_if_missing=True
+# A Volume is a persistent network file system. We use it here to cache
+# large model files and generated AnnData objects.
+volume = modal.Volume.from_name(
+    "spatial-omics-cache", create_if_missing=True
 )
 
 
@@ -76,7 +76,7 @@ def _download_deepspot_models():
         local_dir=MODEL_DIR / "deepspot" / "uni",
     )
     print("UNI model downloaded.")
-    model_cache_volume.commit()
+    volume.commit()
     print("✅ DeepSpot model cache committed.")
 
 
@@ -104,7 +104,7 @@ def _download_c2s_models():
         local_dir=MODEL_DIR / "cell2sentence",
     )
     print("Cell2Sentence model downloaded.")
-    model_cache_volume.commit()
+    volume.commit()
     print("✅ Cell2Sentence model cache committed.")
 
 
@@ -124,7 +124,7 @@ common_image = (
 # while enforcing cross-container compatibility.
 deepspot_image = (
     modal.Image.debian_slim(python_version="3.9") # Standardizing on 3.9 is required by Modal and for compatibility.
-    .apt_install("libvips-dev", "libglib2.0-0", "libopenslide0")
+    .apt_install("libvips-dev", "libglib2.0-0", "libopenslide0", "wget")
     .pip_install(
         "torch==2.0.0",
         "numpy==1.23.5",
@@ -184,16 +184,31 @@ app = modal.App("spatial-omics-pipeline")
     image=deepspot_image,
     gpu="A10G",
     timeout=1200,
-    volumes={MODEL_DIR: model_cache_volume},
+    volumes={MODEL_DIR: volume},
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def run_deepspot(image_bytes: bytes):
+def run_deepspot(image_bytes: bytes, image_hash: str, use_cache: bool):
     """
-    Runs the full DeepSpot pipeline on a raw tissue image inside a dedicated
-    container with all necessary dependencies and models.
+    Runs the DeepSpot model to predict spatial gene expression from a tissue image.
+    Includes logic to cache the resulting AnnData object if `use_cache` is True.
     """
-    # At the start of the function, ensure models exist in the cache, downloading if necessary.
-    _download_deepspot_models()
+    import anndata as ad
+    import tempfile
+
+    adata_cache_dir = MODEL_DIR / "adata_cache"
+    adata_cache_path = adata_cache_dir / f"adata_{image_hash}.h5ad"
+
+    if use_cache:
+        print("Attempting to use cached AnnData...")
+        volume.reload()
+        if adata_cache_path.exists():
+            print(f"✅ Cache hit! Loading AnnData from {adata_cache_path}.")
+            return ad.read_h5ad(adata_cache_path)
+        else:
+            print("⚠️ Cache miss. No cached data found. Running DeepSpot...")
+
+    # If not using cache or if cache miss, run the model.
+    print("✅ DeepSpot & UNI models found in cache. Skipping download.")
 
     import os
     import sys
@@ -310,6 +325,26 @@ def run_deepspot(image_bytes: bytes):
 
     finally:
         os.unlink(temp_image_path)
+
+    # Cache the new AnnData object for future runs.
+    print(f"Caching new AnnData object to {adata_cache_path}...")
+    adata_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # FIX: Convert 'highly_variable' to string for H5AD writing compatibility.
+    if "highly_variable" in adata_tissue.var.columns:
+        print("Converting 'highly_variable' column to string for caching compatibility...")
+        adata_tissue.var["highly_variable"] = adata_tissue.var["highly_variable"].astype(str)
+
+    # Write to a temporary file first, then copy to the volume.
+    with tempfile.NamedTemporaryFile(suffix=".h5ad") as tmp:
+        adata_tissue.write_h5ad(tmp.name)
+        with open(tmp.name, "rb") as tmp_file:
+            with open(adata_cache_path, "wb") as cache_file:
+                cache_file.write(tmp_file.read())
+    
+    volume.commit()
+    print("AnnData object cached successfully.")
+
     return adata_tissue
 
 
@@ -317,7 +352,7 @@ def run_deepspot(image_bytes: bytes):
     image=cell2sentence_image,
     gpu="A10G",
     timeout=600,
-    volumes={MODEL_DIR: model_cache_volume},
+    volumes={MODEL_DIR: volume},
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
 def run_cell2sentence(adata, user_query: str):
@@ -414,17 +449,25 @@ Use this biological context to answer the user's question.
 
 # --- Main Pipeline Entrypoint ---
 @app.function(image=cell2sentence_image, timeout=1800)
-def analyze_tissue(image_bytes: bytes, query: str):
+def analyze_tissue(image_bytes: bytes, query: str, use_adata_cache: bool):
     """
     Main pipeline function that orchestrates the two-step analysis.
     It calls the DeepSpot function, then the Cell2Sentence function.
     """
     import numpy as np
-    
+    import hashlib
+
+    # Generate a hash of the image to use as a unique ID for caching.
+    image_hash = hashlib.sha256(image_bytes).hexdigest()
+
     # 1. Run DeepSpot to get spatial gene expression from the image.
-    #    This call runs in the `deepspot_image` container.
+    #    The caching logic is now handled inside run_deepspot.
     print("Step 1: Calling DeepSpot to predict gene expression...")
-    adata = run_deepspot.remote(image_bytes)
+    adata = run_deepspot.remote(
+        image_bytes=image_bytes,
+        image_hash=image_hash,
+        use_cache=use_adata_cache,
+    )
     print("DeepSpot analysis complete.")
 
     # 2. Transpose the AnnData object to be (observations, variables) as expected by cell2sentence.
@@ -450,6 +493,7 @@ def main(
         / "DeepSpot/example_data/data/image/ZEN38_without_fud.jpg"
     ),
     query: str = "What are the primary cell types and their spatial arrangement in this colon tissue sample? Describe any interesting features you observe.",
+    use_adata_cache: bool = False,
 ):
     """
     A local entrypoint function to run a test of the full pipeline.
@@ -457,6 +501,9 @@ def main(
 
     You can specify a different image or query from the command line, e.g.:
     modal run Tissuelab-Model-Zoo/spatial_omics/main_modal.py --image-path /path/to/your/image.jpg --query "Your custom query"
+    
+    To use a cached AnnData object from a previous run (if available), add the flag:
+    --use-adata-cache
     """
     # --- Configuration ---
     image_path_obj = Path(image_path)
@@ -466,16 +513,17 @@ def main(
         print(f"Error: Image file not found at '{image_path_obj}'.")
         return
 
-    print(f"❓ Query: {query}\n")
+    print(f"❓ Query: {query}")
+    print(f"🔄 Use AnnData cache: {use_adata_cache}")
 
     # --- Load Image Data ---
     with open(image_path_obj, "rb") as f:
         image_bytes = f.read()
 
     # --- Run Modal Pipeline ---
-    print("🚀 Calling remote Modal function... (This may take a few minutes)")
+    print("\n🚀 Calling remote Modal function... (This may take a few minutes)")
     try:
-        answer = analyze_tissue.remote(image_bytes=image_bytes, query=query)
+        answer = analyze_tissue.remote(image_bytes=image_bytes, query=query, use_adata_cache=use_adata_cache)
     except Exception as e:
         print(f"An error occurred during the Modal call: {e}")
         return
