@@ -1,0 +1,3 @@
+[submodule "DeepSpot"]
+    path = DeepSpot
+    url = https://github.com/ratschlab/DeepSpot
