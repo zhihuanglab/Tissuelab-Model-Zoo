@@ -81,11 +81,11 @@ def _download_deepspot_models():
 
 
 def _download_c2s_models():
-    """Downloads the Cell2Sentence model if it doesn't exist in the cache."""
+    """Downloads the C2S-Scale-1B model if it doesn't exist in the cache."""
     # Check if a key file already exists. If so, skip the download.
-    c2s_config_path = MODEL_DIR / "cell2sentence" / "config.json"
+    c2s_config_path = MODEL_DIR / "c2s-scale-1b" / "config.json"
     if c2s_config_path.exists():
-        print("✅ Cell2Sentence model found in cache. Skipping download.")
+        print("✅ C2S-Scale-1B model found in cache. Skipping download.")
         return
 
     import os
@@ -98,14 +98,14 @@ def _download_c2s_models():
     else:
         print("HF_TOKEN secret not found. Proceeding with public access.")
 
-    print("Downloading Cell2Sentence model...")
+    print("Downloading C2S-Scale-1B model...")
     snapshot_download(
-        "vandijklab/C2S-Pythia-410m-diverse-single-and-multi-cell-tasks",
-        local_dir=MODEL_DIR / "cell2sentence",
+        "vandijklab/C2S-Scale-Pythia-1b-pt",
+        local_dir=MODEL_DIR / "c2s-scale-1b",
     )
-    print("Cell2Sentence model downloaded.")
+    print("C2S-Scale-1B model downloaded.")
     volume.commit()
-    print("✅ Cell2Sentence model cache committed.")
+    print("✅ C2S-Scale-1B model cache committed.")
 
 
 # --- Image Definitions ---
@@ -169,6 +169,9 @@ cell2sentence_image = (
         "torchvision==0.15.1",
         "numpy==1.23.5",
         "anndata==0.8.0",
+        "scanpy==1.9.3",
+        "leidenalg",
+        "python-igraph",
         "transformers<4.31.0",  # Critically pinned to avoid LRScheduler error
         # Cell2Sentence specific dependencies
         "cell2sentence==1.1.0",
@@ -211,7 +214,8 @@ def run_deepspot(image_bytes: bytes, image_hash: str, use_cache: bool):
             print("⚠️ Cache miss. No cached data found. Running DeepSpot...")
 
     # If not using cache or if cache miss, run the model.
-    print("✅ DeepSpot & UNI models found in cache. Skipping download.")
+    _download_deepspot_models()
+
 
     import os
     import sys
@@ -352,153 +356,126 @@ def run_deepspot(image_bytes: bytes, image_hash: str, use_cache: bool):
 
 
 @app.function(
-    image=deepspot_image,
-    gpu="A10G", # GPU is useful for scanpy's rapids integration if available
-    timeout=600,
+    image=cell2sentence_image,
+    gpu="A10G",
+    timeout=1200,  # Increased timeout for the larger model
+    volumes={MODEL_DIR: volume},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def summarize_adata(adata):
+def run_c2s_analysis(adata, user_query: str):
     """
-    Performs clustering analysis on an AnnData object to create a high-level
-    biological summary.
+    Performs clustering, summarization, and question-answering using the
+    large C2S-Scale-1B model.
     """
+    # At the start of the function, ensure models exist in the cache.
+    _download_c2s_models()
+
     import scanpy as sc
-    import numpy as np
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     import pandas as pd
 
-    print("🔬 Starting summarization...")
-
-    # --- Preprocessing and Cleaning ---
-    # Ensure data is in a dense format for manipulation
+    # --- 1. Perform Clustering and Marker Gene Analysis (formerly summarize_adata) ---
+    print("🔬 Starting summarization within C2S analysis...")
     if hasattr(adata.X, "toarray"):
         adata.X = adata.X.toarray()
-
-    # Clip values to ensure non-negativity before normalization
     adata.X = adata.X.clip(min=0)
-
-    # Basic filtering
-    sc.pp.filter_cells(adata, min_genes=200)
-    sc.pp.filter_genes(adata, min_cells=3)
     
-    # Check if any data remains after filtering
+    # Filter out cells with few genes and genes present in few cells
+    sc.pp.filter_cells(adata, min_genes=5) # Relaxed filtering
+    sc.pp.filter_genes(adata, min_cells=5) # Relaxed filtering
+    
     if adata.n_obs == 0 or adata.n_vars == 0:
-        return "No data remaining after initial filtering. Cannot perform analysis."
+        return "No data remaining after filtering. Cannot perform analysis."
 
-    # Normalization and Log Transform
     sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
-
-    # Find highly variable genes, with robust error handling
+    
     try:
         sc.pp.highly_variable_genes(adata, min_mean=0.0125, max_mean=3, min_disp=0.5)
-        # --- FIX: Check for and remove NaNs from highly_variable results ---
         hvg_df = adata.var
+        if hvg_df.empty or 'highly_variable' not in hvg_df.columns:
+            raise ValueError("Highly variable gene calculation failed.")
         hvg_df.dropna(subset=['highly_variable', 'means', 'dispersions', 'dispersions_norm'], inplace=True)
-
     except Exception as e:
         return f"An error occurred during highly variable gene selection: {e}"
 
     if 'highly_variable' not in adata.var.columns or adata.var['highly_variable'].sum() == 0:
-         return "No highly variable genes found. Cannot perform clustering."
+        print("No highly variable genes found after filtering. Proceeding with all genes for PCA.")
+        adata_for_pca = adata
+    else:
+        adata_for_pca = adata[:, adata.var.highly_variable]
 
-    # Subset to highly variable genes before scaling
-    adata = adata[:, adata.var.highly_variable]
+    # Handle cases where no variable genes are found
+    if adata_for_pca.n_vars == 0:
+        return "No variable genes to analyze. Cannot perform clustering."
 
-    # Scale, run PCA, and find neighbors
-    sc.pp.scale(adata, max_value=10)
-    sc.tl.pca(adata, svd_solver='arpack')
-    sc.pp.neighbors(adata, n_neighbors=10, n_pcs=40)
+    sc.pp.scale(adata_for_pca, max_value=10)
+    sc.tl.pca(adata_for_pca, svd_solver='arpack')
+    sc.pp.neighbors(adata_for_pca, n_neighbors=10, n_pcs=min(40, adata_for_pca.n_obs-1, adata_for_pca.n_vars-1))
+    sc.tl.leiden(adata_for_pca)
+    sc.tl.rank_genes_groups(adata_for_pca, 'leiden', method='t-test')
+    
+    adata.obs['leiden'] = adata_for_pca.obs['leiden']
 
-    # Cluster the data
-    print("Clustering spots...")
-    sc.tl.leiden(adata)
-
-    # Find marker genes for each cluster
-    print("Finding marker genes...")
-    sc.tl.rank_genes_groups(adata, 'leiden', method='t-test')
-
-    # --- Build the summary string ---
-    print("Building summary string...")
     summary_lines = [f"Analysis of the selected region reveals {len(adata.obs.leiden.cat.categories)} distinct cell populations:"]
     
-    # Extract marker genes for each cluster
-    marker_genes = adata.uns['rank_genes_groups']['names']
-    
+    # FIX: Use the official scanpy helper function to get a tidy DataFrame.
+    # This is much more robust than the previous manual construction and fixes the
+    # "ValueError: All arrays must be of the same length" crash.
+    marker_df = sc.get.rank_genes_groups_df(adata_for_pca, group=None)
+
     for cluster in adata.obs.leiden.cat.categories:
-        # Get top 5 marker genes for the cluster
-        top_markers = [marker_genes[i][cluster] for i in range(5)]
+        # Filter the DataFrame for the current cluster and get top markers
+        top_markers = marker_df[marker_df['group'] == str(cluster)]['names'].head(5).tolist()
         summary_lines.append(
             f"- Cluster {cluster}: Characterized by high expression of {', '.join(top_markers)}."
         )
-        
-    summary_string = "\n".join(summary_lines)
+    biological_summary = "\n".join(summary_lines)
     print("✅ Summarization complete.")
-    print(summary_string)
-    
-    return summary_string
 
-
-@app.function(
-    image=cell2sentence_image,
-    gpu="A10G",
-    timeout=600,
-    volumes={MODEL_DIR: volume},
-    secrets=[modal.Secret.from_name("huggingface-secret")],
-)
-def run_cell2sentence(summary: str, user_query: str):
-    """
-    Uses a Cell2Sentence model to answer a user's query about a tissue sample,
-    based on a pre-computed biological summary.
-    """
-    # At the start of the function, ensure models exist in the cache, downloading if necessary.
-    _download_c2s_models()
-
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    # Define paths to the model files within the container
-    C2S_MODEL_DIR = MODEL_DIR / "cell2sentence"
-
+    # --- 2. Load C2S-Scale-1B Model ---
+    C2S_MODEL_DIR = MODEL_DIR / "c2s-scale-1b"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Running Cell2Sentence on device: {device}")
+    print(f"Running C2S-Scale-1B on device: {device}")
 
-    # --- 1. Load Model and Tokenizer ---
-    print("Loading Cell2Sentence model and tokenizer...")
+    print("Loading C2S-Scale-1B model and tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(C2S_MODEL_DIR)
     model = AutoModelForCausalLM.from_pretrained(C2S_MODEL_DIR)
     model.to(device)
     model.eval()
 
-    # --- 2. Format the Prompt ---
-    prompt = f"""You are an expert biologist assisting a pathologist. Based on the following summary of cell populations identified in a selected tissue region, provide a concise and clear answer to the pathologist's question.
+    # --- 3. Format Prompt for Question Answering ---
+    prompt = f"""You are an expert biologist providing analysis of a tissue sample. Below is a summary of distinct cell populations identified through gene expression analysis. Use this summary to provide a concise and clear answer to the user's question.
 
 [BIOLOGICAL SUMMARY]
-{summary}
+{biological_summary}
 
-[PATHOLOGIST'S QUESTION]
+[USER'S QUESTION]
 {user_query}
 
-[YOUR ANALYSIS]
+[EXPERT ANALYSIS]
 """
     print("📝 Final prompt being sent to the model:")
     print("-----------------------------------------")
     print(prompt)
     print("-----------------------------------------")
 
-
-    # --- 3. Generate the Answer ---
-    print("Generating answer...")
+    # --- 4. Generate the Answer ---
+    print("Generating answer with C2S-Scale-1B...")
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=256,
+            max_new_tokens=512,  # Increased token limit for more detailed answers
             do_sample=True,
             top_p=0.9,
             temperature=0.7,
             pad_token_id=tokenizer.eos_token_id,
         )
     response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    answer = response.split("[YOUR ANALYSIS]")[-1].strip()
+    # The response includes the prompt, so we need to extract the generated part.
+    answer = response[len(prompt):].strip()
 
     print("Answer generated.")
     return answer
@@ -510,8 +487,7 @@ def analyze_tissue(image_bytes: bytes, query: str, use_adata_cache: bool):
     """
     Main pipeline function that orchestrates the three-step analysis:
     1. Predict gene expression from an image (DeepSpot).
-    2. Summarize the expression data into clusters and marker genes.
-    3. Use an LLM to answer a query based on the summary.
+    2. Run C2S-Scale to summarize and answer the query based on the adata object.
     """
     import hashlib
 
@@ -528,17 +504,10 @@ def analyze_tissue(image_bytes: bytes, query: str, use_adata_cache: bool):
     )
     print("DeepSpot analysis complete.")
 
-    # 2. Summarize the AnnData object to get a high-level biological context.
-    #    This call also returns the result string directly.
-    print("Step 2: Calling Summarizer to analyze cell populations...")
-    summary = summarize_adata.remote(adata)
-    print("Summarization complete.")
-
-    # 3. Run Cell2Sentence to answer the query based on the summary.
-    #    This call also returns the final answer string directly.
-    print("Step 3: Calling Cell2Sentence to answer the query...")
-    answer = run_cell2sentence.remote(summary, query)
-    print("Cell2Sentence analysis complete.")
+    # 2. Run C2S-Scale to summarize and answer the query based on the adata object.
+    print("Step 2: Calling C2S-Scale to analyze populations and answer the query...")
+    answer = run_c2s_analysis.remote(adata, query)
+    print("C2S-Scale analysis complete.")
 
     return answer
 
