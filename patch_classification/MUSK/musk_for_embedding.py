@@ -23,8 +23,8 @@ import h5py
 import tiffslide
 from PIL import ImageOps
 from skimage import morphology
-from skimage import measure
-from skimage.measure import label
+
+
 class MUSK:
     """MUSK model wrapper class"""
     def __init__(self, model_path="abc"):
@@ -71,50 +71,59 @@ class MUSK:
         num_batches = (num_images + batch_size - 1) // batch_size
         image_embeddings = []
 
-        for i in range(0, num_images, batch_size):
-            # Clear GPU cache
-            torch.cuda.empty_cache()
-            
-            batch_slice = slice(i, min(i + batch_size, num_images))
-            batch_images = images[batch_slice]
-            
-            # If progress callback is provided, update every 10%
-            if progress_callback and i % max(1, num_images // 10) == 0:
-                progress_percent = int((i / num_images) * 100)
-                progress_callback("encode", progress_percent)
-            
-            # If input is a list of paths, load images
-            if isinstance(batch_images[0], str):
-                loaded_images = []
-                for img_path in batch_images:
-                    try:
-                        img = Image.open(img_path).convert('RGB')
-                        loaded_images.append(img)
-                    except Exception as e:
-                        self.logger.warning(f"Error loading image {img_path}: {str(e)}")
-                        loaded_images.append(Image.new('RGB', (384, 384)))
-                batch_images = loaded_images
+        # make sure model is on GPU
+        self.model = self.model.to(self.device)
+        self.model.eval()  # set to evaluation mode
 
-            # Preprocess batch as float32
-            processed_images = torch.stack([
-                self.preprocess(img) for img in batch_images
-            ]).to(self.device, dtype=torch.float32)
+        with torch.cuda.amp.autocast():  # use automatic mixed precision
+            with torch.no_grad():  # do not calculate gradient
+                for i in range(0, num_images, batch_size):
+                    # Clear GPU cache
+                    torch.cuda.empty_cache()
+                    
+                    batch_slice = slice(i, min(i + batch_size, num_images))
+                    batch_images = images[batch_slice]
+                    
+                    # If progress callback is provided, update every 10%
+                    if progress_callback and i % max(1, num_images // 10) == 0:
+                        progress_percent = int((i / num_images) * 100)
+                        progress_callback("encode", progress_percent)
+                    
+                    # If input is a list of paths, load images
+                    if isinstance(batch_images[0], str):
+                        loaded_images = []
+                        for img_path in batch_images:
+                            try:
+                                img = Image.open(img_path).convert('RGB')
+                                loaded_images.append(img)
+                            except Exception as e:
+                                self.logger.warning(f"Error loading image {img_path}: {str(e)}")
+                                loaded_images.append(Image.new('RGB', (384, 384)))
+                        batch_images = loaded_images
 
-            # Model with DataParallel processing
-            batch_embeddings = self.model(
-                image=processed_images,
-                with_head=True,
-                out_norm=True,
-                ms_aug=False,
-                return_global=True
-            )[0]
-            image_embeddings.append(batch_embeddings)
-            
+                    # Preprocess batch as float32 and move to GPU
+                    processed_images = torch.stack([
+                        self.preprocess(img) for img in batch_images
+                    ]).to(self.device, dtype=torch.float32)
+
+                    # Model with DataParallel processing
+                    batch_embeddings = self.model(
+                        image=processed_images,
+                        with_head=True,
+                        out_norm=True,
+                        ms_aug=False,
+                        return_global=True
+                    )[0]
+                    
+                    # 将结果保存在CPU上以节省GPU内存
+                    image_embeddings.append(batch_embeddings.cpu())
+                    
         # Ensure final 100% progress callback
         if progress_callback:
             progress_callback("encode", 100)
             
-        return torch.cat(image_embeddings, dim=0)
+        # 最后将所有结果合并
+        return torch.cat(image_embeddings, dim=0).to(self.device)
 
     def encode_text(self, texts: List[str], batch_size: int):
         """Text encoding method
@@ -125,7 +134,7 @@ class MUSK:
             torch.Tensor: Text feature vectors
         """
         # Load tokenizer
-        tokenizer = XLMRobertaTokenizer("model/musk/models/tokenizer.spm")
+        tokenizer = XLMRobertaTokenizer("./MUSK/musk/models/tokenizer.spm")
         
         num_texts = len(texts)
         num_batches = (num_texts + batch_size - 1) // batch_size
@@ -301,7 +310,15 @@ class MUSK:
 
     def get_tissue_mask(self, slide, edge_width_ratio=0.025, min_area=None, debug_dir=None):
         """
-        生成填满的主组织mask，并自动去除四周阴影/伪组织，支持debug可视化。
+        Generate a filled tissue mask for a whole-slide image.
+
+        The routine:
+        1. Builds a thumbnail‐level binary mask of tissue,
+        2. Fills gaps and large holes,
+        3. Removes small spurious regions at the slide’s borders (typical “shadow” artifacts),
+        4. Optionally saves every intermediate step to *debug_dir* for visual inspection.
+
+        
         """
         try:
             import numpy as np
@@ -312,59 +329,83 @@ class MUSK:
             from skimage.measure import label, regionprops
             import imageio
 
-            # 1. 缩略图读取
+            # ---------------------------------------------------------------------
+            # 1. Read a thumbnail image at the coarsest reasonable level
+            # ---------------------------------------------------------------------
             level = min(3, len(slide.level_dimensions) - 1)
             dim = slide.level_dimensions[level]
             temp_thumb = slide.read_region((0, 0), level, dim).convert('RGB')
             gray = np.array(ImageOps.grayscale(temp_thumb))
-            h, w = gray.shape
+            h,  w = gray.shape
 
-            # 2. 自适应阈值分割（更严格参数）
+            # ---------------------------------------------------------------------
+            # 2. Adaptive thresholding – stricter parameters for fewer false positives
+            # ---------------------------------------------------------------------
             mask = cv2.adaptiveThreshold(
                 gray, 1, cv2.ADAPTIVE_THRESH_MEAN_C,
                 cv2.THRESH_BINARY_INV, 31, 10
             )
-            if debug_dir: imageio.imwrite(os.path.join(debug_dir, "debug_01_init_mask.png"), mask * 255)
+            if debug_dir:
+                imageio.imwrite(os.path.join(debug_dir, "debug_01_init_mask.png"), mask * 255)
 
-            # 3. 闭运算填补缝隙
+            # ---------------------------------------------------------------------
+            # 3. Morphological closing – bridge small gaps / tears
+            # ---------------------------------------------------------------------
             mask = morphology.binary_closing(mask, morphology.disk(8))
-            if debug_dir: imageio.imwrite(os.path.join(debug_dir, "debug_02_closed.png"), mask.astype(np.uint8)*255)
+            if debug_dir:
+                imageio.imwrite(os.path.join(debug_dir, "debug_02_closed.png"), mask.astype(np.uint8) * 255)
 
-            # 4. 填补大洞
-            mask = morphology.remove_small_holes(mask, area_threshold=int(0.01*h*w))
-            if debug_dir: imageio.imwrite(os.path.join(debug_dir, "debug_03_holes.png"), mask.astype(np.uint8)*255)
+            # ---------------------------------------------------------------------
+            # 4. Fill larger holes inside tissue islands
+            # ---------------------------------------------------------------------
+            mask = morphology.remove_small_holes(mask, area_threshold=int(0.01 * h * w))
+            if debug_dir:
+                imageio.imwrite(os.path.join(debug_dir, "debug_03_holes.png"), mask.astype(np.uint8) * 255)
 
-            # 5. 只保留面积大于阈值的组织块
+            # ---------------------------------------------------------------------
+            # 5. Keep only tissue regions whose area exceeds *min_area*
+            # ---------------------------------------------------------------------
             if min_area is None:
                 min_area = max(int(0.003 * h * w), 5000)
+
             label_img = label(mask)
             mask_clean = np.zeros_like(mask, dtype=bool)
             for region in regionprops(label_img):
                 if region.area >= min_area:
                     mask_clean[label_img == region.label] = 1
-            mask = mask_clean.astype(np.uint8)
-            if debug_dir: imageio.imwrite(os.path.join(debug_dir, "debug_04_area.png"), mask*255)
 
-            # 6. 阴影检测与去除
+            mask = mask_clean.astype(np.uint8)
+            if debug_dir:
+                imageio.imwrite(os.path.join(debug_dir, "debug_04_area.png"), mask * 255)
+
+            # ---------------------------------------------------------------------
+            # 6. Detect and discard shadow / artifact regions along the slide edges
+            # ---------------------------------------------------------------------
             margin_y = int(h * edge_width_ratio)
             margin_x = int(w * edge_width_ratio)
+
             edge_mask = np.zeros_like(mask, dtype=bool)
-            edge_mask[:margin_y, :] = 1
+            edge_mask[:margin_y, :]  = 1
             edge_mask[-margin_y:, :] = 1
-            edge_mask[:, :margin_x] = 1
+            edge_mask[:, :margin_x]  = 1
             edge_mask[:, -margin_x:] = 1
 
             label_img2 = label(mask)
             artifact_mask = np.zeros_like(mask, dtype=bool)
             for region in regionprops(label_img2):
-                if region.area < min_area * 1.5:  # 边缘小块更严格
+                # Apply a stricter size threshold for edge-touching regions
+                if region.area < min_area * 1.5:
                     coords = region.coords
-                    if np.any(edge_mask[coords[:,0], coords[:,1]]):
+                    if np.any(edge_mask[coords[:, 0], coords[:, 1]]):
                         artifact_mask[label_img2 == region.label] = 1
-            if debug_dir: imageio.imwrite(os.path.join(debug_dir, "debug_05_artifact_mask.png"), artifact_mask*255)
 
+            if debug_dir:
+                imageio.imwrite(os.path.join(debug_dir, "debug_05_artifact_mask.png"), artifact_mask * 255)
+
+            # Final mask: tissue minus artifacts
             final_mask = (mask.astype(bool) & (~artifact_mask.astype(bool))).astype(np.uint8)
-            if debug_dir: imageio.imwrite(os.path.join(debug_dir, "debug_06_final_mask.png"), final_mask*255)
+            if debug_dir:
+                imageio.imwrite(os.path.join(debug_dir, "debug_06_final_mask.png"), final_mask * 255)
 
             return final_mask
 
@@ -374,13 +415,7 @@ class MUSK:
             traceback.print_exc()
             return np.ones(dim[::-1], dtype=np.uint8)
 
-
-
-
-
-
-    
-    def process_whole_wsi(self, wsi_path: str, patch_size: int = 224, level: int = 0, 
+    def process_whole_wsi(self, wsi_path: str, patch_size: int = 128, level: int = 0, 
                           batch_size: int = 16, use_tiffslide: bool = True,
                           save_patches: bool = False, output_dir: str = None,
                           tissue_threshold: float = 0.5, progress_callback=None):
