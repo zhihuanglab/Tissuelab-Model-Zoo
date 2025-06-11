@@ -24,7 +24,7 @@ import tiffslide
 from PIL import ImageOps
 from skimage import morphology
 from skimage import measure
-
+from skimage.measure import label
 class MUSK:
     """MUSK model wrapper class"""
     def __init__(self, model_path="abc"):
@@ -300,16 +300,17 @@ class MUSK:
         return patch_embeddings
 
     def get_tissue_mask(self, slide):
-        """Generate tissue mask from WSI with enhanced gray background detection and removal
+        """Generate tissue mask from WSI with enhanced gray background detection and fat tissue preservation
         
-        This function identifies the actual slide edges and excludes all gray 
-        background areas that are not tissue. It uses both RGB and HSV color analysis to
-        robustly distinguish between tissue and various shades of gray backgrounds.
+        This function identifies the actual slide edges and excludes gray background areas
+        while preserving all tissue types including adipose (fat) tissue. It uses both RGB 
+        and HSV color analysis to robustly distinguish between tissue and various shades of 
+        gray backgrounds.
         
         Args:
             slide: TiffSlide object
         Returns:
-            mask: Binary tissue mask where tissue=1, background=0
+            mask: Binary tissue mask where tissue=1 (including fat), background=0
         """
         try:
             # choose appropriate level
@@ -365,13 +366,37 @@ class MUSK:
             gb_diff = np.abs(g.astype(np.int16) - b.astype(np.int16))
             max_diff = np.maximum(np.maximum(rg_diff, rb_diff), gb_diff)
             
+            # FAT TISSUE DETECTION - Detect fat tissue to preserve it
+            # Fat tissue typically appears as whitish areas with slight pink/purple tinge
+            # and has some structure (not uniform like background)
+            fat_tissue_mask = (
+                (r >= 220) & (r <= 255) &
+                (g >= 200) & (g <= 250) &
+                (b >= 220) & (b <= 255) &
+                (max_diff > 5) & (max_diff < 30)  # Some color variation but not too much
+            )
+            
+            # Additional fat detection using local variance
+            # Fat tissue has texture, unlike uniform background
+            gray_float = gray.astype(np.float32)
+            local_variance = cv2.Laplacian(gray_float, cv2.CV_32F)
+            variance_mag = np.abs(local_variance)
+            
+            # Fat areas have some texture (variance > threshold)
+            texture_mask = variance_mag > 2.0
+            
+            # Combine fat detection criteria
+            potential_fat = fat_tissue_mask & texture_mask
+            
             # ENHANCED GRAY DETECTION - Multiple ranges for different gray shades
-            # Light gray (common scanner background)
+            # Modified to exclude fat tissue areas
+            # Light gray (common scanner background) - excluding fat tissue colors
             light_gray_mask = (
                 (r >= 180) & (r <= 245) &
                 (g >= 180) & (g <= 245) &
                 (b >= 180) & (b <= 245) &
-                (max_diff < 10)
+                (max_diff < 10) &
+                ~potential_fat  # Exclude fat tissue
             )
             
             # Medium gray
@@ -390,19 +415,20 @@ class MUSK:
                 (max_diff < 15)
             )
             
-            # Very light gray (almost white backgrounds)
+            # Very light gray (almost white backgrounds) - excluding fat tissue
             very_light_gray_mask = (
                 (r >= 245) & (r <= 255) &
                 (g >= 245) & (g <= 255) &
-                (b >= 245) & (b <= 255)
+                (b >= 245) & (b <= 255) &
+                (variance_mag < 1.0)  # Low variance indicates uniform background
             )
             
             # Combine all RGB-based gray detections
             rgb_gray_mask = light_gray_mask | medium_gray_mask | dark_gray_mask | very_light_gray_mask
             
             # HSV-based gray detection (low saturation indicates gray)
-            # This catches grays that RGB might miss
-            hsv_gray_mask = (s < 30) & (v > 45) & (v < 250)
+            # Modified to preserve fat tissue which may have low saturation
+            hsv_gray_mask = (s < 20) & (v > 45) & (v < 250) & ~potential_fat
             
             # Combine RGB and HSV gray detection
             gray_mask = rgb_gray_mask | hsv_gray_mask
@@ -425,6 +451,7 @@ class MUSK:
                 gray_background = gray_background | (labeled_gray == comp)
             
             # Also include any large gray regions (likely background even if not connected to edges)
+            # BUT exclude regions that contain significant fat tissue
             if num_gray > 0:
                 component_sizes = np.bincount(labeled_gray.ravel())
                 total_pixels = height * width
@@ -432,16 +459,21 @@ class MUSK:
                 # Any gray region larger than 5% of image is likely background
                 for i in range(1, num_gray + 1):
                     if component_sizes[i] > total_pixels * 0.05:
-                        gray_background = gray_background | (labeled_gray == i)
+                        # Check if this component overlaps with fat tissue
+                        component_mask = (labeled_gray == i)
+                        fat_overlap = np.sum(component_mask & potential_fat)
+                        component_size = np.sum(component_mask)
+                        
+                        # If less than 10% of the component is fat tissue, it's background
+                        if fat_overlap < component_size * 0.1:
+                            gray_background = gray_background | component_mask
             
             # Apply Gaussian blur to smooth the gray background mask before dilation
-            # This creates smoother transitions
             gray_background_float = gray_background.astype(np.float32)
             gray_background_smooth = cv2.GaussianBlur(gray_background_float, (11, 11), 3)
-            gray_background_smooth = gray_background_smooth > 0.3  # Threshold back to binary
+            gray_background_smooth = gray_background_smooth > 0.3
             
             # Use morphological gradient for smoother edge transitions
-            # Reduced from disk(5) to disk(3) for less aggressive dilation
             gray_background_dilated = morphology.binary_dilation(gray_background_smooth, morphology.disk(3))
             
             # Apply additional smoothing to the dilated mask
@@ -453,27 +485,36 @@ class MUSK:
             non_gray_mask = ~gray_background
             
             # STANDARD TISSUE DETECTION PROCEDURE
-            # use adaptive threshold with adjusted parameters for smoother detection
-            block_size = 51  # must be odd
-            C = 2  # constant adjustment value
+            # Modified thresholds to better capture fat tissue
+            block_size = 51
+            C = 1  # Reduced constant for better fat detection
             
             # Apply Gaussian blur to the grayscale image before thresholding
-            # This helps create smoother edges
             gray_smoothed = cv2.GaussianBlur(gray, (5, 5), 1.5)
             
+            # Use a more sensitive adaptive threshold for better fat detection
             mask = cv2.adaptiveThreshold(
                 gray_smoothed, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                 cv2.THRESH_BINARY_INV, block_size, C
             )
             
+            # Also create a mask specifically for very light tissues (like fat)
+            # Using a different threshold approach
+            _, light_tissue_mask = cv2.threshold(gray_smoothed, 240, 255, cv2.THRESH_BINARY_INV)
+            
+            # Combine with texture information to distinguish from background
+            light_tissue_mask = light_tissue_mask & texture_mask
+            
             # convert to binary image
             mask = (mask > 0).astype(np.uint8)
+            
+            # Combine standard mask with light tissue mask
+            mask = mask | light_tissue_mask
             
             # Apply the non-gray mask to exclude gray background
             mask = mask & non_gray_mask
             
             # BOTTOM REGION PROCESSING
-            # Process bottom quarter with more sensitivity
             bottom_half_start = height - (height // 35)
             
             # Extract bottom region of image
@@ -483,7 +524,7 @@ class MUSK:
             # Apply more sensitive threshold to bottom region
             bottom_mask = cv2.adaptiveThreshold(
                 bottom_half_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY_INV, 15, C+4
+                cv2.THRESH_BINARY_INV, 15, C+3  # Slightly reduced sensitivity
             )
             bottom_mask = (bottom_mask > 0).astype(np.uint8)
             
@@ -494,17 +535,21 @@ class MUSK:
             combined_mask = mask.copy()
             combined_mask[bottom_half_start:, :] = bottom_mask
             
-            # First morphological processing to remove very small objects
-            clean_mask = morphology.remove_small_objects(combined_mask.astype(bool), min_size=18 * 18, connectivity=2)
+            # Ensure fat tissue is included
+            combined_mask = combined_mask | (potential_fat & non_gray_mask)
             
-            # Apply closing to connect nearby tissue with reduced disk size for smoother results
-            struct_element_closing = morphology.disk(12)  # Reduced from 16
+            # First morphological processing to remove very small objects
+            # Increased minimum size to avoid removing small fat lobules
+            clean_mask = morphology.remove_small_objects(combined_mask.astype(bool), min_size=10 * 10, connectivity=2)
+            
+            # Apply closing to connect nearby tissue
+            struct_element_closing = morphology.disk(12)
             closed_mask = morphology.binary_closing(clean_mask, struct_element_closing)
             
-            # Remove small holes
-            filled_mask = morphology.remove_small_holes(closed_mask, area_threshold=128 * 128)
+            # Remove small holes - reduced threshold to preserve fat tissue structure
+            filled_mask = morphology.remove_small_holes(closed_mask, area_threshold=64 * 64)
             
-            # DOT REMOVAL - Separate handling for top and bottom regions
+            # DOT REMOVAL - with consideration for fat tissue
             # Split mask into top and bottom regions
             top_region_mask = filled_mask.copy()
             top_region_mask[bottom_half_start:, :] = False
@@ -512,7 +557,7 @@ class MUSK:
             bottom_region_mask = filled_mask.copy()
             bottom_region_mask[:bottom_half_start, :] = False
             
-            # Process top region - stricter dot removal
+            # Process top region - less aggressive to preserve fat
             top_labeled_mask, top_num_components = morphology.label(top_region_mask, return_num=True)
             top_clean = top_region_mask.copy()
             
@@ -521,14 +566,14 @@ class MUSK:
                 
                 if len(top_component_sizes) > 1:
                     top_largest_component_size = np.max(top_component_sizes[1:])
-                    top_size_threshold = top_largest_component_size * 0.0003  # More aggressive filtering
+                    top_size_threshold = top_largest_component_size * 0.0001  # More permissive
                     
                     top_clean = np.zeros_like(top_labeled_mask, dtype=bool)
                     for i in range(1, top_num_components + 1):
                         if top_component_sizes[i] > top_size_threshold:
                             top_clean = np.logical_or(top_clean, top_labeled_mask == i)
             
-            # Process bottom region - more permissive component retention
+            # Process bottom region
             bottom_labeled_mask, bottom_num_components = morphology.label(bottom_region_mask, return_num=True)
             bottom_clean = bottom_region_mask.copy()
             
@@ -536,13 +581,12 @@ class MUSK:
                 bottom_component_sizes = np.bincount(bottom_labeled_mask.ravel())
                 
                 if len(bottom_component_sizes) > 1:
-                    # Use top_largest_component_size if available, otherwise use bottom's largest
                     if 'top_largest_component_size' in locals():
                         reference_size = top_largest_component_size
                     else:
                         reference_size = np.max(bottom_component_sizes[1:])
                         
-                    bottom_size_threshold = reference_size * 0.05  # More permissive filtering
+                    bottom_size_threshold = reference_size * 0.02  # More permissive
                     
                     bottom_clean = np.zeros_like(bottom_labeled_mask, dtype=bool)
                     for i in range(1, bottom_num_components + 1):
@@ -552,7 +596,7 @@ class MUSK:
             # Recombine the cleaned regions
             combined_clean_mask = np.logical_or(top_clean, bottom_clean)
             
-            # Apply smoothing before final dilation for smoother edges
+            # Apply smoothing before final dilation
             combined_clean_float = combined_clean_mask.astype(np.float32)
             combined_clean_smooth = cv2.GaussianBlur(combined_clean_float, (9, 9), 2)
             combined_clean_mask = combined_clean_smooth > 0.3
@@ -564,40 +608,41 @@ class MUSK:
             top_mask_for_dilation = combined_clean_mask.copy()
             top_mask_for_dilation[bottom_half_start:, :] = False
             
-            # Dilate with reduced parameters for smoother results
-            bottom_struct_element = morphology.disk(17)  # Reduced from 15
+            # Dilate with reduced parameters
+            bottom_struct_element = morphology.disk(15)
             dilated_bottom = morphology.binary_dilation(bottom_mask_for_dilation, bottom_struct_element)
             
-            top_struct_element = morphology.disk(17)  # Reduced from 16
+            top_struct_element = morphology.disk(15)
             dilated_top = morphology.binary_dilation(top_mask_for_dilation, top_struct_element)
             
             # Combine the dilated regions
             dilated_mask = np.logical_or(dilated_top, dilated_bottom)
             
-            # Apply smoothing to the dilated mask for even smoother edges
+            # Apply smoothing to the dilated mask
             dilated_float = dilated_mask.astype(np.float32)
             dilated_smooth = cv2.GaussianBlur(dilated_float, (15, 15), 4)
             dilated_mask = dilated_smooth > 0.4
             
-            # Apply the non-gray mask one more time
-            # Use smaller erosion for non-gray mask to be more conservative
-            dilated_non_gray = morphology.binary_erosion(non_gray_mask, morphology.disk(3))  # Reduced from 3
+            # Apply the non-gray mask one more time with less erosion
+            dilated_non_gray = morphology.binary_erosion(non_gray_mask, morphology.disk(2))
             dilated_mask = dilated_mask & dilated_non_gray
             
             # Fill small holes in the final mask
-            final_mask = morphology.remove_small_holes(dilated_mask, area_threshold=150*150)
+            final_mask = morphology.remove_small_holes(dilated_mask, area_threshold=100*100)
             
-            # Final cleanup - remove small objects
-            final_mask = morphology.remove_small_objects(final_mask, min_size=20*20)
+            # Final cleanup - remove small objects with smaller threshold
+            final_mask = morphology.remove_small_objects(final_mask, min_size=15*15)
             
-            # Apply final smoothing pass for smoother overall edges
+            # Apply final smoothing pass
             final_float = final_mask.astype(np.float32)
             final_smooth = cv2.GaussianBlur(final_float, (7, 7), 2)
             final_mask = final_smooth > 0.5
             
-            # Optional: Log gray detection statistics for debugging
+            # Log statistics for debugging
             gray_percentage = (np.sum(gray_background) / (height * width)) * 100
+            fat_percentage = (np.sum(potential_fat) / (height * width)) * 100
             self.logger.info(f"Detected {gray_percentage:.1f}% of image as gray background")
+            self.logger.info(f"Detected {fat_percentage:.1f}% of image as potential fat tissue")
             
             return final_mask.astype(np.uint8)
             
@@ -607,6 +652,12 @@ class MUSK:
             traceback.print_exc()
             return np.ones(dim[::-1], dtype=np.uint8)  # return full white mask when error
 
+
+
+
+
+
+    
     def process_whole_wsi(self, wsi_path: str, patch_size: int = 224, level: int = 0, 
                           batch_size: int = 16, use_tiffslide: bool = True,
                           save_patches: bool = False, output_dir: str = None,
