@@ -18,43 +18,103 @@ app = modal.App("instructcell-pipeline")
 # --- Model Downloaders ---
 
 def _download_deepspot_models():
-    # This function is identical to the one in main_modal.py
-    # It ensures the DeepSpot models are available in the volume.
+    """Downloads the DeepSpot and UNI models if they don't exist in the cache."""
+    # Check if a key file already exists. If so, skip the download.
     uni_model_path = MODEL_DIR / "deepspot" / "uni" / "pytorch_model.bin"
     if uni_model_path.exists():
         print("✅ DeepSpot & UNI models found in cache. Skipping download.")
         return
-    
-    # (Implementation is the same as in main_modal.py, so it's omitted here for brevity)
-    # In a real application, this would be refactored into a shared utility.
-    import shutil, subprocess, zipfile
+
+    import shutil
+    import subprocess
+    import zipfile
     from huggingface_hub import hf_hub_download
-    print("Downloading DeepSpot models...")
-    # ... (download and setup logic) ...
+
+    print("Downloading DeepSpot pretrained models package...")
+    deepspot_package_dir = Path("/tmp/deepspot_package")
+    deepspot_package_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = deepspot_package_dir / "deepspot_weights.zip"
+    subprocess.run(
+        [
+            "wget",
+            "-O",
+            str(zip_path),
+            "https://zenodo.org/records/14638865/files/DeepSpot_pretrained_model_weights.zip?download=1",
+        ],
+        check=True,
+    )
+    print("Unzipping DeepSpot package...")
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        zip_ref.extractall(deepspot_package_dir)
+
+    print("Organizing DeepSpot files...")
+    deepspot_model_dir = MODEL_DIR / "deepspot"
+    deepspot_model_dir.mkdir(parents=True, exist_ok=True)
+    source_dir = (
+        deepspot_package_dir
+        / "DeepSpot_pretrained_model_weights"
+        / "Colon_HEST1K"
+    )
+    shutil.copy(
+        source_dir / "final_model.pkl", deepspot_model_dir / "deepspot_model.pt"
+    )
+    shutil.copy(
+        source_dir / "top_param_overall.yaml", deepspot_model_dir / "config.yaml"
+    )
+    shutil.copy(
+        source_dir / "info_highly_variable_genes.csv",
+        deepspot_model_dir / "genes.csv",
+    )
+    print("DeepSpot files organized.")
+
+    print("Downloading UNI model weights...")
+    hf_hub_download(
+        repo_id="MahmoodLab/UNI",
+        filename="pytorch_model.bin",
+        local_dir=MODEL_DIR / "deepspot" / "uni",
+    )
+    print("UNI model downloaded.")
     volume.commit()
-    print("✅ DeepSpot models committed.")
+    print("✅ DeepSpot model cache committed.")
+
 
 def _download_instructcell_models():
-    """Downloads the InstructCell model if it doesn't exist in the cache."""
+    """Downloads the InstructCell model and its required gene vocabulary."""
+    # --- Model Download ---
     instructcell_config_path = MODEL_DIR / "instructcell" / "config.json"
-    if instructcell_config_path.exists():
-        print("✅ InstructCell model found in cache. Skipping download.")
-        return
+    if not instructcell_config_path.exists():
+        import os
+        from huggingface_hub import snapshot_download, login
 
-    import os
-    from huggingface_hub import snapshot_download, login
+        hf_token = os.environ.get("HF_TOKEN")
+        if hf_token:
+            login(token=hf_token)
+        
+        print("Downloading InstructCell model...")
+        snapshot_download(
+            "zjunlp/InstructCell-chat",
+            local_dir=MODEL_DIR / "instructcell",
+        )
+        print("✅ InstructCell model downloaded.")
+    else:
+        print("✅ InstructCell model found in cache.")
 
-    hf_token = os.environ.get("HF_TOKEN")
-    if hf_token:
-        login(token=hf_token)
-    
-    print("Downloading InstructCell model...")
-    snapshot_download(
-        "zjunlp/InstructCell-chat",
-        local_dir=MODEL_DIR / "instructcell",
-    )
+    # --- Gene Vocabulary Download ---
+    gene_vocab_path = MODEL_DIR / "instructcell" / "gene_vocab.npy"
+    if not gene_vocab_path.exists():
+        import requests
+        print("Downloading InstructCell gene vocabulary...")
+        url = "https://github.com/zjunlp/InstructCell/raw/main/exp_log/gene_vocab.npy"
+        response = requests.get(url)
+        response.raise_for_status()
+        with open(gene_vocab_path, "wb") as f:
+            f.write(response.content)
+        print("✅ Gene vocabulary downloaded.")
+    else:
+        print("✅ Gene vocabulary found in cache.")
+
     volume.commit()
-    print("✅ InstructCell model cache committed.")
+    print("✅ InstructCell assets committed to cache.")
 
 # --- Image Definitions ---
 
@@ -77,10 +137,39 @@ deepspot_image = (
 instructcell_image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("git", "wget")
+    # First, install JAX with CUDA support to ensure the correct wheels are used.
+    .pip_install("jax[cuda12]")
+    # Then, install the rest of the dependencies.
     .pip_install(
-        "torch==2.1.0", "torchaudio==2.1.0", "torchvision==0.16.0",
-        "anndata==0.10.3", "scanpy==1.9.6", "scvi-tools==1.1.1",
-        "huggingface_hub", "transformers", "sentencepiece", "accelerate",
+        "torch==2.0.0",
+        "numpy==1.26.4",
+        "scipy==1.11.3",
+        "matplotlib==3.8.2",
+        "seaborn==0.12.2",
+        "pandas==2.1.1",
+        "scikit-learn==1.3.1",
+        "anndata==0.10.3",
+        "scanpy==1.9.6",
+        "tqdm==4.66.1",
+        "transformers==4.33.3",
+        "python-igraph==0.11.5",
+        "igraph==0.11.5",
+        "scikit-misc==0.3.1",
+        "sentencepiece==0.1.99",
+        "pybiomart==0.2.0",
+        "pyensembl==2.3.13",
+        "openai==1.35.7",
+        "tiktoken==0.7.0",
+        "rouge-score==0.1.2",
+        "plotly==5.22.0",
+        "mygene==3.2.2",
+        "nltk==3.8.1",
+        "louvain==0.8.2",
+        "openpyxl==3.1.5",
+        "huggingface_hub",
+        "requests",
+        "accelerate",
+        "scvi-tools==1.1.1",
     )
     .add_local_dir(
         local_path="Tissuelab-Model-Zoo/spatial_omics/InstructCell/utils",
@@ -100,31 +189,30 @@ instructcell_image = (
     timeout=1200,
     volumes={MODEL_DIR: volume},
     secrets=[modal.Secret.from_name("huggingface-secret")],
-    # Since this function is the same, we'll give it a unique name for clarity
-    # if we were to ever combine these apps.
-    name="run_deepspot_for_instructcell" 
 )
 def run_deepspot(image_bytes: bytes, image_hash: str, use_cache: bool):
     """
-    Runs DeepSpot. This function is functionally identical to the one in main_modal.py,
-    but it is defined here to make this script self-contained.
+    Runs the DeepSpot model to predict spatial gene expression from a tissue image.
+    Includes logic to cache the resulting AnnData object if `use_cache` is True.
     """
     import anndata as ad
     import tempfile
-    
-    # Caching logic
+
     adata_cache_dir = MODEL_DIR / "adata_cache"
     adata_cache_path = adata_cache_dir / f"adata_{image_hash}.h5ad"
 
     if use_cache:
+        print("Attempting to use cached AnnData...")
         volume.reload()
         if adata_cache_path.exists():
             print(f"✅ Cache hit! Loading AnnData from {adata_cache_path}.")
             return ad.read_h5ad(adata_cache_path)
         else:
-            print("⚠️ Cache miss. Running DeepSpot...")
-    
+            print("⚠️ Cache miss. No cached data found. Running DeepSpot...")
+
+    # If not using cache or if cache miss, run the model.
     _download_deepspot_models()
+
 
     import os
     import sys
@@ -244,13 +332,19 @@ def run_deepspot(image_bytes: bytes, image_hash: str, use_cache: bool):
     # Cache the new AnnData object for future runs.
     print(f"Caching new AnnData object to {adata_cache_path}...")
     adata_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # FIX: Convert 'highly_variable' to string for H5AD writing compatibility.
     if "highly_variable" in adata_tissue.var.columns:
+        print("Converting 'highly_variable' column to string for caching compatibility...")
         adata_tissue.var["highly_variable"] = adata_tissue.var["highly_variable"].astype(str)
+
+    # Write to a temporary file first, then copy to the volume.
     with tempfile.NamedTemporaryFile(suffix=".h5ad") as tmp:
         adata_tissue.write_h5ad(tmp.name)
         with open(tmp.name, "rb") as tmp_file:
             with open(adata_cache_path, "wb") as cache_file:
                 cache_file.write(tmp_file.read())
+    
     volume.commit()
     print("AnnData object cached successfully.")
 
@@ -264,7 +358,7 @@ def run_deepspot(image_bytes: bytes, image_hash: str, use_cache: bool):
     volumes={MODEL_DIR: volume},
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def run_instructcell_interpretation(adata_bytes: bytes, query: str):
+def run_instructcell_interpretation(adata, query: str):
     """
     Performs clustering and uses InstructCell to generate a natural language
     interpretation of the cell populations based on a user query.
@@ -274,24 +368,28 @@ def run_instructcell_interpretation(adata_bytes: bytes, query: str):
     import scanpy as sc
     import torch
     import sys
+    import pandas as pd
     
     # Add the mounted utility code to the Python path
     sys.path.insert(0, str(INSTRUCTCELL_MMLLM_DIR.parent))
 
-    from mmllm.models.module import InstructCell
-    from utils.basic import unify_gene_features
+    # Corrected imports based on the official README
+    from mmllm.module import InstructCell
+    from utils import unify_gene_features
 
     # --- 1. Load Model and Data ---
-    print("Loading InstructCell model...")
+    print("Loading InstructCell model and assets...")
     _download_instructcell_models()
+    
     model = InstructCell.from_pretrained(MODEL_DIR / "instructcell")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
     
-    adata_buffer = io.BytesIO(adata_bytes)
-    adata = ad.read_h5ad(adata_buffer)
     print("AnnData object loaded.")
+    
+    # Load the required gene vocabulary
+    gene_vocab = np.load(MODEL_DIR / "instructcell" / "gene_vocab.npy")
 
     # --- 2. Preprocessing & Clustering ---
     print("🔬 Performing clustering to identify cell populations...")
@@ -301,34 +399,55 @@ def run_instructcell_interpretation(adata_bytes: bytes, query: str):
     sc.pp.pca(adata)
     sc.pp.neighbors(adata)
     sc.tl.leiden(adata, resolution=0.5)
-    print("Clustering complete.")
+    print(f"Clustering complete. Found {len(adata.obs['leiden'].cat.categories)} clusters.")
 
-    # --- 3. Prepare Inputs for InstructCell ---
-    # InstructCell takes the raw gene counts and a text prompt.
-    # We will pass the full AnnData object, which contains the counts.
-    prompt = query # For this model, the query is the prompt.
-    
-    # Unify gene features (a required preprocessing step for this model)
-    adata_processed = unify_gene_features(adata)
-    gene_counts = adata_processed.X
-    
-    print("Generating interpretation with InstructCell...")
-    response_dict = {}
-    # The model's `predict` method returns a stream of key-value pairs.
-    for key, value in model.predict(
-        prompt,
-        gene_counts=gene_counts,
-        sc_metadata={}, # This can be used for more advanced prompting
-        do_sample=True,
-        top_p=0.9,
-        max_new_tokens=512,
-    ).items():
-        response_dict[key] = value
+    # --- 3. Iterate Through Clusters and Query InstructCell ---
+    # This new workflow queries the model for each cluster individually,
+    # aligning with its single-cell analysis design.
+    cluster_interpretations = {}
 
-    answer = response_dict.get("Answer", "No answer generated by InstructCell.")
+    for cluster_id in adata.obs['leiden'].cat.categories:
+        print(f"Analyzing cluster {cluster_id}...")
+        
+        # Select the first cell from the current cluster as a representative
+        cluster_adata = adata[adata.obs['leiden'] == cluster_id]
+        if cluster_adata.n_obs == 0:
+            continue
+        
+        representative_cell_adata = cluster_adata[0, :].copy()
+
+        # Unify gene features for the single representative cell
+        unified_cell_adata = unify_gene_features(representative_cell_adata, gene_vocab, force_gene_symbol_uppercase=False)
+        gene_counts = unified_cell_adata.X.toarray()
+        
+        # Define a direct prompt for cell type annotation
+        prompt = "Please identify the cell type based on its gene expression profile: {input}"
+        
+        print(f"  > Generating interpretation for cluster {cluster_id}...")
+        response_dict = {}
+        for key, value in model.predict(
+            prompt,
+            gene_counts=gene_counts,
+            sc_metadata={},
+            do_sample=False, # Use greedy decoding for more consistent results
+            max_new_tokens=128,
+        ).items():
+            response_dict[key] = value
+
+        # Extract the most likely answer
+        interpretation = response_dict.get("Answer", "Unknown")
+        cluster_interpretations[cluster_id] = interpretation.strip()
+        print(f"  > Cluster {cluster_id} identified as: {interpretation.strip()}")
+
+    # --- 4. Aggregate Results into a Final Summary ---
+    summary_lines = ["InstructCell Analysis Summary:"]
+    for cluster_id, cell_type in cluster_interpretations.items():
+        summary_lines.append(f"- Cluster {cluster_id}: Predicted as {cell_type}")
     
+    final_answer = "\n".join(summary_lines)
+
     print("✅ Interpretation complete.")
-    return answer
+    return final_answer
 
 # --- Main Pipeline Entrypoint ---
 @app.function(image=deepspot_image, timeout=1800)
@@ -340,18 +459,13 @@ def analyze_tissue_with_instructcell(image_bytes: bytes, query: str, use_adata_c
     image_hash = hashlib.sha256(image_bytes).hexdigest()
 
     print("Step 1: Calling DeepSpot...")
-    adata = run_deepspot.remote(
+    adata_obj = run_deepspot.remote(
         image_bytes=image_bytes, image_hash=image_hash, use_cache=use_adata_cache
     )
     print("DeepSpot complete.")
 
-    # We need to pass the AnnData object's content as bytes.
-    adata_buffer = io.BytesIO()
-    adata.write_h5ad(adata_buffer)
-    adata_bytes = adata_buffer.getvalue()
-
     print("Step 2: Calling InstructCell for interpretation...")
-    answer = run_instructcell_interpretation.remote(adata_bytes, query)
+    answer = run_instructcell_interpretation.remote(adata_obj, query)
     print("InstructCell interpretation complete.")
 
     return answer
