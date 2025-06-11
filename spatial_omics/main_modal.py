@@ -149,6 +149,9 @@ deepspot_image = (
         "timm",
         "lightning",
         "pyvips",
+        # Added for clustering analysis in the summarizer
+        "leidenalg",
+        "python-igraph",
     )
     .add_local_dir(
         local_path="Tissuelab-Model-Zoo/spatial_omics/DeepSpot", remote_path=str(REMOTE_DEEPSPOT_DIR)
@@ -349,22 +352,107 @@ def run_deepspot(image_bytes: bytes, image_hash: str, use_cache: bool):
 
 
 @app.function(
+    image=deepspot_image,
+    gpu="A10G", # GPU is useful for scanpy's rapids integration if available
+    timeout=600,
+)
+def summarize_adata(adata):
+    """
+    Performs clustering analysis on an AnnData object to create a high-level
+    biological summary.
+    """
+    import scanpy as sc
+    import numpy as np
+    import pandas as pd
+
+    print("🔬 Starting summarization...")
+
+    # --- Preprocessing and Cleaning ---
+    # Ensure data is in a dense format for manipulation
+    if hasattr(adata.X, "toarray"):
+        adata.X = adata.X.toarray()
+
+    # Clip values to ensure non-negativity before normalization
+    adata.X = adata.X.clip(min=0)
+
+    # Basic filtering
+    sc.pp.filter_cells(adata, min_genes=200)
+    sc.pp.filter_genes(adata, min_cells=3)
+    
+    # Check if any data remains after filtering
+    if adata.n_obs == 0 or adata.n_vars == 0:
+        return "No data remaining after initial filtering. Cannot perform analysis."
+
+    # Normalization and Log Transform
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+
+    # Find highly variable genes, with robust error handling
+    try:
+        sc.pp.highly_variable_genes(adata, min_mean=0.0125, max_mean=3, min_disp=0.5)
+        # --- FIX: Check for and remove NaNs from highly_variable results ---
+        hvg_df = adata.var
+        hvg_df.dropna(subset=['highly_variable', 'means', 'dispersions', 'dispersions_norm'], inplace=True)
+
+    except Exception as e:
+        return f"An error occurred during highly variable gene selection: {e}"
+
+    if 'highly_variable' not in adata.var.columns or adata.var['highly_variable'].sum() == 0:
+         return "No highly variable genes found. Cannot perform clustering."
+
+    # Subset to highly variable genes before scaling
+    adata = adata[:, adata.var.highly_variable]
+
+    # Scale, run PCA, and find neighbors
+    sc.pp.scale(adata, max_value=10)
+    sc.tl.pca(adata, svd_solver='arpack')
+    sc.pp.neighbors(adata, n_neighbors=10, n_pcs=40)
+
+    # Cluster the data
+    print("Clustering spots...")
+    sc.tl.leiden(adata)
+
+    # Find marker genes for each cluster
+    print("Finding marker genes...")
+    sc.tl.rank_genes_groups(adata, 'leiden', method='t-test')
+
+    # --- Build the summary string ---
+    print("Building summary string...")
+    summary_lines = [f"Analysis of the selected region reveals {len(adata.obs.leiden.cat.categories)} distinct cell populations:"]
+    
+    # Extract marker genes for each cluster
+    marker_genes = adata.uns['rank_genes_groups']['names']
+    
+    for cluster in adata.obs.leiden.cat.categories:
+        # Get top 5 marker genes for the cluster
+        top_markers = [marker_genes[i][cluster] for i in range(5)]
+        summary_lines.append(
+            f"- Cluster {cluster}: Characterized by high expression of {', '.join(top_markers)}."
+        )
+        
+    summary_string = "\n".join(summary_lines)
+    print("✅ Summarization complete.")
+    print(summary_string)
+    
+    return summary_string
+
+
+@app.function(
     image=cell2sentence_image,
     gpu="A10G",
     timeout=600,
     volumes={MODEL_DIR: volume},
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def run_cell2sentence(adata, user_query: str):
+def run_cell2sentence(summary: str, user_query: str):
     """
-    Uses a Cell2Sentence model to answer a user's query about a tissue sample.
-    Runs inside a dedicated container.
+    Uses a Cell2Sentence model to answer a user's query about a tissue sample,
+    based on a pre-computed biological summary.
     """
     # At the start of the function, ensure models exist in the cache, downloading if necessary.
     _download_c2s_models()
 
     import torch
-    from cell2sentence import CSData
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     # Define paths to the model files within the container
@@ -380,55 +468,24 @@ def run_cell2sentence(adata, user_query: str):
     model.to(device)
     model.eval()
 
-    # --- 2. Convert Expression Data to Cell Sentences ---
-    print("Converting gene expression to cell sentences...")
-    # The modern cell2sentence library uses an object-oriented approach.
-    # We must first convert the anndata object to the library's required format.
-    arrow_ds, vocabulary = CSData.adata_to_arrow(
-        adata=adata,
-        sentence_delimiter=' ',
-        # No specific labels needed for this task, so we pass an empty list.
-        label_col_names=[] 
-    )
+    # --- 2. Format the Prompt ---
+    prompt = f"""You are an expert biologist assisting a pathologist. Based on the following summary of cell populations identified in a selected tissue region, provide a concise and clear answer to the pathologist's question.
 
-    # Now, create the CSData object from the arrow dataset. 
-    # This doesn't require saving to disk; it can be done in-memory,
-    # but the function still requires placeholder paths.
-    import tempfile
-    with tempfile.TemporaryDirectory() as temp_dir:
-        sentence_data = CSData.csdata_from_arrow(
-            arrow_dataset=arrow_ds,
-            vocabulary=vocabulary,
-            save_dir=temp_dir,
-            save_name="temp_csdata",
-            dataset_backend="arrow", # Specify in-memory processing
-        )
-    
-        # The sentences are created during the object's initialization.
-        # We can access them by calling the get_sentence_strings() method.
-        ranked_genes = sentence_data.get_sentence_strings()
+[BIOLOGICAL SUMMARY]
+{summary}
 
-    tissue_context = " ".join(ranked_genes)
-    max_tokens_for_context = 3000
-    tissue_context = " ".join(tissue_context.split()[:max_tokens_for_context])
-
-    # --- 3. Format the Prompt ---
-    print("Formatting prompt...")
-    prompt = f"""
-You are an expert biologist analyzing spatial transcriptomics data from a tissue sample.
-Below is a summary of the most highly expressed genes across all spots in the tissue, presented as a series of 'cell sentences'.
-Use this biological context to answer the user's question.
-
-[TISSUE CONTEXT]
-{tissue_context}
-
-[USER QUESTION]
+[PATHOLOGIST'S QUESTION]
 {user_query}
 
 [YOUR ANALYSIS]
 """
+    print("📝 Final prompt being sent to the model:")
+    print("-----------------------------------------")
+    print(prompt)
+    print("-----------------------------------------")
 
-    # --- 4. Generate the Answer ---
+
+    # --- 3. Generate the Answer ---
     print("Generating answer...")
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     with torch.no_grad():
@@ -448,20 +505,21 @@ Use this biological context to answer the user's question.
 
 
 # --- Main Pipeline Entrypoint ---
-@app.function(image=cell2sentence_image, timeout=1800)
+@app.function(image=deepspot_image, timeout=1800)
 def analyze_tissue(image_bytes: bytes, query: str, use_adata_cache: bool):
     """
-    Main pipeline function that orchestrates the two-step analysis.
-    It calls the DeepSpot function, then the Cell2Sentence function.
+    Main pipeline function that orchestrates the three-step analysis:
+    1. Predict gene expression from an image (DeepSpot).
+    2. Summarize the expression data into clusters and marker genes.
+    3. Use an LLM to answer a query based on the summary.
     """
-    import numpy as np
     import hashlib
 
     # Generate a hash of the image to use as a unique ID for caching.
     image_hash = hashlib.sha256(image_bytes).hexdigest()
 
     # 1. Run DeepSpot to get spatial gene expression from the image.
-    #    The caching logic is now handled inside run_deepspot.
+    #    This is a remote-to-remote call, which blocks and returns the object directly.
     print("Step 1: Calling DeepSpot to predict gene expression...")
     adata = run_deepspot.remote(
         image_bytes=image_bytes,
@@ -470,17 +528,16 @@ def analyze_tissue(image_bytes: bytes, query: str, use_adata_cache: bool):
     )
     print("DeepSpot analysis complete.")
 
-    # 2. Transpose the AnnData object to be (observations, variables) as expected by cell2sentence.
-    print("Transposing AnnData object for Cell2Sentence compatibility...")
-    adata = adata.T
+    # 2. Summarize the AnnData object to get a high-level biological context.
+    #    This call also returns the result string directly.
+    print("Step 2: Calling Summarizer to analyze cell populations...")
+    summary = summarize_adata.remote(adata)
+    print("Summarization complete.")
 
-    # Explicitly convert the expression matrix to float32 to ensure compatibility with scipy sparse matrix conversion.
-    adata.X = adata.X.astype(np.float32)
-
-    # 3. Run Cell2Sentence to answer the query based on the expression data.
-    #    This call runs in the `cell2sentence_image` container.
-    print("Step 2: Calling Cell2Sentence to answer the query...")
-    answer = run_cell2sentence.remote(adata, query)
+    # 3. Run Cell2Sentence to answer the query based on the summary.
+    #    This call also returns the final answer string directly.
+    print("Step 3: Calling Cell2Sentence to answer the query...")
+    answer = run_cell2sentence.remote(summary, query)
     print("Cell2Sentence analysis complete.")
 
     return answer
@@ -492,7 +549,7 @@ def main(
         Path(__file__).resolve().parent
         / "DeepSpot/example_data/data/image/ZEN38_without_fud.jpg"
     ),
-    query: str = "What are the primary cell types and their spatial arrangement in this colon tissue sample? Describe any interesting features you observe.",
+    query: str = "Based on the identified cell populations, what kind of tissue is this likely to be, and are there any signs of immune cell activity or infiltration?",
     use_adata_cache: bool = False,
 ):
     """
@@ -513,7 +570,7 @@ def main(
         print(f"Error: Image file not found at '{image_path_obj}'.")
         return
 
-    print(f"❓ Query: {query}")
+    print(f"❓ Query: '{query}'")
     print(f"🔄 Use AnnData cache: {use_adata_cache}")
 
     # --- Load Image Data ---
@@ -521,9 +578,11 @@ def main(
         image_bytes = f.read()
 
     # --- Run Modal Pipeline ---
-    print("\n🚀 Calling remote Modal function... (This may take a few minutes)")
+    print("🚀 Calling remote Modal function... (This may take a few minutes)")
     try:
-        answer = analyze_tissue.remote(image_bytes=image_bytes, query=query, use_adata_cache=use_adata_cache)
+        answer = analyze_tissue.remote(
+            image_bytes=image_bytes, query=query, use_adata_cache=use_adata_cache
+        )
     except Exception as e:
         print(f"An error occurred during the Modal call: {e}")
         return
@@ -531,4 +590,14 @@ def main(
     print("\n✅ Analysis complete!")
     print("\n--- Model's Answer ---")
     print(answer)
-    print("----------------------") 
+    print("----------------------")
+
+    # --- Save output ---
+    output_dir = Path("data_outputs")
+    output_dir.mkdir(exist_ok=True)
+    interpretation_file = output_dir / "interpretation.txt"
+    with open(interpretation_file, "w") as f:
+        f.write(answer)
+    print(f"\n✅ Interpretation saved to: {interpretation_file}")
+
+    print("\n🏁 Pipeline finished.") 
