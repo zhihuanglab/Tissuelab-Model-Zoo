@@ -64,6 +64,7 @@ def parse_args():
     # New arguments for downsampling and bounding box
     parser.add_argument('--target_mpp', default=None, type=float, help='Target microns per pixel for processing')
     parser.add_argument('--bbox', default=None, type=str, help='Bounding box for segmentation in format "x,y,width,height"')
+    parser.add_argument('--polygon_points', default=None, type=json.loads, help='Polygon points for segmentation in JSON string format "[[x1,y1],[x2,y2],...]".')
 
     return parser.parse_args()
 
@@ -350,6 +351,12 @@ def read_node(data: Dict[str, Any]):
                     else:
                         print(f"Warning: bbox value '{val_json}' is not in 'x,y,width,height' format.")
                         ARGS.bbox = None
+                elif k == "polygon_points":
+                    if isinstance(val_json, list) and all(isinstance(p, list) and len(p) == 2 for p in val_json):
+                        ARGS.polygon_points = val_json
+                    else:
+                        print(f"Warning: polygon_points value '{val_json}' is not in the expected [[x1,y1],[x2,y2],...] format.")
+                        ARGS.polygon_points = None
 
     return {"status": "ok", "message": "SegmentationNode read done"}
 
