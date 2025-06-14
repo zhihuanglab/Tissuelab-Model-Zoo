@@ -23,6 +23,7 @@ from skimage.feature import graycomatrix, graycoprops
 from skimage import draw
 import tensorflow as tf
 import sys
+from matplotlib.path import Path
 
 if sys.platform == 'darwin':
     from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
@@ -33,6 +34,19 @@ import czifile
 import tiffslide
 
 opj = os.path.join
+
+def is_point_in_polygon(point, polygon_points):
+    """
+    Checks if a point (x, y) is inside a polygon defined by a list of points.
+    Args:
+        point (tuple): A tuple (x, y) representing the point.
+        polygon_points (list): A list of tuples, where each tuple (x, y) represents a vertex of the polygon.
+    Returns:
+        bool: True if the point is inside the polygon, False otherwise.
+    """
+    
+    path = Path(polygon_points)
+    return path.contains_point(point)
 
 def get_czi_scale(file_path):
     """
@@ -87,7 +101,8 @@ class SlideSegmentation():
                  n_tiles=(4,4,1),
                  stardist_pretrain='2D_versatile_he',
                  isIHC=False,
-                 progress_callback=None
+                 progress_callback=None,
+                 polygon_points=None
                  ):
         
         super(SlideSegmentation, self).__init__()
@@ -178,6 +193,19 @@ class SlideSegmentation():
                     print(f"Warning: Bounding box string '{args.bbox}' not in 'x,y,width,height' format after parsing. Ignoring.")
             except ValueError:
                 print(f"Warning: Could not parse bounding box string '{args.bbox}' as numbers. Ignoring.")
+        
+        # Store polygon points if provided
+        self.polygon_points = None
+        if hasattr(args, 'polygon_points') and args.polygon_points:
+            self.polygon_points = args.polygon_points
+            print(f"Using polygon points: {len(self.polygon_points)} vertices")
+            # Calculate bounding box from polygon points for initial tile iteration
+            xs = [p[0] for p in self.polygon_points]
+            ys = [p[1] for p in self.polygon_points]
+            min_x, min_y = min(xs), min(ys)
+            max_x, max_y = max(xs), max(ys)
+            self.bbox_coords = [int(min_x), int(min_y), int(max_x - min_x), int(max_y - min_y)]
+            print(f"Calculated bounding box from polygon: {self.bbox_coords}")
         
     def read_data(self):
         print("Reading data ...", datetime.now().strftime("%H:%M:%S"))
@@ -461,26 +489,18 @@ class SlideSegmentation():
                 patch_start_time = time.time()
                 
                 ir, ic, x_0, y_0, img_norm, read_duration = data  # Get reading time
+                h_row, w_col = img_norm.shape[:2] # Get dimensions from the received image data
                 curr_idx = ir * self.n_col + ic
                 pbar.update(curr_idx-last_idx)
                 last_idx = curr_idx
                 
                 current_n_tiles_for_prediction = self.n_tiles # Default
 
-                cond_bbox_coords_present = bool(self.bbox_coords)
-                cond_w_col_lt_tile_size = (w_col < self.tile_size)
-                cond_h_row_lt_tile_size = (h_row < self.tile_size)
-                cond_size_check = (cond_w_col_lt_tile_size or cond_h_row_lt_tile_size)
-                final_condition_for_none = cond_bbox_coords_present and cond_size_check
-
-                if final_condition_for_none: # Use the explicitly calculated final_condition
+                if (w_col < self.tile_size) or (h_row < self.tile_size):
                     current_n_tiles_for_prediction = None 
-                    current_n_tiles_for_prediction = None 
-                    print(f"Tile r{ir} c{ic} is small due to BBox ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (IF BRANCH TAKEN)")
+                    print(f"Tile r{ir} c{ic} is small ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction.")
                 else:
-                    print(f"Tile r{ir} c{ic} ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (ELSE BRANCH TAKEN)")
-                    current_n_tiles_for_prediction = None
-                    print(f"Tile r{ir} c{ic} is small due to BBox ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (IF BRANCH TAKEN)")
+                    print(f"Tile r{ir} c{ic} ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction.")
 
                 labels, dicts = self.model.predict_instances(img_norm,
                                                         prob_thresh=self.prob_thresh,
@@ -612,6 +632,7 @@ class SlideSegmentation():
         print(f"\nTotal processing time: {overall_duration:.2f}s ({overall_duration/60:.2f}min)")
         print(f"Start time: {datetime.fromtimestamp(overall_start_time).strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"End time: {datetime.fromtimestamp(overall_end_time).strftime('%Y-%m-%d %H:%M:%S')}")
+        total_nuclei = len(self.final_points) if self.final_points is not None else 0
         print(f"Total nuclei count: {total_nuclei}")
 
         print("---- Segmentation successfully completed ----")
@@ -621,16 +642,6 @@ class SlideSegmentation():
         print(f"Final self.final_points: shape={self.final_points.shape if self.final_points is not None else 'None'}")
         if self.final_points is not None and len(self.final_points) > 0:
             print(f"First 5 centroids: \n{self.final_points[:5]}")
-        
-        # Add final validation
-        print(f"Final self.final_points: shape={self.final_points.shape if self.final_points is not None else 'None'}")
-        if self.final_points is not None and len(self.final_points) > 0:
-            print(f"First 5 centroids: \n{self.final_points[:5]}")
-        
-        
-            # Last validation
-            assert len(self.final_points) > 0, "Nuclei detection result is empty, please check"
-
             # Last validation
             assert len(self.final_points) > 0, "Nuclei detection result is empty, please check"
 
@@ -708,6 +719,29 @@ class SlideSegmentation():
                 img = self.slide.read_region((0, 0), 0, self.dim)
                 img_np = np.array(img)[:,:,:3]  # Ensure RGB format
                 
+                # Apply polygon mask if available (for direct processing path)
+                if self.polygon_points and img_np.size > 0:
+                    try:
+                        mask_img = Image.new('L', (img_np.shape[1], img_np.shape[0]), 0) # L for grayscale (0-255)
+                        draw = ImageDraw.Draw(mask_img)
+                        
+                        # Polygon points are in original slide (level 0) coordinates.
+                        # For this direct processing path, img_np is also read at original level 0.
+                        # Therefore, no scaling of polygon points is needed relative to img_np.
+                        polygon_points_scaled_for_img = [(p[0], p[1]) for p in self.polygon_points]
+
+                        # Draw polygon on the mask
+                        draw.polygon(polygon_points_scaled_for_img, fill=255) # Fill inside with white
+                        mask_np = np.array(mask_img) # Convert mask to numpy array
+
+                        # Apply mask to image (zero out pixels outside the polygon)
+                        img_np[mask_np == 0] = 0  # Set pixels outside polygon to black (or any background color)
+                        print(f"Applied polygon mask for direct processing. Remaining pixels: {np.sum(mask_np > 0)}")
+                    except Exception as e:
+                        print(f"Warning: Error applying polygon mask in direct processing: {e}. Proceeding without mask.")
+                        import traceback
+                        traceback.print_exc()
+
                 if self.progress_callback:
                     self.progress_callback(30)
                     
@@ -813,6 +847,23 @@ class SlideSegmentation():
                 
                 total_nuclei = len(self.final_points) if self.final_points is not None else 0
                 
+                # --- POLYGON FILTERING LOGIC ---
+                if self.polygon_points and self.final_points is not None and len(self.final_points) > 0:
+                    print("[Simple Image Path] Applying final polygon filter to detected nuclei.")
+                    filtered_indices = []
+                    for i, point in enumerate(self.final_points):
+                        if is_point_in_polygon(point, self.polygon_points):
+                            filtered_indices.append(i)
+                    
+                    if len(filtered_indices) < len(self.final_points):
+                        print(f"[Simple Image Path] Filtered {len(self.final_points) - len(filtered_indices)} nuclei outside polygon.")
+                        self.final_points = self.final_points[filtered_indices]
+                        self.final_coord = self.final_coord[filtered_indices]
+                        self.prob_all = self.prob_all[filtered_indices] # Also filter probabilities
+                    else:
+                        print("[Simple Image Path] No nuclei filtered by polygon.")
+                # --- END POLYGON FILTERING LOGIC ---
+
                 if self.progress_callback:
                     self.progress_callback(100)
                 
@@ -858,7 +909,7 @@ class SlideSegmentation():
         
         total_tiles = n_row * n_col
         processed_tiles = 0 
-        total_nuclei = 0
+        total_nuclei = 0 # Initialize here for the tiling path
         iter = 0
 
         pbar = tqdm(total=total_tiles, mininterval=0.1)
@@ -910,32 +961,11 @@ class SlideSegmentation():
                 cond_size_check = (cond_w_col_lt_tile_size or cond_h_row_lt_tile_size)
                 final_condition_for_none = cond_bbox_coords_present and cond_size_check
                 
-                
-                print(f"DEBUG N_TILES: self.bbox_coords raw: {self.bbox_coords}")
-                print(f"DEBUG N_TILES: self.bbox_coords is present (boolean): {cond_bbox_coords_present}")
-                print(f"DEBUG N_TILES: w_col ({w_col}) < self.tile_size ({self.tile_size}): {cond_w_col_lt_tile_size}")
-                print(f"DEBUG N_TILES: h_row ({h_row}) < self.tile_size ({self.tile_size}): {cond_h_row_lt_tile_size}")
-                print(f"DEBUG N_TILES: Combined size check (w_col < tile OR h_row < tile): {cond_size_check}")
-                print(f"DEBUG N_TILES: Final condition for using n_tiles=None (bbox_present AND size_check): {final_condition_for_none}")
-                # --- End Detailed Debug Logging ---
-
-
-                print(f"DEBUG N_TILES: self.bbox_coords raw: {self.bbox_coords}")
-                print(f"DEBUG N_TILES: self.bbox_coords is present (boolean): {cond_bbox_coords_present}")
-                print(f"DEBUG N_TILES: w_col ({w_col}) < self.tile_size ({self.tile_size}): {cond_w_col_lt_tile_size}")
-                print(f"DEBUG N_TILES: h_row ({h_row}) < self.tile_size ({self.tile_size}): {cond_h_row_lt_tile_size}")
-                print(f"DEBUG N_TILES: Combined size check (w_col < tile OR h_row < tile): {cond_size_check}")
-                print(f"DEBUG N_TILES: Final condition for using n_tiles=None (bbox_present AND size_check): {final_condition_for_none}")
-                # --- End Detailed Debug Logging ---
-
                 if final_condition_for_none: # Use the explicitly calculated final_condition
-                    current_n_tiles_for_prediction = None 
                     current_n_tiles_for_prediction = None 
                     print(f"Tile r{ir} c{ic} is small due to BBox ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (IF BRANCH TAKEN)")
                 else:
                     print(f"Tile r{ir} c{ic} ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (ELSE BRANCH TAKEN)")
-                    current_n_tiles_for_prediction = None
-                    print(f"Tile r{ir} c{ic} is small due to BBox ({w_col}x{h_row}), using n_tiles={current_n_tiles_for_prediction} for prediction. (IF BRANCH TAKEN)")
 
                 if self.wsi_mask is not None:
                     # Check mask for efficiency
@@ -943,7 +973,7 @@ class SlideSegmentation():
                                         int(x_0/self.mask_ratio_x):int(x_1/self.mask_ratio_x)]
                     
                     if np.sum(mask) == 0: 
-                        print(f"Tile r{ir} c{ic} is empty in mask, skipping")
+                        print(f"Tile r{ir} c{ic} is empty in mask, skipping.")
                         continue
                 
                 # Record image reading start time
@@ -1034,6 +1064,11 @@ class SlideSegmentation():
                 else:
                     print(f"ERROR: img_np has unexpected shape {img_np.shape} for tile r{ir} c{ic}. Skipping normalization and this tile.")
                     continue # Skip this tile if shape is problematic for normalization
+                
+                # Skip if mostly white pixels (>240). Check on uint8 img_np before normalization.
+                if np.sum(np.all(img_np > 240, axis=2)) / img_np.size > 0.95:
+                    print(f"Tile r{ir} c{ic} is mostly white, skipping.")
+                    continue
 
                 # Determine if joint normalization should be attempted
                 use_joint_normalization = self.wsi_mask is not None and self.normalize_template is not None
@@ -1093,15 +1128,47 @@ class SlideSegmentation():
                     img_norm = normalize(img_np)
                     print(f"DEBUG: Direct normalization used for tile r{ir}c{ic}. img_norm shape: {img_norm.shape}")
 
-                # Skip if mostly white pixels (>240)
-                n_dark_pixels = np.sum(np.any(img_norm < 240, axis=2))  # Count pixels with any RGB channel < 240
-                if n_dark_pixels < 50:
-                    print(f"Tile r{ir} c{ic} is mostly white, skipping")
-                    continue
-                elif np.min(img_norm) < -1e15 or np.max(img_norm) > 1e15:
-                    print("Values too large, skipping this batch")
-                    continue
-                
+                # Apply polygon mask for the current tile if polygon_points exist
+                if self.polygon_points and img_np.size > 0:
+                    try:
+                        # Create a mask for the current tile dimensions
+                        mask_img = Image.new('L', (img_np.shape[1], img_np.shape[0]), 0) # L for grayscale (0-255)
+                        draw = ImageDraw.Draw(mask_img)
+
+                        # Transform polygon points to current tile's local coordinates and current scaling
+                        # polygon_points are in original Level 0 coordinates
+                        # (x_0, y_0) is the global top-left of the current tile in Level 0
+                        # coord_scale_x/y factors scale from original Level 0 to current img_np dimension
+                        tile_polygon_points = []
+                        for p_orig_x, p_orig_y in self.polygon_points:
+                            # Shift to tile's local origin
+                            p_local_x = p_orig_x - x_0
+                            p_local_y = p_orig_y - y_0
+                            # Apply patch scaling (from original Level 0 to current img_np resolution)
+                            p_scaled_x = p_local_x / coord_scale_x # Reverse scaling to get points for resized image
+                            p_scaled_y = p_local_y / coord_scale_y
+                            tile_polygon_points.append((p_scaled_x, p_scaled_y))
+
+                        # Draw polygon on the mask image (using float coordinates for precision)
+                        draw.polygon([tuple(p) for p in tile_polygon_points], fill=255) # Fill inside with white
+                        mask_np_tile = np.array(mask_img) # Convert mask to numpy array
+
+                        # Ensure mask is 3 channels to match img_norm for element-wise multiplication
+                        if mask_np_tile.ndim == 2: # Convert grayscale mask to 3 channels
+                            mask_np_tile = np.stack((mask_np_tile,)*3, axis=-1)
+                        elif mask_np_tile.ndim == 3 and mask_np_tile.shape[2] == 1:
+                            mask_np_tile = np.concatenate([mask_np_tile]*3, axis=2)
+                        
+                        # Mask img_norm: zero out pixels outside the polygon. Must ensure img_norm is 0-1 range first.
+                        # Normalize mask_np_tile to 0 or 1 so it acts as a multiplier
+                        mask_np_tile_normalized = (mask_np_tile / 255.0).astype(img_norm.dtype)
+                        img_norm = img_norm * mask_np_tile_normalized
+
+                        print(f"Applied tile-specific polygon mask for tile r{ir} c{ic}. Original pixel count: {img_np.shape[0]*img_np.shape[1]}, Masked pixels: {np.sum(mask_np_tile_normalized[:,:,0] > 0)}")
+                    except Exception as e:
+                        print(f"Warning: Error applying tile-specific polygon mask for tile r{ir} c{ic}: {e}. Proceeding without mask.")
+                        import traceback
+                        traceback.print_exc()  
                 
                 labels, dicts = self.model.predict_instances(img_norm,
                                                             prob_thresh=self.prob_thresh,
@@ -1215,6 +1282,23 @@ class SlideSegmentation():
                 self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
                 self.prob_all = np.array([])
         
+        # --- NEW FILTERING LOGIC FOR TILED PATH ---
+        if self.polygon_points and self.final_points is not None and len(self.final_points) > 0:
+            print("[Tiled Path] Applying final polygon filter to detected nuclei.")
+            filtered_indices = []
+            for i, point in enumerate(self.final_points):
+                if is_point_in_polygon(point, self.polygon_points):
+                    filtered_indices.append(i)
+            
+            if len(filtered_indices) < len(self.final_points):
+                print(f"[Tiled Path] Filtered {len(self.final_points) - len(filtered_indices)} nuclei outside polygon.")
+                self.final_points = self.final_points[filtered_indices]
+                self.final_coord = self.final_coord[filtered_indices]
+                self.prob_all = self.prob_all[filtered_indices] # Also filter probabilities
+            else:
+                print("[Tiled Path] No nuclei filtered by polygon.")
+        # --- END NEW FILTERING LOGIC FOR TILED PATH ---
+
         # Ensure progress is set to 100%
         if self.progress_callback:
             self.progress_callback(100)
@@ -1226,5 +1310,3 @@ class SlideSegmentation():
         overall_duration = overall_end_time - overall_start_time
         
         print("---- Segmentation successfully completed ----")
-        
-
