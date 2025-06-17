@@ -23,8 +23,8 @@ import h5py
 import tiffslide
 from PIL import ImageOps
 from skimage import morphology
-from skimage import measure
-from skimage.measure import label
+
+
 class MUSK:
     """MUSK model wrapper class"""
     def __init__(self, model_path="abc"):
@@ -71,50 +71,59 @@ class MUSK:
         num_batches = (num_images + batch_size - 1) // batch_size
         image_embeddings = []
 
-        for i in range(0, num_images, batch_size):
-            # Clear GPU cache
-            torch.cuda.empty_cache()
-            
-            batch_slice = slice(i, min(i + batch_size, num_images))
-            batch_images = images[batch_slice]
-            
-            # If progress callback is provided, update every 10%
-            if progress_callback and i % max(1, num_images // 10) == 0:
-                progress_percent = int((i / num_images) * 100)
-                progress_callback("encode", progress_percent)
-            
-            # If input is a list of paths, load images
-            if isinstance(batch_images[0], str):
-                loaded_images = []
-                for img_path in batch_images:
-                    try:
-                        img = Image.open(img_path).convert('RGB')
-                        loaded_images.append(img)
-                    except Exception as e:
-                        self.logger.warning(f"Error loading image {img_path}: {str(e)}")
-                        loaded_images.append(Image.new('RGB', (384, 384)))
-                batch_images = loaded_images
+        # make sure model is on GPU
+        self.model = self.model.to(self.device)
+        self.model.eval()  # set to evaluation mode
 
-            # Preprocess batch as float32
-            processed_images = torch.stack([
-                self.preprocess(img) for img in batch_images
-            ]).to(self.device, dtype=torch.float32)
+        with torch.cuda.amp.autocast():  # use automatic mixed precision
+            with torch.no_grad():  # do not calculate gradient
+                for i in range(0, num_images, batch_size):
+                    # Clear GPU cache
+                    torch.cuda.empty_cache()
+                    
+                    batch_slice = slice(i, min(i + batch_size, num_images))
+                    batch_images = images[batch_slice]
+                    
+                    # If progress callback is provided, update every 10%
+                    if progress_callback and i % max(1, num_images // 10) == 0:
+                        progress_percent = int((i / num_images) * 100)
+                        progress_callback("encode", progress_percent)
+                    
+                    # If input is a list of paths, load images
+                    if isinstance(batch_images[0], str):
+                        loaded_images = []
+                        for img_path in batch_images:
+                            try:
+                                img = Image.open(img_path).convert('RGB')
+                                loaded_images.append(img)
+                            except Exception as e:
+                                self.logger.warning(f"Error loading image {img_path}: {str(e)}")
+                                loaded_images.append(Image.new('RGB', (384, 384)))
+                        batch_images = loaded_images
 
-            # Model with DataParallel processing
-            batch_embeddings = self.model(
-                image=processed_images,
-                with_head=True,
-                out_norm=True,
-                ms_aug=False,
-                return_global=True
-            )[0]
-            image_embeddings.append(batch_embeddings)
-            
+                    # Preprocess batch as float32 and move to GPU
+                    processed_images = torch.stack([
+                        self.preprocess(img) for img in batch_images
+                    ]).to(self.device, dtype=torch.float32)
+
+                    # Model with DataParallel processing
+                    batch_embeddings = self.model(
+                        image=processed_images,
+                        with_head=True,
+                        out_norm=True,
+                        ms_aug=False,
+                        return_global=True
+                    )[0]
+                    
+                    # 将结果保存在CPU上以节省GPU内存
+                    image_embeddings.append(batch_embeddings.cpu())
+                    
         # Ensure final 100% progress callback
         if progress_callback:
             progress_callback("encode", 100)
             
-        return torch.cat(image_embeddings, dim=0)
+        # 最后将所有结果合并
+        return torch.cat(image_embeddings, dim=0).to(self.device)
 
     def encode_text(self, texts: List[str], batch_size: int):
         """Text encoding method
@@ -125,7 +134,7 @@ class MUSK:
             torch.Tensor: Text feature vectors
         """
         # Load tokenizer
-        tokenizer = XLMRobertaTokenizer("model/musk/models/tokenizer.spm")
+        tokenizer = XLMRobertaTokenizer("./MUSK/musk/models/tokenizer.spm")
         
         num_texts = len(texts)
         num_batches = (num_texts + batch_size - 1) // batch_size
@@ -299,366 +308,114 @@ class MUSK:
         
         return patch_embeddings
 
-    def get_tissue_mask(self, slide):
-        """Generate tissue mask from WSI with enhanced gray background detection and fat tissue preservation
+    def get_tissue_mask(self, slide, edge_width_ratio=0.025, min_area=None, debug_dir=None):
+        """
+        Generate a filled tissue mask for a whole-slide image.
+
+        The routine:
+        1. Builds a thumbnail‐level binary mask of tissue,
+        2. Fills gaps and large holes,
+        3. Removes small spurious regions at the slide’s borders (typical “shadow” artifacts),
+        4. Optionally saves every intermediate step to *debug_dir* for visual inspection.
+
         
-        This function identifies the actual slide edges and excludes gray background areas
-        while preserving all tissue types including adipose (fat) tissue. It uses both RGB 
-        and HSV color analysis to robustly distinguish between tissue and various shades of 
-        gray backgrounds.
-        
-        Args:
-            slide: TiffSlide object
-        Returns:
-            mask: Binary tissue mask where tissue=1 (including fat), background=0
         """
         try:
-            # choose appropriate level
+            import numpy as np
+            import cv2
+            import os
+            from PIL import ImageOps
+            from skimage import morphology
+            from skimage.measure import label, regionprops
+            import imageio
+
+            # ---------------------------------------------------------------------
+            # 1. Read a thumbnail image at the coarsest reasonable level
+            # ---------------------------------------------------------------------
             level = min(3, len(slide.level_dimensions) - 1)
             dim = slide.level_dimensions[level]
-            
-            # check thumbnail size
-            if dim[0] > 10000 or dim[1] > 10000:
-                self.logger.warning('Thumbnail too large, using higher level')
-                level = min(level + 1, len(slide.level_dimensions) - 1)
-                dim = slide.level_dimensions[level]
-                
-            # read thumbnail and convert to RGB
-            temp_thumb = slide.read_region((0,0), level, dim).convert('RGB')
-            
-            # Get RGB values for edge and gray region detection
-            rgb = np.array(temp_thumb)
-            r, g, b = rgb[:,:,0], rgb[:,:,1], rgb[:,:,2]
-            
-            # Convert to HSV for additional gray detection
-            hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-            h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
-            
-            # convert to grayscale for standard processing
+            temp_thumb = slide.read_region((0, 0), level, dim).convert('RGB')
             gray = np.array(ImageOps.grayscale(temp_thumb))
-            
-            # Calculate image dimensions
-            height, width = gray.shape
-            
-            # Define edge widths (reduced to 2% for less aggressive edge detection)
-            edge_width_y = max(1, int(height * 0.02))
-            edge_width_x = max(1, int(width * 0.02))
-            
-            # Create masks for the four edges
-            top_edge = np.zeros_like(gray, dtype=bool)
-            top_edge[:edge_width_y, :] = True
-            
-            bottom_edge = np.zeros_like(gray, dtype=bool)
-            bottom_edge[-edge_width_y:, :] = True
-            
-            left_edge = np.zeros_like(gray, dtype=bool)
-            left_edge[:, :edge_width_x] = True
-            
-            right_edge = np.zeros_like(gray, dtype=bool)
-            right_edge[:, -edge_width_x:] = True
-            
-            # Combine all edges
-            all_edges = top_edge | bottom_edge | left_edge | right_edge
-            
-            # Calculate max difference between any two channels
-            rg_diff = np.abs(r.astype(np.int16) - g.astype(np.int16))
-            rb_diff = np.abs(r.astype(np.int16) - b.astype(np.int16))
-            gb_diff = np.abs(g.astype(np.int16) - b.astype(np.int16))
-            max_diff = np.maximum(np.maximum(rg_diff, rb_diff), gb_diff)
-            
-            # FAT TISSUE DETECTION - Detect fat tissue to preserve it
-            # Fat tissue typically appears as whitish areas with slight pink/purple tinge
-            # and has some structure (not uniform like background)
-            fat_tissue_mask = (
-                (r >= 220) & (r <= 255) &
-                (g >= 200) & (g <= 250) &
-                (b >= 220) & (b <= 255) &
-                (max_diff > 5) & (max_diff < 30)  # Some color variation but not too much
-            )
-            
-            # Additional fat detection using local variance
-            # Fat tissue has texture, unlike uniform background
-            gray_float = gray.astype(np.float32)
-            local_variance = cv2.Laplacian(gray_float, cv2.CV_32F)
-            variance_mag = np.abs(local_variance)
-            
-            # Fat areas have some texture (variance > threshold)
-            texture_mask = variance_mag > 2.0
-            
-            # Combine fat detection criteria
-            potential_fat = fat_tissue_mask & texture_mask
-            
-            # ENHANCED GRAY DETECTION - Multiple ranges for different gray shades
-            # Modified to exclude fat tissue areas
-            # Light gray (common scanner background) - excluding fat tissue colors
-            light_gray_mask = (
-                (r >= 180) & (r <= 245) &
-                (g >= 180) & (g <= 245) &
-                (b >= 180) & (b <= 245) &
-                (max_diff < 10) &
-                ~potential_fat  # Exclude fat tissue
-            )
-            
-            # Medium gray
-            medium_gray_mask = (
-                (r >= 120) & (r <= 180) &
-                (g >= 120) & (g <= 180) &
-                (b >= 120) & (b <= 180) &
-                (max_diff < 10)
-            )
-            
-            # Dark gray
-            dark_gray_mask = (
-                (r >= 50) & (r <= 120) &
-                (g >= 50) & (g <= 120) &
-                (b >= 50) & (b <= 120) &
-                (max_diff < 15)
-            )
-            
-            # Very light gray (almost white backgrounds) - excluding fat tissue
-            very_light_gray_mask = (
-                (r >= 245) & (r <= 255) &
-                (g >= 245) & (g <= 255) &
-                (b >= 245) & (b <= 255) &
-                (variance_mag < 1.0)  # Low variance indicates uniform background
-            )
-            
-            # Combine all RGB-based gray detections
-            rgb_gray_mask = light_gray_mask | medium_gray_mask | dark_gray_mask | very_light_gray_mask
-            
-            # HSV-based gray detection (low saturation indicates gray)
-            # Modified to preserve fat tissue which may have low saturation
-            hsv_gray_mask = (s < 20) & (v > 45) & (v < 250) & ~potential_fat
-            
-            # Combine RGB and HSV gray detection
-            gray_mask = rgb_gray_mask | hsv_gray_mask
-            
-            # Find gray regions connected to edges - these are non-tissue background
-            # Start with edges that are gray
-            edge_gray = all_edges & gray_mask
-            
-            # Iteratively grow the edge gray regions to find all connected gray background
-            # Using connected component analysis
-            labeled_gray, num_gray = morphology.label(gray_mask, return_num=True)
-            edge_components = np.unique(labeled_gray[edge_gray])
-            
-            # Remove background (0)
-            edge_components = edge_components[edge_components > 0]
-            
-            # Create mask of gray regions connected to edges
-            gray_background = np.zeros_like(gray, dtype=bool)
-            for comp in edge_components:
-                gray_background = gray_background | (labeled_gray == comp)
-            
-            # Also include any large gray regions (likely background even if not connected to edges)
-            # BUT exclude regions that contain significant fat tissue
-            if num_gray > 0:
-                component_sizes = np.bincount(labeled_gray.ravel())
-                total_pixels = height * width
-                
-                # Any gray region larger than 5% of image is likely background
-                for i in range(1, num_gray + 1):
-                    if component_sizes[i] > total_pixels * 0.05:
-                        # Check if this component overlaps with fat tissue
-                        component_mask = (labeled_gray == i)
-                        fat_overlap = np.sum(component_mask & potential_fat)
-                        component_size = np.sum(component_mask)
-                        
-                        # If less than 10% of the component is fat tissue, it's background
-                        if fat_overlap < component_size * 0.1:
-                            gray_background = gray_background | component_mask
-            
-            # Apply Gaussian blur to smooth the gray background mask before dilation
-            gray_background_float = gray_background.astype(np.float32)
-            gray_background_smooth = cv2.GaussianBlur(gray_background_float, (11, 11), 3)
-            gray_background_smooth = gray_background_smooth > 0.3
-            
-            # Use morphological gradient for smoother edge transitions
-            gray_background_dilated = morphology.binary_dilation(gray_background_smooth, morphology.disk(3))
-            
-            # Apply additional smoothing to the dilated mask
-            gray_background_float = gray_background_dilated.astype(np.float32)
-            gray_background_smooth_final = cv2.GaussianBlur(gray_background_float, (7, 7), 2)
-            gray_background = gray_background_smooth_final > 0.5
-            
-            # Create a non-gray mask (everything that's not gray background)
-            non_gray_mask = ~gray_background
-            
-            # STANDARD TISSUE DETECTION PROCEDURE
-            # Modified thresholds to better capture fat tissue
-            block_size = 51
-            C = 1  # Reduced constant for better fat detection
-            
-            # Apply Gaussian blur to the grayscale image before thresholding
-            gray_smoothed = cv2.GaussianBlur(gray, (5, 5), 1.5)
-            
-            # Use a more sensitive adaptive threshold for better fat detection
+            h,  w = gray.shape
+
+            # ---------------------------------------------------------------------
+            # 2. Adaptive thresholding – stricter parameters for fewer false positives
+            # ---------------------------------------------------------------------
             mask = cv2.adaptiveThreshold(
-                gray_smoothed, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY_INV, block_size, C
+                gray, 1, cv2.ADAPTIVE_THRESH_MEAN_C,
+                cv2.THRESH_BINARY_INV, 31, 10
             )
-            
-            # Also create a mask specifically for very light tissues (like fat)
-            # Using a different threshold approach
-            _, light_tissue_mask = cv2.threshold(gray_smoothed, 240, 255, cv2.THRESH_BINARY_INV)
-            
-            # Combine with texture information to distinguish from background
-            light_tissue_mask = light_tissue_mask & texture_mask
-            
-            # convert to binary image
-            mask = (mask > 0).astype(np.uint8)
-            
-            # Combine standard mask with light tissue mask
-            mask = mask | light_tissue_mask
-            
-            # Apply the non-gray mask to exclude gray background
-            mask = mask & non_gray_mask
-            
-            # BOTTOM REGION PROCESSING
-            bottom_half_start = height - (height // 35)
-            
-            # Extract bottom region of image
-            bottom_half_gray = gray_smoothed[bottom_half_start:, :]
-            bottom_half_non_gray = non_gray_mask[bottom_half_start:, :]
-            
-            # Apply more sensitive threshold to bottom region
-            bottom_mask = cv2.adaptiveThreshold(
-                bottom_half_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY_INV, 15, C+3  # Slightly reduced sensitivity
-            )
-            bottom_mask = (bottom_mask > 0).astype(np.uint8)
-            
-            # Also apply non-gray mask to bottom region
-            bottom_mask = bottom_mask & bottom_half_non_gray
-            
-            # Combine masks - use original for top, enhanced for bottom
-            combined_mask = mask.copy()
-            combined_mask[bottom_half_start:, :] = bottom_mask
-            
-            # Ensure fat tissue is included
-            combined_mask = combined_mask | (potential_fat & non_gray_mask)
-            
-            # First morphological processing to remove very small objects
-            # Increased minimum size to avoid removing small fat lobules
-            clean_mask = morphology.remove_small_objects(combined_mask.astype(bool), min_size=10 * 10, connectivity=2)
-            
-            # Apply closing to connect nearby tissue
-            struct_element_closing = morphology.disk(12)
-            closed_mask = morphology.binary_closing(clean_mask, struct_element_closing)
-            
-            # Remove small holes - reduced threshold to preserve fat tissue structure
-            filled_mask = morphology.remove_small_holes(closed_mask, area_threshold=64 * 64)
-            
-            # DOT REMOVAL - with consideration for fat tissue
-            # Split mask into top and bottom regions
-            top_region_mask = filled_mask.copy()
-            top_region_mask[bottom_half_start:, :] = False
-            
-            bottom_region_mask = filled_mask.copy()
-            bottom_region_mask[:bottom_half_start, :] = False
-            
-            # Process top region - less aggressive to preserve fat
-            top_labeled_mask, top_num_components = morphology.label(top_region_mask, return_num=True)
-            top_clean = top_region_mask.copy()
-            
-            if top_num_components > 1:
-                top_component_sizes = np.bincount(top_labeled_mask.ravel())
-                
-                if len(top_component_sizes) > 1:
-                    top_largest_component_size = np.max(top_component_sizes[1:])
-                    top_size_threshold = top_largest_component_size * 0.0001  # More permissive
-                    
-                    top_clean = np.zeros_like(top_labeled_mask, dtype=bool)
-                    for i in range(1, top_num_components + 1):
-                        if top_component_sizes[i] > top_size_threshold:
-                            top_clean = np.logical_or(top_clean, top_labeled_mask == i)
-            
-            # Process bottom region
-            bottom_labeled_mask, bottom_num_components = morphology.label(bottom_region_mask, return_num=True)
-            bottom_clean = bottom_region_mask.copy()
-            
-            if bottom_num_components > 1:
-                bottom_component_sizes = np.bincount(bottom_labeled_mask.ravel())
-                
-                if len(bottom_component_sizes) > 1:
-                    if 'top_largest_component_size' in locals():
-                        reference_size = top_largest_component_size
-                    else:
-                        reference_size = np.max(bottom_component_sizes[1:])
-                        
-                    bottom_size_threshold = reference_size * 0.02  # More permissive
-                    
-                    bottom_clean = np.zeros_like(bottom_labeled_mask, dtype=bool)
-                    for i in range(1, bottom_num_components + 1):
-                        if bottom_component_sizes[i] > bottom_size_threshold:
-                            bottom_clean = np.logical_or(bottom_clean, bottom_labeled_mask == i)
-            
-            # Recombine the cleaned regions
-            combined_clean_mask = np.logical_or(top_clean, bottom_clean)
-            
-            # Apply smoothing before final dilation
-            combined_clean_float = combined_clean_mask.astype(np.float32)
-            combined_clean_smooth = cv2.GaussianBlur(combined_clean_float, (9, 9), 2)
-            combined_clean_mask = combined_clean_smooth > 0.3
-            
-            # Apply dilation with region-specific parameters
-            bottom_mask_for_dilation = combined_clean_mask.copy()
-            bottom_mask_for_dilation[:bottom_half_start, :] = False
-            
-            top_mask_for_dilation = combined_clean_mask.copy()
-            top_mask_for_dilation[bottom_half_start:, :] = False
-            
-            # Dilate with reduced parameters
-            bottom_struct_element = morphology.disk(15)
-            dilated_bottom = morphology.binary_dilation(bottom_mask_for_dilation, bottom_struct_element)
-            
-            top_struct_element = morphology.disk(15)
-            dilated_top = morphology.binary_dilation(top_mask_for_dilation, top_struct_element)
-            
-            # Combine the dilated regions
-            dilated_mask = np.logical_or(dilated_top, dilated_bottom)
-            
-            # Apply smoothing to the dilated mask
-            dilated_float = dilated_mask.astype(np.float32)
-            dilated_smooth = cv2.GaussianBlur(dilated_float, (15, 15), 4)
-            dilated_mask = dilated_smooth > 0.4
-            
-            # Apply the non-gray mask one more time with less erosion
-            dilated_non_gray = morphology.binary_erosion(non_gray_mask, morphology.disk(2))
-            dilated_mask = dilated_mask & dilated_non_gray
-            
-            # Fill small holes in the final mask
-            final_mask = morphology.remove_small_holes(dilated_mask, area_threshold=100*100)
-            
-            # Final cleanup - remove small objects with smaller threshold
-            final_mask = morphology.remove_small_objects(final_mask, min_size=15*15)
-            
-            # Apply final smoothing pass
-            final_float = final_mask.astype(np.float32)
-            final_smooth = cv2.GaussianBlur(final_float, (7, 7), 2)
-            final_mask = final_smooth > 0.5
-            
-            # Log statistics for debugging
-            gray_percentage = (np.sum(gray_background) / (height * width)) * 100
-            fat_percentage = (np.sum(potential_fat) / (height * width)) * 100
-            self.logger.info(f"Detected {gray_percentage:.1f}% of image as gray background")
-            self.logger.info(f"Detected {fat_percentage:.1f}% of image as potential fat tissue")
-            
-            return final_mask.astype(np.uint8)
-            
+            if debug_dir:
+                imageio.imwrite(os.path.join(debug_dir, "debug_01_init_mask.png"), mask * 255)
+
+            # ---------------------------------------------------------------------
+            # 3. Morphological closing – bridge small gaps / tears
+            # ---------------------------------------------------------------------
+            mask = morphology.binary_closing(mask, morphology.disk(8))
+            if debug_dir:
+                imageio.imwrite(os.path.join(debug_dir, "debug_02_closed.png"), mask.astype(np.uint8) * 255)
+
+            # ---------------------------------------------------------------------
+            # 4. Fill larger holes inside tissue islands
+            # ---------------------------------------------------------------------
+            mask = morphology.remove_small_holes(mask, area_threshold=int(0.01 * h * w))
+            if debug_dir:
+                imageio.imwrite(os.path.join(debug_dir, "debug_03_holes.png"), mask.astype(np.uint8) * 255)
+
+            # ---------------------------------------------------------------------
+            # 5. Keep only tissue regions whose area exceeds *min_area*
+            # ---------------------------------------------------------------------
+            if min_area is None:
+                min_area = max(int(0.003 * h * w), 5000)
+
+            label_img = label(mask)
+            mask_clean = np.zeros_like(mask, dtype=bool)
+            for region in regionprops(label_img):
+                if region.area >= min_area:
+                    mask_clean[label_img == region.label] = 1
+
+            mask = mask_clean.astype(np.uint8)
+            if debug_dir:
+                imageio.imwrite(os.path.join(debug_dir, "debug_04_area.png"), mask * 255)
+
+            # ---------------------------------------------------------------------
+            # 6. Detect and discard shadow / artifact regions along the slide edges
+            # ---------------------------------------------------------------------
+            margin_y = int(h * edge_width_ratio)
+            margin_x = int(w * edge_width_ratio)
+
+            edge_mask = np.zeros_like(mask, dtype=bool)
+            edge_mask[:margin_y, :]  = 1
+            edge_mask[-margin_y:, :] = 1
+            edge_mask[:, :margin_x]  = 1
+            edge_mask[:, -margin_x:] = 1
+
+            label_img2 = label(mask)
+            artifact_mask = np.zeros_like(mask, dtype=bool)
+            for region in regionprops(label_img2):
+                # Apply a stricter size threshold for edge-touching regions
+                if region.area < min_area * 1.5:
+                    coords = region.coords
+                    if np.any(edge_mask[coords[:, 0], coords[:, 1]]):
+                        artifact_mask[label_img2 == region.label] = 1
+
+            if debug_dir:
+                imageio.imwrite(os.path.join(debug_dir, "debug_05_artifact_mask.png"), artifact_mask * 255)
+
+            # Final mask: tissue minus artifacts
+            final_mask = (mask.astype(bool) & (~artifact_mask.astype(bool))).astype(np.uint8)
+            if debug_dir:
+                imageio.imwrite(os.path.join(debug_dir, "debug_06_final_mask.png"), final_mask * 255)
+
+            return final_mask
+
         except Exception as e:
-            print(f"Error generating tissue mask: {str(e)}")
+            print(f"Error generating clean tissue mask: {str(e)}")
             import traceback
             traceback.print_exc()
-            return np.ones(dim[::-1], dtype=np.uint8)  # return full white mask when error
+            return np.ones(dim[::-1], dtype=np.uint8)
 
-
-
-
-
-
-    
-    def process_whole_wsi(self, wsi_path: str, patch_size: int = 224, level: int = 0, 
+    def process_whole_wsi(self, wsi_path: str, patch_size: int = 128, level: int = 0, 
                           batch_size: int = 16, use_tiffslide: bool = True,
                           save_patches: bool = False, output_dir: str = None,
                           tissue_threshold: float = 0.5, progress_callback=None):
