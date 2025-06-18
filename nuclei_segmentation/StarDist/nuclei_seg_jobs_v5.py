@@ -1,4 +1,3 @@
-
 from io import BytesIO
 from pathlib import Path
 import numpy as np
@@ -15,6 +14,7 @@ import psutil
 import threading
 import gc
 import modal
+
 # Suppress warnings
 warnings.filterwarnings('ignore', message='.*torchvision.datapoints.*')
 warnings.filterwarnings('ignore', message='.*torchvision.transforms.v2.*')
@@ -24,7 +24,7 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 # Create the Modal app
 app = modal.App("nuclei-segmentation-v5-1")
 
-# 🚀 OPTIMIZED: Build image with memory-aware configuration
+# 🚀 HIGH PERFORMANCE: Optimized image with better configurations
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install(
@@ -35,7 +35,8 @@ image = (
         "libxrender-dev",
         "libgomp1",
         "build-essential",
-        "libjemalloc2"  # Better memory allocator
+        "libjemalloc2",
+        "libtcmalloc-minimal4"  # Google's tcmalloc for better performance
     )
     .pip_install(
         # Core scientific and image libraries
@@ -59,14 +60,15 @@ image = (
         "stardist==0.9.1",
         "pylibCZIrw",
         "tiffslide",
-        # 🚀 OPTIMIZED: Embedding dependencies
+        # 🚀 HIGH PERFORMANCE: Embedding dependencies
         "torch",
         "torchvision", 
         "transformers",
         "multiprocess",
         "fastdist",
         "psutil",
-        "lz4"
+        "lz4",
+        "blosc2"  # Fast compression
     )
     .pip_install("tensorflow==2.12.0")
     .env({
@@ -75,27 +77,20 @@ image = (
         "PYTHONPATH": "/root",
         "CUDA_VISIBLE_DEVICES": "",
         "TORCH_USE_CUDA": "0",
-        # 🚀 OPTIMIZED: Dynamic threading based on CPU allocation
-        "OMP_NUM_THREADS": "1",
-        "MKL_NUM_THREADS": "1",
-        "NUMEXPR_NUM_THREADS": "1",
-        "OPENBLAS_NUM_THREADS": "1",
-        "VECLIB_MAXIMUM_THREADS": "1",
-        "TORCH_NUM_THREADS": "1",
-        "TF_NUM_INTRAOP_THREADS": "1",
-        "TF_NUM_INTEROP_THREADS": "1",
-        "LD_PRELOAD": "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"
+        # 🚀 HIGH PERFORMANCE: Better memory allocator
+        "LD_PRELOAD": "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4",
+        # Optimized threading will be set dynamically
     })
     # Copy local modules
-    .add_local_file("nuc_seg_mac.py", "/root/nuc_seg_mac.py",copy=True)
-    .add_local_file("nuc_stat.py", "/root/nuc_stat.py",copy=True)
-    .add_local_file("wrappers_mac.py", "/root/wrappers_mac.py",copy=True)
-    .add_local_file("nuc_embedding_mac.py", "/root/nuc_embedding_mac.py",copy=True)
-    .add_local_file("ultra_fast_embedding_v5.py", "/root/ultra_fast_embedding_v5.py",copy=True)
-    .add_local_dir("histomicstk_scripts", "/root/histomicstk_scripts",copy=True)
-    .add_local_dir("checkpoints", "/root/checkpoints",copy=True)
-    .add_local_dir("models", "/root/models",copy=True)
-    .add_local_dir("transformer_cache", "/root/transformer_cache",copy=True)
+    .add_local_file("nuc_seg_mac1.py", "/root/nuc_seg_mac1.py", copy=True)
+    .add_local_file("nuc_stat.py", "/root/nuc_stat.py", copy=True)
+    .add_local_file("wrappers_mac.py", "/root/wrappers_mac.py", copy=True)
+    .add_local_file("nuc_embedding_mac.py", "/root/nuc_embedding_mac.py", copy=True)
+    .add_local_file("ultra_fast_embedding_v5.py", "/root/ultra_fast_embedding_v5.py", copy=True)
+    .add_local_dir("histomicstk_scripts", "/root/histomicstk_scripts", copy=True)
+    .add_local_dir("checkpoints", "/root/checkpoints", copy=True)
+    .add_local_dir("models", "/root/models", copy=True)
+    .add_local_dir("transformer_cache", "/root/transformer_cache", copy=True)
 )
 
 # Volume for caching pre-trained models
@@ -105,29 +100,9 @@ MODEL_CACHE_PATH = "/root/.keras/stardist/models"
 # Thread-safe embedding generation
 _embedding_lock = threading.Lock()
 
-class CloudMemoryMonitor:
-    """Monitor cloud instance memory usage"""
-    
-    def __init__(self, limit_fraction=0.9):
-        self.limit_fraction = limit_fraction
-        self.last_check = 0
-        self.check_interval = 1.0  # seconds
-    
-    def get_memory_usage(self):
-        """Get current memory usage fraction"""
-        mem = psutil.virtual_memory()
-        return mem.percent / 100.0
-    
-    def wait_for_memory(self):
-        """Wait until memory usage is below limit"""
-        while self.get_memory_usage() > self.limit_fraction:
-            print(f"⚠️ Memory usage {self.get_memory_usage()*100:.1f}% > {self.limit_fraction*100:.0f}%, waiting...")
-            time.sleep(2)
-            gc.collect()
-
-def generate_optimized_embeddings_v5(centroids, batch_size=None, num_workers=None, memory_limit=0.9):
+def generate_high_performance_embeddings(centroids, batch_size=None, num_workers=None, memory_limit=0.95):
     """
-    🚀 OPTIMIZED: Memory-aware embedding generation
+    🚀 HIGH PERFORMANCE: Optimized embedding generation
     """
     if not centroids:
         return []
@@ -140,11 +115,7 @@ def generate_optimized_embeddings_v5(centroids, batch_size=None, num_workers=Non
             sys.path.insert(0, "/root")
             from ultra_fast_embedding_v5 import create_reliable_embeddings_v5
             
-            # Monitor memory
-            memory_monitor = CloudMemoryMonitor(memory_limit)
-            memory_monitor.wait_for_memory()
-            
-            print(f"🚀 OPTIMIZED Embedding: {len(centroids)} nuclei, memory limit {memory_limit*100:.0f}%")
+            print(f"🚀 HIGH PERF Embedding: {len(centroids)} nuclei")
             
             # Call the optimized embedding function
             result = create_reliable_embeddings_v5(
@@ -166,14 +137,13 @@ def generate_optimized_embeddings_v5(centroids, batch_size=None, num_workers=Non
                     
                     return embeddings_list
                 except Exception as e:
-                    print(f"❌ Error reading embeddings from H5: {e}")
+                    print(f"❌ Error reading embeddings: {e}")
                     return [[0.0] * 768] * len(centroids)
             else:
-                # Fallback to synthetic embeddings
                 return [[0.0] * 768] * len(centroids)
             
         except Exception as e:
-            print(f"❌ Critical embedding error: {e}")
+            print(f"❌ Embedding error: {e}")
             return [[0.0] * 768] * len(centroids)
 
 @app.function(
@@ -212,44 +182,42 @@ def setup_models():
 
 @app.function(
     image=image.env({"STARDIST_CACHE_DIR": MODEL_CACHE_PATH, "PYTHONPATH": "/root"}),
-    cpu=1,  # Always use 1 CPU for segmentation
-    memory=4096,  # 4GB memory
+    cpu=4,
+    memory=32768,  # Increased memory for better performance
     retries=1,
     volumes={MODEL_CACHE_PATH: model_cache},
-    timeout=900
+    timeout=900,
+    keep_warm=0 # Keep instances warm to reduce cold starts
 )
+@modal.concurrent(max_inputs=10, target_inputs=5)
 def process_segmentation_only(patch_data):
-    """🚀 OPTIMIZED: Memory-aware segmentation processing"""
+    """🚀 HIGH PERFORMANCE: Multi-threaded segmentation"""
     temp_files = []
     
     try:
-        # Set single-threaded environment
+        # Set multi-threaded environment
+        num_threads = 4
         os.environ.update({
             'CUDA_VISIBLE_DEVICES': '',
             'TORCH_USE_CUDA': '0',
             'STARDIST_CACHE_DIR': MODEL_CACHE_PATH,
-            'OMP_NUM_THREADS': '1',
-            'MKL_NUM_THREADS': '1',
-            'NUMEXPR_NUM_THREADS': '1',
-            'OPENBLAS_NUM_THREADS': '1',
-            'TF_NUM_INTRAOP_THREADS': '1',
-            'TF_NUM_INTEROP_THREADS': '1'
+            'OMP_NUM_THREADS': str(num_threads),
+            'MKL_NUM_THREADS': str(num_threads),
+            'NUMEXPR_NUM_THREADS': str(num_threads),
+            'OPENBLAS_NUM_THREADS': str(num_threads),
+            'TF_NUM_INTRAOP_THREADS': str(num_threads),
+            'TF_NUM_INTEROP_THREADS': '2'
         })
-        
-        # Monitor memory if specified
-        memory_limit = patch_data.get('memory_limit', 0.9)
-        memory_monitor = CloudMemoryMonitor(memory_limit)
-        memory_monitor.wait_for_memory()
         
         import numpy as np
         from PIL import Image
         Image.MAX_IMAGE_PIXELS = None
         import sys
         sys.path.insert(0, "/root")
-        from nuc_seg_mac import SlideSegmentation
+        from nuc_seg_mac1 import SlideSegmentation
 
         patch_id = patch_data.get('patch_id', 'unknown')
-        print(f"🔬 OPTIMIZED Processing {patch_id} (mem: {memory_monitor.get_memory_usage()*100:.1f}%)")
+        print(f"🔬 HIGH PERF Processing {patch_id}")
         
         start_time = time.time()
         
@@ -270,10 +238,10 @@ def process_segmentation_only(patch_data):
         
         args = Args()
         
-        # Optimal single-CPU configuration
-        tile_size = min(patch_data.get('tile_size', 512), 1024)
-        overlap = patch_data.get('overlap', 64)
-        n_tiles = (1, 1, 1)
+        # Optimized multi-CPU configuration
+        tile_size = min(patch_data.get('tile_size', 1024), 2048)
+        overlap = patch_data.get('overlap', 224)
+        n_tiles = (2, 2, 1)  # Use 2x2 tiling for parallel processing
         
         ss = SlideSegmentation(
             args,
@@ -290,48 +258,52 @@ def process_segmentation_only(patch_data):
         ss.run_WSI_segmentation()
         seg_time = time.time() - seg_start
         
-        # Extract results safely
-        centroids = []
-        contours = []
-        probs = []
-        
-        if hasattr(ss, 'final_points') and ss.final_points is not None:
-            centroids = ss.final_points.tolist()
-        
-        if hasattr(ss, 'final_coord') and ss.final_coord is not None:
-            contours = ss.final_coord.tolist()
-        
-        if hasattr(ss, 'prob_all') and ss.prob_all is not None:
-            probs = ss.prob_all.tolist()
+        # Extract results
+        centroids = ss.final_points.tolist() if hasattr(ss, 'final_points') and ss.final_points is not None else []
+        contours = ss.final_coord.tolist() if hasattr(ss, 'final_coord') and ss.final_coord is not None else []
+        probs = ss.prob_all.tolist() if hasattr(ss, 'prob_all') and ss.prob_all is not None else []
         
         total_time = time.time() - start_time
         
-        # Adjust coordinates to global space
+        # Adjust coordinates - Ensure contours maintain proper 2D structure
         base_x, base_y = patch_data.get('position', (0, 0))
         scale = patch_data.get('scale', 1.0)
         
-        adj_centroids = []
-        for x, y in centroids:
-            adj_x = int(x * scale + base_x)
-            adj_y = int(y * scale + base_y)
-            adj_centroids.append([adj_x, adj_y])
+        adj_centroids = [[int(x * scale + base_x), int(y * scale + base_y)] for x, y in centroids]
         
+        # Process contours to ensure they're lists of [x,y] coordinates
         adj_contours = []
         for contour in contours:
-            adj_contour = []
-            for px, py in contour:
-                adj_px = int(px * scale + base_x)
-                adj_py = int(py * scale + base_y)
-                adj_contour.append([adj_px, adj_py])
+            if isinstance(contour, list) and len(contour) > 0:
+                # Check if it's already in correct format
+                if isinstance(contour[0], list) and len(contour[0]) == 2:
+                    # Already list of [x,y] points
+                    adj_contour = [[int(px * scale + base_x), int(py * scale + base_y)] 
+                                  for px, py in contour]
+                else:
+                    # Might be flattened or in wrong format
+                    adj_contour = []
+            elif isinstance(contour, np.ndarray):
+                if len(contour.shape) == 2 and contour.shape[1] == 2:
+                    # Shape is (n_points, 2) - correct format
+                    adj_contour = [[int(px * scale + base_x), int(py * scale + base_y)] 
+                                  for px, py in contour]
+                elif len(contour.shape) == 2 and contour.shape[0] == 2:
+                    # Shape is (2, n_points) - need to transpose
+                    adj_contour = [[int(contour[0, i] * scale + base_x), 
+                                   int(contour[1, i] * scale + base_y)] 
+                                  for i in range(contour.shape[1])]
+                else:
+                    adj_contour = []
+            else:
+                adj_contour = []
+                
             adj_contours.append(adj_contour)
         
-        # Calculate performance metrics
+        # Performance metrics
         seg_throughput = len(adj_centroids) / seg_time if seg_time > 0 else 0
         
-        print(f"✅ {patch_id}: {len(adj_centroids)} nuclei in {seg_time:.1f}s")
-        
-        # Force garbage collection
-        gc.collect()
+        print(f"✅ {patch_id}: {len(adj_centroids)} nuclei in {seg_time:.1f}s ({seg_throughput:.1f} nuclei/s)")
         
         result = {
             'status': 'success',
@@ -348,14 +320,14 @@ def process_segmentation_only(patch_data):
             },
             'performance_stats': {
                 'segmentation_throughput': seg_throughput,
-                'memory_usage': memory_monitor.get_memory_usage()
+                'threads_used': num_threads
             }
         }
         
         return result
         
     except Exception as e:
-        print(f"[{patch_data.get('patch_id','unknown')}] SEGMENTATION ERROR: {e}")
+        print(f"[{patch_data.get('patch_id','unknown')}] SEG ERROR: {e}")
         traceback.print_exc()
         return {
             'status': 'error',
@@ -365,7 +337,7 @@ def process_segmentation_only(patch_data):
             'nuclei_count': 0
         }
     finally:
-        # Clean up temp files
+        # Clean up
         for temp_file in temp_files:
             try:
                 if os.path.exists(temp_file):
@@ -378,28 +350,25 @@ def process_segmentation_only(patch_data):
         "STARDIST_CACHE_DIR": MODEL_CACHE_PATH,
         "PYTHONPATH": "/root"
     }),
-    cpu=lambda patch_data: max(2, min(16, patch_data.get('num_workers', 4))),  # Dynamic CPU allocation
-    memory=lambda patch_data: max(4096, min(32768, patch_data.get('num_workers', 4) * 3072)),  # Dynamic memory
+    cpu=lambda patch_data: max(4, min(16, patch_data.get('num_workers', 8))),  # More conservative CPU allocation
+    memory=32768,  # Reasonable memory
     retries=1,
     volumes={MODEL_CACHE_PATH: model_cache},
-    timeout=1200
+    timeout=1800,
+    keep_warm=0  # Keep warm for embeddings
 )
+@modal.concurrent(max_inputs=10, target_inputs=5)
 def process_embedding_only(patch_data):
-    """🚀 OPTIMIZED: Memory-aware embedding processing"""
+    """🚀 HIGH PERFORMANCE: Optimized embedding processing"""
     try:
-        print(f"🧬 OPTIMIZED Embedding processing starting...")
+        print(f"🧬 HIGH PERF Embedding starting...")
         
-        # Get configuration
-        num_workers = patch_data.get('num_workers', 4)
-        memory_limit = patch_data.get('memory_limit', 0.9)
+        # Get configuration with more conservative defaults
+        num_workers = patch_data.get('num_workers', 8)
         available_cpus = psutil.cpu_count()
         optimized_workers = min(num_workers, available_cpus)
         
-        # Monitor memory
-        memory_monitor = CloudMemoryMonitor(memory_limit)
-        memory_monitor.wait_for_memory()
-        
-        # Set environment for optimal performance
+        # Set optimal threading
         os.environ.update({
             'CUDA_VISIBLE_DEVICES': '',
             'TORCH_USE_CUDA': '0',
@@ -424,60 +393,60 @@ def process_embedding_only(patch_data):
             }
         
         nuclei_count = len(centroids)
-        print(f"🚀 Processing {nuclei_count} nuclei with {optimized_workers} workers (mem: {memory_monitor.get_memory_usage()*100:.1f}%)")
+        print(f"🚀 Processing {nuclei_count} nuclei with {optimized_workers} workers")
         
         emb_start = time.time()
         
-        # Determine optimal batch size based on memory
-        mem_usage = memory_monitor.get_memory_usage()
-        if mem_usage > 0.7:  # High memory usage
-            batch_size = min(256, nuclei_count // 8)
-        elif mem_usage > 0.5:
-            batch_size = min(512, nuclei_count // 6)
+        # Dynamic batch sizing for performance
+        if nuclei_count >= 10000:
+            batch_size = 2048  # Reduced from 2048
+        elif nuclei_count >= 5000:
+            batch_size = 1536  # Reduced from 1536
+        elif nuclei_count >= 2000:
+            batch_size = 1024   # Reduced from 1024
+        elif nuclei_count >= 1000:
+            batch_size = 768   # Reduced from 768
         else:
-            batch_size = None  # Auto-determine
+            batch_size = 512   # Reduced from 512
         
         try:
-            embeddings = generate_optimized_embeddings_v5(
+            embeddings = generate_high_performance_embeddings(
                 centroids=centroids,
                 batch_size=batch_size,
                 num_workers=optimized_workers,
-                memory_limit=memory_limit
+                memory_limit=0.95
             )
         except Exception as e:
             print(f"❌ Embedding generation error: {e}")
             embeddings = [[0.0] * 768] * len(centroids)
         
         embed_time = time.time() - emb_start
-        total_time = embed_time
-        
-        # Calculate performance metrics
         throughput = len(embeddings) / embed_time if embed_time > 0 else 0
-        
-        # Force garbage collection
-        gc.collect()
         
         performance_stats = {
             'throughput': throughput,
             'workers_used': optimized_workers,
             'batch_size': batch_size,
-            'memory_usage': memory_monitor.get_memory_usage(),
-            'nuclei_per_cpu': nuclei_count / optimized_workers
+            'nuclei_per_cpu': nuclei_count / optimized_workers,
+            'nuclei_count': nuclei_count
         }
         
-        print(f"🎯 RESULTS: {throughput:.1f} it/s, memory: {memory_monitor.get_memory_usage()*100:.1f}%")
+        print(f"🎯 RESULTS: {throughput:.1f} it/s with {optimized_workers} workers")
+        import gc
+        gc.collect()
+        
         
         return {
             'status': 'success',
             'patch_id': patch_data.get('patch_id'),
             'patch_index': patch_data.get('patch_index'),
             'embeddings': embeddings,
-            'timing': {'total': total_time, 'embedding': embed_time},
+            'timing': {'total': embed_time, 'embedding': embed_time},
             'performance_stats': performance_stats
         }
         
     except Exception as e:
-        print(f"[{patch_data.get('patch_id','unknown')}] EMBEDDING ERROR: {e}")
+        print(f"[{patch_data.get('patch_id','unknown')}] EMB ERROR: {e}")
         traceback.print_exc()
         return {
             'status': 'error',
@@ -489,11 +458,11 @@ def process_embedding_only(patch_data):
 
 @app.function()
 def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat(), "version": "v5_optimized"}
+    return {"status": "healthy", "timestamp": datetime.now().isoformat(), "version": "v5_high_performance"}
 
 @app.local_entrypoint()
 def main():
-    print("🚀 Setting up V5 optimized model cache...")
+    print("🚀 Setting up V5 high performance model cache...")
     res = setup_models.remote()
     print(f"V5 Setup result: {res}")
 
