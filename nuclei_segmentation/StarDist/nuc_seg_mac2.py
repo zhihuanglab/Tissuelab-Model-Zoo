@@ -818,11 +818,12 @@ class SlideSegmentation():
         print("\n🔍 Starting multi-pass duplicate removal...")
         start_time = time.time()
         original_count = len(self.final_points)
-        
+        '''
         # ========== STEP 1: BOUNDARY OVERLAP REMOVAL ==========
         # [Keep your existing boundary overlap removal code here]
         # Calculate tile parameters
-        stride = self.tile_size - self.overlap
+        stride = self.tile_size - 2*self.overlap
+        stride2 = self.tile_size - self.overlap
         n_cols = int(np.ceil(self.dim[0] / stride))
         n_rows = int(np.ceil(self.dim[1] / stride))
         half_overlap = self.overlap / 2
@@ -849,10 +850,10 @@ class SlideSegmentation():
             tile_row = max(0, min(tile_row, n_rows - 1))
             
             # Define the "core" region of this tile (excluding overlap areas)
-            core_x0 = tile_col * stride + (self.overlap if tile_col > 0 else 0)
-            core_x1 = (tile_col + 1) * stride - (self.overlap if tile_col < n_cols - 1 else 0)
-            core_y0 = tile_row * stride + (self.overlap if tile_row > 0 else 0)
-            core_y1 = (tile_row + 1) * stride - (self.overlap if tile_row < n_rows - 1 else 0)
+            core_x0 = tile_col * stride + (half_overlap if tile_col > 0 else 0)
+            core_x1 = (tile_col + 1) * stride - (half_overlap if tile_col < n_cols - 1 else 0)
+            core_y0 = tile_row * stride + (half_overlap if tile_row > 0 else 0)
+            core_y1 = (tile_row + 1) * stride - (half_overlap if tile_row < n_rows - 1 else 0)
             
             # Adjust for image boundaries
             core_x1 = min(core_x1, self.dim[0])
@@ -874,7 +875,7 @@ class SlideSegmentation():
         if debug:
             print(f"   - Boundary overlap removal: {boundary_removed:,} cells removed")
             print(f"   - Remaining after boundary removal: {len(self.final_points):,} cells")
-        
+        '''
         # ========== STEP 2: MULTI-PASS GLOBAL DEDUPLICATION ==========
         total_global_removed = 0
         if len(self.final_points) > 0:
@@ -897,7 +898,7 @@ class SlideSegmentation():
         
         print(f"\n✅ Deduplication complete in {time.time() - start_time:.2f}s")
         print(f"📊 Original nuclei count: {original_count:,}")
-        print(f"🗑️  Total removed: {total_removed:,} (boundary: {boundary_removed:,}, global: {total_global_removed:,})")
+        #print(f"🗑️  Total removed: {total_removed:,} (boundary: {boundary_removed:,}, global: {total_global_removed:,})")
         print(f"✨ Final nuclei count: {len(self.final_points):,}")
         print(f"📉 Total reduction: {total_removed/original_count*100:.2f}%")
         
