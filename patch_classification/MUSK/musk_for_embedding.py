@@ -134,8 +134,8 @@ class MUSK:
             torch.Tensor: Text feature vectors
         """
         # Load tokenizer
-        tokenizer = XLMRobertaTokenizer("./MUSK/musk/models/tokenizer.spm")
-        
+        #tokenizer = XLMRobertaTokenizer("./model/musk/models/tokenizer.spm")
+        tokenizer = XLMRobertaTokenizer("/root/model/musk/models/tokenizer.spm")
         num_texts = len(texts)
         num_batches = (num_texts + batch_size - 1) // batch_size
         text_embeddings = []
@@ -308,7 +308,7 @@ class MUSK:
         
         return patch_embeddings
 
-    def get_tissue_mask(self, slide, edge_width_ratio=0.025, min_area=None, debug_dir=None):
+    def get_tissue_mask(self, slide, edge_width_ratio=0.04, min_area=None, debug_dir=None):
         """
         Generate a filled tissue mask for a whole-slide image.
 
@@ -358,7 +358,7 @@ class MUSK:
             # ---------------------------------------------------------------------
             # 4. Fill larger holes inside tissue islands
             # ---------------------------------------------------------------------
-            mask = morphology.remove_small_holes(mask, area_threshold=int(0.01 * h * w))
+            mask = morphology.remove_small_holes(mask, area_threshold=int(0.001 * h * w))
             if debug_dir:
                 imageio.imwrite(os.path.join(debug_dir, "debug_03_holes.png"), mask.astype(np.uint8) * 255)
 
@@ -366,7 +366,7 @@ class MUSK:
             # 5. Keep only tissue regions whose area exceeds *min_area*
             # ---------------------------------------------------------------------
             if min_area is None:
-                min_area = max(int(0.003 * h * w), 5000)
+                min_area = max(int(0.0005 * h * w), 2000)
 
             label_img = label(mask)
             mask_clean = np.zeros_like(mask, dtype=bool)
@@ -394,7 +394,7 @@ class MUSK:
             artifact_mask = np.zeros_like(mask, dtype=bool)
             for region in regionprops(label_img2):
                 # Apply a stricter size threshold for edge-touching regions
-                if region.area < min_area * 1.5:
+                if region.area < max(int(0.003 * h * w), 5000) * 1.5:
                     coords = region.coords
                     if np.any(edge_mask[coords[:, 0], coords[:, 1]]):
                         artifact_mask[label_img2 == region.label] = 1
