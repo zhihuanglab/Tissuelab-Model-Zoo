@@ -24,6 +24,7 @@ from skimage import draw
 import tensorflow as tf
 from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
 import tiffslide
+from collections import defaultdict
 
 opj = os.path.join
 
@@ -31,11 +32,11 @@ class SlideSegmentation():
 
     def __init__(self,
                  args,
-                 tile_size=512,
+                 tile_size=2048,
                  overlap=224,
                  prob_thresh=0.3,
                  nms_thresh=0.3,
-                 n_tiles=(4,4,1),
+                 n_tiles=(2,2,1),
                  stardist_pretrain='2D_versatile_he',
                  isIHC=False,
                  progress_callback=None
@@ -241,25 +242,6 @@ class SlideSegmentation():
         all white background.
         '''
         
-        # wsi_mask_center is to avoid some slide which has black color in the border.
-        # wsi_mask_center = copy.deepcopy(self.wsi_mask)
-        # wsi_mask_center[:int(self.wsi_mask.shape[0]/10),:] = False
-        # wsi_mask_center[(self.wsi_mask.shape[0]-int(self.wsi_mask.shape[0]/10)):self.wsi_mask.shape[0],:] = False
-        # wsi_mask_center[:,:int(self.wsi_mask.shape[1]/10)] = False
-        # wsi_mask_center[:,(self.wsi_mask.shape[1]-int(self.wsi_mask.shape[1]/10)):self.wsi_mask.shape[1]] = False
-        
-        # cx = np.argmax(np.sum(wsi_mask_center,axis=0))*self.mask_ratio_x
-        # cy = np.argmax(np.sum(wsi_mask_center,axis=1))*self.mask_ratio_y
-        # x_0 = int(np.max((0, cx-self.tile_size/2)))
-        # y_0 = int(np.max((0, cy-self.tile_size/2)))
-        # x_1 = np.min((x_0 + self.tile_size, self.dim[0]))
-        # y_1 = np.min((y_0 + self.tile_size, self.dim[1]))
-        # w = x_1 - x_0
-        # h = y_1 - y_0
-        # normalize_template = self.slide.read_region((x_0, y_0), self.level, (w,h))
-        # # normalize_template.resize((400,400))
-        # normalize_template = np.array(normalize_template)[:,:,:3]
-        # self.normalize_template = normalize_template
         # Load template from local path instead of relative path
         template_path = os.path.join(os.path.dirname(__file__), 'models', 'segmentation_image_template.png')
         if os.path.exists(template_path):
@@ -367,6 +349,10 @@ class SlideSegmentation():
         pbar.update(1)
         last_idx = 0
         
+        # Calculate stride and half overlap for core region approach
+        stride = self.tile_size - self.overlap
+        half_overlap = self.overlap / 2
+        
         while True:
             data = self.data_queue.get(block=True)
             if data is None:
@@ -394,7 +380,6 @@ class SlideSegmentation():
 
                 points[:,0] += x_0
                 points[:,1] += y_0
-                points = pd.DataFrame(points, index=[(ir, ic)]*len(points), columns=['x','y']).reset_index()
                 coord = dicts['coord']
                 coord[:, [1, 0], :] = coord[:, [0, 1], :] # x,y
                 coord = np.round(coord).astype(np.int32)
@@ -402,56 +387,29 @@ class SlideSegmentation():
                 coord[:,1,:] += y_0
                 prob = dicts['prob']
                 
+                # Use core region approach - only keep nuclei in the core region of this tile
+                # Define the "core" region boundaries (excluding overlap areas)
+                core_x0 = x_0 + (half_overlap if ic > 0 else 0)
+                core_x1 = x_0 + self.tile_size - (half_overlap if ic < self.n_col - 1 else 0)
+                core_y0 = y_0 + (half_overlap if ir > 0 else 0)
+                core_y1 = y_0 + self.tile_size - (half_overlap if ir < self.n_row - 1 else 0)
                 
+                # Adjust for image boundaries
+                core_x1 = min(core_x1, self.dim[0])
+                core_y1 = min(core_y1, self.dim[1])
                 
-                # align overlapped index with its previous left and top tile.
-                if ic>0:
-                    # discard the left part overlap from new tile
-                    x_prev_0 = (ic-1)*(self.tile_size-self.overlap)
-                    x_prev_1 = np.min((x_prev_0 + self.tile_size, self.dim[0]))
-                    idx_keep = points['x'].values >= (x_0 + x_prev_1)/2
-                    points = points.loc[idx_keep]
-                    coord = coord[idx_keep, ...]
-                    prob = prob[idx_keep]
-                    
-                    if self.points_all is not None:
-                        # remove right half overlap from previous tile
-                        points_prev_l = self.points_all.loc[self.points_all['index'] == (ir, ic-1),]
-                        idx_rm_l = list(points_prev_l.index.values[points_prev_l['x'].values >= (x_0 + x_prev_1)/2])
-                        
-                        curr_keep = ~np.isin(points_prev_l.index.values, idx_rm_l)
-                        idx_all_keep = (self.points_all['index'] != (ir, ic-1)).values
-                        idx_all_keep[idx_all_keep == False] = curr_keep
-                        
-                        self.points_all = self.points_all.loc[idx_all_keep,]
-                        self.coord_all = self.coord_all[idx_all_keep, ...]
-                        self.prob_all = self.prob_all[idx_all_keep]
-        
-                if ir>0:
-                    # discard the left part overlap from new tile
-                    y_prev_0 = (ir-1)*(self.tile_size-self.overlap)
-                    y_prev_1 = np.min((y_prev_0 + self.tile_size, self.dim[1]))
-                    idx_keep = points['y'].values >= (y_0 + y_prev_1)/2
-                    points = points.loc[idx_keep]
-                    coord = coord[idx_keep, ...]
-                    prob = prob[idx_keep]
-                    
-                    if self.points_all is not None:
-                        # remove right half overlap from previous tile
-                        points_prev_t = self.points_all.loc[self.points_all['index'] == (ir-1, ic),]
-                        idx_rm_t = list(points_prev_t.index.values[points_prev_t['y'].values >= (y_0 + y_prev_1)/2])
-                        
-                        
-                        curr_keep = ~np.isin(points_prev_t.index.values, idx_rm_t)
-                        idx_all_keep = (self.points_all['index'] != (ir-1, ic)).values
-                        idx_all_keep[idx_all_keep == False] = curr_keep
-                        
-                        self.points_all = self.points_all.loc[idx_all_keep,]
-                        self.coord_all = self.coord_all[idx_all_keep, ...]
-                        self.prob_all = self.prob_all[idx_all_keep]
-        
-        
-        
+                # Keep only nuclei in core region
+                idx_keep = (points[:, 0] >= core_x0) & (points[:, 0] < core_x1) & \
+                          (points[:, 1] >= core_y0) & (points[:, 1] < core_y1)
+                
+                points = points[idx_keep]
+                coord = coord[idx_keep, ...]
+                prob = prob[idx_keep]
+                
+                # Convert points to DataFrame for consistency
+                points = pd.DataFrame(points, index=[(ir, ic)]*len(points), columns=['x','y']).reset_index()
+                
+                # Simply accumulate all results - no need for complex overlap handling
                 if self.points_all is None:
                     self.points_all = points
                     self.coord_all = coord
@@ -460,8 +418,6 @@ class SlideSegmentation():
                     self.points_all = pd.concat((self.points_all, points), axis=0)
                     self.coord_all = np.concatenate((self.coord_all, coord), axis=0)
                     self.prob_all = np.concatenate((self.prob_all, prob), axis=0)
-                    
-                # print(curr_idx, 'curr:', len(points), '\t total:', len(self.points_all))
 
                 # Record patch processing end time and duration
                 patch_end_time = time.time()
@@ -470,6 +426,7 @@ class SlideSegmentation():
                 # Print time information (including reading time)
                 print(f"Block r{ir} c{ic} (x={x_0}, y={y_0}) processing time: {patch_duration:.4f}s (reading: {read_duration:.4f}s, computation: {patch_duration-read_duration:.4f}s)")
                 print(f"Start: {datetime.fromtimestamp(patch_start_time).strftime('%H:%M:%S')} - End: {datetime.fromtimestamp(patch_end_time).strftime('%H:%M:%S')}")
+                print(f"Detected {len(points)} nuclei in core region (x: {core_x0}-{core_x1}, y: {core_y0}-{core_y1})")
 
         # Record overall end time and duration
         overall_end_time = time.time()
@@ -591,8 +548,12 @@ class SlideSegmentation():
                 self.final_coord = np.swapaxes(self.final_coord, 1, 2)
                 self.prob_all = prob
                 
+                # Apply post-processing for simple images too
+                self.post_process_remove_duplicates_fixed(debug=True)
+                
+                # Get final count after deduplication
                 total_nuclei = len(self.final_points)
-                print(f"Total detected {total_nuclei} nuclei")
+                print(f"Total detected {total_nuclei} nuclei after deduplication")
                 
                 if self.progress_callback:
                     self.progress_callback(100)
@@ -616,7 +577,7 @@ class SlideSegmentation():
                 print(traceback.format_exc())
                 print("Falling back to standard tiling process")
         
-        # Below is the original tiling processing code
+        # Below is the original tiling processing code WITHOUT patch-level deduplication
         n_col = int(np.ceil(self.dim[0]/(self.tile_size-self.overlap)))
         n_row = int(np.ceil(self.dim[1]/(self.tile_size-self.overlap)))
         
@@ -626,7 +587,6 @@ class SlideSegmentation():
         
         total_tiles = n_row * n_col
         processed_tiles = 0 
-        total_nuclei = 0
         iter = 0
 
         pbar = tqdm(total=total_tiles, mininterval=0.1)
@@ -754,8 +714,6 @@ class SlideSegmentation():
                 # Print nuclei detection results for each tile
                 print("\n========================================")
                 print(f"Tile r{ir} c{ic} (x={x_0}, y={y_0}) detected {len(points)} nuclei")
-                total_nuclei += len(points)
-                print(f"Current total nuclei: {total_nuclei}")
                 print("========================================\n")
                 
                 # Print processing time information
@@ -778,8 +736,9 @@ class SlideSegmentation():
             self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
             self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
             self.prob_all = np.array([])
+            total_nuclei = 0
         else:
-            print(f"Segmentation complete, total accumulated nuclei: {len(points_all)}")
+            print(f"Segmentation complete, total accumulated nuclei before deduplication: {len(points_all)}")
             
             # Print first few rows of points_all to verify data
             print(f"points_all first 5 rows sample: \n{points_all.head().to_string()}")
@@ -800,7 +759,15 @@ class SlideSegmentation():
                     self.final_points = (self.final_points/resize_factor).astype(np.int32)
                     self.final_coord = (self.final_coord/resize_factor).astype(np.int32)
                 
-                print(f"Completed saving {len(self.final_points)} detected nuclei")
+                print(f"Before deduplication: {len(self.final_points)} detected nuclei")
+                
+                # Apply post-processing to remove duplicates
+                self.post_process_remove_duplicates_fixed(debug=True)
+                
+                # Update total count after deduplication
+                total_nuclei = len(self.final_points)
+                print(f"After deduplication: {total_nuclei} nuclei")
+                
             except Exception as e:
                 print(f"Failed to generate final_points: {str(e)}")
                 import traceback
@@ -813,6 +780,7 @@ class SlideSegmentation():
                 self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
                 self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
                 self.prob_all = np.array([])
+                total_nuclei = 0
         
         # Ensure progress is set to 100%
         if self.progress_callback:
@@ -827,7 +795,7 @@ class SlideSegmentation():
         print(f"\nTotal processing time: {overall_duration:.2f}s ({overall_duration/60:.2f}min)")
         print(f"Start time: {datetime.fromtimestamp(overall_start_time).strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"End time: {datetime.fromtimestamp(overall_end_time).strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Total nuclei count: {total_nuclei}")
+        print(f"Total nuclei count: {total_nuclei}")  # This now shows the deduplicated count
 
         print("---- Segmentation successfully completed ----")
         
@@ -839,164 +807,362 @@ class SlideSegmentation():
             # Last validation
             assert len(self.final_points) > 0, "Nuclei detection result is empty, please check"
 
+    def post_process_remove_duplicates_fixed(self, debug=True):
+        """
+        Fixed deduplication method with multiple passes for thorough cleaning
+        """
+        if not hasattr(self, 'final_points') or self.final_points is None or len(self.final_points) == 0:
+            print("No nuclei to process for duplicate removal")
+            return 0
+        
+        print("\n🔍 Starting multi-pass duplicate removal...")
+        start_time = time.time()
+        original_count = len(self.final_points)
+        '''
+        # ========== STEP 1: BOUNDARY OVERLAP REMOVAL ==========
+        # [Keep your existing boundary overlap removal code here]
+        # Calculate tile parameters
+        stride = self.tile_size - 2*self.overlap
+        stride2 = self.tile_size - self.overlap
+        n_cols = int(np.ceil(self.dim[0] / stride))
+        n_rows = int(np.ceil(self.dim[1] / stride))
+        half_overlap = self.overlap / 2
+        
+        if debug:
+            print(f"\n📏 Step 1: Boundary Overlap Removal")
+            print(f"   - Image dimensions: {self.dim}")
+            print(f"   - Tile size: {self.tile_size}")
+            print(f"   - Overlap: {self.overlap}")
+            print(f"   - Half overlap: {half_overlap}")
+            print(f"   - Stride: {stride}")
+            print(f"   - Grid: {n_rows}×{n_cols}")
+        
+        # Only keep nuclei in "core" regions of tiles
+        keep_mask = np.zeros(len(self.final_points), dtype=bool)
+        
+        for idx, (x, y) in enumerate(self.final_points):
+            # Find which tile this nucleus belongs to
+            tile_col = int(x // stride)
+            tile_row = int(y // stride)
+            
+            # Clamp to valid range
+            tile_col = max(0, min(tile_col, n_cols - 1))
+            tile_row = max(0, min(tile_row, n_rows - 1))
+            
+            # Define the "core" region of this tile (excluding overlap areas)
+            core_x0 = tile_col * stride + (half_overlap if tile_col > 0 else 0)
+            core_x1 = (tile_col + 1) * stride - (half_overlap if tile_col < n_cols - 1 else 0)
+            core_y0 = tile_row * stride + (half_overlap if tile_row > 0 else 0)
+            core_y1 = (tile_row + 1) * stride - (half_overlap if tile_row < n_rows - 1 else 0)
+            
+            # Adjust for image boundaries
+            core_x1 = min(core_x1, self.dim[0])
+            core_y1 = min(core_y1, self.dim[1])
+            
+            # Keep only if in core region
+            if core_x0 <= x < core_x1 and core_y0 <= y < core_y1:
+                keep_mask[idx] = True
+        
+        # Apply the boundary overlap mask
+        self.final_points = self.final_points[keep_mask]
+        if hasattr(self, 'final_coord') and self.final_coord is not None:
+            self.final_coord = self.final_coord[keep_mask]
+        if hasattr(self, 'prob_all') and self.prob_all is not None:
+            self.prob_all = self.prob_all[keep_mask]
+        
+        boundary_removed = original_count - len(self.final_points)
+        
+        if debug:
+            print(f"   - Boundary overlap removal: {boundary_removed:,} cells removed")
+            print(f"   - Remaining after boundary removal: {len(self.final_points):,} cells")
+        '''
+        # ========== STEP 2: MULTI-PASS GLOBAL DEDUPLICATION ==========
+        total_global_removed = 0
+        if len(self.final_points) > 0:
+            print("\n📏 Step 2: Stricter Global Deduplication (Centroid Proximity, Highest Probability Wins)")
+            self.final_points, self.final_coord, self.prob_all = self.remove_strict_duplicate_cells_global(
+                self.final_points,
+                self.final_coord,
+                self.prob_all,
+                distance_threshold=6,  # try 6–8 pixels for histology images
+                debug=debug
+            )
+        print(f"   - Final nuclei count: {len(self.final_points)}")
+            
+        if debug:
+            print(f"   - Total global deduplication: {total_global_removed:,} cells removed")
+            print(f"   - Final count: {len(self.final_points):,} cells")
+        
+        # Final statistics
+        total_removed = original_count - len(self.final_points)
+        
+        print(f"\n✅ Deduplication complete in {time.time() - start_time:.2f}s")
+        print(f"📊 Original nuclei count: {original_count:,}")
+        #print(f"🗑️  Total removed: {total_removed:,} (boundary: {boundary_removed:,}, global: {total_global_removed:,})")
+        print(f"✨ Final nuclei count: {len(self.final_points):,}")
+        print(f"📉 Total reduction: {total_removed/original_count*100:.2f}%")
+        
+        return total_removed
+
+    def remove_strict_duplicate_cells_global(self, points, coord, prob, distance_threshold=30, debug=False):
+        if len(points) == 0:
+            return points, coord, prob
+
+        from scipy.spatial import cKDTree as KDTree
+
+        # Always work with numpy arrays
+        if isinstance(points, pd.DataFrame):
+            points_array = points[['x', 'y']].values
+        else:
+            points_array = points
+
+        # Highest prob first
+        sorted_indices = np.argsort(-prob)
+        keep_mask = np.ones(len(points_array), dtype=bool)
+
+        tree = KDTree(points_array)
+
+        for idx in sorted_indices:
+            if not keep_mask[idx]:
+                continue
+            # Find neighbors (including self) within threshold
+            neighbors = tree.query_ball_point(points_array[idx], r=distance_threshold)
+            for nidx in neighbors:
+                if nidx == idx:
+                    continue
+                if keep_mask[nidx]:
+                    keep_mask[nidx] = False  # Remove all lower-priority neighbors
+
+        if isinstance(points, pd.DataFrame):
+            filtered_points = points[keep_mask]
+        else:
+            filtered_points = points_array[keep_mask]
+
+        filtered_coord = coord[keep_mask] if coord is not None else None
+        filtered_prob = prob[keep_mask] if prob is not None else None
+
+        if debug:
+            print(f"Removed {np.sum(~keep_mask)} global duplicates at threshold {distance_threshold}px")
+
+        return filtered_points, filtered_coord, filtered_prob
+
+    def visualize_effective_regions(self, output_path="effective_regions.png"):
+        """
+        可视化显示每个 tile 的有效区域（去掉 overlap 边界后）
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        
+        fig, ax = plt.subplots(1, 1, figsize=(12, 12))
+        
+        # Calculate parameters
+        stride = self.tile_size - self.overlap
+        n_cols = int(np.ceil(self.dim[0] / stride))
+        n_rows = int(np.ceil(self.dim[1] / stride))
+        half_overlap = self.overlap / 2
+        
+        # Draw tiles and their effective regions
+        for row in range(min(3, n_rows)):  # Only show first 3x3 tiles
+            for col in range(min(3, n_cols)):
+                # Tile boundaries
+                tile_x0 = col * stride
+                tile_y0 = row * stride
+                tile_x1 = min(tile_x0 + self.tile_size, self.dim[0])
+                tile_y1 = min(tile_y0 + self.tile_size, self.dim[1])
+                
+                # Draw full tile
+                tile_rect = patches.Rectangle((tile_x0, tile_y0), 
+                                            tile_x1 - tile_x0, tile_y1 - tile_y0,
+                                            linewidth=2, edgecolor='blue', 
+                                            facecolor='lightblue', alpha=0.3)
+                ax.add_patch(tile_rect)
+                
+                # Effective boundaries
+                effective_x0 = tile_x0 if col == 0 else tile_x0 + half_overlap
+                effective_x1 = tile_x1 if col == n_cols - 1 else tile_x0 + self.tile_size - half_overlap
+                effective_y0 = tile_y0 if row == 0 else tile_y0 + half_overlap
+                effective_y1 = tile_y1 if row == n_rows - 1 else tile_y0 + self.tile_size - half_overlap
+                
+                # Draw effective region
+                eff_rect = patches.Rectangle((effective_x0, effective_y0), 
+                                           effective_x1 - effective_x0, 
+                                           effective_y1 - effective_y0,
+                                           linewidth=2, edgecolor='green', 
+                                           facecolor='lightgreen', alpha=0.5)
+                ax.add_patch(eff_rect)
+                
+                # Add labels
+                ax.text(tile_x0 + (tile_x1 - tile_x0)/2, 
+                       tile_y0 + (tile_y1 - tile_y0)/2, 
+                       f"Tile ({row},{col})", 
+                       ha='center', va='center', fontsize=10, weight='bold')
+                
+                # Show dimensions
+                if row == 0 and col == 0:
+                    # Full tile dimension
+                    ax.annotate('', xy=(tile_x1, tile_y0 - 50), xytext=(tile_x0, tile_y0 - 50),
+                               arrowprops=dict(arrowstyle='<->', color='blue'))
+                    ax.text((tile_x0 + tile_x1)/2, tile_y0 - 60, f'{self.tile_size}', 
+                           ha='center', color='blue')
+                    
+                    # Effective dimension
+                    ax.annotate('', xy=(effective_x1, effective_y0 - 30), 
+                               xytext=(effective_x0, effective_y0 - 30),
+                               arrowprops=dict(arrowstyle='<->', color='green'))
+                    ax.text((effective_x0 + effective_x1)/2, effective_y0 - 40, 
+                           f'{int(effective_x1 - effective_x0)}', 
+                           ha='center', color='green')
+        
+        # Draw overlap regions
+        for row in range(min(2, n_rows)):
+            for col in range(min(2, n_cols)):
+                # Vertical overlap
+                if col < n_cols - 1:
+                    overlap_x = (col + 1) * stride
+                    overlap_rect = patches.Rectangle((overlap_x - half_overlap, row * stride), 
+                                                   self.overlap, self.tile_size,
+                                                   facecolor='red', alpha=0.2)
+                    ax.add_patch(overlap_rect)
+                
+                # Horizontal overlap
+                if row < n_rows - 1:
+                    overlap_y = (row + 1) * stride
+                    overlap_rect = patches.Rectangle((col * stride, overlap_y - half_overlap), 
+                                                   self.tile_size, self.overlap,
+                                                   facecolor='red', alpha=0.2)
+                    ax.add_patch(overlap_rect)
+        
+        ax.set_xlim(-100, min(3 * self.tile_size, self.dim[0]) + 100)
+        ax.set_ylim(-100, min(3 * self.tile_size, self.dim[1]) + 100)
+        ax.set_aspect('equal')
+        ax.invert_yaxis()
+        ax.set_title(f'Tile Effective Regions\nBlue: Full tile ({self.tile_size}×{self.tile_size}), ' + 
+                    f'Green: Effective region, Red: Overlap regions ({self.overlap}px)')
+        ax.set_xlabel('X (pixels)')
+        ax.set_ylabel('Y (pixels)')
+        
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"✅ Visualization saved to: {output_path}")
+
+    def diagnose_overlap_parameters(self):
+        """诊断 overlap 参数和去重效果"""
+        print("\n🔍 诊断 Overlap 参数")
+        print("="*60)
+        
+        # 打印实际使用的参数
+        print(f"Tile size: {self.tile_size}")
+        print(f"Overlap: {self.overlap}")
+        print(f"Stride: {self.tile_size - self.overlap}")
+        
+        # 如果有 magnification 调整
+        if hasattr(self.args, 'magnification') and self.args.magnification is not None:
+            resize_factor = self.reference_magnification / self.args.magnification
+            adjusted_tile_size = self.tile_size * resize_factor
+            adjusted_overlap = self.overlap * resize_factor
+            print(f"\n调整后 (magnification={self.args.magnification}):")
+            print(f"Adjusted tile size: {adjusted_tile_size}")
+            print(f"Adjusted overlap: {adjusted_overlap}")
+            print(f"Resize factor: {resize_factor}")
+        
+        print("="*60)
+
+    def analyze_overlap_distribution(self):
+        """
+        Analyze how nuclei are distributed in overlap regions.
+        This helps understand why deduplication isn't working as expected.
+        """
+        if not hasattr(self, 'final_points') or self.final_points is None:
+            print("No nuclei to analyze")
+            return
+        
+        print("\n🔍 OVERLAP DISTRIBUTION ANALYSIS")
+        print("="*60)
+        
+        # Calculate tile parameters
+        stride = self.tile_size - self.overlap
+        n_cols = int(np.ceil(self.dim[0] / stride))
+        n_rows = int(np.ceil(self.dim[1] / stride))
+        
+        print(f"Grid: {n_rows}×{n_cols} tiles")
+        print(f"Tile size: {self.tile_size}, Overlap: {self.overlap}, Stride: {stride}")
+        
+        # Count nuclei in different regions
+        nuclei_in_overlap = 0
+        nuclei_in_vertical_overlap = 0
+        nuclei_in_horizontal_overlap = 0
+        nuclei_in_corner_overlap = 0
+        
+        for x, y in self.final_points:
+            # Calculate primary tile
+            primary_col = int(x // stride)
+            primary_row = int(y // stride)
+            
+            in_vert_overlap = False
+            in_horiz_overlap = False
+            
+            # Check vertical overlaps
+            if primary_col > 0:
+                left_overlap_start = primary_col * stride
+                left_overlap_end = (primary_col - 1) * stride + self.tile_size
+                if x >= left_overlap_start and x < left_overlap_end:
+                    in_vert_overlap = True
+                    nuclei_in_vertical_overlap += 1
+            
+            if primary_col < n_cols - 1:
+                right_overlap_start = (primary_col + 1) * stride
+                right_overlap_end = primary_col * stride + self.tile_size
+                if x >= right_overlap_start and x < right_overlap_end:
+                    in_vert_overlap = True
+                    if not in_vert_overlap:  # Don't double count
+                        nuclei_in_vertical_overlap += 1
+            
+            # Check horizontal overlaps
+            if primary_row > 0:
+                top_overlap_start = primary_row * stride
+                top_overlap_end = (primary_row - 1) * stride + self.tile_size
+                if y >= top_overlap_start and y < top_overlap_end:
+                    in_horiz_overlap = True
+                    nuclei_in_horizontal_overlap += 1
+            
+            if primary_row < n_rows - 1:
+                bottom_overlap_start = (primary_row + 1) * stride
+                bottom_overlap_end = primary_row * stride + self.tile_size
+                if y >= bottom_overlap_start and y < bottom_overlap_end:
+                    in_horiz_overlap = True
+                    if not in_horiz_overlap:  # Don't double count
+                        nuclei_in_horizontal_overlap += 1
+            
+            if in_vert_overlap or in_horiz_overlap:
+                nuclei_in_overlap += 1
+            
+            if in_vert_overlap and in_horiz_overlap:
+                nuclei_in_corner_overlap += 1
+        
+        print(f"\n📊 Nuclei distribution:")
+        print(f"Total nuclei: {len(self.final_points):,}")
+        print(f"Nuclei in ANY overlap: {nuclei_in_overlap:,} ({nuclei_in_overlap/len(self.final_points)*100:.1f}%)")
+        print(f"Nuclei in vertical overlaps: {nuclei_in_vertical_overlap:,}")
+        print(f"Nuclei in horizontal overlaps: {nuclei_in_horizontal_overlap:,}")
+        print(f"Nuclei in corner overlaps: {nuclei_in_corner_overlap:,}")
+        
+        # Calculate expected duplicates
+        overlap_fraction = self.overlap / self.tile_size
+        expected_vert_overlap_fraction = overlap_fraction * (n_cols - 1) / n_cols
+        expected_horiz_overlap_fraction = overlap_fraction * (n_rows - 1) / n_rows
+        expected_total_overlap = expected_vert_overlap_fraction + expected_horiz_overlap_fraction
+        
+        print(f"\n📐 Expected overlap statistics:")
+        print(f"Overlap fraction per tile: {overlap_fraction:.3f}")
+        print(f"Expected nuclei in overlaps: ~{int(len(self.final_points) * expected_total_overlap):,} ({expected_total_overlap*100:.1f}%)")
+        print(f"Expected duplicates to remove: ~{int(len(self.final_points) * expected_total_overlap / 2):,} ({expected_total_overlap*50:.1f}%)")
+        
+        print("="*60)
+
     def rgb2gray(self, rgb):
         """Convert RGB image to grayscale"""
         r, g, b = rgb[:,:,0], rgb[:,:,1], rgb[:,:,2]
         gray = 0.2989 * r + 0.5870 * g + 0.1140 * b
         return gray.astype(np.uint8)
-
-    # def _get_haralick_features(self, nuclei_img_object, resolution, quantization=10):
-    #     """Compute Haralick texture features for a nucleus"""
-    #     # Convert to grayscale if needed
-    #     if len(nuclei_img_object.shape) == 3:
-    #         nuclei_img_2 = self.rgb2gray(nuclei_img_object)
-    #     else:
-    #         nuclei_img_2 = nuclei_img_object.copy()
-            
-    #     # Quantize to reduce computation time
-    #     level = np.int16(255/quantization)+1
-    #     nuclei_img_2 = (nuclei_img_2/quantization).astype(np.uint8)
-        
-    #     # Compute GLCM
-    #     glcm = graycomatrix(nuclei_img_2, 
-    #                        distances=[resolution],
-    #                        angles=[0, np.pi/4, np.pi/2, 3*np.pi/4],
-    #                        levels=level,
-    #                        symmetric=False, 
-    #                        normed=True)
-        
-    #     # Remove background
-    #     glcm = glcm[0:level-1,0:level-1,:,:]
-        
-    #     # Compute Haralick properties
-    #     stat_haralick = {}
-    #     for v in ['contrast', 'homogeneity', 'dissimilarity', 'ASM', 'energy', 'correlation']:
-    #         stat_haralick[v] = np.mean(graycoprops(glcm, v))
-    #     stat_haralick['heterogeneity'] = 1-stat_haralick['homogeneity']
-        
-    #     return stat_haralick
-
-    # def _get_morphological_features(self, mask):
-    #     """Compute morphological features for a nucleus"""
-    #     stat = skimage.measure.regionprops(mask)[0]
-        
-    #     # Initialize dictionary for morphological features
-    #     morph_features = {}
-    #     morph_features['major_axis_length'] = stat.axis_major_length
-    #     morph_features['minor_axis_length'] = stat.axis_minor_length
-    #     morph_features['major_minor_ratio'] = stat.axis_major_length/stat.axis_minor_length
-    #     morph_features['orientation'] = stat.orientation
-    #     morph_features['orientation_degree'] = stat.orientation * (180/np.pi) + 90
-    #     morph_features['area'] = stat.area
-    #     morph_features['extent'] = stat.extent
-    #     morph_features['solidity'] = stat.solidity
-    #     morph_features['convex_area'] = stat.convex_area
-    #     morph_features['eccentricity'] = stat.eccentricity
-    #     morph_features['equivalent_diameter'] = stat.equivalent_diameter
-    #     morph_features['perimeter'] = stat.perimeter
-    #     morph_features['perimeter_crofton'] = stat.perimeter_crofton
-        
-    #     return list(morph_features.keys()), list(morph_features.values())
-
-    # @staticmethod
-    # def _process_nucleus_features_static(nucleus_data):
-    #     """Static method to process features for a single nucleus"""
-    #     img_np, img_gray, contour, x_0, y_0 = nucleus_data
-        
-    #     # Create nucleus mask more efficiently using cv2
-    #     nuc_mask = np.zeros(img_gray.shape, dtype=np.uint8)
-    #     contour = contour - np.array([x_0, y_0]).reshape(2, -1)
-    #     # Convert to format expected by cv2.fillPoly
-    #     contour = np.expand_dims(contour.T, axis=0).astype(np.int32)
-    #     cv2.fillPoly(nuc_mask, contour, 1)
-        
-    #     # Pre-compute mask indices once
-    #     mask_indices = nuc_mask > 0
-        
-    #     # Get morphological features - use pre-computed regionprops
-    #     stat = skimage.measure.regionprops(nuc_mask)[0]
-    #     major_minor_ratio = 99 if stat.axis_minor_length == 0 else stat.axis_major_length/stat.axis_minor_length
-    #     curr_morph = [
-    #         stat.axis_major_length,
-    #         stat.axis_minor_length,
-    #         major_minor_ratio,
-    #         stat.orientation,
-    #         stat.orientation * (180/np.pi) + 90,
-    #         stat.area,
-    #         stat.extent,
-    #         stat.solidity,
-    #         stat.convex_area,
-    #         stat.eccentricity,
-    #         stat.equivalent_diameter,
-    #         stat.perimeter,
-    #         stat.perimeter_crofton
-    #     ]
-        
-    #     # Get color features more efficiently
-    #     nucleus_img = img_np * np.expand_dims(nuc_mask, axis=2)  # Faster than copy + masking
-        
-    #     # Convert to grayscale using dot product instead of individual multiplications
-    #     nucleus_img_grey = np.dot(nucleus_img[mask_indices], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
-        
-    #     # Compute statistics using masked arrays for better performance
-    #     curr_color = [
-    #         np.mean(nucleus_img_grey),
-    #         np.std(nucleus_img_grey),
-    #         np.min(nucleus_img_grey),
-    #         np.max(nucleus_img_grey)
-    #     ]
-        
-    #     # RGB features using masked arrays
-    #     for i in range(3):
-    #         channel_values = nucleus_img[mask_indices, i]
-    #         curr_color.extend([
-    #             np.mean(channel_values),
-    #             np.std(channel_values),
-    #             np.min(channel_values),
-    #             np.max(channel_values)
-    #         ])
-        
-    #     # Optimize Haralick features computation
-    #     nuclei_img_2 = (np.dot(nucleus_img, [0.2989, 0.5870, 0.1140])/10).astype(np.uint8)
-        
-    #     # Use smaller GLCM matrix and fewer angles if precision is not critical
-    #     glcm = graycomatrix(nuclei_img_2,
-    #                        distances=[1],
-    #                        angles=[0, np.pi/2],  # Reduced angles
-    #                        levels=26,  # Reduced levels
-    #                        symmetric=True,  # Use symmetric to reduce computation
-    #                        normed=True)
-        
-    #     glcm = glcm[0:25,0:25,:,:]
-        
-    #     # Compute Haralick properties
-    #     curr_haralick = []
-    #     for v in ['contrast', 'homogeneity', 'dissimilarity', 'ASM', 'energy', 'correlation']:
-    #         curr_haralick.append(np.mean(graycoprops(glcm, v)))
-    #     curr_haralick.append(1-curr_haralick[1])
-        
-    #     return np.concatenate([curr_haralick, curr_morph, curr_color])
-
-    # def compute_all_features(self, img_np, points, coord, x_0, y_0):
-    #     """Compute all features (Haralick, morphological, and color) for nuclei in parallel"""
-    #     img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)  # Faster than manual conversion
-        
-    #     # Prepare data for parallel processing
-    #     nucleus_data_list = [(img_np, img_gray, contour, x_0, y_0) for contour in coord]
-        
-    #     # Use process pool with optimal number of workers
-    #     n_workers = min(len(points), os.cpu_count())
-        
-    #     if len(points) < 10:
-    #         all_features = [self._process_nucleus_features_static(data) for data in nucleus_data_list]
-    #     else:
-    #         # Use context manager with explicit number of workers
-    #         with Pool(processes=n_workers) as pool:
-    #             # Use larger chunksize for better performance
-    #             chunksize = max(1, len(points) // (n_workers * 4))
-    #             all_features = list(pool.imap(self._process_nucleus_features_static, 
-    #                                         nucleus_data_list,
-    #                                         chunksize=chunksize))
-        
-    #     return np.array(all_features)
-        
