@@ -3,9 +3,15 @@ import numpy as np
 import cv2
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
 import matplotlib.pyplot as plt
+import os
 
-def load_sam_model(model_type='vit_h', checkpoint_path='sam_vit_h_4b8939.pth', device='cuda'):
+def load_sam_model(model_type='vit_h', checkpoint_path='sam_vit_h_4b8939.pth', device=None):
     """加载 SAM 模型（支持自动和交互式分割）"""
+    # Check if CUDA is available, otherwise use CPU
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
     sam = sam_model_registry[model_type](checkpoint=checkpoint_path)
     sam.to(device)
 
@@ -20,10 +26,19 @@ def segment_image(image_path, mask_generator, predictor, input_points=None, inpu
     - 如果提供 control points，则进行交互式分割（指定前景/背景）
     - 否则，进行全自动分割
     """
+    print(f"Attempting to load image from: {image_path}")
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image file not found: {image_path}")
+        
     image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"Failed to load image: {image_path}")
+        
+    print(f"Successfully loaded image with shape: {image.shape}")
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
     # 调整图片尺寸
+    print(f"Resizing image to {target_size}")
     image = cv2.resize(image, target_size)
 
     if input_points is not None and input_labels is not None:
@@ -75,11 +90,11 @@ def visualize_masks(image, masks, input_points=None, input_labels=None, area_thr
 if __name__ == "__main__":
     model_type = 'vit_h'
     checkpoint_path = 'sam_vit_h_4b8939.pth'  # 默认路径
-    image_path = 'example.png'
+    image_path = 'full_wsi_image.png'  # Using the existing image file
 
     # 加载模型
     try:
-        mask_generator, predictor = load_sam_model(model_type, checkpoint_path)
+        mask_generator, predictor = load_sam_model(model_type, checkpoint_path, device=None)
     except Exception as e:
         print(f"❌ 加载 SAM 模型出错: {e}")
         exit(1)
