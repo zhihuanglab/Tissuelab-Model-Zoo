@@ -308,7 +308,7 @@ class MUSK:
         
         return patch_embeddings
 
-    def get_tissue_mask(self, slide, edge_width_ratio=0.04, min_area=None, debug_dir=None):
+    def get_tissue_mask(self, slide, edge_width_ratio=0.04, min_area=None, debug_dir="C:/Research/tissuelab_agent_experiments/Tissuelab-Model-Zoo/patch_classification/MUSK/result_h5-2"):
         """
         Generate a filled tissue mask for a whole-slide image.
 
@@ -445,9 +445,9 @@ class MUSK:
             
             # use tqdm to show row processing progress
             for y in tqdm(range(0, height - patch_size + 1, patch_size), 
-                         total=total_rows,
-                         desc="Processing WSI rows",
-                         position=0):
+                        total=total_rows,
+                        desc="Processing WSI rows",
+                        position=0):
                 patch_batch = []
                 coord_batch = []
                 
@@ -461,9 +461,30 @@ class MUSK:
                     if mask[center_y, center_x] == 0:
                         continue
                     
-                    patch_img = slide.read_region(
+                    # Read the patch region
+                    patch_data = slide.read_region(
                         (x, y), level, (patch_size, patch_size)
-                    ).convert("RGB")
+                    )
+                    
+                    # Handle both PIL Image and numpy array cases
+                    if isinstance(patch_data, np.ndarray):
+                        # If it's a numpy array, convert to PIL Image
+                        # Assume it's RGB format
+                        if patch_data.ndim == 2:  # Grayscale
+                            patch_img = Image.fromarray(patch_data, mode='L').convert("RGB")
+                        elif patch_data.ndim == 3:
+                            if patch_data.shape[2] == 3:  # RGB
+                                patch_img = Image.fromarray(patch_data, mode='RGB')
+                            elif patch_data.shape[2] == 4:  # RGBA
+                                patch_img = Image.fromarray(patch_data, mode='RGBA').convert("RGB")
+                            else:
+                                # Handle other cases
+                                patch_img = Image.fromarray(patch_data[:,:,:3], mode='RGB')
+                        else:
+                            raise ValueError(f"Unexpected array shape: {patch_data.shape}")
+                    else:
+                        # If it's already a PIL Image, just convert to RGB
+                        patch_img = patch_data.convert("RGB")
                     
                     valid_patch_count += 1
                     patch_batch.append(patch_img)
