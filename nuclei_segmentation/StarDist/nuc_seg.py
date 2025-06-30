@@ -22,12 +22,7 @@ from scipy.ndimage import zoom
 from skimage.feature import graycomatrix, graycoprops
 from skimage import draw
 import tensorflow as tf
-import sys
-
-if sys.platform == 'darwin':
-    from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
-else:
-    from wrappers import CziImageWrapper, SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
 import xml.etree.ElementTree as ET
 import czifile
 import tiffslide

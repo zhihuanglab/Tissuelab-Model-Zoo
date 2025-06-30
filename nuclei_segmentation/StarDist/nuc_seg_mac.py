@@ -57,7 +57,7 @@ class SlideSegmentation():
             print("No GPUs found. Running on CPU.")
             
         self.args = args
-        self.reference_magnification = 20 # 20x for stardist
+        self.reference_magnification = 10 # Target 1 MPP (corresponds to 10x if 1x=10mpp)
         self.tile_size = tile_size
         self.read_data()
         
@@ -391,10 +391,16 @@ class SlideSegmentation():
                 pbar.update(curr_idx-last_idx)
                 last_idx = curr_idx
                 
+                # Adjust n_tiles for 2D images
+                n_tiles = self.n_tiles
+                if img_norm.ndim == 2 and len(n_tiles) == 3:
+                    n_tiles = n_tiles[:2]
+                    print(f"Adjusted n_tiles to {n_tiles} for 2D image.")
+                
                 labels, dicts = self.model.predict_instances(img_norm,
                                                         prob_thresh=self.prob_thresh,
                                                         nms_thresh=self.nms_thresh,
-                                                        n_tiles=self.n_tiles,
+                                                        n_tiles=n_tiles,
                                                         show_tile_progress=False,
                                                         return_predict=False
                                                         )
@@ -556,13 +562,29 @@ class SlideSegmentation():
             try:
                 # Directly load the entire image
                 img = self.slide.read_region((0, 0), 0, self.dim)
+                
+                # Apply resizing based on magnification to target 1 MPP
+                if self.args.magnification is not None:
+                    resize_factor = self.reference_magnification / self.args.magnification
+                    new_width = int(np.round(self.dim[0] * resize_factor))
+                    new_height = int(np.round(self.dim[1] * resize_factor))
+                    img = img.resize((new_width, new_height))
+                    print(f"Resized full image from {self.dim} to {(new_width, new_height)} with factor {resize_factor}")
+
                 img_np = np.array(img)[:,:,:3]  # Ensure RGB format
+
+                if 'fluo' in self.args.stardist_pretrain:
+                    img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+                    print("Converted image to grayscale for fluorescence model.")
                 
                 if self.progress_callback:
                     self.progress_callback(30)
                     
                 # Normalize image
-                if self.normalize_template is not None:
+                if 'fluo' in self.args.stardist_pretrain:
+                    img_norm = normalize(img_np)
+                    print("Normalized grayscale image directly.")
+                elif self.normalize_template is not None:
                     normalize_template2 = self.normalize_template[:img_np.shape[0],:img_np.shape[1],:]
                     joint_normalize = np.concatenate((img_np, normalize_template2), axis=1)
                     img_norm = normalize(joint_normalize)
@@ -573,11 +595,17 @@ class SlideSegmentation():
                 if self.progress_callback:
                     self.progress_callback(50)
                     
+                # Adjust n_tiles for 2D images
+                n_tiles = self.n_tiles
+                if img_norm.ndim == 2 and len(n_tiles) == 3:
+                    n_tiles = n_tiles[:2]
+                    print(f"Adjusted n_tiles to {n_tiles} for 2D image.")
+                
                 # Direct segmentation
                 labels, dicts = self.model.predict_instances(img_norm,
                                                            prob_thresh=self.prob_thresh,
                                                            nms_thresh=self.nms_thresh,
-                                                           n_tiles=self.n_tiles,
+                                                           n_tiles=n_tiles,
                                                            show_tile_progress=False,
                                                            return_predict=False)
                                                             
@@ -593,6 +621,13 @@ class SlideSegmentation():
                 coord = np.round(coord).astype(np.int32)
                 
                 prob = dicts['prob']
+                
+                # Scale coordinates back to original image size
+                if self.args.magnification is not None:
+                    resize_factor = self.reference_magnification / self.args.magnification
+                    points = (points / resize_factor).astype(np.int32)
+                    coord = (coord / resize_factor).astype(np.int32)
+                    print(f"Scaled coordinates back to original size with factor {1/resize_factor}")
                 
                 # Set final results - fix contours processing
                 self.final_points = points.astype(np.int32)
@@ -712,12 +747,14 @@ class SlideSegmentation():
                     #greyscale
                     img_np = img_np[:, :, np.newaxis]
                 
-                if self.wsi_mask is not None:
-                    help_with_norm = True
-                else:
-                    help_with_norm = False
-
-                if help_with_norm:
+                if 'fluo' in self.args.stardist_pretrain and len(img_np.shape) == 3:
+                    img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+                    print("Converted tile to grayscale for fluorescence model.")
+                
+                if 'fluo' in self.args.stardist_pretrain:
+                    img_norm = normalize(img_np)
+                    print("Normalized grayscale tile directly.")
+                elif self.wsi_mask is not None:
                     normalize_template2 = normalize_template[:img_np.shape[0],:img_np.shape[1],:]
                     joint_normalize = np.concatenate((img_np, normalize_template2), axis=1)
                     img_norm = normalize(joint_normalize)
@@ -725,20 +762,27 @@ class SlideSegmentation():
                 else:
                     img_norm = normalize(img_np)
 
-                # Skip if mostly white pixels (>240)
-                n_dark_pixels = np.sum(np.any(img_np < 240, axis=2))  # Count pixels with any RGB channel < 240
-                if n_dark_pixels < 50:
-                    print(f"Tile r{ir} c{ic} is mostly white, skipping")
-                    continue
-                elif np.min(img_norm) < -1e15 or np.max(img_norm) > 1e15:
+                # Skip if mostly white pixels (>240), not applicable for fluo
+                if 'fluo' not in self.args.stardist_pretrain:
+                    n_dark_pixels = np.sum(np.any(img_np < 240, axis=2))  # Count pixels with any RGB channel < 240
+                    if n_dark_pixels < 50:
+                        print(f"Tile r{ir} c{ic} is mostly white, skipping")
+                        continue
+                
+                if np.min(img_norm) < -1e15 or np.max(img_norm) > 1e15:
                     print("Values too large, skipping this batch")
                     continue
                 
+                # Adjust n_tiles for 2D images
+                n_tiles = self.n_tiles
+                if img_norm.ndim == 2 and len(n_tiles) == 3:
+                    n_tiles = n_tiles[:2]
+                    print(f"Adjusted n_tiles to {n_tiles} for 2D image.")
                 
                 labels, dicts = self.model.predict_instances(img_norm,
                                                             prob_thresh=self.prob_thresh,
                                                             nms_thresh=self.nms_thresh,
-                                                            n_tiles=self.n_tiles,
+                                                            n_tiles=n_tiles,
                                                             show_tile_progress=False,
                                                             return_predict=False
                                                             )

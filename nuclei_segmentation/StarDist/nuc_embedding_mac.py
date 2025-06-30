@@ -64,13 +64,13 @@ class NucleiPatchDataset(Dataset):
             import openslide
             with openslide.OpenSlide(slide_path) as slide:
                 mpp = float(slide.properties['openslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
+                reference_mpp_1x = 40  # objective magnification for 1 MPP target
                 self.magnification = reference_mpp_1x / mpp
         elif read_image_method == 'tiffslide':
             import tiffslide
             with tiffslide.TiffSlide(slide_path) as slide:
                 mpp = float(slide.properties['tiffslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
+                reference_mpp_1x = 40  # objective magnification for 1 MPP target
                 self.magnification = reference_mpp_1x / mpp
         else:
             # Default to provided magnification for PIL and numpy
@@ -162,7 +162,7 @@ class NucleiEmbedding:
                     import openslide
                     with openslide.OpenSlide(self.args.slidepath) as slide:
                         mpp = float(slide.properties['openslide.mpp-x'])
-                        reference_mpp_1x = 10  # objective magnification
+                        reference_mpp_1x = 40  # objective magnification for 1 MPP target
                         self.args.magnification = reference_mpp_1x / mpp
                         print("openslide success")
                     self.read_image_method = 'openslide'
@@ -171,7 +171,7 @@ class NucleiEmbedding:
                     import tiffslide
                     with tiffslide.TiffSlide(self.args.slidepath) as slide:
                         mpp = float(slide.properties['tiffslide.mpp-x'])
-                        reference_mpp_1x = 10  # objective magnification
+                        reference_mpp_1x = 40  # objective magnification for 1 MPP target
                         self.args.magnification = reference_mpp_1x / mpp
                     self.read_image_method = 'tiffslide'
             elif file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
@@ -193,7 +193,7 @@ class NucleiEmbedding:
                     import tiffslide
                     with tiffslide.TiffSlide(self.args.slidepath) as slide:
                         mpp = float(slide.properties['tiffslide.mpp-x'])
-                        reference_mpp_1x = 10
+                        reference_mpp_1x = 40
                         self.args.magnification = reference_mpp_1x / mpp
                     self.read_image_method = 'tiffslide'
                 except Exception:

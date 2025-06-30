@@ -20,12 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 import time
 import xml.etree.ElementTree as ET
 import czifile
-import sys
-
-if sys.platform == 'darwin':
-    from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
-else:
-    from wrappers import CziImageWrapper, SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
 import pathlib
 
 """

@@ -22,15 +22,25 @@ import torch
 from nuc_seg_mac import SlideSegmentation
 from nuc_stat import SlideProperty
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--username', default='default', type=str, help='Username for result directory prefix')
     parser.add_argument('--slidepath', default='C:\\Users\\lsoho\\Git\\penn\\TissueLab\\example_WSI\\H&E\\2_levels_TCGA-2G-AALO-01A-01-TS1.AB6CD2CD-F7D3-4B85-A9FE-12953D3544C6.svs', type=str)
     parser.add_argument('--read_image_method', default='tiffslide', type=str, choices=['openslide','tiffslide','PIL','numpy'])
     parser.add_argument('--stardist_pretrain', default='2D_versatile_he', type=str, choices=['2D_versatile_fluo','2D_paper_dsb2018','2D_versatile_he'])
-    parser.add_argument('--isIHC', default=False, type=bool)
-    parser.add_argument('--calculate_features', default=False, type=bool)
-    parser.add_argument('--debug', default=True, action='store_true', help='Enable debug mode to save mask images')
+    parser.add_argument('--isIHC', default=False, type=str2bool)
+    parser.add_argument('--calculate_features', default=False, type=str2bool)
+    parser.add_argument('--debug', default=False, action='store_true', help='Enable debug mode to save mask images')
     return parser.parse_args()
 
 def calculate_features(args, centroids, contours):
@@ -65,12 +75,11 @@ def main(args):
         # Use svs filename (without path) as base name
         slide_basename = os.path.basename(args.slidepath)
         # Create h5 file in result directory
-        h5_path = os.path.join(result_dir, slide_basename + ".h5")
+        h5_path = args.slidepath + ".h5"
         
         # Check if h5 file exists and has SegmentationNode
         ALREADY_HAVE_NUCLEI_SEGMENTATION = False
         APPEND_FEATURES = False
-        APPEND_EMBEDDINGS = False
         centroids = None
         contours = None
         
@@ -78,41 +87,23 @@ def main(args):
             with h5py.File(h5_path, 'r') as hf:
                 if 'SegmentationNode' in hf:
                     try:
-                        centroids = hf['SegmentationNode']['centroids'][()].copy()  # Make copies of the data
+                        centroids = hf['SegmentationNode']['centroids'][()].copy()
                         contours = hf['SegmentationNode']['contours'][()].copy()
                         ALREADY_HAVE_NUCLEI_SEGMENTATION = True
                     except:
                         print("Error: SegmentationNode group is corrupted.")
                     has_features = 'features' in hf['SegmentationNode']
-                    has_embeddings = 'embedding' in hf['SegmentationNode']
                     
 
-                    if ALREADY_HAVE_NUCLEI_SEGMENTATION and has_features and has_embeddings:
+                    if ALREADY_HAVE_NUCLEI_SEGMENTATION and has_features:
                         result["nuclei_count"] = len(centroids)
-                        result["message"] = "Using existing nuclei segmentation, embeddings, and features."
+                        result["message"] = "Using existing nuclei segmentation and features."
                         return result
                     elif ALREADY_HAVE_NUCLEI_SEGMENTATION and len(centroids) > 0:
-                        if not has_embeddings:
-                            print("Calculating embeddings for existing nuclei segmentation...")
-                            APPEND_EMBEDDINGS = True
                         
                         if not has_features and args.calculate_features:
                             print("Calculating features for existing nuclei segmentation...")
                             APPEND_FEATURES = True
-
-        # Handle embeddings calculation outside of the file read context
-        if APPEND_EMBEDDINGS and centroids is not None:
-            from nuc_embedding_mac import NucleiEmbedding
-            ne = NucleiEmbedding(args, centroids)
-            temp_embedding_path = ne.generate_embeddings()
-            
-            with h5py.File(temp_embedding_path, 'r') as temp_f, h5py.File(h5_path, 'a') as target_f:
-                nuclei_seg = target_f['SegmentationNode']
-                if 'cell_embeddings' in nuclei_seg:
-                    del nuclei_seg['cell_embeddings']
-                temp_f.copy('embedding', nuclei_seg, name='embedding')
-            
-            os.remove(temp_embedding_path)
 
         if APPEND_FEATURES:
             # Add features to existing h5 file
@@ -159,26 +150,18 @@ def main(args):
             probability = ss.prob_all
             del ss
 
-        # 在进行embedding之前确保内存清理
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
-        # 继续处理embedding
-        print("Generating nuclei embeddings...")
-        from nuc_embedding_mac import NucleiEmbedding
-        
-        ne = NucleiEmbedding(args, centroids)
-        temp_embedding_path = ne.generate_embeddings()
-        
-        with h5py.File(temp_embedding_path, 'r') as temp_f, h5py.File(h5_path, 'a') as target_f:
-            nuclei_seg = target_f['SegmentationNode']
-            if 'cell_embeddings' in nuclei_seg:
-                del nuclei_seg['cell_embeddings']
-            temp_f.copy('embedding', nuclei_seg, name='embedding')
-        
-        os.remove(temp_embedding_path)
+            # Save segmentation results first
+            with h5py.File(h5_path, mode) as hf:
+                print("Number of nuclei: %d" % len(centroids))
+                # Create a group for nuclei segmentation
+                if 'SegmentationNode' in hf:
+                    del hf['SegmentationNode']
+                nuclei_seg = hf.create_group('SegmentationNode')
+                nuclei_seg.create_dataset('contours', data=contours)
+                nuclei_seg.create_dataset('centroids', data=centroids)
+                nuclei_seg.create_dataset('probability', data=probability)
 
-        # Calculate features after saving segmentation and embeddings
+        # Calculate features after saving segmentation
         if args.calculate_features:
             features, feature_names, class_vector, class_names = calculate_features(args, centroids, contours)
             # Append features to the h5 file
