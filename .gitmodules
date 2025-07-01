@@ -1,0 +1,3 @@
+[submodule "spatial_omics/starfysh"]
+	path = spatial_omics/starfysh
+	url = https://github.com/azizilab/starfysh
