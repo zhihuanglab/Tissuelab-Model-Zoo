@@ -96,6 +96,8 @@ llm_image = (
         "openai", # or other clients
         "scanpy==1.9.3", # For AnnData manipulation. Pinned to match deepspot_image.
         "anndata==0.8.0", # Explicitly pin anndata as well for safety.
+        "tblib", # Add for rich exception tracebacks from remote functions
+        "numpy==1.23.5", # Pin numpy to a pre-2.0 version to fix np.float_ error.
     )
 )
 
@@ -175,7 +177,8 @@ def run_deepspot_custom(
     image_bytes: bytes,
     tissue_positions_bytes: bytes,
     image_hash: str,
-    use_cache: bool = True,
+    tissue_hires_scalef: float,
+    use_cache: bool = False,
 ):
     """
     Runs DeepSpot to predict spatial gene expression from a tissue image.
@@ -295,24 +298,29 @@ def run_deepspot_custom(
         image_height = image.height
         spot_radius = SPOT_DIAMETER // 2
 
+        # --- Apply the scaling factor to align coordinates ---
+        in_tissue_df['pxl_row_in_hires'] = in_tissue_df['pxl_row_in_fullres'] * tissue_hires_scalef
+        in_tissue_df['pxl_col_in_hires'] = in_tissue_df['pxl_col_in_fullres'] * tissue_hires_scalef
+
         original_spot_count = len(in_tissue_df)
+        # Filter using the newly scaled coordinates
         in_tissue_df = in_tissue_df[
-            (in_tissue_df['pxl_col_in_fullres'] >= spot_radius) &
-            (in_tissue_df['pxl_col_in_fullres'] < image_width - spot_radius) &
-            (in_tissue_df['pxl_row_in_fullres'] >= spot_radius) &
-            (in_tissue_df['pxl_row_in_fullres'] < image_height - spot_radius)
+            (in_tissue_df['pxl_col_in_hires'] >= spot_radius) &
+            (in_tissue_df['pxl_col_in_hires'] < image_width - spot_radius) &
+            (in_tissue_df['pxl_row_in_hires'] >= spot_radius) &
+            (in_tissue_df['pxl_row_in_hires'] < image_height - spot_radius)
         ].copy()
         
         filtered_spot_count = len(in_tissue_df)
         print(f"Filtered out {original_spot_count - filtered_spot_count} spots near the image border.")
 
-        # Create coord_df in the format DeepSpot expects, using the original coordinates.
+        # Create coord_df in the format DeepSpot expects, using the scaled coordinates.
         coord_df = pd.DataFrame(
             {
                 "x_array": in_tissue_df["array_row"],
                 "y_array": in_tissue_df["array_col"],
-                "x_pixel": in_tissue_df["pxl_col_in_fullres"],
-                "y_pixel": in_tissue_df["pxl_row_in_fullres"],
+                "x_pixel": in_tissue_df["pxl_col_in_hires"],
+                "y_pixel": in_tissue_df["pxl_row_in_hires"],
             }
         )
         # The index must be a string for anndata
@@ -344,6 +352,10 @@ def run_deepspot_custom(
         )
         adata_tissue.obs["barcode"] = adata_tissue.obs.index
         adata_tissue.obs["sampleID"] = "sample1"
+
+        # --- FIX: Add the spatial coordinates to .obsm for scanpy ---
+        # The sc.pp.neighbors function with use_rep='spatial' requires this key.
+        adata_tissue.obsm['spatial'] = adata_tissue.obs[['x_pixel', 'y_pixel']].values
 
         # --- 4. Run Prediction ---
         print(f"Predicting expression for {len(adata_tissue)} spots...")
@@ -390,11 +402,36 @@ def run_deepspot_custom(
     timeout=1200,
     volumes={MODEL_DIR: volume},
 )
-def run_starfysh_deconvolution(adata, gene_sig_bytes: bytes):
+def run_starfysh_deconvolution(
+    adata,
+    gene_sig_bytes: bytes,
+    image_hash: str,
+    gene_sig_hash: str,
+    use_cache: bool = True,
+):
     """
     Runs Starfysh to perform cell-type deconvolution on the AnnData object.
     This implementation follows the workflow from the official Starfysh tutorial notebook.
+    Caches its output to the modal.Volume to avoid re-computation.
     """
+    import anndata as ad
+    import tempfile
+
+    # --- Caching Logic ---
+    cache_key = f"{image_hash}_{gene_sig_hash}"
+    adata_cache_dir = MODEL_DIR / "adata_cache"
+    adata_cache_path = adata_cache_dir / f"adata_starfysh_{cache_key}.h5ad"
+
+    if use_cache:
+        print("Attempting to use cached Starfysh AnnData...")
+        volume.reload()
+        if adata_cache_path.exists():
+            print(f"✅ Cache hit! Loading Starfysh AnnData from {adata_cache_path}.")
+            return ad.read_h5ad(adata_cache_path)
+        else:
+            print("⚠️ Cache miss. No cached Starfysh data found. Running deconvolution...")
+
+
     import pandas as pd
     import scanpy as sc
     import torch
@@ -519,108 +556,150 @@ def run_starfysh_deconvolution(adata, gene_sig_bytes: bytes):
 
     # --- 6. Evaluate and Extract Results ---
     print("Evaluating model and extracting cell-type proportions...")
-    # The model_eval function returns a new AnnData object with the results
-    _, _, adata_starfysh = sf_model.model_eval(
-        model, adata, visium_args, device=device, poe=False
+    # **RE-FIX**: The model was trained using only the `final_approved_genes`. We must
+    # filter the AnnData object to this same gene set before passing it to `model_eval`
+    # to prevent a matrix shape mismatch during multiplication.
+    adata_for_eval = adata[:, adata.var_names.isin(final_approved_genes)].copy()
+    print(f"Passing AnnData of shape {adata_for_eval.shape} to model_eval.")
+
+    # **RE-FIX**: The `model_eval` function returns a tuple: (inference_outputs, generative_outputs, returned_anndata).
+    # The cell-type proportions are a numpy array stored in the `.obsm['qc_m']` field of the returned anndata.
+    # We must capture the third element and construct a DataFrame from it.
+    _, _, returned_adata = sf_model.model_eval(
+        model, adata_for_eval, visium_args, device=device, poe=False
     )
-    
-    # The cell-type proportions are stored in adata_starfysh.obs
-    print("Deconvolution complete. Proportions stored in .obs")
+
+    # Construct a DataFrame from the results.
+    # The spot barcodes are in the index of the returned anndata's obs table.
+    # The cell types are the columns of the final signature matrix.
+    proportions_df = pd.DataFrame(
+        returned_adata.obsm['qc_m'],
+        index=returned_adata.obs.index,
+        columns=final_sig.columns
+    )
+
+    # Now, join the proportions dataframe with the original AnnData object's
+    # observation table. This ensures the final output contains all original data
+    # plus the new deconvolution results.
+    print("Copying deconvolution results to the full AnnData object.")
+    adata.obs = adata.obs.join(proportions_df)
 
     # Store the cell types in .uns for downstream use
-    adata_starfysh.uns['cell_types'] = final_sig.columns.tolist()
+    adata.uns['cell_types'] = final_sig.columns.tolist()
 
-    return adata_starfysh
+    # --- Caching ---
+    print(f"Caching new Starfysh AnnData object to {adata_cache_path}...")
+    adata_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # writing to a tempfile first is safer for network filesystems
+    with tempfile.NamedTemporaryFile(suffix=".h5ad") as tmp:
+        adata.write_h5ad(tmp.name)
+        with open(tmp.name, "rb") as tmp_file:
+            with open(adata_cache_path, "wb") as cache_file:
+                cache_file.write(tmp_file.read())
+
+    volume.commit()
+    print("Starfysh AnnData object cached successfully.")
+
+    # Return the original adata, now enriched with deconvolution results.
+    return adata
+
+
+@app.function(
+    image=llm_image,
+    secrets=[modal.Secret.from_name("openai-secret")],
+    max_containers=20, # FIX: Reduce from 50 to avoid API rate limiting.
+)
+def _run_llm_for_single_spot(spot_idx: int, adata, cancer_type: str = "TNBC"):
+    """Internal function to get LLM inference for a single spot's niche."""
+    import os
+    from openai import OpenAI
+
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    cell_type_cols = adata.uns['cell_types']
+
+    # Identify the niche for this spot
+    neighbor_indices = adata.obsp['connectivities'][spot_idx].indices
+    niche_indices = [spot_idx] + list(neighbor_indices)
+    niche_proportions = adata.obs.iloc[niche_indices][cell_type_cols].mean()
+
+    proportions_str = ", ".join(
+        [f"{cell_type} ({prop:.2%})" for cell_type, prop in niche_proportions.items()]
+    )
+
+    system_prompt = "You are an expert biologist specializing in spatial transcriptomics and oncology."
+    user_prompt = f"""
+    We are analyzing a tissue sample from a {cancer_type} patient. Within a selected spatial region (a "niche"), the estimated cell-type proportions are: {proportions_str}.
+
+    Based *only* on this cellular composition, can you determine whether this niche is associated with a Triple-Negative Breast Cancer (TNBC) phenotype?
+
+    Please begin your response with a single word, "Yes" or "No", followed by a period. Then, provide a brief biological interpretation and supporting references for your determination.
+    """
+
+    try:
+        client = OpenAI(api_key=openai_api_key)
+        # Using the standard, modern chat completions API for robustness
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=300,
+        )
+        full_response_text = response.choices[0].message.content
+
+        if full_response_text.lower().startswith('yes'):
+            binary_response = "Yes"
+        elif full_response_text.lower().startswith('no'):
+            binary_response = "No"
+        else:
+            binary_response = "Uncertain"
+        
+        interpretation = full_response_text
+
+    except Exception as e:
+        print(f"An error occurred while querying the LLM for spot {spot_idx}: {e}")
+        binary_response = "Error"
+        interpretation = str(e)
+
+    return {
+        'tnbc_niche_association': binary_response,
+        'tnbc_niche_interpretation': interpretation
+    }
 
 
 @app.function(
     image=llm_image,
     secrets=[modal.Secret.from_name("openai-secret")], # Example secret
+    timeout=1800, # Increased timeout for the parallel map operation
 )
 def run_llm_phenotype_inference(adata, cancer_type: str = "TNBC"):
     """
     Uses an LLM to infer phenotype association for each spot's "niche".
+    This version parallelizes the LLM queries using Modal's .map() for performance.
     """
-    import os
-    from openai import OpenAI
     import pandas as pd
     import scanpy as sc
-    from tqdm import tqdm
     
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-
-    # --- 1. Compute neighborhood graph ---
-    # This is essential for defining the "niche" around each spot.
+    # --- 1. Compute neighborhood graph (ONCE) ---
     print("Computing neighborhood graph...")
-    sc.pp.neighbors(adata, use_rep='spatial', n_neighbors=6) # 6 neighbors is a common choice
+    sc.pp.neighbors(adata, use_rep='spatial', n_neighbors=6)
 
-    # --- 2. Identify cell type proportion columns ---
-    # The cell type proportions are added by Starfysh to adata.obs
-    # We need to identify them to calculate niche averages.
-    cell_type_cols = adata.uns['cell_types']
-
-    # --- 3. Iterate, construct prompt, and query LLM for each spot ---
-    results = []
-    print(f"Querying LLM for {adata.n_obs} spot niches...")
-    for spot_idx in tqdm(range(adata.n_obs)):
-        # Identify the niche (the spot itself + its neighbors)
-        neighbor_indices = adata.obsp['connectivities'][spot_idx].indices
-        niche_indices = [spot_idx] + list(neighbor_indices)
-
-        # Calculate average cell-type proportions for the niche
-        niche_proportions = adata.obs.iloc[niche_indices][cell_type_cols].mean()
-
-        # Format the proportions for the prompt
-        proportions_str = ", ".join(
-            [f"{cell_type} ({prop:.2%})" for cell_type, prop in niche_proportions.items()]
+    # --- 2. Fan-out and run LLM queries in parallel ---
+    print(f"Querying LLM for {adata.n_obs} spot niches in parallel...")
+    # .map() distributes the work across many containers. We collect the results into a list.
+    results = list(
+        _run_llm_for_single_spot.map(
+            range(adata.n_obs), kwargs=dict(adata=adata, cancer_type=cancer_type)
         )
+    )
 
-        # Construct the prompt
-        prompt = f"""
-        We are analyzing a tissue sample from a {cancer_type} patient. Within a selected spatial region (a "niche"), the estimated cell-type proportions are: {proportions_str}.
-
-        Based *only* on this cellular composition, can you determine whether this niche is associated with a Triple-Negative Breast Cancer (TNBC) phenotype?
-
-        Please begin your response with a single word, "Yes" or "No", followed by a period. Then, provide a brief biological interpretation and supporting references for your determination.
-        """
-
-        # Query the LLM
-        try:
-            client = OpenAI(api_key=openai_api_key)
-            response = client.responses.create(
-								model="gpt-4o",
-								instructions="You are an expert biologist specializing in spatial transcriptomics and oncology.",
-								input=prompt,
-								temperature=0.3,
-								max_output_tokens=300,
-						)
-            full_response_text = response.output_text
-
-            # Parse the response
-            if full_response_text.lower().startswith('yes'):
-                binary_response = "Yes"
-            elif full_response_text.lower().startswith('no'):
-                binary_response = "No"
-            else:
-                binary_response = "Uncertain"
-            
-            interpretation = full_response_text
-
-        except Exception as e:
-            print(f"An error occurred while querying the LLM: {e}")
-            binary_response = "Error"
-            interpretation = str(e)
-
-        results.append({
-            'tnbc_niche_association': binary_response,
-            'tnbc_niche_interpretation': interpretation
-        })
-
-    # --- 4. Store results back in AnnData object ---
+    # --- 3. Store results back in AnnData object ---
     print("Storing LLM inference results in AnnData object...")
     results_df = pd.DataFrame(results, index=adata.obs.index)
-    adata.obs['tnbc_niche_association'] = results_df['tnbc_niche_association']
-    adata.obs['tnbc_niche_interpretation'] = results_df['tnbc_niche_interpretation']
+    adata.obs = adata.obs.join(results_df)
     
     print("LLM phenotype inference complete.")
     return adata
@@ -635,24 +714,34 @@ def analyze_tissue_pipeline(
     tissue_positions_bytes: bytes,
     gene_sig_bytes: bytes,
     image_hash: str,
+    tissue_hires_scalef: float,
+    use_cache: bool = True,
 ):
     """
     Main pipeline orchestrator that chains the analysis steps together.
     """
+    import hashlib
+
     # 1. Run DeepSpot to get the initial predicted AnnData object.
     print("Step 1: Calling DeepSpot to predict gene expression...")
     predicted_adata = run_deepspot_custom.remote(
         image_bytes=image_bytes,
         tissue_positions_bytes=tissue_positions_bytes,
         image_hash=image_hash,
-        use_cache=False,  # <-- Temporarily disable cache to generate debug files
+        tissue_hires_scalef=tissue_hires_scalef,
+        use_cache=use_cache,
     )
     print("DeepSpot analysis complete.")
 
     # 2. Run Starfysh for deconvolution.
     print("Step 2: Calling Starfysh for cell-type deconvolution...")
+    gene_sig_hash = hashlib.sha256(gene_sig_bytes).hexdigest()
     starfysh_adata = run_starfysh_deconvolution.remote(
-        predicted_adata, gene_sig_bytes
+        predicted_adata,
+        gene_sig_bytes,
+        image_hash=image_hash,
+        gene_sig_hash=gene_sig_hash,
+        use_cache=use_cache,
     )
     print("Starfysh deconvolution complete.")
 
@@ -731,7 +820,12 @@ def main(
         Path(__file__).resolve().parent
         / "starfysh/data/bc_signatures_version_1013.csv"
     ),
+    scalefactors_path: str = str(
+        Path(__file__).resolve().parent
+        / "starfysh/data/spatial 6/CID44971_spatial/scalefactors_json.json"
+    ),
     output_dir: str = "data_outputs",
+    use_cache: bool = True,
 ):
     """
     Local entrypoint to run the full pipeline.
@@ -740,19 +834,28 @@ def main(
     modal run Tissuelab-Model-Zoo/spatial_omics/starfysh_pipeline.py # Will use default CID44971 data
     Or specify custom paths:
     modal run Tissuelab-Model-Zoo/spatial_omics/starfysh_pipeline.py --image-path /path/to/image.png --tissue-positions-path /path/to/positions.csv --gene-signature-path /path/to/signatures.csv
+    modal run Tissuelab-Model-Zoo/spatial_omics/starfysh_pipeline.py --use-cache=False # To disable caching
     """
     import hashlib
+    import json
 
     # --- 1. Load local data into memory ---
     image_path_obj = Path(image_path)
     tissue_positions_path_obj = Path(tissue_positions_path)
     gene_signature_path_obj = Path(gene_signature_path)
+    scalefactors_path_obj = Path(scalefactors_path)
 
     print(f"🔬 Using image: {image_path_obj}")
     print(f"📍 Using tissue positions: {tissue_positions_path_obj}")
     print(f"🧬 Using gene signatures: {gene_signature_path_obj}")
+    print(f"⚖️ Using scale factors: {scalefactors_path_obj}")
 
-    for p in [image_path_obj, tissue_positions_path_obj, gene_signature_path_obj]:
+    for p in [
+        image_path_obj,
+        tissue_positions_path_obj,
+        gene_signature_path_obj,
+        scalefactors_path_obj,
+    ]:
         if not p.exists():
             print(f"❌ Error: Input file not found at '{p}'.")
             return
@@ -763,6 +866,9 @@ def main(
         tissue_positions_bytes = f.read()
     with open(gene_signature_path_obj, "rb") as f:
         gene_sig_bytes = f.read()
+    with open(scalefactors_path_obj, "rb") as f:
+        scalefactors = json.load(f)
+        tissue_hires_scalef = scalefactors['tissue_hires_scalef']
         
     # Generate a hash of the image to use as a unique ID for caching.
     image_hash = hashlib.sha256(image_bytes).hexdigest()
@@ -775,6 +881,8 @@ def main(
             tissue_positions_bytes=tissue_positions_bytes,
             gene_sig_bytes=gene_sig_bytes,
             image_hash=image_hash,
+            tissue_hires_scalef=tissue_hires_scalef,
+            use_cache=use_cache,
         )
     except Exception as e:
         print(f"An error occurred during the Modal call: {e}")
