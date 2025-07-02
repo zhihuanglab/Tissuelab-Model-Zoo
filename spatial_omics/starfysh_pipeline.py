@@ -1,5 +1,7 @@
 import modal
 from pathlib import Path
+import numpy as np
+import pandas as pd
 
 # --- Modal Resource Definitions ---
 # A Volume is a persistent network file system. We use it here to cache
@@ -77,10 +79,12 @@ starfysh_image = (
     .pip_install_from_requirements(
         "Tissuelab-Model-Zoo/spatial_omics/starfysh/requirements.txt"
     )
-    # 6. Pin data-handling libraries to ensure consistency across all images
+    # 6. Pin data-handling libraries and add tblib for better error reporting
     .pip_install(
         "scanpy==1.9.3",
         "anndata==0.8.0",
+        "scikit-misc",
+        "tblib",
     )
     .run_commands("pip install git+https://github.com/azizilab/starfysh.git")
 )
@@ -314,6 +318,23 @@ def run_deepspot_custom(
         # The index must be a string for anndata
         coord_df.index = in_tissue_df["barcode"].astype(str)
 
+        # --- DEBUGGING: Save coordinate files for visualization ---
+        debug_dir = MODEL_DIR / "debug"
+        debug_dir.mkdir(exist_ok=True)
+        
+        # Save the final coordinates that are being used
+        final_coords_path = debug_dir / f"coords_final_{image_hash}.csv"
+        coord_df.to_csv(final_coords_path)
+        print(f"🐛 Saved final coordinates to {final_coords_path}")
+        
+        # Save the original coordinates for comparison
+        original_coords_path = debug_dir / f"coords_original_{image_hash}.csv"
+        tissue_pos_df.to_csv(original_coords_path)
+        print(f"🐛 Saved original coordinates to {original_coords_path}")
+
+        volume.commit()
+        # --- End Debugging ---
+
         # --- 3. Create initial AnnData object (background filtering is already done) ---
         print(f"Creating AnnData object for {len(coord_df)} in-tissue spots...")
         adata_tissue = ad.AnnData(
@@ -379,40 +400,112 @@ def run_starfysh_deconvolution(adata, gene_sig_bytes: bytes):
     import torch
     import io
 
+    # --- 0. Standardize Gene Names ---
+    # Enforce uppercase on both to ensure consistent matching.
+    adata.var_names = adata.var_names.str.upper()
+    adata.var_names_make_unique()
+
     from starfysh import (
         utils,
         starfysh as sf_model,
     )
 
-    # --- 1. Data Preparation ---
+    # --- 1. Initial Data Cleaning ---
     print("Preparing data for Starfysh...")
-    # Load gene signature from bytes
+    adata.X[np.isnan(adata.X)] = 0
+    adata.X[adata.X < 0] = 0
+    sc.pp.filter_cells(adata, min_counts=1)
+    print(f"AnnData shape after initial cleaning: {adata.shape}")
+
+    # --- 2. Align with Starfysh's Internal Gene Filtering ---
+    # The key issue is that Starfysh internally subsets adata to highly_variable_genes
+    # plus the signature genes. If a signature gene is NOT highly variable and has low
+    # variance, it gets discarded, causing a KeyError later.
+    # We must replicate this logic to filter our signature *before* calling the library.
+
+    print("Identifying the gene set that Starfysh will use internally...")
+    # First, find the highly variable genes (using starfysh's likely defaults)
+    adata_norm = adata.copy()
+    sc.pp.normalize_total(adata_norm, target_sum=1e4)
+    sc.pp.log1p(adata_norm)
+    # Use flavor 'seurat_v3' as it's a common, robust choice. This identifies genes with high variance relative to their expression.
+    sc.pp.highly_variable_genes(adata_norm, n_top_genes=4000, flavor='seurat_v3', subset=False)
+
+    # This is the set of genes that Starfysh will deem "highly variable"
+    hvg_approved = set(adata_norm.var_names[adata_norm.var['highly_variable']])
+    print(f"Identified {len(hvg_approved)} highly variable genes.")
+
+    # Load the signature and get the unique genes it requests
     gene_sig = pd.read_csv(io.BytesIO(gene_sig_bytes))
+    # Use .map and .stack().unique() to robustly get unique, non-NaN, uppercase gene names
+    cleaned_sig = gene_sig.map(lambda g: g.strip().upper() if isinstance(g, str) else np.nan)
+    sig_genes_requested = set(cleaned_sig.stack().unique())
 
-    # Create a normalized AnnData object for input
-    adata_normed = adata.copy()
-    sc.pp.normalize_total(adata_normed, target_sum=1e4)
-    sc.pp.log1p(adata_normed)
-    sc.pp.highly_variable_genes(adata_normed, n_top_genes=2000, inplace=True)
-    adata_normed = adata_normed[:, adata_normed.var.highly_variable]
+    # The final set of genes Starfysh will keep is the union of HVGs and any signature genes that exist in our data.
+    initial_approved_genes = hvg_approved.union(sig_genes_requested.intersection(set(adata.var_names)))
 
-    # Filter gene signature to match genes in our data
-    gene_sig = utils.filter_gene_sig(gene_sig, adata.to_df())
-    print(f"Using {len(gene_sig)} signature genes.")
+    # **THE DEFINITIVE FIX**:
+    # The crash occurs because Starfysh's internal sc.tl.score_genes cannot handle
+    # genes with zero variance AFTER data scaling. We must replicate this process
+    # to find and remove them *before* calling the library.
 
-    # --- 2. Create VisiumArguments ---
-    # This helper class bundles all necessary data for the Starfysh model.
-    # We pass empty image metadata as we're doing deconvolution without histology.
+    # Create a scaled copy to find problem genes
+    adata_temp_scaled = adata_norm[:, list(initial_approved_genes)].copy()
+    sc.pp.scale(adata_temp_scaled)
+    
+    # Find genes with no variance in the *scaled* data.
+    std_devs = adata_temp_scaled.var['std']
+    genes_with_variance = set(std_devs[std_devs > 0].index)
+    
+    final_approved_genes = initial_approved_genes.intersection(genes_with_variance)
+    print(f"Final approved gene set size after scaling and variance check: {len(final_approved_genes)}")
+
+
+    # --- 3. Filter Signature and Prepare Final AnnData ---
+    # Now, filter the signature dataframe to *only* include genes from this final, doubly-approved set
+    final_sig = gene_sig.map(lambda g: g.strip().upper() if isinstance(g, str) and g.strip().upper() in final_approved_genes else np.nan)
+    final_sig = final_sig.loc[:, final_sig.notna().any()]
+
+    if final_sig.empty:
+        raise ValueError("Signature table is empty after aligning with highly_variable_genes.")
+
+    # Use .stack().unique() to get a count of unique non-NaN genes in a pandas-idiomatic way.
+    print(f"Final signature has {final_sig.shape[1]} cell types and {len(final_sig.stack().unique())} unique genes.")
+
+    # Mark ALL genes that Starfysh needs as highly_variable.
+    adata.var['highly_variable'] = adata.var_names.isin(final_approved_genes)
+    adata_norm.var['highly_variable'] = adata_norm.var_names.isin(final_approved_genes)
+
+
+    # --- 4. Call Starfysh ---
     print("Creating VisiumArguments...")
+    dummy_map_info = pd.DataFrame({
+        'array_row': adata.obs['y_array'],
+        'array_col': adata.obs['x_array'],
+        'imagerow': adata.obs['y_pixel'],
+        'imagecol': adata.obs['x_pixel'],
+    }, index=adata.obs.index)
+
+    dummy_scalefactor = {
+        'spot_diameter_fullres': 0.0,
+        'tissue_hires_scalef': 1.0,
+    }
+    dummy_img = np.zeros((1, 1, 3), dtype=np.uint8)
+    img_metadata = {
+        'map_info': dummy_map_info,
+        'scalefactor': dummy_scalefactor,
+        'img': dummy_img,
+    }
+
     visium_args = utils.VisiumArguments(
         adata=adata,
-        adata_normed=adata_normed,
-        gene_sig=gene_sig,
-        img_metadata={}, # No image integration in this step
-        window_size=3, # Default from notebook
+        adata_norm=adata_norm,
+        gene_sig=final_sig,
+        img_metadata=img_metadata,
+        window_size=1, # Use 1 to prevent smoothing on small datasets
     )
 
-    # --- 3. Model Training ---
+    # --- 5. Model Training ---
     print("Training Starfysh model...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Using parameters from the tutorial
@@ -424,7 +517,7 @@ def run_starfysh_deconvolution(adata, gene_sig_bytes: bytes):
     )
     print(f"Starfysh training complete. Final loss: {loss}")
 
-    # --- 4. Evaluate and Extract Results ---
+    # --- 6. Evaluate and Extract Results ---
     print("Evaluating model and extracting cell-type proportions...")
     # The model_eval function returns a new AnnData object with the results
     _, _, adata_starfysh = sf_model.model_eval(
@@ -435,7 +528,7 @@ def run_starfysh_deconvolution(adata, gene_sig_bytes: bytes):
     print("Deconvolution complete. Proportions stored in .obs")
 
     # Store the cell types in .uns for downstream use
-    adata_starfysh.uns['cell_types'] = gene_sig.columns.tolist()
+    adata_starfysh.uns['cell_types'] = final_sig.columns.tolist()
 
     return adata_starfysh
 
@@ -552,6 +645,7 @@ def analyze_tissue_pipeline(
         image_bytes=image_bytes,
         tissue_positions_bytes=tissue_positions_bytes,
         image_hash=image_hash,
+        use_cache=False,  # <-- Temporarily disable cache to generate debug files
     )
     print("DeepSpot analysis complete.")
 
