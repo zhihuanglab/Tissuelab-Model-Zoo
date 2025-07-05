@@ -80,6 +80,7 @@ def main(args):
         # Check if h5 file exists and has SegmentationNode
         ALREADY_HAVE_NUCLEI_SEGMENTATION = False
         APPEND_FEATURES = False
+        APPEND_EMBEDDINGS = False
         centroids = None
         contours = None
         
@@ -93,17 +94,59 @@ def main(args):
                     except:
                         print("Error: SegmentationNode group is corrupted.")
                     has_features = 'features' in hf['SegmentationNode']
+                    has_embeddings = 'cell_embeddings' in hf['SegmentationNode']
                     
 
-                    if ALREADY_HAVE_NUCLEI_SEGMENTATION and has_features:
+                    if ALREADY_HAVE_NUCLEI_SEGMENTATION and has_features and has_embeddings:
                         result["nuclei_count"] = len(centroids)
-                        result["message"] = "Using existing nuclei segmentation and features."
+                        result["message"] = "Using existing nuclei segmentation, embeddings, and features."
                         return result
                     elif ALREADY_HAVE_NUCLEI_SEGMENTATION and len(centroids) > 0:
+                        if not has_embeddings:
+                            print("Calculating embeddings for existing nuclei segmentation...")
+                            APPEND_EMBEDDINGS = True
                         
                         if not has_features and args.calculate_features:
                             print("Calculating features for existing nuclei segmentation...")
                             APPEND_FEATURES = True
+
+        # Handle embeddings calculation outside of the file read context
+        if APPEND_EMBEDDINGS and centroids is not None:
+            from nuc_embedding_mac import NucleiEmbedding
+            
+            # 创建临时文件路径
+            h5_dir = os.path.dirname(h5_path)
+            slide_basename = os.path.basename(args.slidepath)
+            temp_h5_path = os.path.join(h5_dir, f"temp_{slide_basename}.h5")
+            
+            ne = NucleiEmbedding(args, centroids)
+            # 将embeddings保存到临时文件
+            result_path = ne.generate_embeddings(temp_h5_path=temp_h5_path)
+            
+            # 创建备份
+            backup_path = os.path.join(h5_dir, f"backup_{slide_basename}_embedding.h5")
+            try:
+                import shutil
+                shutil.copy2(result_path, backup_path)
+                print(f"Created embeddings backup: {backup_path}")
+            except Exception as e:
+                print(f"Warning: failed to create backup: {str(e)}")
+            
+            # 从临时文件读取embeddings并保存到目标文件
+            with h5py.File(temp_h5_path, "r") as tf:
+                embedding_data = tf["embedding"][()]
+                
+            with h5py.File(h5_path, 'a') as hf_write:
+                nuclei_seg = hf_write['SegmentationNode']
+                if 'cell_embeddings' in nuclei_seg:
+                    del nuclei_seg['cell_embeddings']
+                nuclei_seg.create_dataset('cell_embeddings', data=embedding_data)
+            
+            # 清理临时文件
+            try:
+                os.remove(temp_h5_path)
+            except:
+                print(f"Warning: Could not remove temporary file {temp_h5_path}")
 
         if APPEND_FEATURES:
             # Add features to existing h5 file
@@ -161,7 +204,35 @@ def main(args):
                 nuclei_seg.create_dataset('centroids', data=centroids)
                 nuclei_seg.create_dataset('probability', data=probability)
 
-        # Calculate features after saving segmentation
+            # After segmentation and before feature calculation, generate embeddings
+            print("Generating nuclei embeddings...")
+            from nuc_embedding_mac import NucleiEmbedding
+
+            h5_dir = os.path.dirname(h5_path)
+            slide_basename = os.path.basename(args.slidepath)
+            temp_h5_path = os.path.join(h5_dir, f"temp_{slide_basename}.h5")
+
+            ne = NucleiEmbedding(args, centroids)
+            result_path = ne.generate_embeddings(temp_h5_path=temp_h5_path)
+
+            backup_path = os.path.join(h5_dir, f"backup_{slide_basename}_embedding.h5")
+            try:
+                import shutil
+                shutil.copy2(result_path, backup_path)
+                print(f"Created embeddings backup: {backup_path}")
+            except Exception as e:
+                print(f"Warning: failed to create backup: {str(e)}")
+
+            with h5py.File(temp_h5_path, "r") as tf:
+                embedding_data = tf["embedding"][()]
+                
+            with h5py.File(h5_path, 'a') as hf:
+                nuclei_seg = hf['SegmentationNode']
+                if 'embedding' in nuclei_seg:
+                    del nuclei_seg['embedding']
+                nuclei_seg.create_dataset('embedding', data=embedding_data)
+
+        # Calculate features after saving segmentation and embeddings
         if args.calculate_features:
             features, feature_names, class_vector, class_names = calculate_features(args, centroids, contours)
             # Append features to the h5 file
