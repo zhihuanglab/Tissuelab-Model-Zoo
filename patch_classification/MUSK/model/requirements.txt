@@ -34,3 +34,9 @@ pycocoevalcap
 webdataset>=0.2.31
 huggingface-hub
 safetensors
+uvicorn
+sse_starlette
+starlette
+xgboost
+tiffslide
+datasets
