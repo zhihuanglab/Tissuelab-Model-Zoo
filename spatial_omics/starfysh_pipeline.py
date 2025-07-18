@@ -85,6 +85,8 @@ starfysh_image = (
         "anndata==0.8.0",
         "scikit-misc",
         "tblib",
+        "scikit-image", # For archetypal analysis
+        "scikit-dimension", # For archetypal analysis
     )
     .run_commands("pip install git+https://github.com/azizilab/starfysh.git")
 )
@@ -167,6 +169,48 @@ def _download_deepspot_models():
 
 
 # --- Pipeline Functions ---
+
+@app.function(
+    image=starfysh_image,
+    volumes={MODEL_DIR: volume},
+    timeout=600,
+)
+def run_archetypal_analysis(adata):
+    """
+    Performs Archetypal Analysis on an AnnData object to discover
+    cell types and their marker genes in an unsupervised manner.
+    """
+    import scanpy as sc
+    from starfysh import AA
+
+    print("Running Archetypal Analysis to find signature genes...")
+
+    # --- 1. Normalize Data ---
+    # AA requires a normalized AnnData object.
+    adata_norm = adata.copy()
+    sc.pp.normalize_total(adata_norm, target_sum=1e4)
+    sc.pp.log1p(adata_norm)
+    sc.pp.highly_variable_genes(adata_norm, n_top_genes=4000, flavor='seurat_v3', subset=True)
+
+    # --- 2. Instantiate and Fit AA Model ---
+    print("Instantiating and fitting AA model...")
+    aa_model = AA.model(adata_norm)
+    
+    # Automatically find the optimal number of archetypes (cell types)
+    k_suggestion = aa_model.find_k()
+    print(f"AA suggests k={k_suggestion} archetypes.")
+
+    # Fit the model with the suggested k
+    aa_model.fit(n_archetypes=k_suggestion)
+
+    # --- 3. Generate Signature Matrix ---
+    print("Generating signature gene matrix from archetypes...")
+    gene_sig_df = aa_model.find_markers(display=False)
+    
+    print(f"✅ Archetypal analysis complete. Found {gene_sig_df.shape[1]} cell types.")
+
+    return gene_sig_df
+
 
 @app.function(
     image=deepspot_image,
@@ -379,9 +423,8 @@ def run_deepspot_custom(
 )
 def run_starfysh_deconvolution(
     adata,
-    gene_sig_bytes: bytes,
+    gene_sig_df, # FIX: This will be a Modal Object (Future)
     image_hash: str,
-    gene_sig_hash: str,
     use_cache: bool = True,
 ):
     """
@@ -390,9 +433,16 @@ def run_starfysh_deconvolution(
     Caches its output to the modal.Volume to avoid re-computation.
     """
     import anndata as ad
+    import hashlib
     import tempfile
+    import pandas as pd
 
     # --- Caching Logic ---
+    # FIX: Resolve the future object here to get the actual dataframe
+    gene_sig_df = gene_sig_df.get()
+    
+    # The cache key now depends on the hash of the *content* of the gene signature dataframe
+    gene_sig_hash = hashlib.sha256(pd.util.hash_pandas_object(gene_sig_df).values).hexdigest()
     cache_key = f"{image_hash}_{gene_sig_hash}"
     adata_cache_dir = MODEL_DIR / "adata_cache"
     adata_cache_path = adata_cache_dir / f"adata_starfysh_{cache_key}.h5ad"
@@ -407,7 +457,6 @@ def run_starfysh_deconvolution(
             print("⚠️ Cache miss. No cached Starfysh data found. Running deconvolution...")
 
 
-    import pandas as pd
     import scanpy as sc
     import torch
     import io
@@ -448,7 +497,7 @@ def run_starfysh_deconvolution(
     print(f"Identified {len(hvg_approved)} highly variable genes.")
 
     # Load the signature and get the unique genes it requests
-    gene_sig = pd.read_csv(io.BytesIO(gene_sig_bytes))
+    gene_sig = gene_sig_df 
     # Use .map and .stack().unique() to robustly get unique, non-NaN, uppercase gene names
     cleaned_sig = gene_sig.map(lambda g: g.strip().upper() if isinstance(g, str) else np.nan)
     sig_genes_requested = set(cleaned_sig.stack().unique())
@@ -728,7 +777,6 @@ def run_llm_phenotype_inference(adata, cancer_type: str = "TNBC", n_clusters: in
 )
 def analyze_tissue_pipeline(
     image_bytes: bytes,
-    gene_sig_bytes: bytes,
     image_hash: str,
     use_cache: bool = True,
 ):
@@ -736,6 +784,7 @@ def analyze_tissue_pipeline(
     Main pipeline orchestrator that chains the analysis steps together.
     """
     import hashlib
+    import pandas as pd
 
     # 1. Run DeepSpot to get the initial predicted AnnData object.
     print("Step 1: Calling DeepSpot to predict gene expression...")
@@ -746,30 +795,34 @@ def analyze_tissue_pipeline(
     )
     print("DeepSpot analysis complete.")
 
-    # 2. Run Starfysh for deconvolution.
-    print("Step 2: Calling Starfysh for cell-type deconvolution...")
-    gene_sig_hash = hashlib.sha256(gene_sig_bytes).hexdigest()
+    # 2. NEW: Run Archetypal Analysis to get the signature matrix
+    print("Step 2: Calling Archetypal Analysis to generate signatures...")
+    gene_sig_df = run_archetypal_analysis.remote(predicted_adata)
+    print("Archetypal analysis complete.")
+
+
+    # 3. Run Starfysh for deconvolution.
+    print("Step 3: Calling Starfysh for cell-type deconvolution...")
     starfysh_adata = run_starfysh_deconvolution.remote(
         predicted_adata,
-        gene_sig_bytes,
+        gene_sig_df, # Pass the future object directly
         image_hash=image_hash,
-        gene_sig_hash=gene_sig_hash,
         use_cache=use_cache,
     )
     print("Starfysh deconvolution complete.")
 
-    # 3. Run LLM for phenotype inference.
-    print("Step 3: Calling LLM for phenotype inference...")
+    # 4. Run LLM for phenotype inference.
+    print("Step 4: Calling LLM for phenotype inference...")
     final_adata = run_llm_phenotype_inference.remote(starfysh_adata)
     print("LLM phenotype inference complete.")
 
-    # 4. Save the final AnnData object to a file in the container's mounted volume.
+    # 5. Save the final AnnData object to a file in the container's mounted volume.
     output_path = CACHE_DIR / f"{image_hash}_final_result.h5ad"
     print(f"Saving final AnnData object to remote path: {output_path}")
     final_adata.write_h5ad(output_path)
     volume.commit()
 
-    # 5. Return the path to the saved file.
+    # 6. Return the path to the saved file.
     return str(output_path)
 
 
@@ -831,10 +884,6 @@ def main(
         Path(__file__).resolve().parent
         / "starfysh/data/spatial 6/CID44971_spatial/tissue_hires_image.png"
     ),
-    gene_signature_path: str = str(
-        Path(__file__).resolve().parent
-        / "starfysh/data/bc_signatures_version_1013.csv"
-    ),
     output_dir: str = "data_outputs",
     use_cache: bool = True,
 ):
@@ -843,8 +892,8 @@ def main(
 
     Example command:
     modal run Tissuelab-Model-Zoo/spatial_omics/starfysh_pipeline.py # Will use default CID44971 data
-    Or specify custom paths:
-    modal run Tissuelab-Model-Zoo/spatial_omics/starfysh_pipeline.py --image-path /path/to/image.png --tissue-positions-path /path/to/positions.csv --gene-signature-path /path/to/signatures.csv
+    Or specify a custom image path:
+    modal run Tissuelab-Model-Zoo/spatial_omics/starfysh_pipeline.py --image-path /path/to/image.png
     modal run Tissuelab-Model-Zoo/spatial_omics/starfysh_pipeline.py --use-cache=False # To disable caching
     """
     import hashlib
@@ -852,23 +901,15 @@ def main(
 
     # --- 1. Load local data into memory ---
     image_path_obj = Path(image_path)
-    gene_signature_path_obj = Path(gene_signature_path)
 
     print(f"🔬 Using image: {image_path_obj}")
-    print(f"🧬 Using gene signatures: {gene_signature_path_obj}")
 
-    for p in [
-        image_path_obj,
-        gene_signature_path_obj,
-    ]:
-        if not p.exists():
-            print(f"❌ Error: Input file not found at '{p}'.")
-            return
+    if not image_path_obj.exists():
+        print(f"❌ Error: Input file not found at '{image_path_obj}'.")
+        return
 
     with open(image_path_obj, "rb") as f:
         image_bytes = f.read()
-    with open(gene_signature_path_obj, "rb") as f:
-        gene_sig_bytes = f.read()
         
     # Generate a hash of the image to use as a unique ID for caching.
     image_hash = hashlib.sha256(image_bytes).hexdigest()
@@ -880,7 +921,6 @@ def main(
         print("Running remote pipeline (this may take several minutes)...")
         remote_adata_path = analyze_tissue_pipeline.remote(
             image_bytes=image_bytes,
-            gene_sig_bytes=gene_sig_bytes,
             image_hash=image_hash,
             use_cache=use_cache,
         )
