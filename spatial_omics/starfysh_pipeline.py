@@ -89,15 +89,17 @@ starfysh_image = (
     .run_commands("pip install git+https://github.com/azizilab/starfysh.git")
 )
 
-# LLM image - this will be new and lightweight
+# LLM image - now with clustering libraries
 llm_image = (
     modal.Image.debian_slim(python_version="3.9")
     .pip_install(
-        "openai", # or other clients
-        "scanpy==1.9.3", # For AnnData manipulation. Pinned to match deepspot_image.
-        "anndata==0.8.0", # Explicitly pin anndata as well for safety.
-        "tblib", # Add for rich exception tracebacks from remote functions
-        "numpy==1.23.5", # Pin numpy to a pre-2.0 version to fix np.float_ error.
+        "openai",  # The OpenAI client
+        "scanpy==1.9.3",  # For AnnData manipulation and clustering
+        "anndata==0.8.0",  # Pinned for consistency
+        "tblib",  # For rich exception tracebacks
+        "numpy==1.23.5",  # Pinned to a pre-2.0 version
+        "leidenalg",  # For clustering
+        "python-igraph",  # For clustering
     )
 )
 
@@ -608,37 +610,31 @@ def run_starfysh_deconvolution(
 @app.function(
     image=llm_image,
     secrets=[modal.Secret.from_name("openai-secret")],
-    max_containers=20, # FIX: Reduce from 50 to avoid API rate limiting.
+    max_containers=4, # FIX: Use max_containers as concurrency_limit is deprecated.
 )
-def _run_llm_for_single_spot(spot_idx: int, adata, cancer_type: str = "TNBC"):
-    """Internal function to get LLM inference for a single spot's niche."""
+def _run_llm_for_cluster_profile(cluster_id: str, avg_proportion: dict, cancer_type: str = "TNBC"):
+    """Internal function to get LLM inference for a cluster's average profile."""
     import os
     from openai import OpenAI
 
     openai_api_key = os.getenv("OPENAI_API_KEY")
-    cell_type_cols = adata.uns['cell_types']
 
-    # Identify the niche for this spot
-    neighbor_indices = adata.obsp['connectivities'][spot_idx].indices
-    niche_indices = [spot_idx] + list(neighbor_indices)
-    niche_proportions = adata.obs.iloc[niche_indices][cell_type_cols].mean()
-
+    # avg_proportion is a dict from cell_type to proportion
     proportions_str = ", ".join(
-        [f"{cell_type} ({prop:.2%})" for cell_type, prop in niche_proportions.items()]
+        [f"{cell_type} ({prop:.2%})" for cell_type, prop in avg_proportion.items()]
     )
 
     system_prompt = "You are an expert biologist specializing in spatial transcriptomics and oncology."
     user_prompt = f"""
-    We are analyzing a tissue sample from a {cancer_type} patient. Within a selected spatial region (a "niche"), the estimated cell-type proportions are: {proportions_str}.
+    We are analyzing a tissue sample from a {cancer_type} patient. We have identified a cluster of spatial regions (cluster {cluster_id}) with the following *average* cell-type composition: {proportions_str}.
 
-    Based *only* on this cellular composition, can you determine whether this niche is associated with a Triple-Negative Breast Cancer (TNBC) phenotype?
+    Based *only* on this average cellular composition, can you determine whether this microenvironment is associated with a Triple-Negative Breast Cancer (TNBC) phenotype?
 
     Please begin your response with a single word, "Yes" or "No", followed by a period. Then, provide a brief biological interpretation and supporting references for your determination.
     """
 
     try:
         client = OpenAI(api_key=openai_api_key)
-        # Using the standard, modern chat completions API for robustness
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -656,15 +652,16 @@ def _run_llm_for_single_spot(spot_idx: int, adata, cancer_type: str = "TNBC"):
             binary_response = "No"
         else:
             binary_response = "Uncertain"
-        
+
         interpretation = full_response_text
 
     except Exception as e:
-        print(f"An error occurred while querying the LLM for spot {spot_idx}: {e}")
+        print(f"An error occurred while querying the LLM for cluster {cluster_id}: {e}")
         binary_response = "Error"
         interpretation = str(e)
 
     return {
+        'cluster_id': cluster_id,
         'tnbc_niche_association': binary_response,
         'tnbc_niche_interpretation': interpretation
     }
@@ -672,42 +669,75 @@ def _run_llm_for_single_spot(spot_idx: int, adata, cancer_type: str = "TNBC"):
 
 @app.function(
     image=llm_image,
-    secrets=[modal.Secret.from_name("openai-secret")], # Example secret
-    timeout=1800, # Increased timeout for the parallel map operation
+    secrets=[modal.Secret.from_name("openai-secret")],
+    timeout=1800,
 )
-def run_llm_phenotype_inference(adata, cancer_type: str = "TNBC"):
+def run_llm_phenotype_inference(adata, cancer_type: str = "TNBC", n_clusters: int = 8):
     """
-    Uses an LLM to infer phenotype association for each spot's "niche".
-    This version parallelizes the LLM queries using Modal's .map() for performance.
+    Clusters spots by cell-type proportion, then uses an LLM to infer phenotype
+    association for each *cluster*, which is much more efficient.
     """
     import pandas as pd
     import scanpy as sc
-    
-    # --- 1. Compute neighborhood graph (ONCE) ---
-    print("Computing neighborhood graph...")
-    sc.pp.neighbors(adata, use_rep='spatial', n_neighbors=6)
+    import anndata as ad
 
-    # --- 2. Fan-out and run LLM queries in parallel ---
-    print(f"Querying LLM for {adata.n_obs} spot niches in parallel...")
-    # .map() distributes the work across many containers. We collect the results into a list.
-    results = list(
-        _run_llm_for_single_spot.map(
-            range(adata.n_obs), kwargs=dict(adata=adata, cancer_type=cancer_type)
-        )
-    )
+    # --- 1. Extract cell-type proportions and cluster ---
+    cell_type_cols = adata.uns['cell_types']
+    proportion_data = adata.obs[cell_type_cols]
 
-    # --- 3. Store results back in AnnData object ---
+    # Use a temporary AnnData object just for clustering
+    adata_for_clustering = ad.AnnData(proportion_data)
+
+    print("Clustering spots based on cell-type proportions...")
+    # These parameters can be tuned. Using Seurat's flavor is robust.
+    sc.pp.neighbors(adata_for_clustering, n_neighbors=15, use_rep='X')
+    sc.tl.leiden(adata_for_clustering, resolution=0.5, key_added='leiden_clusters')
+
+    # If clustering gives too many/few clusters, re-run with different resolution.
+    # This is a simple heuristic to aim for roughly `n_clusters`.
+    actual_n_clusters = len(adata_for_clustering.obs['leiden_clusters'].unique())
+    if not (0.5 * n_clusters < actual_n_clusters < 1.5 * n_clusters):
+        print(f"Initial clustering gave {actual_n_clusters} clusters. Re-running with adjusted resolution...")
+        sc.tl.leiden(adata_for_clustering, key_added='leiden_clusters', resolution=0.8, n_iterations=2)
+
+    # Store cluster labels back in the main AnnData object
+    adata.obs['leiden_clusters'] = adata_for_clustering.obs['leiden_clusters'].astype(str).values
+
+    # --- 2. Get representative profiles and query LLM for each cluster IN PARALLEL ---
+    unique_clusters = adata.obs['leiden_clusters'].unique()
+    print(f"Found {len(unique_clusters)} clusters. Querying LLM for each representative profile...")
+
+    # Prepare arguments for the .map() call. We need one iterable for each argument.
+    cluster_ids_arg = unique_clusters.tolist()
+    avg_proportion_arg = []
+    for cluster_id in cluster_ids_arg:
+        cluster_mask = adata.obs['leiden_clusters'] == cluster_id
+        avg_proportion = adata.obs.loc[cluster_mask, cell_type_cols].mean()
+        avg_proportion_arg.append(avg_proportion.to_dict())
+
+    # Call the LLM in parallel using .map().
+    all_results = list(_run_llm_for_cluster_profile.map(
+        cluster_ids_arg, avg_proportion_arg, kwargs=dict(cancer_type=cancer_type)
+    ))
+
+    # --- 3. Resolve futures and map results back to all spots ---
     print("Storing LLM inference results in AnnData object...")
-    results_df = pd.DataFrame(results, index=adata.obs.index)
-    adata.obs = adata.obs.join(results_df)
-    
+    # Create a mapping from cluster ID to the results
+    association_map = {res['cluster_id']: res['tnbc_niche_association'] for res in all_results}
+    interpretation_map = {res['cluster_id']: res['tnbc_niche_interpretation'] for res in all_results}
+
+    # Map the results from the cluster to each spot using the cluster labels
+    adata.obs['tnbc_niche_association'] = adata.obs['leiden_clusters'].map(association_map)
+    adata.obs['tnbc_niche_interpretation'] = adata.obs['leiden_clusters'].map(interpretation_map)
+
     print("LLM phenotype inference complete.")
     return adata
 
 
 @app.function(
     image=llm_image, # The orchestrator needs an env with anndata
-    timeout=1800
+    timeout=1800,
+    volumes={CACHE_DIR: volume}, # Add a volume to save the final result
 )
 def analyze_tissue_pipeline(
     image_bytes: bytes,
@@ -750,8 +780,14 @@ def analyze_tissue_pipeline(
     final_adata = run_llm_phenotype_inference.remote(starfysh_adata)
     print("LLM phenotype inference complete.")
 
-    # 4. Return the final AnnData object.
-    return final_adata
+    # 4. Save the final AnnData object to a file in the container's mounted volume.
+    output_path = CACHE_DIR / f"{image_hash}_final_result.h5ad"
+    print(f"Saving final AnnData object to remote path: {output_path}")
+    final_adata.write_h5ad(output_path)
+    volume.commit()
+
+    # 5. Return the path to the saved file.
+    return str(output_path)
 
 
 def _add_spatial_metadata_to_adata(adata, image_path: Path):
@@ -876,7 +912,9 @@ def main(
     # --- 2. Run Modal Pipeline ---
     print("\n🚀 Calling remote Modal function... (This may take several minutes)")
     try:
-        final_adata = analyze_tissue_pipeline.remote(
+        # Run the pipeline synchronously – `.remote()` blocks and returns the result path.
+        print("Running remote pipeline (this may take several minutes)...")
+        remote_adata_path = analyze_tissue_pipeline.remote(
             image_bytes=image_bytes,
             tissue_positions_bytes=tissue_positions_bytes,
             gene_sig_bytes=gene_sig_bytes,
@@ -884,26 +922,46 @@ def main(
             tissue_hires_scalef=tissue_hires_scalef,
             use_cache=use_cache,
         )
+
+        # --- 3. Download the final result ---
+        print(f"Downloading result from remote path: {remote_adata_path}...")
+
+        # Convert the container path to a Volume-relative path
+        volume_rel_path = (
+            remote_adata_path[len("/cache/") :]
+            if remote_adata_path.startswith("/cache/")
+            else remote_adata_path.lstrip("/")
+        )
+
+        output_path = Path(output_dir)
+        output_path.mkdir(exist_ok=True)
+        output_filename = f"{image_path_obj.stem}_analysis_result.h5ad"
+        output_filepath = output_path / output_filename
+
+        with open(output_filepath, "wb") as local_f:
+            for chunk in volume.read_file(volume_rel_path):
+                local_f.write(chunk)
+
+        print(f"\n💾 Result saved to: {output_filepath}")
+
+
+        # --- 4. (Optional) Load the data locally for further processing ---
+        import anndata as ad
+        final_adata = ad.read_h5ad(output_filepath)
+
     except Exception as e:
         print(f"An error occurred during the Modal call: {e}")
         return
 
-    # --- 3. Add spatial metadata for visualization ---
+    # --- 5. Add spatial metadata for visualization ---
     print("\n🖼️ Adding spatial metadata to AnnData object for visualization...")
     final_adata = _add_spatial_metadata_to_adata(final_adata, image_path_obj)
 
-    # --- 4. Save the final AnnData object ---
-    print("\n✅ Analysis complete! Saving final AnnData object...")
-    output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
-    output_filename = f"{image_path_obj.stem}_analysis_result.h5ad"
-    output_filepath = output_path / output_filename
+    # --- 6. Save the final AnnData object with metadata ---
+    print("\n✅ Analysis complete! Saving final AnnData object with metadata...")
     
-    # Make sure we have the object locally before writing
-    if final_adata:
-        final_adata.write_h5ad(output_filepath)
-        print(f"\n💾 Result saved to: {output_filepath}")
-    else:
-        print("❌ Final AnnData object was not returned from pipeline. Skipping save.")
+    # Overwrite the file with the new version containing the visualization metadata
+    final_adata.write_h5ad(output_filepath)
+    print(f"\n💾 Final result with metadata saved to: {output_filepath}")
 
     print("\n🏁 Pipeline finished.") 
