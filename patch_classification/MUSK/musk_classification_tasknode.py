@@ -24,6 +24,7 @@ import xgboost as xgb
 import io
 import base64
 import tiffslide
+from datetime import datetime
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -527,6 +528,7 @@ def run_classification(args) -> Dict[str, Any]:
             if use_supervised and annotations_data is not None and 'train_time' in locals() and 'test_time' in locals():
                 metadata_dict["training_time"] = train_time
                 metadata_dict["testing_time"] = test_time
+            metadata_dict['created'] = datetime.now().isoformat()
             grp_cls.create_dataset('metadata', data=json.dumps(metadata_dict).encode("utf-8"))
             
             # Restore previously saved datasets under the new NODE_NAME group
