@@ -23,6 +23,7 @@ from sse_starlette.sse import EventSourceResponse
 import xgboost as xgb
 import io
 import base64
+from datetime import datetime
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -513,6 +514,7 @@ def run_classification(args) -> Dict[str, Any]:
             if use_supervised and annotations_data is not None and 'train_time' in locals() and 'test_time' in locals(): 
                 metadata["training_time"] = train_time
                 metadata["testing_time"] = test_time
+            metadata['created'] = datetime.now().isoformat()
             grp_cls.create_dataset('metadata', data=json.dumps(metadata).encode("utf-8"))
 
             hf.flush()
