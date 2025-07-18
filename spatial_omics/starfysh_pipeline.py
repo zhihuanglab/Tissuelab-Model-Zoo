@@ -36,7 +36,7 @@ deepspot_image = (
         "squidpy==1.2.2",
         "matplotlib==3.8.2",
         "torchvision==0.15.1",
-        "scikit-learn==1.2.2",
+        "scikit-learn==1.5.1", # FIX: Upgrade to match the trained model's version
         "numba>=0.57.0",
         "llvmlite>=0.40.0",
         "dask-image==2022.9.0",
@@ -177,15 +177,13 @@ def _download_deepspot_models():
 )
 def run_deepspot_custom(
     image_bytes: bytes,
-    tissue_positions_bytes: bytes,
     image_hash: str,
-    tissue_hires_scalef: float,
     use_cache: bool = False,
 ):
     """
     Runs DeepSpot to predict spatial gene expression from a tissue image.
-    This version is modified to use precise spot locations from a tissue_positions_list.csv
-    and specific parameters for spot diameter and white cutoff.
+    This version is modified to generate its own spot grid based on image
+    properties, removing the need for a pre-computed tissue_positions_list.csv file.
     """
     import anndata as ad
     import tempfile
@@ -225,10 +223,13 @@ def run_deepspot_custom(
     from deepspot.utils.utils_image import (
         get_morphology_model_and_preprocess,
         predict_spot_spatial_transcriptomics_from_image_path,
+        crop_tile, # Import the tile cropping utility
     )
 
-    # --- Mentor's Custom Parameters ---
+    # --- Mentor's Custom Parameters for Spot Generation ---
     SPOT_DIAMETER = 15
+    SPOT_DISTANCE = 15
+    WHITE_CUTOFF = 210
 
     # Define paths to the model files within the container
     DEEPSPOT_MODEL_DIR = MODEL_DIR / "deepspot"
@@ -267,85 +268,54 @@ def run_deepspot_custom(
     morphology_model.to(device)
     morphology_model.eval()
 
-    # --- 2. Load Image and Generate Spot Grid from tissue_positions_list.csv ---
-    print("Loading image and generating spot grid from tissue_positions_list.csv...")
+    # --- 2. Load Image and Generate Spot Grid ---
+    print("Loading image and generating spot grid...")
     temp_image_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     try:
         temp_image_file.write(image_bytes)
         temp_image_file.close()
         temp_image_path = Path(temp_image_file.name)
         image = pyvips.Image.new_from_file(str(temp_image_path))
-
-        # Load tissue positions from bytes, specifying column names as there's no header.
-        col_names = [
-            "barcode",
-            "in_tissue",
-            "array_row",
-            "array_col",
-            "pxl_row_in_fullres",
-            "pxl_col_in_fullres",
-        ]
-        tissue_pos_df = pd.read_csv(
-            io.BytesIO(tissue_positions_bytes), header=None, names=col_names
-        )
-
-        # Filter for in-tissue spots
-        in_tissue_df = tissue_pos_df[tissue_pos_df["in_tissue"] == 1].copy()
-
-        # --- NEW: Filter out spots too close to the image border ---
-        # The 'bad extract area' error persists because some spots, while in
-        # tissue, are too close to the edge of the image for a full-sized
-        # tile to be cropped. We get the image dimensions and filter these out.
-        image_width = image.width
-        image_height = image.height
-        spot_radius = SPOT_DIAMETER // 2
-
-        # --- Apply the scaling factor to align coordinates ---
-        in_tissue_df['pxl_row_in_hires'] = in_tissue_df['pxl_row_in_fullres'] * tissue_hires_scalef
-        in_tissue_df['pxl_col_in_hires'] = in_tissue_df['pxl_col_in_fullres'] * tissue_hires_scalef
-
-        original_spot_count = len(in_tissue_df)
-        # Filter using the newly scaled coordinates
-        in_tissue_df = in_tissue_df[
-            (in_tissue_df['pxl_col_in_hires'] >= spot_radius) &
-            (in_tissue_df['pxl_col_in_hires'] < image_width - spot_radius) &
-            (in_tissue_df['pxl_row_in_hires'] >= spot_radius) &
-            (in_tissue_df['pxl_row_in_hires'] < image_height - spot_radius)
-        ].copy()
         
-        filtered_spot_count = len(in_tissue_df)
-        print(f"Filtered out {original_spot_count - filtered_spot_count} spots near the image border.")
+        # --- FIX: Re-implement the spot generation and filtering logic ---
+        # This logic is based on the official DeepSpot example notebook.
+        
+        # 1. Generate a grid of coordinates
+        coord = []
+        for i, x in enumerate(range(SPOT_DIAMETER + 1, image.height - SPOT_DIAMETER - 1, SPOT_DISTANCE)):
+            for j, y in enumerate(range(SPOT_DIAMETER + 1, image.width - SPOT_DIAMETER - 1, SPOT_DISTANCE)):
+                coord.append([i, j, x, y])
+        coord_df = pd.DataFrame(coord, columns=['x_array', 'y_array', 'x_pixel', 'y_pixel'])
+        coord_df.index = coord_df.index.astype(str)
+        print(f"Generated a raw grid of {len(coord_df)} spots.")
 
-        # Create coord_df in the format DeepSpot expects, using the scaled coordinates.
-        coord_df = pd.DataFrame(
-            {
-                "x_array": in_tissue_df["array_row"],
-                "y_array": in_tissue_df["array_col"],
-                "x_pixel": in_tissue_df["pxl_col_in_hires"],
-                "y_pixel": in_tissue_df["pxl_row_in_hires"],
-            }
-        )
-        # The index must be a string for anndata
-        coord_df.index = in_tissue_df["barcode"].astype(str)
+        # 2. Filter out spots on white background
+        is_white = []
+        for _, row in coord_df.iterrows():
+            x = row.x_pixel - int(SPOT_DIAMETER // 2)
+            y = row.y_pixel - int(SPOT_DIAMETER // 2)
+            main_tile = crop_tile(image, x, y, SPOT_DIAMETER)
+            main_tile = main_tile[:,:,:3] # Ensure 3 channels (RGB)
+            white = np.mean(main_tile)
+            is_white.append(white)
+        
+        coord_df['is_white'] = is_white
+        # Keep spots that are NOT white
+        coord_df = coord_df[coord_df['is_white'] <= WHITE_CUTOFF].copy()
+        print(f"Filtered to {len(coord_df)} spots on tissue.")
+
 
         # --- DEBUGGING: Save coordinate files for visualization ---
         debug_dir = MODEL_DIR / "debug"
         debug_dir.mkdir(exist_ok=True)
         
         # Save the final coordinates that are being used
-        final_coords_path = debug_dir / f"coords_final_{image_hash}.csv"
+        final_coords_path = debug_dir / f"coords_generated_{image_hash}.csv"
         coord_df.to_csv(final_coords_path)
-        print(f"🐛 Saved final coordinates to {final_coords_path}")
-        
-        # Save the original coordinates for comparison
-        original_coords_path = debug_dir / f"coords_original_{image_hash}.csv"
-        tissue_pos_df.to_csv(original_coords_path)
-        print(f"🐛 Saved original coordinates to {original_coords_path}")
-
+        print(f"🐛 Saved generated coordinates to {final_coords_path}")
         volume.commit()
-        # --- End Debugging ---
 
-        # --- 3. Create initial AnnData object (background filtering is already done) ---
+        # --- 3. Create initial AnnData object ---
         print(f"Creating AnnData object for {len(coord_df)} in-tissue spots...")
         adata_tissue = ad.AnnData(
             np.zeros((len(coord_df), len(genes_to_predict))),
@@ -357,13 +327,9 @@ def run_deepspot_custom(
 
         # --- FIX: Add the SPATIAL coordinates to .obsm for scanpy ---
         # Scanpy's visualization tools expect the *full-resolution* coordinates.
-        # It uses the scalefactor from `uns` to place them on the hires image.
-        # We must store the original, unscaled coordinates here, while keeping the
-        # scaled coordinates in `adata.obs` for DeepSpot's use.
-        fullres_coords = in_tissue_df[
-            ['pxl_col_in_fullres', 'pxl_row_in_fullres']
-        ].values
-        adata_tissue.obsm['spatial'] = fullres_coords
+        # In this new method, the generated `x_pixel` and `y_pixel` ARE the
+        # full-resolution coordinates relative to the provided image patch.
+        adata_tissue.obsm['spatial'] = adata_tissue.obs[['x_pixel', 'y_pixel']].values
 
 
         # --- 4. Run Prediction ---
@@ -679,46 +645,60 @@ def _run_llm_for_cluster_profile(cluster_id: str, avg_proportion: dict, cancer_t
     secrets=[modal.Secret.from_name("openai-secret")],
     timeout=1800,
 )
-def run_llm_phenotype_inference(adata, cancer_type: str = "TNBC", n_clusters: int = 8):
+def run_llm_phenotype_inference(adata, cancer_type: str = "TNBC", n_clusters: int = 16):
     """
-    Clusters spots by cell-type proportion, then uses an LLM to infer phenotype
-    association for each *cluster*, which is much more efficient.
+    Performs niche-based analysis. For each spot, it calculates the average
+    cell-type proportion in its neighborhood (niche), then clusters these
+    niche profiles to identify archetypal microenvironments. Finally, it uses
+    an LLM to infer phenotype association for each niche cluster.
     """
     import pandas as pd
     import scanpy as sc
     import anndata as ad
 
-    # --- 1. Extract cell-type proportions and cluster ---
+    # --- 1. Compute neighborhood graph ---
+    # This is the basis for defining the "niche" for each spot.
+    print("Computing neighborhood graph for niche analysis...")
+    sc.pp.neighbors(adata, use_rep='spatial', n_neighbors=6)
+
+    # --- 2. Calculate niche composition for each spot ---
+    print("Calculating niche composition for each spot...")
     cell_type_cols = adata.uns['cell_types']
-    proportion_data = adata.obs[cell_type_cols]
+    niche_profiles = []
+    # .obsp['connectivities'] is a sparse matrix where non-zero entries mark neighbors.
+    for i in range(adata.n_obs):
+        # Get indices of the neighbors for spot i, plus the spot itself.
+        neighbor_indices = adata.obsp['connectivities'][i].indices
+        niche_indices = [i] + list(neighbor_indices)
+        
+        # Calculate the mean proportion of cell types in this niche.
+        niche_profile = adata.obs.iloc[niche_indices][cell_type_cols].mean()
+        niche_profiles.append(niche_profile)
+    
+    niche_df = pd.DataFrame(niche_profiles, index=adata.obs.index)
 
-    # Use a temporary AnnData object just for clustering
-    adata_for_clustering = ad.AnnData(proportion_data)
-
-    print("Clustering spots based on cell-type proportions...")
-    # These parameters can be tuned. Using Seurat's flavor is robust.
+    # --- 3. Cluster the niche profiles ---
+    # We now cluster these niche profiles to find common microenvironments.
+    adata_for_clustering = ad.AnnData(niche_df)
+    print("Clustering niche profiles...")
     sc.pp.neighbors(adata_for_clustering, n_neighbors=15, use_rep='X')
-    sc.tl.leiden(adata_for_clustering, resolution=0.5, key_added='leiden_clusters')
-
-    # If clustering gives too many/few clusters, re-run with different resolution.
-    # This is a simple heuristic to aim for roughly `n_clusters`.
-    actual_n_clusters = len(adata_for_clustering.obs['leiden_clusters'].unique())
-    if not (0.5 * n_clusters < actual_n_clusters < 1.5 * n_clusters):
-        print(f"Initial clustering gave {actual_n_clusters} clusters. Re-running with adjusted resolution...")
-        sc.tl.leiden(adata_for_clustering, key_added='leiden_clusters', resolution=0.8, n_iterations=2)
+    sc.tl.leiden(adata_for_clustering, resolution=0.5, key_added='niche_leiden_clusters')
 
     # Store cluster labels back in the main AnnData object
-    adata.obs['leiden_clusters'] = adata_for_clustering.obs['leiden_clusters'].astype(str).values
+    adata.obs['niche_leiden_clusters'] = adata_for_clustering.obs['niche_leiden_clusters'].astype(str).values
 
-    # --- 2. Get representative profiles and query LLM for each cluster IN PARALLEL ---
-    unique_clusters = adata.obs['leiden_clusters'].unique()
-    print(f"Found {len(unique_clusters)} clusters. Querying LLM for each representative profile...")
+    # --- 4. Get representative profiles and query LLM for each niche cluster ---
+    unique_clusters = adata.obs['niche_leiden_clusters'].unique()
+    print(f"Found {len(unique_clusters)} niche clusters. Querying LLM for each representative profile...")
 
-    # Prepare arguments for the .map() call. We need one iterable for each argument.
+    # Prepare arguments for the .map() call.
     cluster_ids_arg = unique_clusters.tolist()
     avg_proportion_arg = []
     for cluster_id in cluster_ids_arg:
-        cluster_mask = adata.obs['leiden_clusters'] == cluster_id
+        cluster_mask = adata.obs['niche_leiden_clusters'] == cluster_id
+        # --- FIX: Calculate the average from the original spot proportions ---
+        # The representative profile should be the average of the original cell-type
+        # proportions for all spots belonging to that niche cluster.
         avg_proportion = adata.obs.loc[cluster_mask, cell_type_cols].mean()
         avg_proportion_arg.append(avg_proportion.to_dict())
 
@@ -727,15 +707,15 @@ def run_llm_phenotype_inference(adata, cancer_type: str = "TNBC", n_clusters: in
         cluster_ids_arg, avg_proportion_arg, kwargs=dict(cancer_type=cancer_type)
     ))
 
-    # --- 3. Resolve futures and map results back to all spots ---
+    # --- 5. Map results back to all spots ---
     print("Storing LLM inference results in AnnData object...")
     # Create a mapping from cluster ID to the results
     association_map = {res['cluster_id']: res['tnbc_niche_association'] for res in all_results}
     interpretation_map = {res['cluster_id']: res['tnbc_niche_interpretation'] for res in all_results}
 
-    # Map the results from the cluster to each spot using the cluster labels
-    adata.obs['tnbc_niche_association'] = adata.obs['leiden_clusters'].map(association_map)
-    adata.obs['tnbc_niche_interpretation'] = adata.obs['leiden_clusters'].map(interpretation_map)
+    # Map the results from the cluster to each spot using the new niche cluster labels
+    adata.obs['tnbc_niche_association'] = adata.obs['niche_leiden_clusters'].map(association_map)
+    adata.obs['tnbc_niche_interpretation'] = adata.obs['niche_leiden_clusters'].map(interpretation_map)
 
     print("LLM phenotype inference complete.")
     return adata
@@ -748,10 +728,8 @@ def run_llm_phenotype_inference(adata, cancer_type: str = "TNBC", n_clusters: in
 )
 def analyze_tissue_pipeline(
     image_bytes: bytes,
-    tissue_positions_bytes: bytes,
     gene_sig_bytes: bytes,
     image_hash: str,
-    tissue_hires_scalef: float,
     use_cache: bool = True,
 ):
     """
@@ -763,9 +741,7 @@ def analyze_tissue_pipeline(
     print("Step 1: Calling DeepSpot to predict gene expression...")
     predicted_adata = run_deepspot_custom.remote(
         image_bytes=image_bytes,
-        tissue_positions_bytes=tissue_positions_bytes,
         image_hash=image_hash,
-        tissue_hires_scalef=tissue_hires_scalef,
         use_cache=use_cache,
     )
     print("DeepSpot analysis complete.")
@@ -855,19 +831,11 @@ def main(
         Path(__file__).resolve().parent
         / "starfysh/data/spatial 6/CID44971_spatial/tissue_hires_image.png"
     ),
-    tissue_positions_path: str = str(
-        Path(__file__).resolve().parent
-        / "starfysh/data/spatial 6/CID44971_spatial/tissue_positions_list.csv"
-    ),
     gene_signature_path: str = str(
         Path(__file__).resolve().parent
         / "starfysh/data/bc_signatures_version_1013.csv"
     ),
-    scalefactors_path: str = str(
-        Path(__file__).resolve().parent
-        / "starfysh/data/spatial 6/CID44971_spatial/scalefactors_json.json"
-    ),
-    output_dir: str = "Tissuelab-Model-Zoo/spatial_omics/data_outputs",
+    output_dir: str = "data_outputs",
     use_cache: bool = True,
 ):
     """
@@ -884,20 +852,14 @@ def main(
 
     # --- 1. Load local data into memory ---
     image_path_obj = Path(image_path)
-    tissue_positions_path_obj = Path(tissue_positions_path)
     gene_signature_path_obj = Path(gene_signature_path)
-    scalefactors_path_obj = Path(scalefactors_path)
 
     print(f"🔬 Using image: {image_path_obj}")
-    print(f"📍 Using tissue positions: {tissue_positions_path_obj}")
     print(f"🧬 Using gene signatures: {gene_signature_path_obj}")
-    print(f"⚖️ Using scale factors: {scalefactors_path_obj}")
 
     for p in [
         image_path_obj,
-        tissue_positions_path_obj,
         gene_signature_path_obj,
-        scalefactors_path_obj,
     ]:
         if not p.exists():
             print(f"❌ Error: Input file not found at '{p}'.")
@@ -905,13 +867,8 @@ def main(
 
     with open(image_path_obj, "rb") as f:
         image_bytes = f.read()
-    with open(tissue_positions_path_obj, "rb") as f:
-        tissue_positions_bytes = f.read()
     with open(gene_signature_path_obj, "rb") as f:
         gene_sig_bytes = f.read()
-    with open(scalefactors_path_obj, "rb") as f:
-        scalefactors = json.load(f)
-        tissue_hires_scalef = scalefactors['tissue_hires_scalef']
         
     # Generate a hash of the image to use as a unique ID for caching.
     image_hash = hashlib.sha256(image_bytes).hexdigest()
@@ -923,10 +880,8 @@ def main(
         print("Running remote pipeline (this may take several minutes)...")
         remote_adata_path = analyze_tissue_pipeline.remote(
             image_bytes=image_bytes,
-            tissue_positions_bytes=tissue_positions_bytes,
             gene_sig_bytes=gene_sig_bytes,
             image_hash=image_hash,
-            tissue_hires_scalef=tissue_hires_scalef,
             use_cache=use_cache,
         )
 
@@ -942,7 +897,7 @@ def main(
 
         output_path = Path(output_dir)
         output_path.mkdir(exist_ok=True)
-        output_filename = f"{image_path_obj.stem}_analysis_result.h5ad"
+        output_filename = f"{image_path_obj.stem}_{image_hash[:8]}_analysis_result.h5ad"
         output_filepath = output_path / output_filename
 
         with open(output_filepath, "wb") as local_f:
