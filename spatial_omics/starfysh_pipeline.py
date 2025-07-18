@@ -355,9 +355,16 @@ def run_deepspot_custom(
         adata_tissue.obs["barcode"] = adata_tissue.obs.index
         adata_tissue.obs["sampleID"] = "sample1"
 
-        # --- FIX: Add the spatial coordinates to .obsm for scanpy ---
-        # The sc.pp.neighbors function with use_rep='spatial' requires this key.
-        adata_tissue.obsm['spatial'] = adata_tissue.obs[['x_pixel', 'y_pixel']].values
+        # --- FIX: Add the SPATIAL coordinates to .obsm for scanpy ---
+        # Scanpy's visualization tools expect the *full-resolution* coordinates.
+        # It uses the scalefactor from `uns` to place them on the hires image.
+        # We must store the original, unscaled coordinates here, while keeping the
+        # scaled coordinates in `adata.obs` for DeepSpot's use.
+        fullres_coords = in_tissue_df[
+            ['pxl_col_in_fullres', 'pxl_row_in_fullres']
+        ].values
+        adata_tissue.obsm['spatial'] = fullres_coords
+
 
         # --- 4. Run Prediction ---
         print(f"Predicting expression for {len(adata_tissue)} spots...")
@@ -860,7 +867,7 @@ def main(
         Path(__file__).resolve().parent
         / "starfysh/data/spatial 6/CID44971_spatial/scalefactors_json.json"
     ),
-    output_dir: str = "data_outputs",
+    output_dir: str = "Tissuelab-Model-Zoo/spatial_omics/data_outputs",
     use_cache: bool = True,
 ):
     """
