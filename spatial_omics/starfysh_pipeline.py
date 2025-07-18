@@ -188,20 +188,30 @@ def run_archetypal_analysis(adata):
     # --- 1. Normalize Data ---
     # AA requires a normalized AnnData object.
     adata_norm = adata.copy()
+
+    # --- FIX: Replicate the robust data cleaning from the Starfysh function ---
+    # 1. Clip negative predictions and replace NaNs, which can corrupt log-transformation.
+    adata_norm.X[np.isnan(adata_norm.X)] = 0
+    adata_norm.X[adata_norm.X < 0] = 0
+
+    # 2. Filter out empty spots (cells) and unexpressed genes.
+    sc.pp.filter_cells(adata_norm, min_counts=1)
+    sc.pp.filter_genes(adata_norm, min_cells=1)
+
+    # 3. Now, normalization can proceed safely.
     sc.pp.normalize_total(adata_norm, target_sum=1e4)
     sc.pp.log1p(adata_norm)
-    sc.pp.highly_variable_genes(adata_norm, n_top_genes=4000, flavor='seurat_v3', subset=True)
+    
+    # The 'seurat' flavor is more robust to unusual variance distributions.
+    sc.pp.highly_variable_genes(adata_norm, n_top_genes=4000, flavor='seurat', subset=True)
 
     # --- 2. Instantiate and Fit AA Model ---
     print("Instantiating and fitting AA model...")
-    aa_model = AA.model(adata_norm)
+    aa_model = AA.ArchetypalAnalysis(adata_orig=adata_norm)
     
-    # Automatically find the optimal number of archetypes (cell types)
-    k_suggestion = aa_model.find_k()
-    print(f"AA suggests k={k_suggestion} archetypes.")
-
-    # Fit the model with the suggested k
-    aa_model.fit(n_archetypes=k_suggestion)
+    # This is the explicit computation/fitting step we were missing.
+    print("Computing archetypes...")
+    aa_model.compute_archetypes()
 
     # --- 3. Generate Signature Matrix ---
     print("Generating signature gene matrix from archetypes...")
@@ -212,43 +222,25 @@ def run_archetypal_analysis(adata):
     return gene_sig_df
 
 
+# --- NEW: Parallelized DeepSpot Worker ---
 @app.function(
     image=deepspot_image,
     gpu="A10G",
-    timeout=1200,
     volumes={MODEL_DIR: volume},
-    secrets=[modal.Secret.from_name("huggingface-secret")],
+    timeout=1200,  # Generous timeout for a single batch
+    # Keep one container warm to reduce startup latency for batch jobs.
+    min_containers=1,
+    # Set the maximum number of concurrent workers.
+    max_containers=5,
 )
-def run_deepspot_custom(
-    image_bytes: bytes,
-    image_hash: str,
-    use_cache: bool = False,
-):
+def _run_deepspot_batch(coord_batch_df: pd.DataFrame, image_bytes: bytes):
     """
-    Runs DeepSpot to predict spatial gene expression from a tissue image.
-    This version is modified to generate its own spot grid based on image
-    properties, removing the need for a pre-computed tissue_positions_list.csv file.
+    Worker function to predict gene expression for a small batch of spots.
+    This is called in parallel by run_deepspot_custom.
     """
-    import anndata as ad
-    import tempfile
-    import io
-
-    adata_cache_dir = MODEL_DIR / "adata_cache"
-    adata_cache_path = adata_cache_dir / f"adata_deepspot_{image_hash}.h5ad"
-
-    if use_cache:
-        print("Attempting to use cached AnnData...")
-        volume.reload()
-        if adata_cache_path.exists():
-            print(f"✅ Cache hit! Loading AnnData from {adata_cache_path}.")
-            return ad.read_h5ad(adata_cache_path)
-        else:
-            print("⚠️ Cache miss. No cached data found. Running DeepSpot...")
-
-    _download_deepspot_models()
-
     import os
     import sys
+    import tempfile
 
     # Set the PYTHONPATH at runtime to include the DeepSpot source code.
     os.environ["PYTHONPATH"] = (
@@ -259,21 +251,13 @@ def run_deepspot_custom(
     import anndata as ad
     import numpy as np
     import pandas as pd
-    import pyvips
     import torch
     import yaml
     from deepspot.spot import dataloader, loss, model
-    from deepspot.spot.model import DeepSpot
     from deepspot.utils.utils_image import (
         get_morphology_model_and_preprocess,
         predict_spot_spatial_transcriptomics_from_image_path,
-        crop_tile, # Import the tile cropping utility
     )
-
-    # --- Custom Parameters for Spot Generation ---
-    SPOT_DIAMETER = 100
-    SPOT_DISTANCE = 100
-    WHITE_CUTOFF = 210
 
     # Define paths to the model files within the container
     DEEPSPOT_MODEL_DIR = MODEL_DIR / "deepspot"
@@ -283,15 +267,11 @@ def run_deepspot_custom(
     GENE_LIST_PATH = DEEPSPOT_MODEL_DIR / "genes.csv"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Running DeepSpot on device: {device}")
 
     # --- 1. Load Configs and Models ---
-    print("Loading models and configuration...")
     with open(CONFIG_PATH, "r") as stream:
         config = yaml.safe_load(stream)
-
-    # Override config with mentor's params
-    config["spot_diameter"] = SPOT_DIAMETER
+    config["spot_diameter"] = 15  # Hardcoded to match training
 
     genes_df = pd.read_csv(GENE_LIST_PATH)
     genes_to_predict = genes_df[genes_df.isPredicted.values]
@@ -312,95 +292,27 @@ def run_deepspot_custom(
     morphology_model.to(device)
     morphology_model.eval()
 
-    # --- 2. Load Image and Generate Spot Grid ---
-    print("Loading image and generating spot grid...")
+    # --- 2. Create AnnData for the batch ---
+    adata_batch = ad.AnnData(
+        np.zeros((len(coord_batch_df), len(genes_to_predict))),
+        obs=coord_batch_df,
+        var=genes_to_predict.set_index("gene_name"),
+    )
+    adata_batch.obs["barcode"] = adata_batch.obs.index
+    adata_batch.obs["sampleID"] = "sample1"
+    adata_batch.obsm['spatial'] = adata_batch.obs[['x_pixel', 'y_pixel']].values
+
+    # --- 3. Run Prediction on the Batch ---
+    # The prediction function requires a file path, so we write the in-memory bytes to a temporary file.
     temp_image_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     try:
         temp_image_file.write(image_bytes)
         temp_image_file.close()
         temp_image_path = Path(temp_image_file.name)
-        image = pyvips.Image.new_from_file(str(temp_image_path))
-        
-        # --- FIX: Re-implement the spot generation and filtering logic ---
-        # This logic is based on the official DeepSpot example notebook.
-        
-        # 1. Generate a grid of coordinates
-        coord = []
-        for i, x in enumerate(range(SPOT_DIAMETER + 1, image.height - SPOT_DIAMETER - 1, SPOT_DISTANCE)):
-            for j, y in enumerate(range(SPOT_DIAMETER + 1, image.width - SPOT_DIAMETER - 1, SPOT_DISTANCE)):
-                coord.append([i, j, x, y])
-        coord_df = pd.DataFrame(coord, columns=['x_array', 'y_array', 'x_pixel', 'y_pixel'])
-        coord_df.index = coord_df.index.astype(str)
-        print(f"Generated a raw grid of {len(coord_df)} spots.")
 
-        # 2. Filter out spots on white background (EFFICIENTLY)
-        print("Filtering spots on tissue via convolution (this is much faster)...")
-        # First, convert to a single band (greyscale) to calculate mean intensity.
-        # We also drop the alpha channel if it exists.
-        if image.hasalpha():
-            image = image.flatten()
-        image_grey = image.colourspace('b-w')
-
-        # Create a convolution kernel (a mean filter) of the same size as a spot.
-        mean_kernel = pyvips.Image.new_from_array(
-            np.full((SPOT_DIAMETER, SPOT_DIAMETER), 1.0 / (SPOT_DIAMETER**2))
-        )
-        
-        # Convolve the image. The result is an image where each pixel's value 
-        # is the mean of its neighborhood. This is much faster than a Python loop.
-        mean_intensity_image = image_grey.conv(mean_kernel, precision='float')
-        
-        # Now, efficiently sample the intensity values from this new image 
-        # by converting to a numpy array and using vectorized indexing.
-        print("Converting convolved image to numpy array for fast sampling...")
-        mean_intensity_array = mean_intensity_image.numpy()
-
-        # Get coordinates as integer numpy arrays.
-        y_coords = coord_df['y_pixel'].values.astype(int)
-        x_coords = coord_df['x_pixel'].values.astype(int)
-
-        # In numpy, indexing is [row, col], so we use [x_coords, y_coords].
-        print(f"Sampling intensities for {len(coord_df)} spots...")
-        is_white = mean_intensity_array[x_coords, y_coords]
-        
-        coord_df['is_white'] = is_white
-        # Keep spots that are NOT white
-        coord_df = coord_df[coord_df['is_white'] <= WHITE_CUTOFF].copy()
-        print(f"Filtered to {len(coord_df)} spots on tissue.")
-
-
-        # --- DEBUGGING: Save coordinate files for visualization ---
-        debug_dir = MODEL_DIR / "debug"
-        debug_dir.mkdir(exist_ok=True)
-        
-        # Save the final coordinates that are being used
-        final_coords_path = debug_dir / f"coords_generated_{image_hash}.csv"
-        coord_df.to_csv(final_coords_path)
-        print(f"🐛 Saved generated coordinates to {final_coords_path}")
-        volume.commit()
-
-        # --- 3. Create initial AnnData object ---
-        print(f"Creating AnnData object for {len(coord_df)} in-tissue spots...")
-        adata_tissue = ad.AnnData(
-            np.zeros((len(coord_df), len(genes_to_predict))),
-            obs=coord_df,
-            var=genes_to_predict.set_index("gene_name"),
-        )
-        adata_tissue.obs["barcode"] = adata_tissue.obs.index
-        adata_tissue.obs["sampleID"] = "sample1"
-
-        # --- FIX: Add the SPATIAL coordinates to .obsm for scanpy ---
-        # Scanpy's visualization tools expect the *full-resolution* coordinates.
-        # In this new method, the generated `x_pixel` and `y_pixel` ARE the
-        # full-resolution coordinates relative to the provided image patch.
-        adata_tissue.obsm['spatial'] = adata_tissue.obs[['x_pixel', 'y_pixel']].values
-
-
-        # --- 4. Run Prediction ---
-        print(f"Predicting expression for {len(adata_tissue)} spots...")
         predicted_counts = predict_spot_spatial_transcriptomics_from_image_path(
             str(temp_image_path),
-            adata_tissue,
+            adata_batch,
             config["spot_diameter"],
             config["n_mini_tiles"],
             preprocess,
@@ -408,13 +320,175 @@ def run_deepspot_custom(
             model_expression,
             device,
         )
-        adata_tissue.X = predicted_counts
-        print("Prediction complete.")
+    finally:
+        os.unlink(temp_image_path)
+
+    # --- 4. Return just the numpy array of predicted counts ---
+    # This is more efficient than returning a full AnnData object.
+    return predicted_counts
+
+
+@app.function(
+    image=deepspot_image,
+    gpu="A10G",
+    timeout=3600,  # Increased timeout for orchestrating many jobs
+    volumes={MODEL_DIR: volume},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    # Ensure only one coordinator runs at a time for a given image to prevent duplicate work.
+    max_containers=1,
+)
+def run_deepspot_custom(
+    image_bytes: bytes,
+    image_hash: str,
+    use_cache: bool = False,
+):
+    """
+    Runs DeepSpot to predict spatial gene expression from a tissue image.
+    This is the COORDINATOR function. It generates a spot grid, filters it,
+    splits it into batches, and uses .starmap() to process them in parallel
+    on many workers. It then assembles the final result.
+    """
+    import anndata as ad
+    import tempfile
+    import io
+    import math
+
+    adata_cache_dir = MODEL_DIR / "adata_cache"
+    adata_cache_path = adata_cache_dir / f"adata_deepspot_{image_hash}.h5ad"
+
+    if use_cache:
+        print("Attempting to use cached AnnData...")
+        volume.reload()
+        if adata_cache_path.exists():
+            print(f"✅ Cache hit! Loading AnnData from {adata_cache_path}.")
+            return ad.read_h5ad(adata_cache_path)
+        else:
+            print("⚠️ Cache miss. No cached data found. Running DeepSpot...")
+
+    _download_deepspot_models()
+
+    import os
+    import sys
+
+    # Set the PYTHONPATH at runtime
+    os.environ["PYTHONPATH"] = (
+        f"{os.environ.get('PYTHONPATH', '')}:{REMOTE_DEEPSPOT_DIR}"
+    )
+    sys.path.insert(0, str(REMOTE_DEEPSPOT_DIR))
+
+    import anndata as ad
+    import numpy as np
+    import pandas as pd
+    import pyvips
+
+    # --- Parameters for Parallelization & Spot Generation ---
+    SPOT_DIAMETER = 15
+    SPOT_DISTANCE = 100  # INCREASED as per user request to reduce spot density
+    WHITE_CUTOFF = 210
+    BATCH_SIZE = 10000  # Number of spots to process per worker
+    MAX_WORKERS = 5  # As requested for initial testing
+
+    # Define paths
+    DEEPSPOT_MODEL_DIR = MODEL_DIR / "deepspot"
+    GENE_LIST_PATH = DEEPSPOT_MODEL_DIR / "genes.csv"
+    genes_df = pd.read_csv(GENE_LIST_PATH)
+    genes_to_predict = genes_df[genes_df.isPredicted.values]
+
+    print(f"Running DeepSpot with SPOT_DISTANCE={SPOT_DISTANCE}")
+
+    # --- 1. Load Image and Generate Spot Grid (No models needed in coordinator) ---
+    print("Loading image and generating full spot grid...")
+    temp_image_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    try:
+        temp_image_file.write(image_bytes)
+        temp_image_file.close()
+        temp_image_path = Path(temp_image_file.name)
+        image = pyvips.Image.new_from_file(str(temp_image_path))
+
+        # 1. Generate a grid of coordinates
+        coord = []
+        for i, x in enumerate(
+            range(
+                SPOT_DIAMETER + 1, image.height - SPOT_DIAMETER - 1, SPOT_DISTANCE
+            )
+        ):
+            for j, y in enumerate(
+                range(
+                    SPOT_DIAMETER + 1, image.width - SPOT_DIAMETER - 1, SPOT_DISTANCE
+                )
+            ):
+                coord.append([i, j, x, y])
+        coord_df = pd.DataFrame(
+            coord, columns=['x_array', 'y_array', 'x_pixel', 'y_pixel']
+        )
+        coord_df.index = coord_df.index.astype(str)
+        print(f"Generated a raw grid of {len(coord_df)} spots.")
+
+        # 2. Filter out spots on white background
+        print("Filtering spots on tissue via convolution...")
+        if image.hasalpha():
+            image = image.flatten()
+        image_grey = image.colourspace('b-w')
+
+        mean_kernel = pyvips.Image.new_from_array(
+            np.full((SPOT_DIAMETER, SPOT_DIAMETER), 1.0 / (SPOT_DIAMETER**2))
+        )
+        mean_intensity_image = image_grey.conv(mean_kernel, precision='float')
+        mean_intensity_array = mean_intensity_image.numpy()
+
+        y_coords = coord_df['y_pixel'].values.astype(int)
+        x_coords = coord_df['x_pixel'].values.astype(int)
+
+        is_white = mean_intensity_array[x_coords, y_coords]
+
+        coord_df['is_white'] = is_white
+        # Keep spots that are NOT white, and reset the index for clean batching
+        coord_df = (
+            coord_df[coord_df['is_white'] <= WHITE_CUTOFF].copy().reset_index(drop=True)
+        )
+        coord_df.index = coord_df.index.astype(str)
+        print(f"Filtered to {len(coord_df)} spots on tissue.")
+
+        if len(coord_df) == 0:
+            raise ValueError("No tissue spots found after filtering. Halting pipeline.")
 
     finally:
         os.unlink(temp_image_path)
 
-    # --- 5. Cache Result ---
+    # --- 2. Batch coordinates and fan out to workers ---
+    print(f"Splitting {len(coord_df)} spots into batches of {BATCH_SIZE}...")
+    num_batches = math.ceil(len(coord_df) / BATCH_SIZE)
+    coord_batches = np.array_split(coord_df, num_batches)
+
+    print(
+        f"Launching {len(coord_batches)} parallel workers (max concurrency: {MAX_WORKERS})..."
+    )
+
+    all_predicted_counts = []
+    # Use .starmap to pass the same image_bytes to each worker along with its unique coordinate batch.
+    # Concurrency is controlled by the `max_containers` decorator on the `_run_deepspot_batch` function.
+    for batch_counts in _run_deepspot_batch.starmap(
+        [(batch, image_bytes) for batch in coord_batches]
+    ):
+        all_predicted_counts.append(batch_counts)
+
+    print("All worker jobs completed. Assembling final AnnData object...")
+
+    # --- 3. Assemble final AnnData object from results ---
+    # Concatenate the numpy arrays returned from all workers
+    final_predicted_counts = np.vstack(all_predicted_counts)
+
+    print(f"Creating final AnnData object for {len(coord_df)} in-tissue spots...")
+    adata_tissue = ad.AnnData(
+        final_predicted_counts,
+        obs=coord_df,
+        var=genes_to_predict.set_index("gene_name"),
+    )
+    adata_tissue.obs["barcode"] = adata_tissue.obs.index
+    adata_tissue.obs["sampleID"] = "sample1"
+    adata_tissue.obsm['spatial'] = adata_tissue.obs[['x_pixel', 'y_pixel']].values
+
+    # --- 4. Cache Final Result ---
     print(f"Caching new AnnData object to {adata_cache_path}...")
     adata_cache_dir.mkdir(parents=True, exist_ok=True)
 
