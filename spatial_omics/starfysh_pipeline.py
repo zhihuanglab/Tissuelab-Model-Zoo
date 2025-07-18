@@ -270,9 +270,9 @@ def run_deepspot_custom(
         crop_tile, # Import the tile cropping utility
     )
 
-    # --- Mentor's Custom Parameters for Spot Generation ---
-    SPOT_DIAMETER = 15
-    SPOT_DISTANCE = 15
+    # --- Custom Parameters for Spot Generation ---
+    SPOT_DIAMETER = 100
+    SPOT_DISTANCE = 100
     WHITE_CUTOFF = 210
 
     # Define paths to the model files within the container
@@ -333,15 +333,35 @@ def run_deepspot_custom(
         coord_df.index = coord_df.index.astype(str)
         print(f"Generated a raw grid of {len(coord_df)} spots.")
 
-        # 2. Filter out spots on white background
-        is_white = []
-        for _, row in coord_df.iterrows():
-            x = row.x_pixel - int(SPOT_DIAMETER // 2)
-            y = row.y_pixel - int(SPOT_DIAMETER // 2)
-            main_tile = crop_tile(image, x, y, SPOT_DIAMETER)
-            main_tile = main_tile[:,:,:3] # Ensure 3 channels (RGB)
-            white = np.mean(main_tile)
-            is_white.append(white)
+        # 2. Filter out spots on white background (EFFICIENTLY)
+        print("Filtering spots on tissue via convolution (this is much faster)...")
+        # First, convert to a single band (greyscale) to calculate mean intensity.
+        # We also drop the alpha channel if it exists.
+        if image.hasalpha():
+            image = image.flatten()
+        image_grey = image.colourspace('b-w')
+
+        # Create a convolution kernel (a mean filter) of the same size as a spot.
+        mean_kernel = pyvips.Image.new_from_array(
+            np.full((SPOT_DIAMETER, SPOT_DIAMETER), 1.0 / (SPOT_DIAMETER**2))
+        )
+        
+        # Convolve the image. The result is an image where each pixel's value 
+        # is the mean of its neighborhood. This is much faster than a Python loop.
+        mean_intensity_image = image_grey.conv(mean_kernel, precision='float')
+        
+        # Now, efficiently sample the intensity values from this new image 
+        # by converting to a numpy array and using vectorized indexing.
+        print("Converting convolved image to numpy array for fast sampling...")
+        mean_intensity_array = mean_intensity_image.numpy()
+
+        # Get coordinates as integer numpy arrays.
+        y_coords = coord_df['y_pixel'].values.astype(int)
+        x_coords = coord_df['x_pixel'].values.astype(int)
+
+        # In numpy, indexing is [row, col], so we use [x_coords, y_coords].
+        print(f"Sampling intensities for {len(coord_df)} spots...")
+        is_white = mean_intensity_array[x_coords, y_coords]
         
         coord_df['is_white'] = is_white
         # Keep spots that are NOT white
