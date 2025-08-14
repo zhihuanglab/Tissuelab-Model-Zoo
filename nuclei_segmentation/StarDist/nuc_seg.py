@@ -733,6 +733,8 @@ class SlideSegmentation():
         # Check file extension, for PNG/JPG/JPEG formats directly process the entire image
         file_extension = os.path.splitext(self.args.slidepath)[1].lower()
         simple_image_formats = ['.png', '.jpg', '.jpeg', '.bmp']
+        # Ensure roi is defined for later references (tiling path logging uses it)
+        roi = None
         
         if file_extension in simple_image_formats and self.dim[0] * self.dim[1] < 25000000:  # Limit image size, e.g. 5000x5000
             roi = self.roi_bbox_level0

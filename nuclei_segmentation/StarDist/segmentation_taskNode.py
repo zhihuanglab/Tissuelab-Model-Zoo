@@ -341,8 +341,17 @@ def read_node(data: Dict[str, Any]):
             slidepath="",
             read_image_method="tiffslide",
             stardist_pretrain="2D_versatile_he",
-            isIHC=False
+            isIHC=False,
+            # Initialize ROI/scaling-related fields to avoid stale carry-over
+            target_mpp=None,
+            bbox=None,
+            polygon_points=None,
         )
+    else:
+        # Reset ROI/scaling-related fields on every /read to prevent using values from a previous run
+        ARGS.target_mpp = None
+        ARGS.bbox = None
+        ARGS.polygon_points = None
 
     with h5py.File(H5_PATH, "r") as hf:
         user_data_path = f"{NODE_NAME}/userData"
