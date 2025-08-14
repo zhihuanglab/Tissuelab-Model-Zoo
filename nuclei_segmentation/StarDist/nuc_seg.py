@@ -22,7 +22,7 @@ from scipy.ndimage import zoom
 from skimage.feature import graycomatrix, graycoprops
 from skimage import draw
 import tensorflow as tf
-from wrappers import CziImageWrapper, SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
 import xml.etree.ElementTree as ET
 import czifile
 import tiffslide
@@ -101,6 +101,19 @@ class SlideSegmentation():
             print("No GPUs found. Running on CPU.")
             
         self.args = args
+        self.VIEWER_SCALE_FACTOR = 16
+        # Parse ROI from args (bbox is expected as "x,y,width,height" from frontend OSD coords)
+        self.roi_bbox_level0 = None
+        try:
+            bbox_str = getattr(self.args, 'bbox', None)
+            if isinstance(bbox_str, str) and len(bbox_str.split(',')) == 4:
+                bx, by, bw, bh = [float(v) for v in bbox_str.split(',')]
+                # Temporarily store; we'll validate/scale after slide is opened (need dimensions)
+                self._roi_bbox_osd = (bx, by, bw, bh)
+            else:
+                self._roi_bbox_osd = None
+        except Exception:
+            self._roi_bbox_osd = None
         self.reference_magnification = 20 # 20x for stardist
         self.tile_size = tile_size
         self.read_data()
@@ -198,11 +211,64 @@ class SlideSegmentation():
                 self.slide = TiffSlideWrapper(self.args.slidepath)
                 mpp = 0.25  # Default value
         
+        # Initialize ROI bbox in level-0 coordinates now that dimensions are known
+        try:
+            if not hasattr(self, 'dim') or self.dim is None:
+                # Attempt to infer dimensions
+                try:
+                    self.dim = self.slide.level_dimensions[self.level]
+                except Exception:
+                    self.dim = getattr(self.slide, 'dimensions', None)
+            if hasattr(self, '_roi_bbox_osd') and self._roi_bbox_osd is not None and self.dim is not None:
+                bx, by, bw, bh = self._roi_bbox_osd
+                # Heuristic: if OSD coords exceed image dims, divide by viewer scale factor
+                use_div = (bx + bw) > self.dim[0] or (by + bh) > self.dim[1]
+                rx = int(max(0, (bx / self.VIEWER_SCALE_FACTOR) if use_div else bx))
+                ry = int(max(0, (by / self.VIEWER_SCALE_FACTOR) if use_div else by))
+                rw = int(max(1, (bw / self.VIEWER_SCALE_FACTOR) if use_div else bw))
+                rh = int(max(1, (bh / self.VIEWER_SCALE_FACTOR) if use_div else bh))
+                rx2 = min(self.dim[0], rx + rw)
+                ry2 = min(self.dim[1], ry + rh)
+                if rx < rx2 and ry < ry2:
+                    self.roi_bbox_level0 = (rx, ry, rx2 - rx, ry2 - ry)
+                    print(f"[ROI DEBUG] Using ROI bbox level0: (x={rx}, y={ry}, w={rx2-rx}, h={ry2-ry})")
+        except Exception as e:
+            print(f"[ROI DEBUG] Failed to initialize ROI bbox: {e}")
+
         # Add magnification attribute to self.args if not already set by CZI processing
         if not hasattr(self.args, 'magnification') or self.args.magnification is None:
             reference_mpp_1x = 10  # Target magnification
             self.args.magnification = reference_mpp_1x / mpp
             print("Magnification: ", self.args.magnification)
+        else:
+            print(f"[SEG DEBUG] Using native magnification: {self.args.magnification}x")
+
+        # Compute processing resize factor from target_mpp (allow upsample with cap) now that native magnification is known
+        self.processing_resize_factor = None
+        try:
+            t_mpp_raw = getattr(self.args, 'target_mpp', None)
+            if t_mpp_raw is not None:
+                t_mpp = float(t_mpp_raw)
+                if t_mpp > 0:
+                    desired_mag = 10.0 / t_mpp
+                    native_mag = float(self.args.magnification) if self.args.magnification is not None else None
+                    if native_mag and native_mag > 0:
+                        factor = desired_mag / native_mag
+                        # Allow upsample but cap to avoid huge cost
+                        max_upscale = getattr(self.args, 'max_upscale', 4.0)
+                        if factor > 1.0:
+                            rf = min(factor, max_upscale)
+                            if rf < factor:
+                                print(f"[SEG DEBUG] Upscale requested {factor:.3f}x capped to {rf:.3f}x (max_upscale={max_upscale})")
+                        else:
+                            rf = max(1e-6, factor)  # downsample
+                        self.processing_resize_factor = rf
+                        direction = 'up' if rf > 1.0 else 'down'
+                        print(f"[SEG DEBUG] target_mpp={t_mpp} => desired_mag={desired_mag:.3f}x, native_mag={native_mag:.3f}x, processing_resize_factor={self.processing_resize_factor:.4f} ({direction}sample)")
+                    else:
+                        print(f"[SEG DEBUG] native magnification unavailable; skipping target_mpp resampling")
+        except Exception as e:
+            print(f"[SEG DEBUG] Failed to compute processing resize factor from target_mpp: {e}")
         
         # Set tile size based on magnification
         if self.args.magnification > 80+1:
@@ -570,25 +636,59 @@ class SlideSegmentation():
         simple_image_formats = ['.png', '.jpg', '.jpeg', '.bmp']
         
         if file_extension in simple_image_formats and self.dim[0] * self.dim[1] < 25000000:  # Limit image size, e.g. 5000x5000
-            print(f"Detected simple image format: {file_extension}, processing the entire image without tiling")
+            roi = self.roi_bbox_level0
+            if roi is not None:
+                rx, ry, rw, rh = roi
+                print(f"Detected simple image format: {file_extension}, processing ROI only: (x={rx}, y={ry}, w={rw}, h={rh})")
+            else:
+                print(f"Detected simple image format: {file_extension}, processing the entire image without tiling")
             
             if self.progress_callback:
                 self.progress_callback(10)  # Initial progress
                 
             try:
                 # Directly load the entire image
-                img = self.slide.read_region((0, 0), 0, self.dim)
+                if roi is not None:
+                    rx, ry, rw, rh = roi
+                    img = self.slide.read_region((rx, ry), 0, (rw, rh))
+                else:
+                    img = self.slide.read_region((0, 0), 0, self.dim)
                 img_np = np.array(img)[:,:,:3]  # Ensure RGB format
+
+                # If a target_mpp was provided, apply resampling (up to cap)
+                resize_factor = None
+                if getattr(self, 'processing_resize_factor', None) is not None:
+                    rf = float(self.processing_resize_factor)
+                    if abs(rf - 1.0) > 1e-6:
+                        try:
+                            new_w = int(np.round(img_np.shape[1] * rf))
+                            new_h = int(np.round(img_np.shape[0] * rf))
+                            verb = "Downsampling" if rf < 1.0 else "Upsampling"
+                            print(f"[SEG DEBUG] {verb} simple image by factor {rf:.4f} to ({new_w}, {new_h}) for target_mpp")
+                            img_np = np.array(Image.fromarray(img_np).resize((new_w, new_h)))
+                            resize_factor = rf
+                        except Exception as e:
+                            print(f"[SEG DEBUG] Failed to resample simple image: {e}")
                 
                 if self.progress_callback:
                     self.progress_callback(30)
                     
-                # Normalize image
+                # Normalize image (ensure template matches resized dimensions)
                 if self.normalize_template is not None:
-                    normalize_template2 = self.normalize_template[:img_np.shape[0],:img_np.shape[1],:]
-                    joint_normalize = np.concatenate((img_np, normalize_template2), axis=1)
-                    img_norm = normalize(joint_normalize)
-                    img_norm = img_norm[:img_np.shape[0],:img_np.shape[1],:]
+                    try:
+                        tmpl = self.normalize_template
+                        # If shapes mismatch, resize the template to match the current image size
+                        if tmpl.shape[0] != img_np.shape[0] or tmpl.shape[1] != img_np.shape[1]:
+                            print(f"[SEG DEBUG] Resizing normalization template from ({tmpl.shape[1]},{tmpl.shape[0]}) to ({img_np.shape[1]},{img_np.shape[0]})")
+                            tmpl_resized = np.array(Image.fromarray(tmpl).resize((img_np.shape[1], img_np.shape[0])))
+                        else:
+                            tmpl_resized = tmpl
+                        joint_normalize = np.concatenate((img_np, tmpl_resized), axis=1)
+                        img_norm = normalize(joint_normalize)
+                        img_norm = img_norm[:img_np.shape[0],:img_np.shape[1],:]
+                    except Exception as e:
+                        print(f"[SEG DEBUG] Normalization with template failed ({e}), falling back to direct normalize")
+                        img_norm = normalize(img_np)
                 else:
                     img_norm = normalize(img_np)
                 
@@ -621,6 +721,24 @@ class SlideSegmentation():
                 self.final_coord = coord.astype(np.int32)
                 # Ensure final_coord has dimensions (n, m, 2)
                 self.final_coord = np.swapaxes(self.final_coord, 1, 2)
+
+                # If image was resampled, rescale results back to original coordinates
+                if resize_factor is not None and abs(resize_factor - 1.0) > 1e-6:
+                    try:
+                        inv = 1.0 / resize_factor
+                        self.final_points = (self.final_points * inv).astype(np.int32)
+                        self.final_coord = (self.final_coord * inv).astype(np.int32)
+                        print(f"[SEG DEBUG] Rescaled outputs back by {inv:.4f}")
+                    except Exception as e:
+                        print(f"[SEG DEBUG] Failed to rescale outputs back: {e}")
+
+                # If ROI used, translate results back to slide coordinates
+                if roi is not None:
+                    rx, ry, _, _ = roi
+                    self.final_points[:, 0] += rx
+                    self.final_points[:, 1] += ry
+                    self.final_coord[:, :, 0] += rx
+                    self.final_coord[:, :, 1] += ry
                 self.prob_all = prob
                 
                 total_nuclei = len(self.final_points)
@@ -649,8 +767,23 @@ class SlideSegmentation():
                 print("Falling back to standard tiling process")
         
         # Below is the original tiling processing code
-        n_col = int(np.ceil(self.dim[0]/(self.tile_size-self.overlap)))
-        n_row = int(np.ceil(self.dim[1]/(self.tile_size-self.overlap)))
+        # If ROI present, restrict tiling grid to ROI
+        roi = self.roi_bbox_level0
+        full_w, full_h = self.dim
+        if roi is not None:
+            rx, ry, rw, rh = roi
+            grid_x0 = rx
+            grid_y0 = ry
+            grid_x1 = rx + rw
+            grid_y1 = ry + rh
+        else:
+            grid_x0 = 0
+            grid_y0 = 0
+            grid_x1 = full_w
+            grid_y1 = full_h
+
+        n_col = int(np.ceil((grid_x1 - grid_x0)/(self.tile_size-self.overlap)))
+        n_row = int(np.ceil((grid_y1 - grid_y0)/(self.tile_size-self.overlap)))
         
         points_all = None
         coord_all = None
@@ -668,7 +801,10 @@ class SlideSegmentation():
         os.makedirs(patch_save_dir, exist_ok=True)
 
         # Print status before starting loop
-        print(f"Starting segmentation process - Total tiles: {n_row}x{n_col}={n_row*n_col}")
+        if roi is not None:
+            print(f"Starting segmentation process (ROI) - Tiles: {n_row}x{n_col}={n_row*n_col} within (x={rx}, y={ry}, w={rw}, h={rh})")
+        else:
+            print(f"Starting segmentation process - Total tiles: {n_row}x{n_col}={n_row*n_col}")
         
         for ir in range(n_row):
             for ic in range(n_col):
@@ -681,16 +817,16 @@ class SlideSegmentation():
                     self.progress_callback(progress)
                 
                 # Calculate current tile position
-                x_0 = ic*(self.tile_size-self.overlap)
-                y_0 = ir*(self.tile_size-self.overlap)
+                x_0 = grid_x0 + ic*(self.tile_size-self.overlap)
+                y_0 = grid_y0 + ir*(self.tile_size-self.overlap)
                 
                 print(f"Processing tile r{ir} c{ic} (x={x_0}, y={y_0}) - {processed_tiles}/{total_tiles}")
                 
                 # Record tile processing start time
                 patch_start_time = time.time()
                 
-                x_1 = np.min((x_0 + self.tile_size, self.dim[0]))
-                y_1 = np.min((y_0 + self.tile_size, self.dim[1]))
+                x_1 = np.min((x_0 + self.tile_size, grid_x1))
+                y_1 = np.min((y_0 + self.tile_size, grid_y1))
                 
                 w_col = x_1 - x_0
                 h_row = y_1 - y_0
@@ -711,24 +847,25 @@ class SlideSegmentation():
                 read_end_time = time.time()
                 read_duration = read_end_time - read_start_time
                 
-                if self.args.magnification is not None:
-                    st = time.time()
-                    resize_factor = self.reference_magnification / self.args.magnification
-                    img = img.resize((int(np.round(w_col*resize_factor)), int(np.round(h_row*resize_factor))))
-                    et = time.time()
-                    
-                    x_0 = int(np.round(x_0*resize_factor)) 
-                    x_1 = int(np.round(x_1*resize_factor))
-                    y_0 = int(np.round(y_0*resize_factor))
-                    y_1 = int(np.round(y_1*resize_factor))
-                    
-                    w_col = x_1 - x_0
-                    h_row = y_1 - y_0
-                    
-                    tile_size = self.tile_size*resize_factor
-                    overlap = self.overlap*resize_factor
-                    dim = (self.dim[0]*resize_factor, self.dim[1]*resize_factor)
-                    normalize_template = np.array(Image.fromarray(self.normalize_template).resize(img.size))
+                # Apply resampling for target_mpp (up/down with cap)
+                resize_factor = None
+                if getattr(self, 'processing_resize_factor', None) is not None:
+                    rf = float(self.processing_resize_factor)
+                    if abs(rf - 1.0) > 1e-6:
+                        st = time.time()
+                        img = img.resize((int(np.round(w_col*rf)), int(np.round(h_row*rf))))
+                        et = time.time()
+                        # Update coordinates to match resampled image
+                        x_0 = int(np.round(x_0*rf)) 
+                        x_1 = int(np.round(x_1*rf))
+                        y_0 = int(np.round(y_0*rf))
+                        y_1 = int(np.round(y_1*rf))
+                        w_col = x_1 - x_0
+                        h_row = y_1 - y_0
+                        tile_size = self.tile_size*rf
+                        overlap = self.overlap*rf
+                        dim = (self.dim[0]*rf, self.dim[1]*rf)
+                        normalize_template = np.array(Image.fromarray(self.normalize_template).resize(img.size)) if self.normalize_template is not None else None
 
                 img_np = np.array(img)
                 if len(img_np.shape) == 3:
@@ -744,10 +881,18 @@ class SlideSegmentation():
                     help_with_norm = False
 
                 if help_with_norm:
-                    normalize_template2 = normalize_template[:img_np.shape[0],:img_np.shape[1],:]
-                    joint_normalize = np.concatenate((img_np, normalize_template2), axis=1)
-                    img_norm = normalize(joint_normalize)
-                    img_norm = img_norm[:img_np.shape[0],:img_np.shape[1],:]
+                    try:
+                        if normalize_template is not None and (normalize_template.shape[0] != img_np.shape[0] or normalize_template.shape[1] != img_np.shape[1]):
+                            normalize_template = np.array(Image.fromarray(normalize_template).resize((img_np.shape[1], img_np.shape[0])))
+                        if normalize_template is None:
+                            img_norm = normalize(img_np)
+                        else:
+                            normalize_template2 = normalize_template[:img_np.shape[0],:img_np.shape[1],:]
+                            joint_normalize = np.concatenate((img_np, normalize_template2), axis=1)
+                            img_norm = normalize(joint_normalize)
+                            img_norm = img_norm[:img_np.shape[0],:img_np.shape[1],:]
+                    except Exception:
+                        img_norm = normalize(img_np)
                 else:
                     img_norm = normalize(img_np)
 
@@ -830,11 +975,11 @@ class SlideSegmentation():
                 
                 self.prob_all = prob_all
                 
-                if self.args.magnification is not None:
-                    # Need to scale back to original size since calculations were at 20x
-                    resize_factor = self.reference_magnification / self.args.magnification
-                    self.final_points = (self.final_points/resize_factor).astype(np.int32)
-                    self.final_coord = (self.final_coord/resize_factor).astype(np.int32)
+                # If we resampled tiles earlier, rescale results back to original coordinates
+                if 'resize_factor' in locals() and resize_factor is not None and abs(resize_factor - 1.0) > 1e-6:
+                    inv = 1.0 / resize_factor
+                    self.final_points = (self.final_points * inv).astype(np.int32)
+                    self.final_coord = (self.final_coord * inv).astype(np.int32)
                 
                 print(f"Completed saving {len(self.final_points)} detected nuclei")
             except Exception as e:
