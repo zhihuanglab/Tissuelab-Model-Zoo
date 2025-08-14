@@ -20,7 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 import time
 import xml.etree.ElementTree as ET
 import czifile
-from wrappers import CziImageWrapper, SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
 import pathlib
 
 """
@@ -105,19 +105,35 @@ class NucleiPatchDataset(Dataset):
         self.read_image_method = read_image_method
         print(f"Using read method: {self.read_image_method} for file: {slide_path}")
         
-        # Get magnification from MPP
-        if read_image_method == 'openslide':
-            import openslide
-            with openslide.OpenSlide(slide_path) as slide:
-                mpp = float(slide.properties['openslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / mpp
+        # Get magnification from provided arg first; fall back to metadata
+        if magnification is not None:
+            self.magnification = float(magnification)
+        elif read_image_method == 'openslide':
+            try:
+                import openslide
+                with openslide.OpenSlide(slide_path) as slide:
+                    raw = slide.properties.get('openslide.mpp-x')
+                    mpp = float(raw) if raw is not None else None
+                    if mpp is None or not (0.05 <= mpp <= 20.0):
+                        raise ValueError(f"Unreasonable mpp from OpenSlide: {raw}")
+                    reference_mpp_1x = 10
+                    self.magnification = reference_mpp_1x / mpp
+            except Exception as e:
+                print(f"[EMBED DEBUG] OpenSlide mpp read failed or invalid: {e}. Using default 40x.")
+                self.magnification = 40
         elif read_image_method == 'tiffslide':
-            import tiffslide
-            with tiffslide.TiffSlide(slide_path) as slide:
-                mpp = float(slide.properties['tiffslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / mpp
+            try:
+                import tiffslide
+                with tiffslide.TiffSlide(slide_path) as slide:
+                    raw = slide.properties.get('tiffslide.mpp-x')
+                    mpp = float(raw) if raw is not None else None
+                    if mpp is None or not (0.05 <= mpp <= 20.0):
+                        raise ValueError(f"Unreasonable mpp from TiffSlide: {raw}")
+                    reference_mpp_1x = 10
+                    self.magnification = reference_mpp_1x / mpp
+            except Exception as e:
+                print(f"[EMBED DEBUG] TiffSlide mpp read failed or invalid: {e}. Using default 40x.")
+                self.magnification = 40
         elif read_image_method == 'czi':
             # Get pixel scale from CZI file
             mpp = get_czi_scale(slide_path)
@@ -282,8 +298,28 @@ class NucleiEmbedding:
             if not hasattr(self.args, 'magnification') or self.args.magnification is None:
                 self.args.magnification = 40
         
+        # Debug: show what frontend requested vs what metadata yielded
+        try:
+            frontend_target_mpp = getattr(self.args, 'target_mpp', None)
+            print(f"[EMBED DEBUG] Frontend target_mpp: {frontend_target_mpp}")
+            # Determine an effective magnification for embedding without mutating ARGS
+            effective_mag = getattr(self.args, 'magnification', 40)
+            if frontend_target_mpp is not None:
+                try:
+                    t_mpp = float(frontend_target_mpp)
+                    if t_mpp > 0:
+                        desired_mag = 10.0 / t_mpp
+                        print(f"[EMBED DEBUG] Using target_mpp override for embedding. desired_mag={desired_mag:.3f}x (10um / mpp)")
+                        effective_mag = desired_mag
+                except Exception as e:
+                    print(f"[EMBED DEBUG] Could not parse target_mpp '{frontend_target_mpp}' to override magnification: {e}")
+            # Store for dataset creation
+            self._effective_magnification_for_embedding = effective_mag
+        except Exception:
+            # Fallback
+            self._effective_magnification_for_embedding = getattr(self.args, 'magnification', 40)
         print(f"Using read method: {self.read_image_method} for file: {self.args.slidepath}")
-        print(f"Magnification: {self.args.magnification}x")
+        print(f"Magnification from metadata/detection: {self.args.magnification}x")
         
         # Continue with the rest of initialization
         self.model_key = getattr(self.args, 'model_key', 'plip')
@@ -381,12 +417,17 @@ class NucleiEmbedding:
 
         print(f"Generating embeddings using {num_workers} workers and batch size {batch_size}...")
         
+        # Debug: trace magnification passed into patch dataset
+        try:
+            print(f"[EMBED DEBUG] NucleiPatchDataset magnification arg: {self._effective_magnification_for_embedding}")
+        except Exception:
+            pass
         dataset = NucleiPatchDataset(
             slide_path=self.args.slidepath,
             read_image_method=self.read_image_method,
             centroids=self.centroids,
             patch_size=self.patch_size,
-            magnification=getattr(self, 'magnification', 40),
+            magnification=self._effective_magnification_for_embedding,
             processor=self.processor
         )
         
