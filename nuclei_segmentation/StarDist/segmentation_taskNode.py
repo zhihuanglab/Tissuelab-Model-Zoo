@@ -13,7 +13,6 @@ import uvicorn
 import requests
 import platform
 import numpy as np
-import copy
 import cv2
 from sse_starlette.sse import EventSourceResponse
 import asyncio
@@ -99,15 +98,6 @@ def run_segmentation(args):
     result = {"status": "success", "message": "", "nuclei_count": 0}
 
     try:
-        # Debug: Summarize ARGS affecting scale/mpp/roi
-        try:
-            print("[RUN DEBUG] ARGS summary => slidepath=", getattr(args, 'slidepath', None))
-            print("[RUN DEBUG] ARGS summary => target_mpp=", getattr(args, 'target_mpp', None))
-            print("[RUN DEBUG] ARGS summary => bbox=", getattr(args, 'bbox', None))
-            print("[RUN DEBUG] ARGS summary => polygon_points len=",
-                  len(getattr(args, 'polygon_points', []) or []) if hasattr(args, 'polygon_points') else 0)
-        except Exception:
-            pass
         start_time = time.time()
 
         # Step A: check if already have segmentation
@@ -160,12 +150,7 @@ def run_segmentation(args):
         # Step B: if not have segmentation => run stardist
         if not ALREADY_HAVE_SEG:
             print(f"Working on {args.slidepath} with stardist_pretrain={args.stardist_pretrain}, isIHC={args.isIHC}")
-            # Use a copy of args so per-run overrides do not leak across runs
-            try:
-                args_copy = copy.copy(args)
-            except Exception:
-                args_copy = args
-            ss = SlideSegmentation(args_copy,
+            ss = SlideSegmentation(args,
                                    tile_size=4096,
                                    overlap=256,
                                    prob_thresh=0.3,
@@ -174,17 +159,7 @@ def run_segmentation(args):
                                    stardist_pretrain=args.stardist_pretrain,
                                    isIHC=args.isIHC,
                                    progress_callback=update_progress)
-            try:
-                print(f"[RUN DEBUG] Segmentation args magnification after init: {getattr(ss.args, 'magnification', None)}")
-            except Exception:
-                pass
             ss.run_WSI_segmentation()
-            try:
-                # If SlideSegmentation exposes any magnification/mpp, print it here
-                detected_mag = getattr(ss, 'detected_magnification', getattr(ss.args, 'magnification', None))
-                print(f"[RUN DEBUG] Detected/Args magnification used by segmentation: {detected_mag}")
-            except Exception:
-                pass
             
             # Retrieve results from ss object, with checks
             if hasattr(ss, 'final_points') and ss.final_points is not None:
