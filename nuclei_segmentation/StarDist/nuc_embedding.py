@@ -20,7 +20,12 @@ from torch.utils.data import Dataset, DataLoader
 import time
 import xml.etree.ElementTree as ET
 import czifile
-from wrappers import CziImageWrapper, SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+import sys
+
+if sys.platform == 'darwin':
+    from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+else:
+    from wrappers import CziImageWrapper, SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
 import pathlib
 
 """
@@ -71,12 +76,13 @@ def get_czi_scale(file_path):
         return None
 
 class NucleiPatchDataset(Dataset):
-    def __init__(self, slide_path, read_image_method=None, centroids=None, patch_size=224, magnification=40, processor=None):
+    def __init__(self, slide_path, read_image_method=None, centroids=None, patch_size=224, magnification=40, processor=None, target_mpp=None):
 
         self.slide_path = slide_path
         self.centroids = centroids
         self.patch_size = patch_size
         self.processor = processor
+        self.target_mpp = target_mpp
         
         # Detect file type by extension if read_image_method is not specified
         if read_image_method is None:
@@ -105,40 +111,43 @@ class NucleiPatchDataset(Dataset):
         self.read_image_method = read_image_method
         print(f"Using read method: {self.read_image_method} for file: {slide_path}")
         
-        # Get magnification from MPP
-        if read_image_method == 'openslide':
-            import openslide
-            with openslide.OpenSlide(slide_path) as slide:
-                mpp = float(slide.properties['openslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / mpp
-        elif read_image_method == 'tiffslide':
-            import tiffslide
-            with tiffslide.TiffSlide(slide_path) as slide:
-                mpp = float(slide.properties['tiffslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / mpp
-        elif read_image_method == 'czi':
-            # Get pixel scale from CZI file
-            mpp = get_czi_scale(slide_path)
-            if mpp is None:
-                print('Warning: Unable to get mpp value from CZI file, using default value 0.25')
-                mpp = 0.25
-                self.magnification = 40  # Default magnification
-            else:
-                # Calculate magnification - at 10x, mpp is about 1.0 microns/pixel
-                reference_mpp_10x = 1.0
-                self.magnification = reference_mpp_10x / mpp * 10
-                print(f'Calculated magnification from CZI: {self.magnification:.1f}x')
-        else:
-            # Default to provided magnification for PIL and numpy
-            self.magnification = magnification
+        # --- Unified Resolution Logic with Verification Logging ---
+        self.actual_slide_mpp = self.get_slide_mpp(slide_path, self.read_image_method)
+
+        # Determine the target mpp for analysis
+        final_target_mpp = self.target_mpp
+
+        if not isinstance(final_target_mpp, float) or final_target_mpp <= 0:
+            # Fallback to magnification if target_mpp is not available/valid
+            reference_mpp_40x = 0.25 
+            scale_factor = magnification / 40.0
+            final_target_mpp = reference_mpp_40x * scale_factor
         
-        # Calculate scale factor based on target magnification (40x)
-        self.scale_factor = 40 / self.magnification
-        print("Magnification:", self.magnification)
-        print("Scale factor:", self.scale_factor)
-        self.extraction_size = int(self.patch_size * self.scale_factor)
+        # Calculate the size of the patch to extract from the native slide resolution
+        if self.actual_slide_mpp > 0:
+            self.extraction_size = int(round((self.patch_size * final_target_mpp) / self.actual_slide_mpp))
+        else:
+            self.extraction_size = self.patch_size
+
+    def get_slide_mpp(self, slide_path, read_method):
+        """Calculates the microns-per-pixel for a given slide."""
+        try:
+            if read_method == 'openslide':
+                import openslide
+                with openslide.OpenSlide(slide_path) as slide:
+                    return float(slide.properties.get('openslide.mpp-x', 0.25))
+            elif read_method == 'tiffslide':
+                import tiffslide
+                with tiffslide.TiffSlide(slide_path) as slide:
+                    return float(slide.properties.get('tiffslide.mpp-x', 0.25))
+            elif read_method == 'czi':
+                mpp = get_czi_scale(slide_path)
+                return mpp if mpp is not None else 0.25
+            else: # For PIL, numpy, dicom, etc. where MPP is not in metadata
+                return 0.25 # Default assumption (approx 40x)
+        except Exception as e:
+            print(f"Could not determine MPP for {slide_path} using method {read_method}: {e}. Defaulting to 0.25.")
+            return 0.25
 
     def __len__(self):
         return len(self.centroids)
@@ -177,7 +186,7 @@ class NucleiPatchDataset(Dataset):
                 level=0,
                 size=(self.extraction_size, self.extraction_size)
             )
-            
+
             if patch.mode != 'RGB':
                 patch = patch.convert('RGB')
                 
@@ -210,7 +219,7 @@ class NucleiEmbedding:
         self.args = args
         self.progress_callback = progress_callback
         
-        print("Getting slide magnification...")
+        print("Initializing Nuclei Embedding Generator...")
         
         # Determine file type by extension
         file_extension = os.path.splitext(self.args.slidepath)[1].lower()[1:]
@@ -220,70 +229,35 @@ class NucleiEmbedding:
             if file_extension == 'czi':
                 # Handle CZI files specifically
                 self.read_image_method = 'czi'
-                # Get pixel scale from CZI file
-                mpp = get_czi_scale(self.args.slidepath)
-                if mpp is None:
-                    print('Warning: Unable to get mpp value from CZI file, using default value 0.25')
-                    mpp = 0.25
-                    self.args.magnification = 40  # Default magnification
-                else:
-                    # Calculate magnification - at 10x, mpp is about 1.0 microns/pixel
-                    reference_mpp_10x = 1.0
-                    self.args.magnification = reference_mpp_10x / mpp * 10
-                    print(f'Calculated magnification from CZI: {self.args.magnification:.1f}x')
             elif file_extension in ['svs', 'ndpi', 'vms', 'vmu', 'scn', 'mrxs', 'tif', 'tiff', 'bif']:
                 try:
                     import openslide
-                    with openslide.OpenSlide(self.args.slidepath) as slide:
-                        mpp = float(slide.properties['openslide.mpp-x'])
-                        reference_mpp_1x = 10  # objective magnification
-                        self.args.magnification = reference_mpp_1x / mpp
-                        print("openslide success")
                     self.read_image_method = 'openslide'
                 except (ImportError, Exception) as e:
                     print(f"OpenSlide failed: {str(e)}")
                     import tiffslide
-                    with tiffslide.TiffSlide(self.args.slidepath) as slide:
-                        mpp = float(slide.properties['tiffslide.mpp-x'])
-                        reference_mpp_1x = 10  # objective magnification
-                        self.args.magnification = reference_mpp_1x / mpp
                     self.read_image_method = 'tiffslide'
             elif file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
                 self.read_image_method = 'PIL'
                 # Use default magnification if provided in args
-                if not hasattr(self.args, 'magnification') or self.args.magnification is None:
-                    self.args.magnification = 40  # Default
             elif file_extension in ['dcm']:
                 self.read_image_method = 'dicom'
-                if not hasattr(self.args, 'magnification') or self.args.magnification is None:
-                    self.args.magnification = 40  # Default for DICOM
             elif file_extension in ['npy', 'npz']:
                 self.read_image_method = 'numpy'
-                if not hasattr(self.args, 'magnification') or self.args.magnification is None:
-                    self.args.magnification = 40  # Default for numpy arrays
             else:
                 # Try TiffSlide as fallback
                 try:
                     import tiffslide
-                    with tiffslide.TiffSlide(self.args.slidepath) as slide:
-                        mpp = float(slide.properties['tiffslide.mpp-x'])
-                        reference_mpp_1x = 10
-                        self.args.magnification = reference_mpp_1x / mpp
                     self.read_image_method = 'tiffslide'
                 except Exception:
                     # Last resort, use PIL
                     self.read_image_method = 'PIL'
-                    if not hasattr(self.args, 'magnification') or self.args.magnification is None:
-                        self.args.magnification = 40  # Default
         except Exception as e:
             print(f"Error determining file type: {str(e)}")
             # Fallback to default
             self.read_image_method = 'PIL'
-            if not hasattr(self.args, 'magnification') or self.args.magnification is None:
-                self.args.magnification = 40
-        
-        print(f"Using read method: {self.read_image_method} for file: {self.args.slidepath}")
-        print(f"Magnification: {self.args.magnification}x")
+
+        print(f"Determined read method: {self.read_image_method} for file: {self.args.slidepath}")
         
         # Continue with the rest of initialization
         self.model_key = getattr(self.args, 'model_key', 'plip')
@@ -302,6 +276,7 @@ class NucleiEmbedding:
         self.model = self.model.to("cuda" if torch.cuda.is_available() else "cpu")
 
         # Load trained checkpoint if available
+        # checkpoint_path = os.path.join(os.path.dirname(__file__), 'checkpoints/contrastive_checkpoint_epoch_0.pt')
         checkpoint_path = os.path.join(os.path.dirname(__file__), 'checkpoints/checkpoint_step_10000.pt')
         if os.path.exists(checkpoint_path):
             print(f"Loading trained checkpoint from {checkpoint_path}")
@@ -347,7 +322,7 @@ class NucleiEmbedding:
     def generate_embeddings(self, batch_size=None, num_workers=None, temp_h5_path=None):
         """Generate embeddings for all nuclei using PyTorch DataLoader."""
         if num_workers is None:
-            num_workers = min(mp.cpu_count(), 20)
+            num_workers = min(mp.cpu_count(), 2)
 
         # Dynamically determine batch size based on available GPU memory
         if batch_size is None and torch.cuda.is_available():
@@ -363,7 +338,7 @@ class NucleiEmbedding:
                 print(f"Cached: {cached_memory:.2f} GB")
                 
                 # Reserve some memory for the model and system
-                available_memory = total_memory * 0.8 # Use 90% of total memory
+                available_memory = total_memory * 0.5  # Use 90% of total memory
                 print(f"Setting available memory to: {available_memory:.2f} GB")
                 # Estimate memory per sample (in GB) - PLIP model typically uses about 0.5GB for batch_size=1
                 memory_per_sample = 0.01
@@ -381,13 +356,19 @@ class NucleiEmbedding:
 
         print(f"Generating embeddings using {num_workers} workers and batch size {batch_size}...")
         
+        # Debug: trace magnification passed into patch dataset
+        try:
+            print(f"[EMBED DEBUG] NucleiPatchDataset magnification arg: {self._effective_magnification_for_embedding}")
+        except Exception:
+            pass
         dataset = NucleiPatchDataset(
             slide_path=self.args.slidepath,
             read_image_method=self.read_image_method,
             centroids=self.centroids,
             patch_size=self.patch_size,
-            magnification=getattr(self, 'magnification', 40),
-            processor=self.processor
+            magnification=getattr(self.args, 'magnification', 40),
+            processor=self.processor,
+            target_mpp=getattr(self.args, 'target_mpp', None)
         )
         
         dataloader = DataLoader(
