@@ -140,7 +140,7 @@ def load_checkpoint_at_init():
     print(f"[ClassificationNode] Loading big model at init stage..., device={device}")
     # Note: weights_only=False to allow pickle
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    print(f"checkpoint: {checkpoint}")
+    print(f"[ClassificationNode] Checkpoint loaded from: {checkpoint_path}")
     processor = AutoProcessor.from_pretrained("vinid/plip")
     model = AutoModelForZeroShotImageClassification.from_pretrained("vinid/plip").to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
