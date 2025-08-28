@@ -499,6 +499,21 @@ def run_classification(args) -> Dict[str, Any]:
             colors_ascii = [c.encode('utf-8') for c in final_class_colors]
             grp_cls.create_dataset('nuclei_class_HEX_color', (len(colors_ascii),), dtype='S256', data=colors_ascii)
 
+            # Save probability scores for active learning
+            if prediction_probs is not None:
+                grp_cls.create_dataset('nuclei_class_probabilities', data=prediction_probs.astype(np.float32))
+                print(f"Saved classification probabilities for active learning, shape: {prediction_probs.shape}")
+            elif 'sims_arr' in locals() and sims_arr is not None:
+                # For zero-shot: save similarity scores as pseudo-probabilities
+                # Normalize similarity scores to [0, 1] range using softmax
+                print(f"Converting similarity scores to probabilities, shape: {sims_arr.shape}")
+                exp_sims = np.exp(sims_arr - np.max(sims_arr, axis=1, keepdims=True))
+                pseudo_probs = exp_sims / np.sum(exp_sims, axis=1, keepdims=True)
+                grp_cls.create_dataset('nuclei_class_probabilities', data=pseudo_probs.astype(np.float32))
+                print(f"Saved zero-shot similarity scores as probabilities for active learning, shape: {pseudo_probs.shape}")
+            else:
+                print("Warning: No probability data available to save for active learning")
+
             print("================")
             print({
                 "predictions": list(set(predictions)), 
