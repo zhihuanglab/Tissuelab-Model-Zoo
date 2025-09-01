@@ -57,6 +57,8 @@ MUSK_MODEL = None
 progress_value = 0  # Global variable to track progress
 progress_complete = False  # Flag to indicate completion
 last_printed_progress = -1  # Added for the new update_progress function
+H5_GROUP = None
+DEP_H5_GROUPS = {}
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -66,13 +68,27 @@ def parse_args():
 
     # === patch classification parameters ===
     parser.add_argument('--slidepath', default='', type=str)
-    parser.add_argument('--patch_size', default=128, type=int)
+    parser.add_argument('--patch_size', default=224, type=int)
     parser.add_argument('--level', default=1, type=int)
     parser.add_argument('--tissue_threshold', default=0.1, type=float)
     parser.add_argument('--batch_size', default=4, type=int)
     parser.add_argument('--model_path', default='model/model.safetensors', type=str)
 
     return parser.parse_args()
+
+def _to_int(val, default=None):
+    try:
+        s = str(val).strip()
+        return int(s) if s != "" else default
+    except (TypeError, ValueError):
+        return default
+
+def _to_float(val, default=None):
+    try:
+        s = str(val).strip()
+        return float(s) if s != "" else default
+    except (TypeError, ValueError):
+        return default
 
 def update_progress(value):
     """Update the progress value for the frontend"""
@@ -173,12 +189,12 @@ def run_patch_classification(args):
         
         if os.path.exists(H5_PATH):
             with h5py.File(H5_PATH, 'r') as hf:
-                if NODE_NAME in hf:
+                if H5_GROUP in hf:
                     try:
-                        embeddings = hf[f"{NODE_NAME}/embedding"][()]
-                        coordinates = hf[f"{NODE_NAME}/coordinates"][()]
+                        embeddings = hf[f"{H5_GROUP}/embedding"][()]
+                        coordinates = hf[f"{H5_GROUP}/coordinates"][()]
                         ALREADY_HAVE_EMBEDDINGS = True
-                        print(f"[{NODE_NAME}] Using existing embeddings => skip processing")
+                        print(f"[{NODE_NAME}] Using existing embeddings from {H5_GROUP} => skip processing")
                         result["message"] = "Using existing embeddings"
                         result["patch_count"] = len(embeddings)
                     except:
@@ -196,16 +212,24 @@ def run_patch_classification(args):
             print(f"[{NODE_NAME}] Starting to process WSI with patch_size={args.patch_size}, level={args.level}")
             
             # Define progress callback function
-            def progress_callback(stage, percent):
-                if stage == "extract":
-                    # Extract stage: 10%-50%
-                    progress = 10 + int(percent * 40 / 100)
-                    update_progress(progress)
-                elif stage == "encode":
-                    # Encode stage: 50%-90%
-                    progress = 50 + int(percent * 40 / 100)
-                    update_progress(progress)
+            def progress_callback(stage, payload):
+                if stage == "row":
+                    try:
+                        percent = int(payload)
+                        update_progress(min(99, max(1, percent)))
+                    except Exception:
+                        pass
             
+            # Determine mask export path (same folder as H5)
+            mask_export_path = None
+            try:
+                if H5_PATH:
+                    base_dir = os.path.dirname(H5_PATH)
+                    base_name = os.path.splitext(os.path.basename(args.slidepath))[0]
+                    mask_export_path = os.path.join(base_dir, f"{base_name}_mask.png")
+            except Exception:
+                mask_export_path = None
+
             patch_embeddings, patch_coordinates = MUSK_MODEL.process_whole_wsi(
                 wsi_path=args.slidepath,
                 patch_size=args.patch_size,
@@ -213,6 +237,7 @@ def run_patch_classification(args):
                 batch_size=args.batch_size,
                 tissue_threshold=args.tissue_threshold,
                 save_patches=False,
+                output_mask_path=mask_export_path,
                 progress_callback=progress_callback
             )
             
@@ -229,12 +254,12 @@ def run_patch_classification(args):
         # Step 3: Save to h5 file
         if embeddings is not None and coordinates is not None:
             with h5py.File(H5_PATH, "a") as hf:
-                # If Node already exists, delete it
-                if NODE_NAME in hf:
-                    del hf[NODE_NAME]
+                # If group already exists, delete it
+                if H5_GROUP in hf:
+                    del hf[H5_GROUP]
                 
-                # Create Node group
-                node_grp = hf.create_group(NODE_NAME)
+                # Create group
+                node_grp = hf.create_group(H5_GROUP)
                 
                 # Write embeddings and coordinates
                 node_grp.create_dataset('embedding', data=embeddings)
@@ -292,54 +317,147 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS
+    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS, H5_GROUP, DEP_H5_GROUPS
     
+    # Extract basic information from request
     NODE_NAME = data.get("node_name", "MuskNode")
     DEPENDENCIES = data.get("dependencies", [])
     H5_PATH = data.get("h5_path", None)
+    H5_GROUP = data.get("h5_group", NODE_NAME)
+    DEP_H5_GROUPS = data.get("dependencies_h5_groups", {})
+
+    print(f"[{NODE_NAME}] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}, h5_group={H5_GROUP}")
     
-    print(f"[{NODE_NAME}] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}")
-    
+    # Validate H5 file exists
     if not H5_PATH or not os.path.exists(H5_PATH):
         print(f"[{NODE_NAME}] no h5 file => skip read.")
         return {"status": "ok", "message": "no H5 file found."}
     
+    # Initialize ARGS with defaults if not already initialized
     if ARGS is None:
         ARGS = argparse.Namespace(
             slidepath="",
-            patch_size=128,
+            patch_size=224,
             level=1,
             tissue_threshold=0.1,
             batch_size=4,
             model_path="model/model.safetensors"
         )
     
-    with h5py.File(H5_PATH, "r") as hf:
-        user_data_path = f"{NODE_NAME}/userData"
-        if user_data_path in hf:
-            for k in hf[user_data_path].keys():
-                raw_bytes = hf[user_data_path][k][()]
-                raw_str = raw_bytes.decode("utf-8")
-                try:
-                    val_json = json.loads(raw_str)
-                except:
-                    val_json = raw_str
-                print(f"[{NODE_NAME}] user param {k} => {val_json}")
-                
-                if k == "path":
-                    ARGS.slidepath = val_json
-                elif k == "patch_size":
-                    ARGS.patch_size = int(val_json)
-                elif k == "level":
-                    ARGS.level = int(val_json)
-                elif k == "tissue_threshold":
-                    ARGS.tissue_threshold = float(val_json)
-                elif k == "batch_size":
-                    ARGS.batch_size = int(val_json)
-                elif k == "model_path":
-                    ARGS.model_path = val_json
+    # Read and apply user parameters from H5 file
+    _load_parameters_from_h5(H5_PATH, H5_GROUP)
+    
+    # Log final resolution
+    print(f"[{NODE_NAME}] Final parameters:")
+    print(f"  - slidepath: {ARGS.slidepath if ARGS.slidepath else 'Not set'}")
+    print(f"  - patch_size: {ARGS.patch_size}")
+    print(f"  - level: {ARGS.level}")
+    print(f"  - tissue_threshold: {ARGS.tissue_threshold}")
+    print(f"  - batch_size: {ARGS.batch_size}")
     
     return {"status": "ok", "message": f"{NODE_NAME} read done"}
+
+def _load_parameters_from_h5(h5_path: str, h5_group: str):
+    """
+    Load user parameters from H5 file in a structured way.
+    Only reads from the designated h5_group/userData location.
+    """
+    global ARGS
+    
+    try:
+        with h5py.File(h5_path, "r") as hf:
+            user_data_path = f"{h5_group}/userData"
+            if user_data_path not in hf:
+                print(f"[{NODE_NAME}] No userData found in {h5_group}")
+                return
+            
+            # Read each parameter and apply it
+            for param_name in hf[user_data_path].keys():
+                raw_bytes = hf[user_data_path][param_name][()]
+                param_value = _decode_h5_parameter(raw_bytes)
+                
+                if param_value is not None:
+                    _apply_parameter(param_name, param_value)
+                    
+    except Exception as e:
+        print(f"[{NODE_NAME}] Error reading parameters from H5: {e}")
+
+def _decode_h5_parameter(raw_bytes):
+    """Decode a parameter value from H5 storage."""
+    try:
+        raw_str = raw_bytes.decode("utf-8")
+        # Try to parse as JSON first
+        try:
+            return json.loads(raw_str)
+        except json.JSONDecodeError:
+            # If not JSON, return as string
+            return raw_str
+    except Exception as e:
+        print(f"[{NODE_NAME}] Error decoding parameter: {e}")
+        return None
+
+def _apply_parameter(param_name: str, param_value):
+    """Apply a single parameter to ARGS based on its name and value."""
+    global ARGS
+    
+    # Map of parameter names to their handlers (keep only canonical keys)
+    param_handlers = {
+        "path": lambda v: _set_slide_path(v),  # WSI path
+        "patch_size": lambda v: _set_int_param("patch_size", v, min_val=1),
+        "level": lambda v: _set_int_param("level", v, min_val=0),
+        "batch_size": lambda v: _set_int_param("batch_size", v, min_val=1),
+        "tissue_threshold": lambda v: _set_float_param("tissue_threshold", v, min_val=0.0, max_val=1.0),
+        "model_path": lambda v: _set_string_param("model_path", v),
+    }
+    
+    # Apply the parameter if we have a handler for it
+    if param_name in param_handlers:
+        param_handlers[param_name](param_value)
+        print(f"[{NODE_NAME}] Set {param_name} => {param_value}")
+    else:
+        print(f"[{NODE_NAME}] Unknown parameter: {param_name} => {param_value}")
+
+def _set_slide_path(value):
+    """Set the slide path if it's valid."""
+    global ARGS
+    if isinstance(value, str) and value:
+        # Only set if the file actually exists
+        if os.path.isfile(value):
+            ARGS.slidepath = value
+        else:
+            print(f"[{NODE_NAME}] Warning: Slide path does not exist: {value}")
+
+def _set_int_param(param_name: str, value, min_val=None, max_val=None):
+    """Set an integer parameter with optional bounds checking."""
+    global ARGS
+    parsed = _to_int(value)
+    if parsed is not None:
+        if min_val is not None and parsed < min_val:
+            print(f"[{NODE_NAME}] Warning: {param_name}={parsed} is below minimum {min_val}, using {min_val}")
+            parsed = min_val
+        if max_val is not None and parsed > max_val:
+            print(f"[{NODE_NAME}] Warning: {param_name}={parsed} is above maximum {max_val}, using {max_val}")
+            parsed = max_val
+        setattr(ARGS, param_name, parsed)
+
+def _set_float_param(param_name: str, value, min_val=None, max_val=None):
+    """Set a float parameter with optional bounds checking."""
+    global ARGS
+    parsed = _to_float(value)
+    if parsed is not None:
+        if min_val is not None and parsed < min_val:
+            print(f"[{NODE_NAME}] Warning: {param_name}={parsed} is below minimum {min_val}, using {min_val}")
+            parsed = min_val
+        if max_val is not None and parsed > max_val:
+            print(f"[{NODE_NAME}] Warning: {param_name}={parsed} is above maximum {max_val}, using {max_val}")
+            parsed = max_val
+        setattr(ARGS, param_name, parsed)
+
+def _set_string_param(param_name: str, value):
+    """Set a string parameter."""
+    global ARGS
+    if isinstance(value, str) and value:
+        setattr(ARGS, param_name, value)
 
 @app.post("/execute")
 def execute_node():
@@ -348,16 +466,12 @@ def execute_node():
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
     
-    if not ARGS or not getattr(ARGS, "slidepath", None):
-        print(f"[{NODE_NAME}] no slidepath => skip.")
-        out_val = {
-            "status": "ok",
-            "message": "no slidepath, skipping.",
-            "patch_count": 0
-        }
-        # Update progress to 100 when skipping
+    # Validate slide path
+    if (not ARGS) or (not getattr(ARGS, "slidepath", None)) or (not os.path.isfile(ARGS.slidepath)):
+        msg = f"Invalid slide path: {getattr(ARGS,'slidepath',None)}"
+        print(f"[{NODE_NAME}] {msg}")
+        out_val = {"status": "error", "message": msg, "patch_count": 0}
         progress_value = 100
-        print(f"[{NODE_NAME}] Progress: 100%")
     else:
         print(f"[{NODE_NAME}] /execute => run_patch_classification with slidepath={ARGS.slidepath}")
         print(f"[{NODE_NAME}] ARGS: {ARGS}")
@@ -366,7 +480,7 @@ def execute_node():
     # Store the result to 'output'
     if H5_PATH and os.path.exists(H5_PATH):
         with h5py.File(H5_PATH, "a") as hf:
-            node_out_path = f"{NODE_NAME}/output"
+            node_out_path = f"{H5_GROUP}/output"
             if node_out_path in hf:
                 del hf[node_out_path]
             out_str = json.dumps(out_val, ensure_ascii=False)
