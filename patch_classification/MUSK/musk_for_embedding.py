@@ -84,9 +84,10 @@ class MUSK:
                     batch_slice = slice(i, min(i + batch_size, num_images))
                     batch_images = images[batch_slice]
                     
-                    # If progress callback is provided, update every 10%
-                    if progress_callback and i % max(1, num_images // 10) == 0:
-                        progress_percent = int((i / num_images) * 100)
+                    # If progress callback is provided, update each batch
+                    if progress_callback:
+                        done = min(i + batch_size, num_images)
+                        progress_percent = int((done / max(1, num_images)) * 100)
                         progress_callback("encode", progress_percent)
                     
                     # If input is a list of paths, load images
@@ -179,6 +180,92 @@ class MUSK:
 
         pbar.close()
         return torch.cat(text_embeddings, dim=0)
+
+    def get_tissue_mask_from_image(self, pil_image, edge_width_ratio=0.04, min_area=None, debug_dir=None):
+        """
+        Generate a filled tissue mask for a regular RGB image using the same
+        steps as get_tissue_mask(slide):
+          - Downscale to approx level-3 scale (1/8 resolution)
+          - Adaptive threshold (MEAN) with binary inverse
+          - Morphological closing
+          - Remove small holes
+          - Remove small/edge-touching artifacts
+        """
+        try:
+            import numpy as np
+            import cv2
+            from PIL import ImageOps
+            from skimage import morphology
+            from skimage.measure import label, regionprops
+            import os
+
+            # Optionally create debug directory
+            if debug_dir:
+                try:
+                    os.makedirs(debug_dir, exist_ok=True)
+                except Exception:
+                    pass
+
+            img = np.array(pil_image.convert('RGB'))
+            h_full, w_full = img.shape[0], img.shape[1]
+
+            # Mimic level-3 by downscaling ~1/8 per side (guard minimums)
+            small_w = max(1, w_full // 8)
+            small_h = max(1, h_full // 8)
+            img_small = cv2.resize(img, (small_w, small_h), interpolation=cv2.INTER_AREA)
+
+            gray = cv2.cvtColor(img_small, cv2.COLOR_RGB2GRAY)
+            # Adaptive threshold, inverse (tissue bright => white after inversion)
+            mask = cv2.adaptiveThreshold(
+                gray, 1, cv2.ADAPTIVE_THRESH_MEAN_C,
+                cv2.THRESH_BINARY_INV, 31, 10
+            )
+
+            # Closing to bridge gaps
+            mask = morphology.binary_closing(mask, morphology.disk(8))
+            # Fill larger holes
+            mask = morphology.remove_small_holes(mask, area_threshold=int(0.001 * small_h * small_w))
+
+            # Keep only sufficiently large regions
+            if min_area is None:
+                min_area = max(int(0.0005 * small_h * small_w), 2000)
+
+            label_img = label(mask)
+            mask_clean = np.zeros_like(mask, dtype=bool)
+            for region in regionprops(label_img):
+                if region.area >= min_area:
+                    mask_clean[label_img == region.label] = 1
+            mask = mask_clean
+
+            # Remove edge-touching small artifacts (similar to WSI path)
+            margin_y = int(small_h * edge_width_ratio)
+            margin_x = int(small_w * edge_width_ratio)
+            edge_mask = np.zeros_like(mask, dtype=bool)
+            edge_mask[:margin_y, :]  = 1
+            edge_mask[-margin_y:, :] = 1
+            edge_mask[:, :margin_x]  = 1
+            edge_mask[:, -margin_x:] = 1
+
+            label_img2 = label(mask)
+            artifact_mask = np.zeros_like(mask, dtype=bool)
+            for region in regionprops(label_img2):
+                if region.area < max(int(0.003 * small_h * small_w), 5000) * 1.5:
+                    coords = region.coords
+                    if np.any(edge_mask[coords[:, 0], coords[:, 1]]):
+                        artifact_mask[label_img2 == region.label] = 1
+
+            final_mask_small = (mask.astype(bool) & (~artifact_mask.astype(bool))).astype(np.uint8)
+
+            # Upscale to original size
+            final_mask = cv2.resize(final_mask_small, (w_full, h_full), interpolation=cv2.INTER_NEAREST)
+            return final_mask
+
+        except Exception as e:
+            print(f"Error generating image tissue mask: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to full mask to avoid dropping all patches
+            return np.ones((pil_image.size[1], pil_image.size[0]), dtype=np.uint8)
 
     def encode_wsi(self, wsi_path: str, patch_coordinates: List[Tuple[int, int, int, int]], 
                    level: int = 0, batch_size: int = 16, use_tiffslide: bool = True,
@@ -308,7 +395,7 @@ class MUSK:
         
         return patch_embeddings
 
-    def get_tissue_mask(self, slide, edge_width_ratio=0.04, min_area=None, debug_dir="C:/Research/tissuelab_agent_experiments/Tissuelab-Model-Zoo/patch_classification/MUSK/result_h5-2"):
+    def get_tissue_mask(self, slide, edge_width_ratio=0.04, min_area=None, debug_dir="debug"):
         """
         Generate a filled tissue mask for a whole-slide image.
 
@@ -328,6 +415,15 @@ class MUSK:
             from skimage import morphology
             from skimage.measure import label, regionprops
             import imageio
+
+            # Resolve debug directory cross-platform and ensure existence (optional)
+            if debug_dir:
+                import re
+                def _is_abs_any(p: str) -> bool:
+                    return os.path.isabs(p) or bool(re.match(r'^[A-Za-z]:[\\/]', p))
+                if not _is_abs_any(debug_dir):
+                    debug_dir = os.path.join(os.path.dirname(__file__), debug_dir)
+                os.makedirs(debug_dir, exist_ok=True)
 
             # ---------------------------------------------------------------------
             # 1. Read a thumbnail image at the coarsest reasonable level
@@ -418,21 +514,55 @@ class MUSK:
     def process_whole_wsi(self, wsi_path: str, patch_size: int = 128, level: int = 0, 
                           batch_size: int = 16, use_tiffslide: bool = True,
                           save_patches: bool = False, output_dir: str = None,
+                          output_mask_path: str = None,
                           tissue_threshold: float = 0.5, progress_callback=None):
         """Process entire WSI by dividing it into patches using streaming approach"""
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {device}")
         
-        slide = tiffslide.TiffSlide(wsi_path)
-        width, height = slide.dimensions
-        
-        print("Generating tissue mask...")
-        mask = self.get_tissue_mask(slide)
-        if mask is None:
-            print("Failed to generate tissue mask")
-            return None, []
+        # Try WSI via tiffslide; fallback to PIL for regular images (e.g., JPG/PNG)
+        slide = None
+        fallback_image = None
+        try:
+            slide = tiffslide.TiffSlide(wsi_path)
+            width, height = slide.dimensions
+            print("Generating tissue mask...")
+            mask = self.get_tissue_mask(slide)
+            if mask is None:
+                print("Failed to generate tissue mask")
+                return None, []
             
-        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+            mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+            # Export final mask if requested
+            if output_mask_path:
+                try:
+                    PILImage.fromarray((mask * 255).astype(np.uint8)).save(output_mask_path)
+                except Exception:
+                    pass
+        except Exception as open_err:
+            try:
+                fallback_image = Image.open(wsi_path).convert("RGB")
+                width, height = fallback_image.size
+                print(f"[MUSK] Non-WSI image detected. Using PIL fallback, size={width}x{height}")
+                # Build tissue mask with the same policy as WSI path
+                mask = self.get_tissue_mask_from_image(fallback_image)
+
+                # Optional: export debug mask for JPGs when saving patches
+                if save_patches and output_dir:
+                    try:
+                        os.makedirs(output_dir, exist_ok=True)
+                        PILImage.fromarray((mask * 255).astype(np.uint8)).save(os.path.join(output_dir, "mask_debug.png"))
+                    except Exception:
+                        pass
+                # Export final mask if requested
+                if output_mask_path:
+                    try:
+                        PILImage.fromarray((mask * 255).astype(np.uint8)).save(output_mask_path)
+                    except Exception:
+                        pass
+            except Exception as pil_err:
+                self.logger.error(f"Failed to open image as WSI and as PIL: {open_err} | {pil_err}")
+                return None, []
         
         # calculate total patches number for progress bar
         total_rows = (height - patch_size + 1) // patch_size
@@ -444,10 +574,10 @@ class MUSK:
             processed_count = 0
             
             # use tqdm to show row processing progress
-            for y in tqdm(range(0, height - patch_size + 1, patch_size), 
+            for row_idx, y in enumerate(tqdm(range(0, height - patch_size + 1, patch_size), 
                         total=total_rows,
                         desc="Processing WSI rows",
-                        position=0):
+                        position=0)):
                 patch_batch = []
                 coord_batch = []
                 
@@ -458,13 +588,28 @@ class MUSK:
                     if center_x >= width or center_y >= height:
                         continue
                         
-                    if mask[center_y, center_x] == 0:
-                        continue
+                    # Patch acceptance
+                    if fallback_image is not None:
+                        # For flat images, require tissue coverage within the patch (use tissue_threshold)
+                        patch_mask = mask[y:y + patch_size, x:x + patch_size]
+                        if patch_mask.size == 0:
+                            continue
+                        coverage = float(np.mean(patch_mask))
+                        if coverage < float(tissue_threshold):
+                            continue
+                    else:
+                        # For WSI, keep the original, cheaper center-pixel check to avoid level-scaling issues
+                        if mask[center_y, center_x] == 0:
+                            continue
                     
                     # Read the patch region
-                    patch_data = slide.read_region(
-                        (x, y), level, (patch_size, patch_size)
-                    )
+                    if slide is not None:
+                        patch_data = slide.read_region(
+                            (x, y), level, (patch_size, patch_size)
+                        )
+                    else:
+                        # Crop directly from PIL fallback image
+                        patch_data = fallback_image.crop((x, y, x + patch_size, y + patch_size))
                     
                     # Handle both PIL Image and numpy array cases
                     if isinstance(patch_data, np.ndarray):
@@ -505,6 +650,9 @@ class MUSK:
                 
                 if patch_batch:
                     yield patch_batch, coord_batch
+                if progress_callback:
+                    row_percent = int(((row_idx + 1) / max(1, total_rows)) * 100)
+                    progress_callback("row", row_percent)
         
         all_embeddings = []
         all_coordinates = []

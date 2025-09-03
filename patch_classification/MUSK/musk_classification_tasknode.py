@@ -60,6 +60,10 @@ progress_value = 0  # Global variable to store progress
 CLASSIFIER_PATH = None
 SAVE_CLASSIFIER_PATH = None
 
+# H5 group controls (populated in /read)
+H5_GROUP = None
+DEP_H5_GROUPS = {}
+
 # --------------- utils functions ---------------
 
 def print_h5_structure(file_path):
@@ -118,11 +122,17 @@ def _generate_text_description(tissue_classes: list[str]) -> list[np.ndarray]:
 
 def generate_distinct_colors(tissue_classes: list[str]) -> list[str]:
     # generate distinct colors for each tissue_class
+    # default for Negative control => uniform light gray
+    NEGATIVE_CONTROL_COLOR = "#F3F4F5"
     colors = []
     num_classes = len(tissue_classes)
     for i, tissue_class in enumerate(tissue_classes):
-        if tissue_class.lower() == "other":
-            colors.append("F3F4F5")
+        name_lower = str(tissue_class).lower()
+        if name_lower == "negative control":
+            colors.append(NEGATIVE_CONTROL_COLOR)
+            continue
+        if name_lower == "other":
+            colors.append("#F3F4F5")
             continue
         golden_ratio = 0.618033988749895
         hue = (i * golden_ratio) % 1
@@ -133,7 +143,7 @@ def generate_distinct_colors(tissue_classes: list[str]) -> list[str]:
             saturation = 0.85 + (0.1 * (i % 2))
             value = 0.85 + (0.1 * ((i // 2) % 2))
         r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
-        color = f"{int(r*255):02X}{int(g*255):02X}{int(b*255):02X}"
+        color = f"#{int(r*255):02X}{int(g*255):02X}{int(b*255):02X}"
         colors.append(color)
     return colors
 
@@ -339,10 +349,14 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     class_colors_map = annotations.groupby('tissue_class')['tissue_color'].first().to_dict()
     class_colors = []
     for cn in class_names:
-        if cn in class_colors_map:
+        if cn in class_colors_map and str(class_colors_map[cn]).strip() != "":
             class_colors.append(class_colors_map[cn])
         else:
-            class_colors.append("#F3F4F5")
+            # Default colors when not provided by user annotations
+            if str(cn).lower() == "negative control":
+                class_colors.append("#F3F4F5")
+            else:
+                class_colors.append("#F3F4F5")
 
     cell_indices = annotations['patch_ID'].astype(int).values
     X_train = cell_embeddings[cell_indices]
@@ -419,30 +433,31 @@ def run_classification(args) -> Dict[str, Any]:
             embedding_source_group = None
 
             if DEPENDENCIES:
-                embedding_node_name = DEPENDENCIES[0]
-                print(f"[{NODE_NAME}] Attempting to read embeddings from dependency node group: {embedding_node_name}")
-                if embedding_node_name in hf and 'embedding' in hf[embedding_node_name]:
-                    cell_embeddings = hf[embedding_node_name]['embedding'][()]
-                    embedding_source_group = embedding_node_name
+                dep0 = DEPENDENCIES[0]
+                dep_group = DEP_H5_GROUPS.get(dep0, dep0) if isinstance(DEP_H5_GROUPS, dict) else dep0
+                print(f"[{NODE_NAME}] Attempting to read embeddings from dependency h5 group: {dep_group}")
+                if dep_group in hf and 'embedding' in hf[dep_group]:
+                    cell_embeddings = hf[dep_group]['embedding'][()]
+                    embedding_source_group = dep_group
                     print(f"[{NODE_NAME}] Successfully loaded embeddings from dependency group '{embedding_source_group}', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
                 else:
-                    print(f"[{NODE_NAME}] Embedding not found in dependency group '{embedding_node_name}'. Will try reading from own group.")
+                    print(f"[{NODE_NAME}] Embedding not found in dependency group '{dep_group}'. Will try reading from own group.")
 
             if cell_embeddings is None:
-                print(f"[{NODE_NAME}] Attempting to read embeddings from own node group: {NODE_NAME}")
-                if NODE_NAME in hf and 'embedding' in hf[NODE_NAME]:
-                    cell_embeddings = hf[NODE_NAME]['embedding'][()]
-                    embedding_source_group = NODE_NAME
+                print(f"[{NODE_NAME}] Attempting to read embeddings from own h5 group: {H5_GROUP}")
+                if H5_GROUP in hf and 'embedding' in hf[H5_GROUP]:
+                    cell_embeddings = hf[H5_GROUP]['embedding'][()]
+                    embedding_source_group = H5_GROUP
                     print(f"[{NODE_NAME}] Successfully loaded embeddings from own group '{embedding_source_group}', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
                 else:
-                    print(f"[{NODE_NAME}] Embedding not found in own group '{NODE_NAME}'.")
+                    print(f"[{NODE_NAME}] Embedding not found in own group '{H5_GROUP}'.")
 
             if cell_embeddings is None:
                 error_msg = f"Embedding dataset not found in expected locations: "
                 expected_locations = []
                 if DEPENDENCIES:
                     expected_locations.append(f"dependency group '{DEPENDENCIES[0]}'")
-                expected_locations.append(f"own group '{NODE_NAME}'")
+                expected_locations.append(f"own group '{H5_GROUP}'")
                 error_msg += " or ".join(sorted(list(set(expected_locations))))
                 raise ValueError(error_msg + " => no cell_embeddings")
 
@@ -483,8 +498,8 @@ def run_classification(args) -> Dict[str, Any]:
                 prediction_probs = None # For zero-shot
 
                 final_class_colors = None
-                if NODE_NAME in hf and 'tissue_class_HEX_color' in hf[NODE_NAME]:
-                    old_colors = hf[NODE_NAME]['tissue_class_HEX_color'][()]
+                if H5_GROUP in hf and 'tissue_class_HEX_color' in hf[H5_GROUP]:
+                    old_colors = hf[H5_GROUP]['tissue_class_HEX_color'][()]
                     if len(old_colors) == len(tissue_classes):
                         final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
                 
@@ -497,15 +512,15 @@ def run_classification(args) -> Dict[str, Any]:
 
             # D) result => cell_classification
             saved_datasets = {}
-            if NODE_NAME in hf:
+            if H5_GROUP in hf:
                 for name in ['coordinates', 'embedding']: # Preserve these if they exist under NODE_NAME
-                    if name in hf[NODE_NAME]:
+                    if name in hf[H5_GROUP]:
                         print(f"[{NODE_NAME}] Found {name} in existing group, will preserve it")
-                        saved_datasets[name] = hf[NODE_NAME][name][()]
+                        saved_datasets[name] = hf[H5_GROUP][name][()]
             
-            if NODE_NAME in hf:
-                del hf[NODE_NAME]
-            grp_cls = hf.create_group(NODE_NAME)
+            if H5_GROUP in hf:
+                del hf[H5_GROUP]
+            grp_cls = hf.create_group(H5_GROUP)
 
             grp_cls.create_dataset('tissue_class_id', data=predictions.astype(np.int32))
 
@@ -597,11 +612,13 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH
+    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, H5_GROUP, DEP_H5_GROUPS
     NODE_NAME = data.get("node_name", "MuskNode")
     DEPENDENCIES = data.get("dependencies", [])
     H5_PATH = data.get("h5_path", None)
-    
+    H5_GROUP = data.get("h5_group", NODE_NAME)
+    DEP_H5_GROUPS = data.get("dependencies_h5_groups", {})
+
     CLASSIFIER_PATH = None
     SAVE_CLASSIFIER_PATH = None
 
@@ -617,7 +634,7 @@ def read_node(data: Dict[str, Any]):
         )
 
     with h5py.File(H5_PATH, "r") as hf:
-        user_data_path = f"{NODE_NAME}/userData"
+        user_data_path = f"{H5_GROUP}/userData"
         if user_data_path in hf:
             for k in hf[user_data_path].keys():
                 raw_bytes = hf[user_data_path][k][()]
@@ -670,7 +687,7 @@ def execute_node():
     # write out to /NODE_NAME/output
     if H5_PATH and os.path.exists(H5_PATH):
         with h5py.File(H5_PATH, "a") as hf:
-            out_ds = f"{NODE_NAME}/output"
+            out_ds = f"{H5_GROUP}/output"
             if out_ds in hf:
                 del hf[out_ds]
             out_str = json.dumps(out_val, ensure_ascii=False)
