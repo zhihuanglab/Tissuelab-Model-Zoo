@@ -171,7 +171,7 @@ def generate_distinct_colors(nuclei_classes: list[str]) -> list[str]:
             saturation = 0.85 + (0.1 * (i % 2))
             value = 0.85 + (0.1 * ((i // 2) % 2))
         r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
-        color = f"{int(r*255):02X}{int(g*255):02X}{int(b*255):02X}"
+        color = f"#{int(r*255):02X}{int(g*255):02X}{int(b*255):02X}"
         colors.append(color)
     return colors
 
