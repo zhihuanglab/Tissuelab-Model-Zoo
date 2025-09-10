@@ -22,6 +22,7 @@ uvicorn
 transformers
 
 czifile
-pywin32
 pydicom
-pylibCZIrw
+# Windows-only dependencies; skip on macOS
+pywin32; platform_system == "Windows"
+pylibCZIrw; platform_system == "Windows"
