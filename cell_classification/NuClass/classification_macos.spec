@@ -39,6 +39,14 @@ hiddenimport_data = (
         *transformers_hiddenimports,
     ])
 
+# Resolve shared runtime hook path robustly even when __file__ is undefined
+try:
+    _spec_dir = os.path.abspath(os.path.dirname(sys.argv[0])) if (hasattr(sys, 'argv') and sys.argv and sys.argv[0].endswith('.spec')) else os.getcwd()
+except Exception:
+    _spec_dir = os.getcwd()
+RUNTIME_HOOKS_DIR = os.path.abspath(os.path.join(_spec_dir, "..", "..", "runtime_hooks"))
+rth_spawn_guard = os.path.join(RUNTIME_HOOKS_DIR, "rth_spawn_guard.py")
+
 a = Analysis(
     ['classification_taskNode.py'],  # Main entry script
     pathex=[],
@@ -56,7 +64,7 @@ a = Analysis(
     hiddenimports=hiddenimport_data,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[rth_spawn_guard],
     excludes=[],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
