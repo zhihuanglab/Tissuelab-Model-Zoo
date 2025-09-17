@@ -442,21 +442,21 @@ class MUSK:
                 cv2.THRESH_BINARY_INV, 31, 10
             )
             if debug_dir:
-                imageio.imwrite(os.path.join(debug_dir, "debug_01_init_mask.png"), mask * 255)
+                imageio.imwrite(os.path.join(debug_dir, "debug_01_init_mask.png"), (mask * 255).astype(np.uint8))
 
             # ---------------------------------------------------------------------
             # 3. Morphological closing – bridge small gaps / tears
             # ---------------------------------------------------------------------
             mask = morphology.binary_closing(mask, morphology.disk(8))
             if debug_dir:
-                imageio.imwrite(os.path.join(debug_dir, "debug_02_closed.png"), mask.astype(np.uint8) * 255)
+                imageio.imwrite(os.path.join(debug_dir, "debug_02_closed.png"), (mask.astype(np.uint8) * 255).astype(np.uint8))
 
             # ---------------------------------------------------------------------
             # 4. Fill larger holes inside tissue islands
             # ---------------------------------------------------------------------
             mask = morphology.remove_small_holes(mask, area_threshold=int(0.001 * h * w))
             if debug_dir:
-                imageio.imwrite(os.path.join(debug_dir, "debug_03_holes.png"), mask.astype(np.uint8) * 255)
+                imageio.imwrite(os.path.join(debug_dir, "debug_03_holes.png"), (mask.astype(np.uint8) * 255).astype(np.uint8))
 
             # ---------------------------------------------------------------------
             # 5. Keep only tissue regions whose area exceeds *min_area*
@@ -472,7 +472,7 @@ class MUSK:
 
             mask = mask_clean.astype(np.uint8)
             if debug_dir:
-                imageio.imwrite(os.path.join(debug_dir, "debug_04_area.png"), mask * 255)
+                imageio.imwrite(os.path.join(debug_dir, "debug_04_area.png"), (mask * 255).astype(np.uint8))
 
             # ---------------------------------------------------------------------
             # 6. Detect and discard shadow / artifact regions along the slide edges
@@ -496,12 +496,12 @@ class MUSK:
                         artifact_mask[label_img2 == region.label] = 1
 
             if debug_dir:
-                imageio.imwrite(os.path.join(debug_dir, "debug_05_artifact_mask.png"), artifact_mask * 255)
+                imageio.imwrite(os.path.join(debug_dir, "debug_05_artifact_mask.png"), artifact_mask.astype(np.uint8) * 255)
 
             # Final mask: tissue minus artifacts
             final_mask = (mask.astype(bool) & (~artifact_mask.astype(bool))).astype(np.uint8)
             if debug_dir:
-                imageio.imwrite(os.path.join(debug_dir, "debug_06_final_mask.png"), final_mask * 255)
+                imageio.imwrite(os.path.join(debug_dir, "debug_06_final_mask.png"), (final_mask * 255).astype(np.uint8))
 
             return final_mask
 
