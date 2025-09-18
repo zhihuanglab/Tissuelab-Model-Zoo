@@ -68,3 +68,4 @@ downloads
 *.json
 !zero2_config.json
 pretrain/
+patch_classification/MUSK/debug/*.png

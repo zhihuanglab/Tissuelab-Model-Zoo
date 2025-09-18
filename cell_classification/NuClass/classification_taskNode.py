@@ -280,7 +280,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         'tree_method': 'hist',
         'device': device,
         'eval_metric': 'mlogloss',
-        'random_state': 42
+        'random_state': 42,
+        'base_score': 0.5  # Initial value for XGBoost, must be in (0,1) for logistic loss
     }
 
     if annotations is None:
