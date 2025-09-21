@@ -237,7 +237,7 @@ def run_patch_classification(args):
                 batch_size=args.batch_size,
                 tissue_threshold=args.tissue_threshold,
                 save_patches=False,
-                output_mask_path=mask_export_path,
+                output_mask_path=None,
                 progress_callback=progress_callback
             )
             
