@@ -395,7 +395,7 @@ class MUSK:
         
         return patch_embeddings
 
-    def get_tissue_mask(self, slide, edge_width_ratio=0.04, min_area=None, debug_dir="debug"):
+    def get_tissue_mask(self, slide, edge_width_ratio=0.04, min_area=None, debug_dir=None):
         """
         Generate a filled tissue mask for a whole-slide image.
 
