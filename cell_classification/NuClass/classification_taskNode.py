@@ -102,7 +102,7 @@ def _generate_text_description(processor,
     inputs = {k: v.to(device) for k, v in inputs.items()}
     
     with torch.no_grad():
-        text_outputs = text_encoder(**inputs, return_dict=True) # Use **inputs
+        text_outputs = text_encoder(**inputs) # Remove return_dict=True as CLIPTextTransformer doesn't support it
         text_features = text_outputs.last_hidden_state.mean(dim=1)
         projected_features = text_projection(text_features)
         normalized_features = torch.nn.functional.normalize(projected_features, dim=1)
