@@ -445,20 +445,17 @@ def run_classification(args) -> Dict[str, Any]:
                     print(f"[{NODE_NAME}] Embedding not found in dependency group '{dep_group}'. Will try reading from own group.")
 
             if cell_embeddings is None:
-                print(f"[{NODE_NAME}] Attempting to read embeddings from own h5 group: {H5_GROUP}")
-                if H5_GROUP in hf and 'embedding' in hf[H5_GROUP]:
-                    cell_embeddings = hf[H5_GROUP]['embedding'][()]
-                    embedding_source_group = H5_GROUP
-                    print(f"[{NODE_NAME}] Successfully loaded embeddings from own group '{embedding_source_group}', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
-                else:
-                    print(f"[{NODE_NAME}] Embedding not found in own group '{H5_GROUP}'.")
+                if 'MuskNode' in hf and 'embedding' in hf['MuskNode']:
+                    cell_embeddings = hf['MuskNode']['embedding'][()]
+                    embedding_source_group = 'MuskNode'
+                    print(f"[{NODE_NAME}] Loaded embeddings from 'MuskNode', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
 
             if cell_embeddings is None:
                 error_msg = f"Embedding dataset not found in expected locations: "
                 expected_locations = []
                 if DEPENDENCIES:
                     expected_locations.append(f"dependency group '{DEPENDENCIES[0]}'")
-                expected_locations.append(f"own group '{H5_GROUP}'")
+                expected_locations.extend([f"own group '{H5_GROUP}'", "MuskNode"])
                 error_msg += " or ".join(sorted(list(set(expected_locations))))
                 raise ValueError(error_msg + " => no cell_embeddings")
 
@@ -617,7 +614,7 @@ def read_node(data: Dict[str, Any]):
     NODE_NAME = data.get("node_name", "MuskNode")
     DEPENDENCIES = data.get("dependencies", [])
     H5_PATH = data.get("h5_path", None)
-    H5_GROUP = data.get("h5_group", NODE_NAME)
+    H5_GROUP = data.get("h5_group", "MuskNode")
     DEP_H5_GROUPS = data.get("dependencies_h5_groups", {})
 
     CLASSIFIER_PATH = None
@@ -685,10 +682,9 @@ def execute_node():
         print(f"[{NODE_NAME}] ARGS: {ARGS}")
         out_val = run_classification(ARGS)
 
-    # write out to /NODE_NAME/output
     if H5_PATH and os.path.exists(H5_PATH):
         with h5py.File(H5_PATH, "a") as hf:
-            out_ds = f"{H5_GROUP}/output"
+            out_ds = f"{H5_GROUP}/classification_output"
             if out_ds in hf:
                 del hf[out_ds]
             out_str = json.dumps(out_val, ensure_ascii=False)
