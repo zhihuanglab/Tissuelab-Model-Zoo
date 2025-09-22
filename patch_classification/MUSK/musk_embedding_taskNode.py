@@ -63,7 +63,7 @@ DEP_H5_GROUPS = {}
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8007, help='port')
-    parser.add_argument('--name', type=str, default='MuskEmbeddingNode', help='node name')
+    parser.add_argument('--name', type=str, default='MuskEmbedding', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
 
     # === patch classification parameters ===
@@ -320,10 +320,10 @@ def read_node(data: Dict[str, Any]):
     global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS, H5_GROUP, DEP_H5_GROUPS
     
     # Extract basic information from request
-    NODE_NAME = data.get("node_name", "MuskNode")
+    NODE_NAME = data.get("node_name", "MuskEmbedding")
     DEPENDENCIES = data.get("dependencies", [])
     H5_PATH = data.get("h5_path", None)
-    H5_GROUP = data.get("h5_group", NODE_NAME)
+    H5_GROUP = data.get("h5_group") or "MuskNode"
     DEP_H5_GROUPS = data.get("dependencies_h5_groups", {})
 
     print(f"[{NODE_NAME}] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}, h5_group={H5_GROUP}")
