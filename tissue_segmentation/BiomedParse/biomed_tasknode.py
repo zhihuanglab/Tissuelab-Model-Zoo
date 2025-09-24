@@ -35,7 +35,7 @@ from tqdm import tqdm
 from skimage import transform
 
 # 导入NiftiImageWrapper
-from wrappers import NiftiImageWrapper
+from wrapper import NiftiImageWrapper
 
 def print_model_devices(model):
     """Device Information"""

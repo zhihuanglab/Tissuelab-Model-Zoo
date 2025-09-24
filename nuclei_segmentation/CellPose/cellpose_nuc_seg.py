@@ -17,7 +17,7 @@ from scipy.ndimage import zoom
 from skimage.feature import graycomatrix, graycoprops
 from skimage import draw
 import tensorflow as tf
-from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+from wrapper import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
 import tiffslide
 from collections import defaultdict
 import torch

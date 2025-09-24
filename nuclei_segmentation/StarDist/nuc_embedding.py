@@ -23,9 +23,17 @@ import czifile
 import sys
 
 if sys.platform == 'darwin':
-    from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+    from wrapper import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+    try:
+        from wrapper import CziImageWrapper
+    except Exception:
+        CziImageWrapper = None
 else:
-    from wrappers import CziImageWrapper, SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+    from wrapper import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+    try:
+        from wrapper import CziImageWrapper
+    except Exception:
+        CziImageWrapper = None
 import pathlib
 
 """

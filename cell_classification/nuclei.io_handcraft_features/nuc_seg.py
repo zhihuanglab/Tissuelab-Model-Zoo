@@ -22,7 +22,11 @@ from scipy.ndimage import zoom
 from skimage.feature import graycomatrix, graycoprops
 from skimage import draw
 import tensorflow as tf
-from wrappers import CziImageWrapper, SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+from wrapper import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+try:
+    from wrapper import CziImageWrapper
+except Exception:
+    CziImageWrapper = None
 import xml.etree.ElementTree as ET
 import czifile
 import tiffslide
