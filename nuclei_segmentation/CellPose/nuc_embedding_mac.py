@@ -18,7 +18,7 @@ import os
 from nuc_stat import PILSlide, NumpySlide
 from torch.utils.data import Dataset, DataLoader
 import time
-from wrapper import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
 import pathlib
 
 # Disable multiprocessing for TensorFlow to avoid conflicts
@@ -109,7 +109,7 @@ class NucleiPatchDataset(Dataset):
             if file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
                 slide = SimpleImageWrapper(self.slide_path)
             else:
-                slide = TiffSlideWrapper(self.slide_path)
+                slide = TiffFileWrapper(self.slide_path)
 
         x, y = self.centroids[idx]
         x1 = max(0, x - self.extraction_size // 2)

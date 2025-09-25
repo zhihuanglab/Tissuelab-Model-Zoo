@@ -22,9 +22,9 @@ from scipy.ndimage import zoom
 from skimage.feature import graycomatrix, graycoprops
 from skimage import draw
 import tensorflow as tf
-from wrapper import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
 try:
-    from wrapper import CziImageWrapper
+    from tissuelab_sdk.wrapper import CziImageWrapper
 except Exception:
     CziImageWrapper = None
 import xml.etree.ElementTree as ET
@@ -199,7 +199,7 @@ class SlideSegmentation():
                 self.args.magnification = magnification
                 print(f'Calculated magnification: {magnification:.1f}x')
             else:
-                self.slide = TiffSlideWrapper(self.args.slidepath)
+                self.slide = TiffFileWrapper(self.args.slidepath)
                 mpp = 0.25  # Default value
         
         # Add magnification attribute to self.args if not already set by CZI processing

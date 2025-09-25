@@ -26,16 +26,16 @@ import sys
 from matplotlib.path import Path
 
 if sys.platform == 'darwin':
-    from wrapper import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+    from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
     # Try to import CZI wrapper if available
     try:
-        from wrapper import CziImageWrapper
+        from tissuelab_sdk.wrapper import CziImageWrapper
     except Exception:
         CziImageWrapper = None
 else:
-    from wrapper import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+    from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
     try:
-        from wrapper import CziImageWrapper
+        from tissuelab_sdk.wrapper import CziImageWrapper
     except Exception:
         CziImageWrapper = None
 import xml.etree.ElementTree as ET
@@ -264,11 +264,11 @@ class SlideSegmentation():
                     self.args.magnification = magnification
                     print(f'Calculated magnification: {magnification:.1f}x')
                 else:
-                    print('CziImageWrapper not available on this platform. Falling back to TiffSlideWrapper with default MPP.')
-                    self.slide = TiffSlideWrapper(self.args.slidepath)
+                    print('CziImageWrapper not available on this platform. Falling back to TiffFileWrapper with default MPP.')
+                    self.slide = TiffFileWrapper(self.args.slidepath)
                     mpp = 0.25
             else:
-                self.slide = TiffSlideWrapper(self.args.slidepath)
+                self.slide = TiffFileWrapper(self.args.slidepath)
                 mpp = 0.25  # Default value
         
         self.actual_slide_mpp = mpp # Store the determined MPP

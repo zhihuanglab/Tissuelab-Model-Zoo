@@ -23,15 +23,15 @@ import czifile
 import sys
 
 if sys.platform == 'darwin':
-    from wrapper import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+    from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
     try:
-        from wrapper import CziImageWrapper
+        from tissuelab_sdk.wrapper import CziImageWrapper
     except Exception:
         CziImageWrapper = None
 else:
-    from wrapper import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+    from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
     try:
-        from wrapper import CziImageWrapper
+        from tissuelab_sdk.wrapper import CziImageWrapper
     except Exception:
         CziImageWrapper = None
 import pathlib
@@ -182,7 +182,7 @@ class NucleiPatchDataset(Dataset):
             if file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
                 slide = SimpleImageWrapper(self.slide_path)
             else:
-                slide = TiffSlideWrapper(self.slide_path)
+                slide = TiffFileWrapper(self.slide_path)
 
         x, y = self.centroids[idx]
         x1 = max(0, x - self.extraction_size // 2)
