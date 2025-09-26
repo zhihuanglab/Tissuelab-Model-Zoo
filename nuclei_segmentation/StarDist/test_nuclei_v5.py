@@ -22,6 +22,7 @@ from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
 from PIL import Image as PILImage
 import h5py
+from safe_h5_utils import safe_h5_open
 import math
 from datetime import datetime
 from io import BytesIO
@@ -174,7 +175,7 @@ class HighPerformancePipelineProcessor:
             console.print(f"[yellow]Existing file removed: {self.output_path}[/yellow]")
         
         # Create H5 file with resizable datasets
-        with h5py.File(self.temp_output_path, 'w') as h5f:
+        with safe_h5_open(self.temp_output_path, 'w') as h5f:
             seg_group = h5f.create_group('SegmentationNode')
             
             # Create resizable datasets
@@ -228,7 +229,7 @@ class HighPerformancePipelineProcessor:
         # Write to H5
         with self.h5_lock:
             try:
-                with h5py.File(self.temp_output_path, 'a') as h5f:
+                with safe_h5_open(self.temp_output_path, 'a') as h5f:
                     seg_group = h5f['SegmentationNode']
                     
                     # Process segmentation results
@@ -898,7 +899,7 @@ class HighPerformancePipelineProcessor:
                 self.temp_output_path.rename(self.output_path)
                 
             # Add final metadata
-            with h5py.File(self.output_path, 'a') as h5f:
+            with safe_h5_open(self.output_path, 'a') as h5f:
                 meta = h5f['Metadata']
                 with self.stats_lock:
                     stats = dict(self.stats)
@@ -1104,7 +1105,7 @@ def test_v5_optimized_pipeline(image_path=None):
         
         # Read final statistics from H5
         try:
-            with h5py.File(output_path, 'r') as h5f:
+            with safe_h5_open(output_path, 'r') as h5f:
                 total_nuclei = h5f['SegmentationNode']['centroids'].shape[0]
                 total_embeddings = h5f['SegmentationNode']['embedding'].shape[0]
                 

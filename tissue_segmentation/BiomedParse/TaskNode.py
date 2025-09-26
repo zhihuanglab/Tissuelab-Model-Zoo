@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 import json
 import h5py
+from safe_h5_utils import safe_h5_open
 import argparse
 import uvicorn
 
@@ -249,7 +250,7 @@ class BiomedParseNode(TaskNode):
             return
 
         # Open h5 file to read:
-        with h5py.File(self.h5_path, "r") as hf:
+        with safe_h5_open(self.h5_path, "r") as hf:
             # 1) Read frontend userData for this node (if exists)
             node_user_data = f"{self.name}/userData"
             if node_user_data in hf:
@@ -317,7 +318,7 @@ class BiomedParseNode(TaskNode):
 
         # Write results to h5
         if self.h5_path:
-            with h5py.File(self.h5_path, "a") as hf:
+            with safe_h5_open(self.h5_path, "a") as hf:
                 # Assume storing to /myNode/output
                 out_path = f"{self.name}/output"
                 # Delete if exists first (prevent errors)

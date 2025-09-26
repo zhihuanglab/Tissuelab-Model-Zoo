@@ -5,6 +5,7 @@ import time
 import base64
 from PIL import Image
 import h5py
+from safe_h5_utils import safe_h5_open
 import os
 import warnings
 from datetime import datetime
@@ -127,7 +128,7 @@ def generate_high_performance_embeddings(centroids, batch_size=None, num_workers
             # Extract embeddings from H5 file if returned
             if result.get('h5_path'):
                 try:
-                    with h5py.File(result['h5_path'], 'r') as h5f:
+                    with safe_h5_open(result['h5_path'], 'r') as h5f:
                         embeddings = h5f['embedding'][:]
                         embeddings_list = embeddings.tolist()
                     
