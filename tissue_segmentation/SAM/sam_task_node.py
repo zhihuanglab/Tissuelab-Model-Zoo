@@ -16,6 +16,7 @@ from typing import Dict, Any
 from pathlib import Path
 from sse_starlette.sse import EventSourceResponse
 import asyncio
+from safe_h5_utils import safe_h5_open
 
 # =========== 2)other user's independency ===========
 from PIL import Image
@@ -316,7 +317,7 @@ def read_node(data: Dict[str, Any]):
 
     user_data_dict = {}
 
-    with h5py.File(H5_PATH, "r") as hf:
+    with safe_h5_open(H5_PATH, "r") as hf:
         self_ud = f"{NODE_NAME}/userData"
         if self_ud in hf:
             for k in hf[self_ud].keys():
@@ -565,7 +566,7 @@ def execute_node(background_tasks: BackgroundTasks):
                 result_value = {"status": "error", "message": str(e)}
 
     if H5_PATH and os.path.exists(H5_PATH):
-        with h5py.File(H5_PATH, "a") as hf:
+        with safe_h5_open(H5_PATH, "a") as hf:
             out_path = f"{NODE_NAME}/output"
             if out_path in hf:
                 del hf[out_path]
@@ -573,7 +574,7 @@ def execute_node(background_tasks: BackgroundTasks):
             hf.create_dataset(out_path, data=out_str.encode("utf-8"))
             print(f"[DEBUG] => wrote JSON to {out_path}: {out_str}")
             try:
-                with h5py.File(H5_PATH, "r") as hf:
+                with safe_h5_open(H5_PATH, "r") as hf:
                     print("[DEBUG] H5 top-level keys:", list(hf.keys()))
                     for key in hf.keys():
                         print(f"    - {key} => subkeys:", list(hf[key].keys()))

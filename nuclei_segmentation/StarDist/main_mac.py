@@ -15,6 +15,7 @@ opj=os.path.join
 import cv2
 from scipy.interpolate import interp1d
 import h5py
+from safe_h5_utils import safe_h5_open
 import multiprocess as mp
 import json
 
@@ -65,7 +66,7 @@ def main(args):
         contours = None
         
         if os.path.exists(h5_path):
-            with h5py.File(h5_path, 'r') as hf:
+            with safe_h5_open(h5_path, 'r') as hf:
                 if 'SegmentationNode' in hf:
                     try:
                         centroids = hf['SegmentationNode']['centroids'][()].copy()  # Make copies of the data
@@ -113,10 +114,10 @@ def main(args):
             #     print(f"Warning: failed to create backup: {str(e)}")
             
             # 从临时文件读取embeddings并保存到目标文件
-            with h5py.File(temp_h5_path, "r") as tf:
+            with safe_h5_open(temp_h5_path, "r") as tf:
                 embedding_data = tf["embedding"][()]
                 
-            with h5py.File(h5_path, 'a') as hf_write:
+            with safe_h5_open(h5_path, 'a') as hf_write:
                 nuclei_seg = hf_write['SegmentationNode']
                 if 'cell_embeddings' in nuclei_seg:
                     del nuclei_seg['cell_embeddings']
@@ -130,7 +131,7 @@ def main(args):
 
         if APPEND_FEATURES:
             # Add features to existing h5 file
-            with h5py.File(h5_path, 'a') as hf_write:
+            with safe_h5_open(h5_path, 'a') as hf_write:
                 hf_write['SegmentationNode'].create_dataset('features', data=features)
                 hf_write['SegmentationNode'].create_dataset('feature_names', data=feature_names)
                 hf_write['SegmentationNode'].create_dataset('class_vector', data=class_vector)
@@ -166,7 +167,7 @@ def main(args):
             probability = ss.prob_all
 
             # Save segmentation results first
-            with h5py.File(h5_path, mode) as hf:
+            with safe_h5_open(h5_path, mode) as hf:
                 print("Number of nuclei: %d" % len(ss.final_points))
                 print("=====final mask shape in main=====")
                 # Create a group for nuclei segmentation
@@ -196,10 +197,10 @@ def main(args):
             # except Exception as e:
             #     print(f"Warning: failed to create backup: {str(e)}")
 
-            with h5py.File(temp_h5_path, "r") as tf:
+            with safe_h5_open(temp_h5_path, "r") as tf:
                 embedding_data = tf["embedding"][()]
                 
-            with h5py.File(h5_path, 'a') as hf:
+            with safe_h5_open(h5_path, 'a') as hf:
                 nuclei_seg = hf['SegmentationNode']
                 if 'embedding' in nuclei_seg:
                     del nuclei_seg['embedding']
@@ -209,7 +210,7 @@ def main(args):
             if args.calculate_features:
                 features, feature_names, class_vector, class_names = calculate_features(args, centroids, contours)
                 # Append features to the h5 file
-                with h5py.File(h5_path, 'a') as hf:
+                with safe_h5_open(h5_path, 'a') as hf:
                     nuclei_seg = hf['SegmentationNode']
                     nuclei_seg.create_dataset('features', data=features)
                     nuclei_seg.create_dataset('feature_names', data=feature_names)

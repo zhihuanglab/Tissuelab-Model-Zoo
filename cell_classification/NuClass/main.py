@@ -3,6 +3,7 @@
 import argparse
 import numpy as np
 import h5py
+from safe_h5_utils import safe_h5_open
 import os
 import time
 from typing import Dict, Any
@@ -147,7 +148,7 @@ def main(slidepath: str,
         # Check if h5 file exists and has required data
         if not os.path.exists(h5_path):
             raise FileNotFoundError(f"H5 file not found: {h5_path}")
-        with h5py.File(h5_path, 'r') as hf:
+        with safe_h5_open(h5_path, 'r') as hf:
             # Check for annotations in either location
             annotations_data = None
             if 'user_annotation' in hf and 'nuclei_annotations' in hf['user_annotation']:
@@ -165,7 +166,7 @@ def main(slidepath: str,
                 print("No annotations found, using zero-shot classification")
                 use_supervised = False # Zero-shot classification
         # Load embeddings first as they're needed for both approaches
-        with h5py.File(h5_path, 'r') as hf:
+        with safe_h5_open(h5_path, 'r') as hf:
             if 'nuclei_segmentation' not in hf:
                 raise ValueError("No nuclei segmentation data found in h5 file")
             nuclei_seg = hf['nuclei_segmentation']
@@ -202,7 +203,7 @@ def main(slidepath: str,
 
             # Check for existing colors in h5 file before generating new ones
             existing_colors = None
-            with h5py.File(h5_path, 'r') as hf:
+            with safe_h5_open(h5_path, 'r') as hf:
                 if 'cell_classification' in hf and 'nuclei_class_HEX_color' in hf['cell_classification']:
                     existing_colors = hf['cell_classification']['nuclei_class_HEX_color'][()]
             # Use existing colors if available and match current classes, otherwise generate new ones
@@ -213,7 +214,7 @@ def main(slidepath: str,
 
 
         # Save results
-        with h5py.File(h5_path, 'r+') as hf:
+        with safe_h5_open(h5_path, 'r+') as hf:
             if 'cell_classification' in hf:
                 del hf['cell_classification']
             cell_class = hf.create_group('cell_classification')

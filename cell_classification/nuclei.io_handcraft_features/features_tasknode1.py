@@ -10,6 +10,7 @@ import sys
 import time
 import json
 import h5py
+from safe_h5_utils import safe_h5_open
 import uvicorn
 import requests
 import platform
@@ -171,7 +172,7 @@ def run_segmentation_and_features(args):
         contours = None
 
         if os.path.exists(H5_PATH):
-            with h5py.File(H5_PATH, 'r') as hf:
+            with safe_h5_open(H5_PATH, 'r') as hf:
                 # Check for segmentation data in SegmentationNode
                 if 'SegmentationNode' in hf:
                     try:
@@ -318,7 +319,7 @@ def run_segmentation_and_features(args):
             update_progress(90)
 
         # Step D: Save results to H5 file
-        with h5py.File(H5_PATH, "a") as hf:
+        with safe_h5_open(H5_PATH, "a") as hf:
             # Save segmentation data in SegmentationNode
             if centroids is not None and need_segmentation:
                 if 'SegmentationNode' in hf:
@@ -448,7 +449,7 @@ def read_node(data: Dict[str, Any]):
 
     # Read user data from H5 file
     if os.path.exists(H5_PATH):
-        with h5py.File(H5_PATH, "r") as hf:
+        with safe_h5_open(H5_PATH, "r") as hf:
             user_data_path = f"{NODE_NAME}/userData"
             if user_data_path in hf:
                 for k in hf[user_data_path].keys():

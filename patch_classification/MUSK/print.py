@@ -1,4 +1,5 @@
 import h5py
+from safe_h5_utils import safe_h5_open
 import numpy as np
 import os
 import matplotlib.pyplot as plt
@@ -32,7 +33,7 @@ def print_h5_structure(name, obj):
 def read_h5_file(file_path):
     """Read H5 file and display its structure"""
     try:
-        with h5py.File(file_path, 'r') as f:
+        with safe_h5_open(file_path, 'r') as f:
             print(f"File: {file_path}")
             print("=" * 50)
             f.visititems(print_h5_structure)
@@ -49,7 +50,7 @@ def generate_patch_visualization(file_path, output_image_path=None, scale_factor
         scale_factor: Scale factor to reduce image size, default is 1.0 (original size)
     """
     try:
-        with h5py.File(file_path, 'r') as f:
+        with safe_h5_open(file_path, 'r') as f:
             # Read coordinates information
             coordinates = f['MuskNode/coordinates'][...]
             

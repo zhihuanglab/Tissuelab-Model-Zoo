@@ -7,6 +7,7 @@ from collections import Counter
 import os
 import matplotlib.pyplot as plt
 import h5py
+from safe_h5_utils import safe_h5_open
 
 def init_node():
     """
@@ -181,7 +182,7 @@ def save_results_to_h5(results, output_path):
         results: 处理结果字典
         output_path: 保存路径
     """
-    with h5py.File(output_path, 'w') as f:
+    with safe_h5_open(output_path, 'w') as f:
         # 创建patches组
         patches_group = f.create_group('patches')
         

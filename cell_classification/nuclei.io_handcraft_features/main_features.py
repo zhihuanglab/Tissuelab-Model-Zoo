@@ -11,6 +11,7 @@ import time
 import os
 import platform
 import h5py
+from safe_h5_utils import safe_h5_open
 import json
 import multiprocess as mp
 from tqdm import tqdm
@@ -207,7 +208,7 @@ def check_existing_results(h5_path):
         return False, None, None, False
     
     try:
-        with h5py.File(h5_path, 'r') as hf:
+        with safe_h5_open(h5_path, 'r') as hf:
             if 'SegmentationNode' not in hf:
                 return False, None, None, False
             
@@ -294,7 +295,7 @@ def main(args):
             
             # Save segmentation results
             mode = 'w' if args.force_recalculate else 'a'
-            with h5py.File(h5_path, mode) as hf:
+            with safe_h5_open(h5_path, mode) as hf:
                 # Create or get SegmentationNode group
                 if 'SegmentationNode' in hf:
                     del hf['SegmentationNode']
@@ -334,7 +335,7 @@ def main(args):
             )
             
             # Save features to h5 file in CellFeatureNode
-            with h5py.File(h5_path, 'a') as hf:
+            with safe_h5_open(h5_path, 'a') as hf:
                 # Create or recreate CellFeatureNode
                 if 'CellFeatureNode' in hf:
                     del hf['CellFeatureNode']
