@@ -11,7 +11,6 @@ import sys
 import time
 import json
 import h5py
-from safe_h5_utils import safe_h5_open
 import uvicorn
 import requests
 import numpy as np
@@ -70,14 +69,13 @@ DEP_H5_GROUPS = {}
 def print_h5_structure(file_path):
     """print H5 file"""
     import h5py
-from safe_h5_utils import safe_h5_open
     def print_item(name, obj):
         indent = "  " * (name.count("/"))
         if isinstance(obj, h5py.Group):
             print(f"{indent}{name} (Group)")
         elif isinstance(obj, h5py.Dataset):
             print(f"{indent}{name} (Dataset), shape: {obj.shape}, dtype: {obj.dtype}")
-    with safe_h5_open(file_path, "r") as hf:
+    with h5py.File(file_path, "r") as hf:
         hf.visititems(print_item)
 
 def load_checkpoint_at_init():
@@ -413,13 +411,16 @@ def run_classification(args) -> Dict[str, Any]:
     cell_embeddings = None
     class_embeddings = None # Renamed from class_embeddings_arr for clarity if it's a list of arrays
     sims_arr = None # Or sims if it's a list before converting to numpy array
+    
+    progress_value = 30
+    print(f"[{NODE_NAME}] Progress: 30%")
 
     try:
         start_time = time.time()
         h5_path = H5_PATH
 
         # Open H5 file once for all operations
-        with safe_h5_open(h5_path, 'a') as hf: # Open in append mode for read/write
+        with h5py.File(h5_path, 'a') as hf: # Open in append mode for read/write
             # A) check annotation
             annotations_data = None
             use_supervised = False
@@ -464,8 +465,8 @@ def run_classification(args) -> Dict[str, Any]:
             # C) supervised or zero-shot
             tissue_classes = getattr(args, "tissue_classes", [])
             tissue_colors = getattr(args, "tissue_colors", [])
-            progress_value = 50
-            print(f"[{NODE_NAME}] Progress: 50%")
+            progress_value = 80
+            print(f"[{NODE_NAME}] Progress: 80%")
 
             if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
                 clf, class_names, class_colors, predictions, prediction_probs, \
@@ -492,8 +493,6 @@ def run_classification(args) -> Dict[str, Any]:
                     # np.dot(cell_embeddings (N,D), ce_single_class.T (D,1)) -> (N,1)
                     sim = np.dot(cell_embeddings, ce_single_class.T) 
                     sim_list.append(sim)
-                    progress_value = int((idx + 1) / len(class_embeddings) * 100)
-                    print(f"Progress: {progress_value}%")
                 
                 sims_arr = np.concatenate(sim_list, axis=1) # Concatenate along class dimension
                 predictions = np.argmax(sims_arr, axis=1)
@@ -602,7 +601,9 @@ def init_node():
     """
     at this stage => download + load HF big model
     """
-    global IS_MODEL_INITED
+    global IS_MODEL_INITED, progress_value
+    progress_value = 10
+    print(f"[{NODE_NAME}] Progress: 10%")
     if not IS_MODEL_INITED:
         IS_MODEL_INITED = True
         print("[MuskNode] /init => let's load HF big model now ...")
@@ -635,7 +636,7 @@ def read_node(data: Dict[str, Any]):
             tissue_classes=["Negative control", "Tumor"]
         )
 
-    with safe_h5_open(H5_PATH, "r") as hf:
+    with h5py.File(H5_PATH, "r") as hf:
         user_data_path = f"{H5_GROUP}/userData"
         if user_data_path in hf:
             for k in hf[user_data_path].keys():
@@ -687,13 +688,16 @@ def execute_node():
         out_val = run_classification(ARGS)
 
     if H5_PATH and os.path.exists(H5_PATH):
-        with safe_h5_open(H5_PATH, "a") as hf:
+        with h5py.File(H5_PATH, "a") as hf:
             out_ds = f"{H5_GROUP}/classification_output"
             if out_ds in hf:
                 del hf[out_ds]
             out_str = json.dumps(out_val, ensure_ascii=False)
             hf.create_dataset(out_ds, data=out_str.encode("utf-8"))
             hf.flush()
+    
+    progress_value = 100
+    print(f"[{NODE_NAME}] Progress: 100%")
 
     return {"status": "ok", "output": out_val}
 
@@ -712,8 +716,10 @@ async def progress():
     async def event_generator():
         global progress_value
         last_value = -1
-        while progress_value < 100:
+        progress_value = 0
+        while True:
             if progress_value != last_value:
+                print(f"[SSE] Progress: {progress_value}%")
                 yield {"data": str(progress_value)}
                 last_value = progress_value
             await asyncio.sleep(0.1)  # Adjust the sleep time as needed
