@@ -462,6 +462,8 @@ def run_classification(args) -> Dict[str, Any]:
             # C) supervised or zero-shot
             tissue_classes = getattr(args, "tissue_classes", [])
             tissue_colors = getattr(args, "tissue_colors", [])
+            progress_value = 50
+            print(f"[{NODE_NAME}] Progress: 50%")
 
             if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
                 clf, class_names, class_colors, predictions, prediction_probs, \
