@@ -165,17 +165,18 @@ def main(args):
 
             # Modify temporary file and backup file save locations
             temp_h5_path = os.path.join(result_dir, f"temp_{slide_basename}.h5")
-            backup_path = os.path.join(result_dir, f"backup_{slide_basename}_embedding.h5")
+            # backup_path = os.path.join(result_dir, f"backup_{slide_basename}_embedding.h5")  # 已禁用
 
             ne = NucleiEmbedding(args, centroids)
             result_path = ne.generate_embeddings(temp_h5_path=temp_h5_path)
 
-            try:
-                import shutil
-                shutil.copy2(result_path, backup_path)
-                print(f"Created embeddings backup: {backup_path}")
-            except Exception as e:
-                print(f"Warning: failed to create backup: {str(e)}")
+            # 创建备份 - 已禁用
+            # try:
+            #     import shutil
+            #     shutil.copy2(result_path, backup_path)
+            #     print(f"Created embeddings backup: {backup_path}")
+            # except Exception as e:
+            #     print(f"Warning: failed to create backup: {str(e)}")
 
             with h5py.File(temp_h5_path, "r") as tf:
                 embedding_data = tf["embedding"][()]
