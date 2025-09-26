@@ -1,4 +1,5 @@
 import h5py
+from safe_h5_utils import safe_h5_open
 import os
 import numpy as np
 
@@ -20,8 +21,8 @@ def rename_nuclei_groups(input_file, output_file=None):
             return
     
     # Create a new file
-    with h5py.File(input_file, 'r') as source:
-        with h5py.File(output_file, 'w') as target:
+    with safe_h5_open(input_file, 'r') as source:
+        with safe_h5_open(output_file, 'w') as target:
             # Recursively copy groups and datasets, while renaming
             def copy_and_rename(name, obj):
                 # Get parent group path and current item name
@@ -96,7 +97,7 @@ def print_h5_structure(name, obj):
 def read_h5_file(file_path):
     """Read H5 file and display its structure"""
     try:
-        with h5py.File(file_path, 'r') as f:
+        with safe_h5_open(file_path, 'r') as f:
             print(f"File: {file_path}")
             print("=" * 50)
             f.visititems(print_h5_structure)

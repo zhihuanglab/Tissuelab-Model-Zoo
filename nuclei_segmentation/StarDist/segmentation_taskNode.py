@@ -27,6 +27,7 @@ from pathlib import Path
 
 from nuc_seg import SlideSegmentation
 from nuc_embedding import NucleiEmbedding
+from safe_h5_utils import safe_h5_open
 
 app = FastAPI()
 
@@ -80,7 +81,7 @@ def print_h5_structure(file_path):
         elif isinstance(obj, h5py.Dataset):
             print(f"{indent}{name} (Dataset), shape: {obj.shape}, dtype: {obj.dtype}")
 
-    with h5py.File(file_path, "r") as hf:
+    with safe_h5_open(file_path, "r") as hf:
         hf.visititems(print_item)
 
 
@@ -110,7 +111,7 @@ def run_segmentation(args):
         probability = None # Initialize probability
 
         if os.path.exists(H5_PATH):
-            with h5py.File(H5_PATH, 'r') as hf:
+            with safe_h5_open(H5_PATH, 'r') as hf:
                 if NODE_NAME in hf:
                     try:
                         centroids = hf[f"{NODE_NAME}/centroids"][()]
@@ -204,7 +205,7 @@ def run_segmentation(args):
             have_cached_embedding = False
             if os.path.exists(temp_h5_path):
                 try:
-                    with h5py.File(temp_h5_path, "r") as tf:
+                    with safe_h5_open(temp_h5_path, "r") as tf:
                         if "embedding" in tf:
                             e = tf["embedding"][()]
                             if len(e) == len(centroids):
@@ -231,7 +232,7 @@ def run_segmentation(args):
                 #     print(f"warning: failed to create backup: {str(e)}")
                 
                 # read embeddings for later saving
-                with h5py.File(temp_h5_path, "r") as tf:
+                with safe_h5_open(temp_h5_path, "r") as tf:
                     embedding_data = tf["embedding"][()]
         elif centroids is not None and len(centroids) == 0:
             print("[EMBED LOG] No centroids detected from segmentation, skipping embedding generation.")
@@ -242,7 +243,7 @@ def run_segmentation(args):
         # Step D:  copy segmentation + embedding to workflow_data.h5
         # write to h5
         if centroids is not None: # Only proceed if centroids were processed (even if empty from seg)
-            with h5py.File(H5_PATH, "a") as hf:
+            with safe_h5_open(H5_PATH, "a") as hf:
                 if NODE_NAME in hf: # if group already exists, delete it to ensure fresh write
                     del hf[NODE_NAME]
                 node_grp = hf.create_group(NODE_NAME)
@@ -335,7 +336,7 @@ def read_node(data: Dict[str, Any]):
         ARGS.bbox = None
         ARGS.polygon_points = None
 
-    with h5py.File(H5_PATH, "r") as hf:
+    with safe_h5_open(H5_PATH, "r") as hf:
         user_data_path = f"{NODE_NAME}/userData"
         if user_data_path in hf:
             for k in hf[user_data_path].keys():
@@ -397,7 +398,7 @@ def execute_node():
 
     # store the result to 'output'
     if H5_PATH and os.path.exists(H5_PATH):
-        with h5py.File(H5_PATH, "a") as hf:
+        with safe_h5_open(H5_PATH, "a") as hf:
             node_out_path = f"{NODE_NAME}/output"
             if node_out_path in hf:
                 del hf[node_out_path]

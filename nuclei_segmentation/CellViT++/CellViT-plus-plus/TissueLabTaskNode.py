@@ -8,6 +8,7 @@ os.environ['OPENBLAS_NUM_THREADS'] = '4'
 opj = os.path.join
 from scipy.interpolate import interp1d
 import h5py
+from safe_h5_utils import safe_h5_open
 from types import SimpleNamespace
 from pipeline.segmentation import SlideSegmentation
 import json
@@ -134,7 +135,7 @@ class NucleiSegmentationNode(TaskNode):
 
                 # Check if file exists and has nuclei_segmentation group
                 if os.path.exists(h5_path):
-                    with h5py.File(h5_path, 'r') as hf:
+                    with safe_h5_open(h5_path, 'r') as hf:
                         if 'nuclei_segmentation' in hf:
                             nuclei_group = hf['nuclei_segmentation']
                             centroids = nuclei_group['centroids'][:]
@@ -149,7 +150,7 @@ class NucleiSegmentationNode(TaskNode):
 
                 # Open file in append mode if it exists, write mode if it doesn't
                 mode = 'a' if os.path.exists(h5_path) else 'w'
-                with h5py.File(h5_path, mode) as hf:
+                with safe_h5_open(h5_path, mode) as hf:
                     print("=====final mask shape in main=====")
                     print(ss.mask.shape)
                     # Create a group for nuclei segmentation
