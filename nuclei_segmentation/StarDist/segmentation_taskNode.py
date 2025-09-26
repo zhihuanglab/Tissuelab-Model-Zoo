@@ -65,6 +65,9 @@ def parse_args():
     parser.add_argument('--target_mpp', default=None, type=float, help='Target microns per pixel for processing')
     parser.add_argument('--bbox', default=None, type=str, help='Bounding box for segmentation in format "x,y,width,height"')
     parser.add_argument('--polygon_points', default=None, type=json.loads, help='Polygon points for segmentation in JSON string format "[[x1,y1],[x2,y2],...]".')
+    
+    # CPU control parameter
+    parser.add_argument('--max_workers', type=int, default=15, help='Maximum number of CPU workers for processing (default: 4)')
 
     return parser.parse_args()
 
@@ -150,6 +153,10 @@ def run_segmentation(args):
         # Step B: if not have segmentation => run stardist
         if not ALREADY_HAVE_SEG:
             print(f"Working on {args.slidepath} with stardist_pretrain={args.stardist_pretrain}, isIHC={args.isIHC}")
+            # Add max_workers to args if not present
+            if not hasattr(args, 'max_workers'):
+                args.max_workers = 15
+                
             ss = SlideSegmentation(args,
                                    tile_size=4096,
                                    overlap=256,
