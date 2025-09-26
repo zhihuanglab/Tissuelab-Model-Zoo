@@ -214,14 +214,14 @@ def run_segmentation(args):
                 # pass the temp file path to the embedding generator
                 result_path = ne.generate_embeddings(temp_h5_path=temp_h5_path)
                 
-                # create a backup
-                backup_path = os.path.join(h5_dir, f"backup_{slide_basename}_embedding.h5")
-                try:
-                    import shutil
-                    shutil.copy2(result_path, backup_path)
-                    print(f"created embeddings backup: {backup_path}")
-                except Exception as e:
-                    print(f"warning: failed to create backup: {str(e)}")
+                # create a backup - 已禁用
+                # backup_path = os.path.join(h5_dir, f"backup_{slide_basename}_embedding.h5")
+                # try:
+                #     import shutil
+                #     shutil.copy2(result_path, backup_path)
+                #     print(f"created embeddings backup: {backup_path}")
+                # except Exception as e:
+                #     print(f"warning: failed to create backup: {str(e)}")
                 
                 # read embeddings for later saving
                 with h5py.File(temp_h5_path, "r") as tf:
