@@ -11,6 +11,7 @@ import sys
 import time
 import json
 import h5py
+from safe_h5_utils import safe_h5_open
 import uvicorn
 import requests
 import numpy as np
@@ -69,13 +70,14 @@ DEP_H5_GROUPS = {}
 def print_h5_structure(file_path):
     """print H5 file"""
     import h5py
+from safe_h5_utils import safe_h5_open
     def print_item(name, obj):
         indent = "  " * (name.count("/"))
         if isinstance(obj, h5py.Group):
             print(f"{indent}{name} (Group)")
         elif isinstance(obj, h5py.Dataset):
             print(f"{indent}{name} (Dataset), shape: {obj.shape}, dtype: {obj.dtype}")
-    with h5py.File(file_path, "r") as hf:
+    with safe_h5_open(file_path, "r") as hf:
         hf.visititems(print_item)
 
 def load_checkpoint_at_init():
@@ -417,7 +419,7 @@ def run_classification(args) -> Dict[str, Any]:
         h5_path = H5_PATH
 
         # Open H5 file once for all operations
-        with h5py.File(h5_path, 'a') as hf: # Open in append mode for read/write
+        with safe_h5_open(h5_path, 'a') as hf: # Open in append mode for read/write
             # A) check annotation
             annotations_data = None
             use_supervised = False
@@ -633,7 +635,7 @@ def read_node(data: Dict[str, Any]):
             tissue_classes=["Negative control", "Tumor"]
         )
 
-    with h5py.File(H5_PATH, "r") as hf:
+    with safe_h5_open(H5_PATH, "r") as hf:
         user_data_path = f"{H5_GROUP}/userData"
         if user_data_path in hf:
             for k in hf[user_data_path].keys():
@@ -685,7 +687,7 @@ def execute_node():
         out_val = run_classification(ARGS)
 
     if H5_PATH and os.path.exists(H5_PATH):
-        with h5py.File(H5_PATH, "a") as hf:
+        with safe_h5_open(H5_PATH, "a") as hf:
             out_ds = f"{H5_GROUP}/classification_output"
             if out_ds in hf:
                 del hf[out_ds]

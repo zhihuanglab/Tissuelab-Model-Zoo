@@ -14,6 +14,7 @@ from PIL import Image
 import multiprocess as mp
 from tqdm import tqdm
 import h5py
+from safe_h5_utils import safe_h5_open
 import os
 from nuc_stat import PILSlide, NumpySlide
 from torch.utils.data import Dataset, DataLoader
@@ -334,7 +335,7 @@ class NucleiEmbedding:
         print(f"store embeddings to: {temp_h5_path}")
         total_processed = 0
         
-        with h5py.File(temp_h5_path, 'w') as h5f:
+        with safe_h5_open(temp_h5_path, 'w') as h5f:
             # create extendable dataset
             embeddings_dset = h5f.create_dataset(
                 'embedding',

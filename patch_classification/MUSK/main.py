@@ -2,6 +2,7 @@ from musk_for_embedding import MUSK
 import time
 import os
 import h5py
+from safe_h5_utils import safe_h5_open
 import numpy as np
 from PIL import Image
 import tiffslide
@@ -61,7 +62,7 @@ if patch_embeddings is not None and len(patch_coordinates) > 0:
     h5_path = os.path.join("C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\result_h5", f"{wsi_filename}.h5")
     print(f"Saving embeddings to {h5_path}")
     
-    with h5py.File(h5_path, 'w') as f:
+    with safe_h5_open(h5_path, 'w') as f:
         # create MuskNode group
         musk_node = f.create_group('MuskNode')
         

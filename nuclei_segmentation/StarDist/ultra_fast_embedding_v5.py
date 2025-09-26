@@ -15,6 +15,7 @@ from PIL import Image
 import multiprocess as mp
 from tqdm import tqdm
 import h5py
+from safe_h5_utils import safe_h5_open
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
@@ -400,7 +401,7 @@ class HighPerformanceEmbeddingV5:
                 embeddings_array = np.array([], dtype=np.float16).reshape(0, 768)
             
             # Save with balanced settings
-            with h5py.File(temp_h5_path, 'w', libver='latest') as h5f:
+            with safe_h5_open(temp_h5_path, 'w', libver='latest') as h5f:
                 # Use reasonable chunk size
                 chunk_size = min(5000, len(embeddings_array)) if len(embeddings_array) > 0 else None
                 
@@ -430,7 +431,7 @@ class HighPerformanceEmbeddingV5:
         """Create empty H5 file"""
         temp_h5_path = f"temp_embeddings_empty_{int(time.time())}_{os.getpid()}.h5"
         try:
-            with h5py.File(temp_h5_path, 'w') as h5f:
+            with safe_h5_open(temp_h5_path, 'w') as h5f:
                 h5f.create_dataset('embedding', data=np.array([], dtype=np.float16).reshape(0, 768))
                 h5f.attrs['empty'] = True
                 h5f.attrs['creation_time'] = time.time()
