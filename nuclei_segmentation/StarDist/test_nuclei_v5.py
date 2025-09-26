@@ -161,12 +161,17 @@ class HighPerformancePipelineProcessor:
         self.output_path = out_dir / f"{slide_name}.h5"
         self.temp_output_path = out_dir / f"{slide_name}_temp.h5"
         
-        # If output already exists, create a backup with timestamp
+        # If output already exists, create a backup with timestamp - 已禁用
+        # if self.output_path.exists():
+        #     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        #     backup_path = out_dir / f"{slide_name}_backup_{timestamp}.h5"
+        #     self.output_path.rename(backup_path)
+        #     console.print(f"[yellow]Existing file backed up to: {backup_path}[/yellow]")
+        
+        # 如果输出文件已存在，直接删除（不创建备份）
         if self.output_path.exists():
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = out_dir / f"{slide_name}_backup_{timestamp}.h5"
-            self.output_path.rename(backup_path)
-            console.print(f"[yellow]Existing file backed up to: {backup_path}[/yellow]")
+            self.output_path.unlink()
+            console.print(f"[yellow]Existing file removed: {self.output_path}[/yellow]")
         
         # Create H5 file with resizable datasets
         with h5py.File(self.temp_output_path, 'w') as h5f:
