@@ -165,7 +165,7 @@ def run_segmentation(args):
                                    n_tiles=(2, 2, 1),
                                    stardist_pretrain=args.stardist_pretrain,
                                    isIHC=args.isIHC,
-                                   progress_callback=update_progress)
+                                   progress_callback=lambda x: update_progress(x, "segmentation"))
             ss.run_WSI_segmentation()
             
             # Retrieve results from ss object, with checks
@@ -217,7 +217,7 @@ def run_segmentation(args):
 
             if not have_cached_embedding:
                 print("no cached embeddings => generate new embeddings")
-                ne = NucleiEmbedding(args, centroids, progress_callback=update_progress)
+                ne = NucleiEmbedding(args, centroids, progress_callback=lambda x: update_progress(x, "embedding"))
                 # pass the temp file path to the embedding generator
                 result_path = ne.generate_embeddings(temp_h5_path=temp_h5_path)
                 
@@ -274,7 +274,7 @@ def run_segmentation(args):
             print("[H5 WRITE] Centroids are None after segmentation step, nothing to write to H5 for this node.")
 
         progress_complete = True
-        update_progress(100)
+        update_progress(100, "embedding")
 
         end_time = time.time()
         print(f"Time taken: {end_time - start_time:.2f}s")
@@ -407,10 +407,25 @@ def execute_node():
     return {"status": "ok", "output": out_val}
 
 
-def update_progress(value):
+def update_progress(value, phase="segmentation"):
+    """
+    Update progress with phase-specific scaling
+    - segmentation: 0-50
+    - embedding: 50-100
+    """
     global progress_value
-    progress_value = value
-    # print(f"Global progress updated: {progress_value}%")  # Add debug output
+    
+    if phase == "segmentation":
+        # Scale segmentation progress from 0-100 to 0-50
+        progress_value = int(value * 0.5)
+    elif phase == "embedding":
+        # Scale embedding progress from 0-100 to 50-100
+        progress_value = 50 + int(value * 0.5)
+    else:
+        # Default behavior for backward compatibility
+        progress_value = value
+    
+    # print(f"Global progress updated: {progress_value}% (phase: {phase})")  # Add debug output
 
 
 @app.get("/progress")
