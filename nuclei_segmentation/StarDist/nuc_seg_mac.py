@@ -24,7 +24,7 @@ from skimage import draw
 import tensorflow as tf
 from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
 import tiffslide
-
+import multiprocessing as mp
 opj = os.path.join
 
 class SlideSegmentation():
@@ -55,6 +55,12 @@ class SlideSegmentation():
                 print(f"Memory growth must be set before GPUs have been initialized: {e}")
         else:
             print("No GPUs found. Running on CPU.")
+            
+        # Configure TensorFlow CPU limits - 限制为15个线程
+        tf.config.threading.set_intra_op_parallelism_threads(min(15, mp.cpu_count()))
+        tf.config.threading.set_inter_op_parallelism_threads(min(15, mp.cpu_count()))
+        workers = min(15, mp.cpu_count())
+        print(f"TensorFlow configured with {workers} threads")
             
         self.args = args
         self.reference_magnification = 20 # 20x for stardist
