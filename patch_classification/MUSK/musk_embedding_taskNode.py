@@ -35,6 +35,7 @@ import tiffslide
 
 # Import MUSK model class - adjust the import path as needed
 from musk_for_embedding import MUSK
+from safe_h5_utils import safe_h5_open
 
 app = FastAPI()
 
@@ -115,7 +116,7 @@ def print_h5_structure(file_path):
         elif isinstance(obj, h5py.Dataset):
             print(f"{indent}{name} (Dataset), shape: {obj.shape}, dtype: {obj.dtype}")
 
-    with h5py.File(file_path, "r") as hf:
+    with safe_h5_open(file_path, "r") as hf:
         hf.visititems(print_item)
 
 def load_model_at_init():
@@ -188,7 +189,7 @@ def run_patch_classification(args):
         coordinates = None
         
         if os.path.exists(H5_PATH):
-            with h5py.File(H5_PATH, 'r') as hf:
+            with safe_h5_open(H5_PATH, 'r') as hf:
                 if H5_GROUP in hf:
                     try:
                         embeddings = hf[f"{H5_GROUP}/embedding"][()]
@@ -253,7 +254,7 @@ def run_patch_classification(args):
         
         # Step 3: Save to h5 file
         if embeddings is not None and coordinates is not None:
-            with h5py.File(H5_PATH, "a") as hf:
+            with safe_h5_open(H5_PATH, "a") as hf:
                 # If group already exists, delete it
                 if H5_GROUP in hf:
                     del hf[H5_GROUP]
@@ -365,7 +366,7 @@ def _load_parameters_from_h5(h5_path: str, h5_group: str):
     global ARGS
     
     try:
-        with h5py.File(h5_path, "r") as hf:
+        with safe_h5_open(h5_path, "r") as hf:
             user_data_path = f"{h5_group}/userData"
             if user_data_path not in hf:
                 print(f"[{NODE_NAME}] No userData found in {h5_group}")
@@ -479,7 +480,7 @@ def execute_node():
     
     # Store the result to 'output'
     if H5_PATH and os.path.exists(H5_PATH):
-        with h5py.File(H5_PATH, "a") as hf:
+        with safe_h5_open(H5_PATH, "a") as hf:
             node_out_path = f"{H5_GROUP}/output"
             if node_out_path in hf:
                 del hf[node_out_path]

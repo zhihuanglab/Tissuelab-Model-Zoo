@@ -31,6 +31,7 @@ from typing import Dict, Any
 from pathlib import Path
 from sklearn.linear_model import LogisticRegression
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
+from safe_h5_utils import safe_h5_open
 
 app = FastAPI()
 
@@ -69,7 +70,7 @@ def print_h5_structure(file_path):
             print(f"{indent}{name} (Group)")
         elif isinstance(obj, h5py.Dataset):
             print(f"{indent}{name} (Dataset), shape: {obj.shape}, dtype: {obj.dtype}")
-    with h5py.File(file_path, "r") as hf:
+    with safe_h5_open(file_path, "r") as hf:
         hf.visititems(print_item)
 
 def encode_text(processor, text_encoder, text_projection, prompt: str, device: str) -> np.ndarray:
@@ -413,7 +414,7 @@ def run_classification(args) -> Dict[str, Any]:
         start_time = time.time()
         h5_path = H5_PATH
 
-        with h5py.File(h5_path, 'a') as hf:  # Open in append mode for read/write
+        with safe_h5_open(h5_path, 'a') as hf:  # Open in append mode for read/write
             # A) check annotation
             annotations_data = None
             use_supervised = False
@@ -611,7 +612,7 @@ def read_node(data: Dict[str, Any]):
             nuclei_classes=["Negative control", "Tumor", "Lymphocyte"]
         )
 
-    with h5py.File(H5_PATH, "r") as hf:
+    with safe_h5_open(H5_PATH, "r") as hf:
         user_data_path = f"{NODE_NAME}/userData"
         if user_data_path in hf:
             for k in hf[user_data_path].keys():
@@ -668,7 +669,7 @@ def execute_node():
 
     # write out to /ClassificationNode/output
     if H5_PATH and os.path.exists(H5_PATH):
-        with h5py.File(H5_PATH, "a") as hf:
+        with safe_h5_open(H5_PATH, "a") as hf:
             out_ds = f"{NODE_NAME}/output"
             if out_ds in hf:
                 del hf[out_ds]

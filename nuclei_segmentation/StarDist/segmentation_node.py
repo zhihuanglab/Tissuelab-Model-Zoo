@@ -9,6 +9,7 @@ import sys
 import time
 import json
 import h5py
+from safe_h5_utils import safe_h5_open
 import uvicorn
 import requests
 import platform
@@ -51,13 +52,14 @@ def parse_args():
 
 def print_h5_structure(file_path):
     import h5py
+from safe_h5_utils import safe_h5_open
     def print_item(name, obj):
         indent = "  " * (name.count("/") )
         if isinstance(obj, h5py.Group):
             print(f"{indent}{name} (Group)")
         elif isinstance(obj, h5py.Dataset):
             print(f"{indent}{name} (Dataset), shape: {obj.shape}, dtype: {obj.dtype}")
-    with h5py.File(file_path, "r") as hf:
+    with safe_h5_open(file_path, "r") as hf:
         hf.visititems(print_item)
 
 def update_progress(value):
@@ -88,7 +90,7 @@ def run_segmentation(args):
 
         # Check existing results in workflow H5
         if H5_PATH and os.path.exists(H5_PATH):
-            with h5py.File(H5_PATH, 'r') as hf:
+            with safe_h5_open(H5_PATH, 'r') as hf:
                 if NODE_NAME in hf:
                     try:
                         centroids = hf[f"{NODE_NAME}/centroids"][()].copy()
@@ -132,7 +134,7 @@ def run_segmentation(args):
 
         # Save results directly under SegmentationNode in workflow H5 file
         if H5_PATH:
-            with h5py.File(H5_PATH, 'a') as hf:
+            with safe_h5_open(H5_PATH, 'a') as hf:
                 if NODE_NAME in hf:
                     del hf[NODE_NAME]
                 node_grp = hf.create_group(NODE_NAME)
@@ -211,7 +213,7 @@ def read_node(data: Dict[str, Any]):
         )
 
     # read userData from h5 file
-    with h5py.File(H5_PATH, "r") as hf:
+    with safe_h5_open(H5_PATH, "r") as hf:
         user_data_path = f"{NODE_NAME}/userData"
         if user_data_path in hf:
             for k in hf[user_data_path].keys():
@@ -254,7 +256,7 @@ def execute_node():
         out_val = run_segmentation(ARGS)
 
     if H5_PATH and os.path.exists(H5_PATH):
-        with h5py.File(H5_PATH, "a") as hf:
+        with safe_h5_open(H5_PATH, "a") as hf:
             node_out_path = f"{NODE_NAME}/output"
             if node_out_path in hf:
                 del hf[node_out_path]

@@ -5,6 +5,7 @@ import os
 import sys
 import json
 import h5py
+from safe_h5_utils import safe_h5_open
 import torch
 import cv2
 import numpy as np
@@ -323,7 +324,7 @@ def read_node(data: Dict[str, Any]):
     user_data_dict = {}
 
     # 3) Open the H5 file and read userData / dependency outputs
-    with h5py.File(H5_PATH, "r") as hf:
+    with safe_h5_open(H5_PATH, "r") as hf:
         # 3.1) Read this node's userData
         self_ud = f"{NODE_NAME}/userData"
         if self_ud in hf:
@@ -572,7 +573,7 @@ def execute_node():
 
     # 写入 H5 文件输出
     if H5_PATH and os.path.exists(H5_PATH):
-        with h5py.File(H5_PATH, "a") as hf:
+        with safe_h5_open(H5_PATH, "a") as hf:
             out_path = f"{NODE_NAME}/output"
             if out_path in hf:
                 del hf[out_path]
@@ -580,7 +581,7 @@ def execute_node():
             hf.create_dataset(out_path, data=out_str.encode("utf-8"))
             print(f"[DEBUG] => wrote JSON to {out_path}: {out_str}")
             try:
-                with h5py.File(H5_PATH, "r") as hf:
+                with safe_h5_open(H5_PATH, "r") as hf:
                     print("[DEBUG] H5 top-level keys:", list(hf.keys()))
                     for key in hf.keys():
                         print(f"    - {key} => subkeys:", list(hf[key].keys()))
