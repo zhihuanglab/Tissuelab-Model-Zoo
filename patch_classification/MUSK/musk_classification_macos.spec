@@ -13,7 +13,8 @@ fastapi_datas, fastapi_binaries, fastapi_hiddenimports = collect_all('fastapi')
 uvicorn_datas, uvicorn_binaries, uvicorn_hiddenimports = collect_all('uvicorn')
 
 hiddenimport_data = (
-    [
+    _imagecodecs_hidden
+    + [
         'tiffslide',
         'torch',
         'torchvision',
@@ -25,6 +26,17 @@ hiddenimport_data = (
         'uvicorn',
         'sse_starlette.sse',
         'colorsys',
+        # Additional dependencies from requirements.txt
+        'timm',
+        'PIL',
+        'scipy',
+        'cv2',  # opencv-python
+        'transformers',
+        'tissuelab_sdk',
+        'einops',
+        'requests',
+        'skimage',  # scikit-image
+        'h5py',
     ]
     + fastapi_hiddenimports
     + uvicorn_hiddenimports
