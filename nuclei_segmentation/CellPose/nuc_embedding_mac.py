@@ -19,7 +19,7 @@ import os
 from nuc_stat import PILSlide, NumpySlide
 from torch.utils.data import Dataset, DataLoader
 import time
-from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
 import pathlib
 
 # Disable multiprocessing for TensorFlow to avoid conflicts
