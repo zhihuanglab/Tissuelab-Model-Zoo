@@ -503,9 +503,12 @@ async def progress():
     async def event_generator():
         global progress_value, progress_complete
         last_value = -1
+        progress_value = 0  # Reset progress to 0 for each new connection
+        progress_complete = False  # Reset completion flag
         
         while not progress_complete and progress_value < 100:
             if progress_value != last_value:
+                print(f"[SSE] Progress: {progress_value}%")
                 yield {"data": str(progress_value)}
                 last_value = progress_value
             await asyncio.sleep(0.1)
