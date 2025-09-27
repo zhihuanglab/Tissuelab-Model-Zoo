@@ -35,6 +35,17 @@ hiddenimport_data = (
         'tqdm',
         'natsort',
         'einops',
+        # Additional dependencies from requirements.txt
+        'sklearn',  # scikit-learn
+        'requests',
+        'sse_starlette',  # sse-starlette
+        'fastapi',
+        'uvicorn',
+        'h5py',
+        'tissuelab_sdk',
+        'torch',
+        'torchvision',
+        'torchaudio',
         *stardist_hiddenimports,
         *transformers_hiddenimports,
     ])
