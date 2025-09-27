@@ -171,3 +171,4 @@ cython_debug/
 
 **/checkpoints/
 !patch_classification/MUSK/checkpoints/
+!patch_classification/MUSK/checkpoints/**
