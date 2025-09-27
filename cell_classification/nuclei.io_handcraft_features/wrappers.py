@@ -10,7 +10,7 @@ import czifile
 import xml.etree.ElementTree as ET
 TILE_SIZE = 1024
 
-class TiffSlideWrapper:
+class TiffFileWrapper:
 
     def __init__(self, tiff_path):
         self.path = tiff_path
