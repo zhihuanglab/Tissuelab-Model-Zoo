@@ -179,4 +179,5 @@ dependencies:
       - wcwidth==0.2.13
       - werkzeug==3.0.4
       - yacs==0.1.8
+      - tissuelab_sdk==0.1.7
 prefix: /anaconda/envs/biomedparse

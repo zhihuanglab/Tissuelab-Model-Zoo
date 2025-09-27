@@ -20,7 +20,7 @@ sse-starlette
 fastapi
 uvicorn
 transformers
-
+tissuelab_sdk==0.1.7
 czifile
 pydicom
 # Windows-only dependencies; skip on macOS

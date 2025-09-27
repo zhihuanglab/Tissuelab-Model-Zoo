@@ -17,7 +17,7 @@ from scipy.ndimage import zoom
 from skimage.feature import graycomatrix, graycoprops
 from skimage import draw
 import tensorflow as tf
-from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
 import tiffslide
 from collections import defaultdict
 import torch
@@ -143,7 +143,7 @@ class SlideSegmentation():
                 self.slide = DicomImageWrapper(self.args.slidepath)
                 mpp = 0.25  # Default value
             else:
-                self.slide = TiffSlideWrapper(self.args.slidepath)
+                self.slide = TiffFileWrapper(self.args.slidepath)
                 mpp = 0.25  # Default value
         
         # Add magnification attribute to self.args if not already set
