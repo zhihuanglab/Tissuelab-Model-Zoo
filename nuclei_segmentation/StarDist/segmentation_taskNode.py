@@ -25,8 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from pathlib import Path
 
-from nuc_seg import SlideSegmentation
-from nuc_embedding import NucleiEmbedding
+from nuc_seg_mac import SlideSegmentation
+from nuc_embedding_mac import NucleiEmbedding
 from safe_h5_utils import safe_h5_open
 
 app = FastAPI()

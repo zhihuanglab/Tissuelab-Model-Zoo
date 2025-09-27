@@ -56,6 +56,7 @@ def get_parser_args():
     parser_eval.add_argument("--distributed", action="store_true", help="evaluation in parallel")
     parser_eval.add_argument('--seed', default=0, type=int, help="random seed.")
     parser_eval.add_argument('--batch_size', default=64, type=int)
+    parser_eval.add_argument('--batch_size_eval', default=256, type=int)
     parser_eval.add_argument('--model_cache_dir', default=None, type=str,
                              help="directory to where downloaded models are cached")
     parser_eval.add_argument('--feature_root', default="features", type=str,
@@ -195,6 +196,10 @@ def fix_seed(seed):
     torch.backends.cudnn.benchmark = False
     # torch.set_deterministic(True)  # torch < 1.8
     torch.use_deterministic_algorithms(True, warn_only=True)  # torch >= 1.8
+    
+    # disable TF32 on Ampere (A6000) and Ada (L40) GPUs
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
 
 def run(args, transforms=None):
@@ -420,7 +425,7 @@ def run(args, transforms=None):
             train_dataloader,
             dataloader,
             args.fewshot_k,
-            args.batch_size,
+            args.batch_size_eval,
             args.num_workers,
             args.fewshot_lr,
             args.fewshot_epochs,
