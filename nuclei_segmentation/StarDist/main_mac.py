@@ -19,7 +19,7 @@ from safe_h5_utils import safe_h5_open
 import multiprocess as mp
 import json
 
-from nuc_seg_mac2 import SlideSegmentation
+from nuc_seg_mac import SlideSegmentation
 from nuc_stat import SlideProperty
 
 def parse_args():

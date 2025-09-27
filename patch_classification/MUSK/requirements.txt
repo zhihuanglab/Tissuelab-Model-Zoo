@@ -41,3 +41,4 @@ xgboost
 tiffslide
 datasets
 fastapi
+tissuelab_sdk==0.1.7
