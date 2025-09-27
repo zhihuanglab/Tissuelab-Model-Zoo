@@ -24,9 +24,9 @@ import czifile
 import sys
 
 if sys.platform == 'darwin':
-    from wrappers_mac import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+    from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
 else:
-    from wrappers import CziImageWrapper, SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+    from tissuelab_sdk.wrapper import CziImageWrapper, SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
 import pathlib
 
 """
