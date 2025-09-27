@@ -91,13 +91,6 @@ def load_checkpoint_at_init():
     checkpoint_path = os.path.join(base_path, "checkpoints", "model.safetensors")
     
     print(f"[{NODE_NAME}] Looking for checkpoint at: {checkpoint_path}")
-    if not os.path.exists(checkpoint_path):
-        print(f"Warning: Checkpoint not found at {checkpoint_path}, trying alternate locations...")
-        alt_path = "checkpoints/contrastive_checkpoint_epoch_0.pt"
-        if os.path.exists(alt_path):
-            checkpoint_path = alt_path
-            print(f"Found checkpoint at: {checkpoint_path}")
-    
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[{NODE_NAME}] Loading MUSK model at init stage..., device={device}")
     
