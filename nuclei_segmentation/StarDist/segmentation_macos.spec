@@ -39,6 +39,18 @@ hiddenimport_data = (
         'pylibCZIrw',
         'openslide',
         'openslide.lowlevel',
+        # Additional dependencies from requirements.txt
+        'xgboost',
+        'sklearn',  # scikit-learn
+        'tensorflow',
+        'fastdist',
+        'sse_starlette',  # sse-starlette
+        'fastapi',
+        'uvicorn',
+        'tissuelab_sdk',
+        'torch',
+        'torchvision',
+        'torchaudio',
         *stardist_hiddenimports,
         *transformers_hiddenimports,
     ])
