@@ -129,15 +129,16 @@ def load_model_at_init():
     try:
         # Get the base path where the model is stored
         base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
-        model_path = os.path.join(base_path, "model", "model.safetensors")
+        model_path = os.path.join(base_path, "checkpoints", "model.safetensors")
         
         print(f"[{NODE_NAME}] Looking for model at: {model_path}")
         
         if not os.path.exists(model_path):
-            print(f"[{NODE_NAME}] Warning: Model not found at {model_path}, trying alternate location...")
+            print(f"[{NODE_NAME}] Warning: Model not found at {model_path}, trying alternate locations...")
             alt_paths = [
-                "model/model.safetensors",
-                os.path.join(base_path, "checkpoints", "model.safetensors")
+                "checkpoints/model.safetensors",
+                os.path.join(base_path, "model", "model.safetensors"),
+                "model/model.safetensors"
             ]
             
             for alt_path in alt_paths:
@@ -147,7 +148,7 @@ def load_model_at_init():
                     break
         
         if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Could not find model file at any of the expected locations. Please ensure model.safetensors exists in either ./model/ or ./checkpoints/ directory.")
+            raise FileNotFoundError(f"Could not find model file at any of the expected locations. Please ensure model.safetensors exists in either ./checkpoints/ or ./model/ directory.")
         
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"[{NODE_NAME}] Loading MUSK model, device={device}")
