@@ -24,9 +24,9 @@ import czifile
 import sys
 
 if sys.platform == 'darwin':
-    from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+    from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
 else:
-    from tissuelab_sdk.wrapper import CziImageWrapper, SimpleImageWrapper, DicomImageWrapper, TiffSlideWrapper
+    from tissuelab_sdk.wrapper import CziImageWrapper, SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
 import pathlib
 
 """
@@ -150,7 +150,7 @@ class NucleiPatchDataset(Dataset):
                     self._slide_cache = tiffslide.TiffSlide(self.slide_path)
                     self._slide_cache_method = 'tiffslide'
                 except Exception as e:
-                    print(f"TiffSlide failed in embedding reader: {e}. Falling back to TiffSlideWrapper.")
+                    print(f"TiffSlide failed in embedding reader: {e}. Falling back to TiffFileWrapper.")
                     self._fallback_to_wrapper()
             elif self.read_image_method == 'PIL':
                 self._slide_cache = PILSlide(self.slide_path)
@@ -174,14 +174,14 @@ class NucleiPatchDataset(Dataset):
                     self._fallback_to_wrapper()
         except Exception as e:
             # As a last resort, ensure we still provide a workable wrapper
-            print(f"Failed to open slide using method '{self.read_image_method}': {e}. Falling back to TiffSlideWrapper.")
+            print(f"Failed to open slide using method '{self.read_image_method}': {e}. Falling back to TiffFileWrapper.")
             self._fallback_to_wrapper()
 
         return self._slide_cache
 
     def _fallback_to_wrapper(self):
-        """Fallback to TiffSlideWrapper and reset resolution defaults."""
-        self._slide_cache = TiffSlideWrapper(self.slide_path)
+        """Fallback to TiffFileWrapper and reset resolution defaults."""
+        self._slide_cache = TiffFileWrapper(self.slide_path)
         self._slide_cache_method = 'tiffslide_wrapper'
         self.read_image_method = 'tiffslide_wrapper'
         # Preserve provided MPP if available, otherwise attempt to compute from TIFF metadata.
@@ -245,7 +245,7 @@ class NucleiPatchDataset(Dataset):
             return patch
         except Exception as e:
             if self._slide_cache_method == 'tiffslide':
-                print(f"Error processing centroid {self.centroids[idx]} with tiffslide: {str(e)}. Falling back to TiffSlideWrapper and retrying.")
+                print(f"Error processing centroid {self.centroids[idx]} with tiffslide: {str(e)}. Falling back to TiffFileWrapper and retrying.")
                 self._fallback_to_wrapper()
                 return self.__getitem__(idx)
             print(f"Error processing centroid {self.centroids[idx]}: {str(e)}")
