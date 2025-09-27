@@ -437,14 +437,17 @@ async def progress():
     async def event_generator():
         global progress_value, progress_complete
         last_value = -1
+        progress_value = 0  # Reset progress to 0 for each new connection
+        progress_complete = False  # Reset completion flag
+        
         while True:
             # Check if progress changed or if it's the final 100% update
             if progress_value != last_value or (progress_value == 100 and progress_complete):
                 if last_value > progress_value:
                     yield {"data": str(-1)}
+                print(f"[SSE] Progress: {progress_value}%")  # Add consistent debug output
                 yield {"data": str(progress_value)}
                 last_value = progress_value
-                # print(f"Progress updated to: {progress_value}%, {progress_complete}")
 
                 # If progress reaches 100 and completion flag is set, wait a bit before breaking
                 if progress_value == 100 and progress_complete:
