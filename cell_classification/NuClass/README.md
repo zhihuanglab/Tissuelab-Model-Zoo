@@ -6,8 +6,8 @@
 ```bash
 # Create and activate environment, then install requirements in one go
 
-conda create -n stardist_environment python=3.10.16 -y
-conda activate stardist_environment
+conda create -n nuclass_environment python=3.10.16 -y
+conda activate nuclass_environment
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
