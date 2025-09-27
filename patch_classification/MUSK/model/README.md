@@ -67,6 +67,7 @@ Please refer to `demo.ipynb` for a demonstration.
 1. Load the MUSK model  
 
 ```python
+import torch
 from musk import utils, modeling
 from timm.models import create_model
 model = create_model("musk_large_patch16_384")
@@ -97,12 +98,12 @@ with torch.inference_mode():
         out_norm=False,
         ms_aug=True,
         return_global=True  
-        )[0]  # return (vision_cls, text_cls)
+        )[0]
 
 ```
-- `with_head=True`: Enable head for image-text retrieval.  
-- `out_norm=True`: Apply normalization.  
-- `ms_aug=True`: Use multiscale augmentation (for tasks, e.g., linear probe classification, MIL).  
+- `with_head=True`: Utilize this head for zero-shot tasks (image-text retrieval and zero-shot image classification).
+- `out_norm=True`: Apply normalization, especially for zero-shot tasks.  
+- `ms_aug=True`: Use multiscale image augmentation for tasks, e.g., linear probe classification, MIL; set it `False` for zero-shot tasks.
 - `return_global=True`: Return only [CLS] token, exclude patch tokens.  
 
 
@@ -120,9 +121,13 @@ with torch.inference_mode():
       out_norm=True,
       ms_aug=False,
       return_global=True 
-   )[1]  # return (vision_cls, text_cls)
+   )[1]
 ```
 
+- `with_head=True`: Utilize this head for zero-shot tasks (image-text retrieval and zero-shot image classification).
+- `out_norm=True`: Apply normalization, especially for zero-shot tasks.  
+- `ms_aug=True`: This parameter is ineffective for text inputs.
+- `return_global=True`: Return only [CLS] token, exclude patch tokens.  
 
 ## Evaluation on Patch-level Benchmarks
 
@@ -148,8 +153,7 @@ The evaluated dataset includes:
 
 </small>
 
-First, download the necessary datasets. For demonstrations, we provide example datasets [here](https://drive.google.com/file/d/1FCGRn6mtdrw8l3WAR_U76V0eRBnsQxD1/view?usp=sharing). Download and unzip it to a local path, for example `/root/to/downstreams_demo`, then, change the directory path `dataset_root=/root/to/downstreams_demo`. The code will automatically extract features and perform evaluations.
-
+To begin, download the required datasets. For demonstration purposes, we provide example datasets available [here](https://drive.google.com/file/d/1FCGRn6mtdrw8l3WAR_U76V0eRBnsQxD1/view?usp=sharing). The UniToPatho dataset has been downsampled to 224×224 resolution to enable faster downloads, as the original dataset exceeds 300GB in size. (As such, performance may vary slightly compared to the results reported in the paper.) Once downloaded, unzip the dataset to a local directory, such as `/root/to/downstreams_demo`. Next, update the directory path to `dataset_root=/root/to/downstreams_demo`. The code will then automatically extract features and carry out evaluations.
 
 The main file is `clip_benchmark.cli` and includes the following options:
 - `--pretrained_model`: Specifies the model name and the path to its weights.
@@ -218,7 +222,7 @@ and more tasks in `./benchmarks/demo.ipynb`.
 
 ## Acknowledgements
 
-The project was built on many amazing open-source repositories: [Quilt1M](https://github.com/wisdomikezogwo/quilt1m), [PathAsst](https://github.com/superjamessyx/Generative-Foundation-AI-Assistant-for-Pathology), [torchscale](https://github.com/microsoft/torchscale), [accelerate](https://github.com/huggingface/accelerate) (model pretraining), [deepspeed](https://github.com/microsoft/DeepSpeed) (model pretraining), [pytorch-lightning](https://github.com/Lightning-AI/pytorch-lightning) (downstream finetuning), and [CLIP Benchmark](https://github.com/LAION-AI/CLIP_benchmark) (model evaluation). We thank the authors and developers for their contributions.
+The project was built on many amazing open-source repositories: [Quilt1M](https://github.com/wisdomikezogwo/quilt1m), [PathAsst](https://github.com/superjamessyx/Generative-Foundation-AI-Assistant-for-Pathology), [torchscale](https://github.com/microsoft/torchscale), [accelerate](https://github.com/huggingface/accelerate) (model pretraining), [deepspeed](https://github.com/microsoft/DeepSpeed) (model pretraining), [pytorch-lightning](https://github.com/Lightning-AI/pytorch-lightning) (downstream finetuning), [CLIP Benchmark](https://github.com/LAION-AI/CLIP_benchmark) (model evaluation), and  [PORPOISE](https://github.com/mahmoodlab/PORPOISE/tree/master) (prognosis). We thank the authors and developers for their contributions.
 
 ## Issues
 - Please open new threads or address questions to xiangjx@stanford.edu or xiyue.wang.scu@gmail.com

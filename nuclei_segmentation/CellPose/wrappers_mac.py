@@ -4,7 +4,7 @@ import pydicom
 import numpy as np
 TILE_SIZE = 1024
 
-class TiffSlideWrapper:
+class TiffFileWrapper:
 
     def __init__(self, tiff_path):
         self.path = tiff_path

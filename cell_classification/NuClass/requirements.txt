@@ -1,5 +1,5 @@
 setuptools
-numpy==1.24.2
+numpy==1.26.4
 matplotlib==3.5.2
 pandas==1.4.3
 opencv-python==4.6.0.66
@@ -16,4 +16,5 @@ sse-starlette
 fastapi
 uvicorn
 h5py
+tissuelab_sdk==0.1.7
 # Also, please manually install torch (GPU): pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 && pip install transformers
