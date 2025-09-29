@@ -44,7 +44,7 @@ class SlideSegmentation():
         
         super(SlideSegmentation, self).__init__()
         
-        # Add GPU check
+        # Add GPU check and configure CPU threading
         gpus = tf.config.list_physical_devices('GPU')
         if gpus:
             try:
@@ -56,6 +56,22 @@ class SlideSegmentation():
                 print(f"Memory growth must be set before GPUs have been initialized: {e}")
         else:
             print("No GPUs found. Running on CPU.")
+        
+        # Configure TensorFlow CPU threading to limit total workers to 15
+        try:
+            # Calculate max TensorFlow threads based on n_tiles
+            if isinstance(n_tiles, tuple) and len(n_tiles) >= 2:
+                stardist_workers = n_tiles[0] * n_tiles[1] * (n_tiles[2] if len(n_tiles) > 2 else 1)
+                # Reserve some threads for other processes, limit TensorFlow to 10 threads max
+                tf_threads = min(10, 15 - stardist_workers)
+            else:
+                tf_threads = 10
+            
+            tf.config.threading.set_intra_op_parallelism_threads(tf_threads)
+            tf.config.threading.set_inter_op_parallelism_threads(2)
+            print(f"TensorFlow CPU threading configured: intra_op={tf_threads}, inter_op=2")
+        except Exception as e:
+            print(f"Warning: Could not configure TensorFlow threading: {e}")
             
         self.args = args
         self.reference_magnification = 20 # 20x for stardist
@@ -90,7 +106,19 @@ class SlideSegmentation():
         self.overlap = overlap
         self.prob_thresh = prob_thresh
         self.nms_thresh = nms_thresh
-        self.n_tiles = n_tiles
+        
+        # Limit n_tiles to ensure total workers <= 15
+        if isinstance(n_tiles, tuple) and len(n_tiles) >= 2:
+            total_workers = n_tiles[0] * n_tiles[1] * (n_tiles[2] if len(n_tiles) > 2 else 1)
+            if total_workers > 15:
+                # Scale down to (3,3,1) = 9 workers max
+                self.n_tiles = (3, 3, 1)
+                print(f"Worker limit: Changed n_tiles from {n_tiles} to {self.n_tiles} (max 15 workers)")
+            else:
+                self.n_tiles = n_tiles
+        else:
+            self.n_tiles = n_tiles
+            
         self.isIHC = isIHC
         
         self.progress_callback = progress_callback  # Store the reference to progress callback
