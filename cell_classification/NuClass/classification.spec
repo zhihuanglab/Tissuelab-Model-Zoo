@@ -12,14 +12,11 @@ block_cipher = None
 # Collect all necessary data for packages
 stardist_datas, stardist_binaries, stardist_hiddenimports = collect_all('stardist')
 transformers_datas, transformers_binaries, transformers_hiddenimports = collect_all('transformers')
+xgboost_datas, xgboost_binaries, xgboost_hiddenimports = collect_all('xgboost')
 
 hiddenimport_data = (
     ["imagecodecs." + x for x in imagecodecs._extensions()]
     + [
-        'tensorflow',
-        'tensorflow.python',
-        'tensorflow.python.framework',
-        'tensorflow.python.ops',
         'stardist',
         'stardist.models',
         'transformers',
@@ -35,29 +32,38 @@ hiddenimport_data = (
         'numpy',
         'tqdm',
         'natsort',
-        'einops',
         'multiprocess',
         'transformers',
+        # Missing dependencies from requirements.txt
+        'requests',
+        'sse_starlette',
+        'fastapi',
+        'uvicorn',
+        'h5py',
+        'tissuelab_sdk',
+        'torch',
+        'torch.nn',
+        'torch.optim',
+        'torch.utils',
         *stardist_hiddenimports,
         *transformers_hiddenimports,
+        *xgboost_hiddenimports,
     ])
 
 a = Analysis(
     ['classification_taskNode.py'],  # Main entry script
     pathex=[],
-    binaries=[],
+    binaries=xgboost_binaries,
     datas=[
-        ('checkpoints/contrastive_checkpoint_epoch_4.pt', 'checkpoints'),
+        ('checkpoints/contrastive_checkpoint_epoch_0.pt', 'checkpoints'),
+        ('checkpoints/checkpoint_step_10000.pt', 'checkpoints'),
         ('checkpoints', 'checkpoints'),
         ('negative_control_example_vectors.npy', '.'),
         ('negative_control_examples', 'negative_control_examples'),
-        ("Resources\\imagecodecs\\_zlib.cp39-win_amd64.pyd", "imagecodecs"),
-        ("Resources\\imagecodecs\\_jpeg8.cp39-win_amd64.pyd", "imagecodecs"),
-        ("Resources\\imagecodecs\\_jpeg2k.cp39-win_amd64.pyd", "imagecodecs"),
-        ("Resources\\imagecodecs\\_imcd.cp39-win_amd64.pyd", "imagecodecs"),
-        ("Resources\\imagecodecs\\_shared.cp39-win_amd64.pyd", "imagecodecs"),
+        ('classifier.xgb', '.'),
         *stardist_datas,
         *transformers_datas,
+        *xgboost_datas,
     ],
     hiddenimports=hiddenimport_data,
     hookspath=[],
