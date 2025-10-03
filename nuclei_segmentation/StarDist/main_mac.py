@@ -75,7 +75,7 @@ def main(args):
                     except:
                         print("Error: SegmentationNode group is corrupted.")
                     has_features = 'features' in hf['SegmentationNode']
-                    has_embeddings = 'cell_embeddings' in hf['SegmentationNode']
+                    has_embeddings = 'embedding' in hf['SegmentationNode']
                     
 
                     if ALREADY_HAVE_NUCLEI_SEGMENTATION and has_features and has_embeddings:
@@ -119,9 +119,9 @@ def main(args):
                 
             with safe_h5_open(h5_path, 'a') as hf_write:
                 nuclei_seg = hf_write['SegmentationNode']
-                if 'cell_embeddings' in nuclei_seg:
-                    del nuclei_seg['cell_embeddings']
-                nuclei_seg.create_dataset('cell_embeddings', data=embedding_data)
+                if 'embedding' in nuclei_seg:
+                    del nuclei_seg['embedding']
+                nuclei_seg.create_dataset('embedding', data=embedding_data)
             
             # 清理临时文件
             try:
