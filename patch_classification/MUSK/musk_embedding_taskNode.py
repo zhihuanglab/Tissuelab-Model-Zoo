@@ -184,7 +184,7 @@ def run_patch_classification(args):
     try:
         start_time = time.time()
         
-        # Step 1: Check if embeddings already exist
+        # Step 1: Check if embeddings already exist and patch_size matches
         ALREADY_HAVE_EMBEDDINGS = False
         embeddings = None
         coordinates = None
@@ -193,14 +193,46 @@ def run_patch_classification(args):
             with safe_h5_open(H5_PATH, 'r') as hf:
                 if H5_GROUP in hf:
                     try:
-                        embeddings = hf[f"{H5_GROUP}/embedding"][()]
+                        # Load coordinates first to calculate stored patch_size
                         coordinates = hf[f"{H5_GROUP}/coordinates"][()]
-                        ALREADY_HAVE_EMBEDDINGS = True
-                        print(f"[{NODE_NAME}] Using existing embeddings from {H5_GROUP} => skip processing")
-                        result["message"] = "Using existing embeddings"
-                        result["patch_count"] = len(embeddings)
-                    except:
-                        print(f"[{NODE_NAME}] Warning: embedding data is corrupted or missing. Will re-process.")
+                        embeddings = hf[f"{H5_GROUP}/embedding"][()]
+                        
+                        # Calculate stored_patch_size from coordinates
+                        stored_patch_size = None
+                        if len(coordinates) >= 2:
+                            # Calculate the minimum non-zero distance between patches
+                            coords_array = np.array(coordinates)
+                            # Get unique x and y coordinates
+                            unique_x = np.unique(coords_array[:, 0])
+                            unique_y = np.unique(coords_array[:, 1])
+                            
+                            # Calculate patch_size from coordinate spacing
+                            if len(unique_x) >= 2:
+                                x_diff = np.min(np.diff(np.sort(unique_x)))
+                                stored_patch_size = int(x_diff)
+                            elif len(unique_y) >= 2:
+                                y_diff = np.min(np.diff(np.sort(unique_y)))
+                                stored_patch_size = int(y_diff)
+                        
+                        # Only use existing embeddings if patch_size matches
+                        if stored_patch_size is not None and stored_patch_size == args.patch_size:
+                            # Patch size matches, use existing embeddings
+                            ALREADY_HAVE_EMBEDDINGS = True
+                            print(f"[{NODE_NAME}] Using existing embeddings from {H5_GROUP} (patch_size={stored_patch_size}) => skip processing")
+                            result["message"] = "Using existing embeddings"
+                            result["patch_count"] = len(embeddings)
+                        else:
+                            # Patch size doesn't match or couldn't be determined, need to re-process
+                            if stored_patch_size is None:
+                                print(f"[{NODE_NAME}] Could not determine patch_size from coordinates")
+                            else:
+                                print(f"[{NODE_NAME}] Patch size mismatch: stored={stored_patch_size}, current={args.patch_size}")
+                            print(f"[{NODE_NAME}] Will delete old embeddings and re-process...")
+                            # Reset to trigger re-processing
+                            embeddings = None
+                            coordinates = None
+                    except Exception as e:
+                        print(f"[{NODE_NAME}] Warning: embedding data is corrupted or missing. Will re-process. Error: {e}")
         
         # Step 2: If embeddings don't exist, process the WSI
         if not ALREADY_HAVE_EMBEDDINGS:
@@ -253,10 +285,10 @@ def run_patch_classification(args):
             result["patch_count"] = len(coordinates)
             result["message"] = "Patch classification completed successfully"
         
-        # Step 3: Save to h5 file
-        if embeddings is not None and coordinates is not None:
+        # Step 3: Save to h5 file (only if we generated new embeddings)
+        if not ALREADY_HAVE_EMBEDDINGS and embeddings is not None and coordinates is not None:
             with safe_h5_open(H5_PATH, "a") as hf:
-                # If group already exists, delete it
+                # If group already exists, delete it (e.g., if patch_size changed)
                 if H5_GROUP in hf:
                     del hf[H5_GROUP]
                 
@@ -272,6 +304,10 @@ def run_patch_classification(args):
                 
                 # Add empty output dataset
                 node_grp.create_dataset('output', shape=(), dtype=h5py.string_dtype())
+                
+                # Save patch_size as metadata for future comparison
+                node_grp.attrs['patch_size'] = args.patch_size
+                node_grp.attrs['level'] = args.level
                 
                 hf.flush()  # Force write to disk
             
