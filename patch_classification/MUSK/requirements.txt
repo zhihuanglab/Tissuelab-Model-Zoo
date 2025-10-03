@@ -39,8 +39,11 @@ xgboost
 tiffslide
 datasets
 fastapi
-tissuelab_sdk==0.1.8
+
 
 # GPU Support Installation:
 # For CUDA 12.1: pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
 # For CUDA 11.8: pip install torch==2.5.1+cu118 torchvision==0.20.1+cu118 torchaudio==2.5.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+
+tissuelab_sdk==0.1.9
+
