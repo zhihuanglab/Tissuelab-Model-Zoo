@@ -460,6 +460,10 @@ def run_classification(args) -> Dict[str, Any]:
             tissue_colors = getattr(args, "tissue_colors", [])
             progress_value = 80
             print(f"[{NODE_NAME}] Progress: 80%")
+            
+            # Debug: Print tissue_classes to see what's being used
+            print(f"[{NODE_NAME}] Using tissue_classes: {tissue_classes}")
+            print(f"[{NODE_NAME}] tissue_classes type: {type(tissue_classes)}, length: {len(tissue_classes) if tissue_classes else 0}")
 
             if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
                 clf, class_names, class_colors, predictions, prediction_probs, \
@@ -474,6 +478,12 @@ def run_classification(args) -> Dict[str, Any]:
                 
                 if MUSK_MODEL is None:
                     raise ValueError("MUSK_MODEL not loaded => please ensure /init is called first.")
+
+                # Check if tissue_classes is empty and use default if needed
+                if not tissue_classes:
+                    print(f"[{NODE_NAME}] Warning: tissue_classes is empty, using default classes")
+                    tissue_classes = ["Negative control", "Tumor"]
+                    print(f"[{NODE_NAME}] Using default tissue_classes: {tissue_classes}")
 
                 class_embeddings = _generate_text_description(tissue_classes) # list of np.ndarray
                 
@@ -651,6 +661,9 @@ def read_node(data: Dict[str, Any]):
                     if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.tissue_classes = val_json
                         print(f"[{NODE_NAME}] tissue_classes: {ARGS.tissue_classes}")
+                    else:
+                        print(f"[{NODE_NAME}] Warning: tissue_classes is not a valid list or is empty: {val_json}")
+                        print(f"[{NODE_NAME}] Keeping default tissue_classes: {ARGS.tissue_classes}")
                 elif k == "tissue_colors":
                     if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.tissue_colors = val_json
