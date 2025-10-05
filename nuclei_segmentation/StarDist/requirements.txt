@@ -22,7 +22,7 @@ sse-starlette
 fastapi
 uvicorn
 transformers
-tissuelab_sdk==0.1.9
+tissuelab_sdk==0.1.10
 czifile
 pydicom
 torch

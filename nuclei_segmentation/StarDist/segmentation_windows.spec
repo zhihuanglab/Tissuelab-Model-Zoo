@@ -56,9 +56,9 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-        ('nuc_seg.py', '.'),
+        ('nuc_seg_mac.py', '.'),
         ('nuc_stat.py', '.'),
-        ('nuc_embedding.py', '.'),
+        ('nuc_embedding_mac.py', '.'),
         ('checkpoints', 'checkpoints'),
         ('histomicstk_scripts', 'histomicstk_scripts'),
         ('models', 'models'),
