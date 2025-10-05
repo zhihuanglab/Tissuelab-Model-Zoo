@@ -8,86 +8,48 @@ import multiprocessing as mp
 
 block_cipher = None
 
+# Handle imagecodecs imports
+try:
+    import imagecodecs
+    _imagecodecs_hidden = ["imagecodecs." + x for x in imagecodecs._extensions()]
+except Exception:
+    _imagecodecs_hidden = []
+
 # Collect package data
 fastapi_datas, fastapi_binaries, fastapi_hiddenimports = collect_all('fastapi')
 uvicorn_datas, uvicorn_binaries, uvicorn_hiddenimports = collect_all('uvicorn')
-torch_datas, torch_binaries, torch_hiddenimports = collect_all('torch')
-transformers_datas, transformers_binaries, transformers_hiddenimports = collect_all('transformers')
-imagecodecs_datas, imagecodecs_binaries, imagecodecs_hiddenimports = collect_all('imagecodecs')
-
-# Specify CUDA version for PyTorch
-CUDA_VERSION = "12.1"  # Change this to your desired CUDA version
 
 hiddenimport_data = (
-    [
+    _imagecodecs_hidden
+    + [
         'tiffslide',
         'torch',
-        'torch.nn',
-        'torch.optim',
-        'torch.utils',
         'torchvision',
         'torchvision.io.image',
-        'torchaudio',
-        'timm',
-        'PIL',
-        'sse_starlette.sse',
+        'xgboost',
+        'numpy',
+        'pandas',
         'fastapi',
         'uvicorn',
-        'numpy',
-        'opencv-python',
-        'cv2',
+        'sse_starlette.sse',
+        'colorsys',
         # Additional dependencies from requirements.txt
-        'xgboost',
-        'pandas',
+        'timm',
+        'PIL',
         'scipy',
+        'cv2',  # opencv-python
         'transformers',
         'tissuelab_sdk',
         'einops',
         'requests',
         'skimage',  # scikit-image
         'h5py',
-        'blobfile',
-        'mypy',
-        'pytest',
-        'tensorboardX',
-        'ftfy',
-        'sentencepiece',
-        'pyarrow',
-        'pytorch_lightning',
-        'nltk',
-        'rouge',
-        'accelerate',
-        'fairscale',
-        'ruamel.yaml',
-        'wandb',
-        'future',
-        'scikit_survival',
-        'torchmetrics',
-        'open_clip_torch',
-        'pycocoevalcap',
-        'webdataset',
-        'huggingface_hub',
         'safetensors',
-        'starlette',
-        'datasets',
-        # Windows-specific
-        'win32con',
-        'win32api',
-        'win32security',
-        'pywin32',
-        # Image codecs
-        'imagecodecs',
-        'imagecodecs.jpeg8',
-        'imagecodecs.jpeg2k',
-        'imagecodecs.zlib',
-        'imagecodecs.imcd',
-        'imagecodecs.shared',
+        'huggingface_hub',
+        'safe_h5_utils',
     ]
     + fastapi_hiddenimports
     + uvicorn_hiddenimports
-    + torch_hiddenimports
-    + transformers_hiddenimports
-    + imagecodecs_hiddenimports
 )
 
 # Resolve shared runtime hook path robustly even when __file__ is undefined
@@ -98,19 +60,23 @@ except Exception:
 RUNTIME_HOOKS_DIR = os.path.abspath(os.path.join(_spec_dir, "..", "..", "runtime_hooks"))
 rth_spawn_guard = os.path.join(RUNTIME_HOOKS_DIR, "rth_spawn_guard.py")
 
+# Bundle XGBoost native library and VERSION file (like NuClass)
+xgboost_binaries = collect_dynamic_libs('xgboost')
+xgboost_datas = collect_data_files('xgboost', includes=['VERSION'])
+
 a = Analysis(
-    ['musk_embedding_taskNode.py'],
+    ['musk_classification_tasknode.py'],
     pathex=[],
-    binaries=torch_binaries + imagecodecs_binaries,
+    binaries=xgboost_binaries,
     datas=[
-        # Bundle model assets so the binary can find them under _MEIPASS
-        ('model', 'model'),
+        # Bundle model/checkpoints and optional negative control vectors
         ('checkpoints', 'checkpoints'),
+        ('model', 'model'),
+        ('negative_control_vectors_1024d.npy', '.'),
+        ('safe_h5_utils.py', '.'),
+        *xgboost_datas,
         *fastapi_datas,
         *uvicorn_datas,
-        *torch_datas,
-        *transformers_datas,
-        *imagecodecs_datas,
     ],
     hiddenimports=hiddenimport_data,
     hookspath=[],
@@ -129,11 +95,11 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='TissueLab_MUSK_Embedding',
+    name='TissueLab_MUSK_Classification_Win',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -150,9 +116,9 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
-    name='TissueLab_MUSK_Embedding',
+    name='TissueLab_MUSK_Classification_Win',
 )
 
 parser = argparse.ArgumentParser()
@@ -160,3 +126,5 @@ args, unknown = parser.parse_known_args()
 
 if __name__ == '__main__':
     mp.set_start_method('spawn')
+
+

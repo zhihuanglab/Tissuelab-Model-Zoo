@@ -134,9 +134,12 @@ class MUSK:
         Returns:
             torch.Tensor: Text feature vectors
         """
-        # Load tokenizer
-        #tokenizer = XLMRobertaTokenizer("./model/musk/models/tokenizer.spm")
-        tokenizer = XLMRobertaTokenizer("/root/model/musk/models/tokenizer.spm")
+        # Load tokenizer - handle both development and packaged environments
+        import sys
+        import os
+        base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
+        tokenizer_path = os.path.join(base_path, "checkpoints", "tokenizer.spm")
+        tokenizer = XLMRobertaTokenizer(tokenizer_path)
         num_texts = len(texts)
         num_batches = (num_texts + batch_size - 1) // batch_size
         text_embeddings = []

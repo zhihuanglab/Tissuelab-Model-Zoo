@@ -1,21 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import sys
-import os
-from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs, collect_data_files
-import argparse
-import multiprocessing as mp
-
-block_cipher = None
-
-# Handle imagecodecs imports
 try:
     import imagecodecs
     _imagecodecs_hidden = ["imagecodecs." + x for x in imagecodecs._extensions()]
 except Exception:
     _imagecodecs_hidden = []
+from PyInstaller.utils.hooks import collect_all
+import argparse
+import multiprocessing as mp
+import os
 
-# Collect package data
+block_cipher = None
+
+# Collect package data as needed (timm/torch/torchvision have their own hooks)
 fastapi_datas, fastapi_binaries, fastapi_hiddenimports = collect_all('fastapi')
 uvicorn_datas, uvicorn_binaries, uvicorn_hiddenimports = collect_all('uvicorn')
 
@@ -26,18 +24,17 @@ hiddenimport_data = (
         'torch',
         'torchvision',
         'torchvision.io.image',
-        'xgboost',
-        'numpy',
-        'pandas',
-        'fastapi',
-        'uvicorn',
-        'sse_starlette.sse',
-        'colorsys',
-        # Additional dependencies from requirements.txt
         'timm',
         'PIL',
+        'sse_starlette.sse',
+        'fastapi',
+        'uvicorn',
+        'numpy',
+        'opencv-python',
+        # Additional dependencies from requirements.txt
+        'xgboost',
+        'pandas',
         'scipy',
-        'cv2',  # opencv-python
         'transformers',
         'tissuelab_sdk',
         'einops',
@@ -52,7 +49,7 @@ hiddenimport_data = (
     + uvicorn_hiddenimports
 )
 
-# Resolve shared runtime hook path robustly even when __file__ is undefined
+# Resolve shared runtime hook path
 try:
     _spec_dir = os.path.abspath(os.path.dirname(sys.argv[0])) if (hasattr(sys, 'argv') and sys.argv and sys.argv[0].endswith('.spec')) else os.getcwd()
 except Exception:
@@ -60,21 +57,16 @@ except Exception:
 RUNTIME_HOOKS_DIR = os.path.abspath(os.path.join(_spec_dir, "..", "..", "runtime_hooks"))
 rth_spawn_guard = os.path.join(RUNTIME_HOOKS_DIR, "rth_spawn_guard.py")
 
-# Bundle XGBoost native library and VERSION file (like NuClass)
-xgboost_binaries = collect_dynamic_libs('xgboost')
-xgboost_datas = collect_data_files('xgboost', includes=['VERSION'])
-
 a = Analysis(
-    ['musk_classification_tasknode.py'],
+    ['musk_embedding_taskNode.py'],
     pathex=[],
-    binaries=xgboost_binaries,
+    binaries=[],
     datas=[
-        # Bundle model/checkpoints and optional negative control vectors
-        ('checkpoints', 'checkpoints'),
+        # Bundle model assets so the binary can find them under _MEIPASS
         ('model', 'model'),
-        ('negative_control_vectors_1024d.npy', '.'),
+        ('checkpoints', 'checkpoints'),
         ('safe_h5_utils.py', '.'),
-        *xgboost_datas,
+        ('TissueLab_logo.ico', '.'),
         *fastapi_datas,
         *uvicorn_datas,
     ],
@@ -95,7 +87,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='TissueLab_MUSK_Classification_Mac',
+    name='TissueLab_MUSK_Embedding_Win',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -118,7 +110,7 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='TissueLab_MUSK_Classification_Mac',
+    name='TissueLab_MUSK_Embedding_Win',
 )
 
 parser = argparse.ArgumentParser()

@@ -155,7 +155,7 @@ def load_model_at_init():
         
         # Specify the correct path for tokenizer.spm
         os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Avoid warnings
-        print(f"[{NODE_NAME}] Setting XLMRobertaTokenizer path to ./MUSK/musk/models/tokenizer.spm")
+        print(f"[{NODE_NAME}] Setting XLMRobertaTokenizer path to ./checkpoints/tokenizer.spm")
         
         MUSK_MODEL = MUSK(model_path=model_path)
         print(f"[{NODE_NAME}] MUSK model loaded successfully")
