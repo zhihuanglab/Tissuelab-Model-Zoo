@@ -389,7 +389,6 @@ class NucleiEmbedding:
         self.model = self.model.to("cuda" if torch.cuda.is_available() else "cpu")
 
         # Load trained checkpoint if available
-        # checkpoint_path = os.path.join(os.path.dirname(__file__), 'checkpoints/contrastive_checkpoint_epoch_0.pt')
         checkpoint_path = os.path.join(os.path.dirname(__file__), 'checkpoints/checkpoint_step_10000.pt')
         if os.path.exists(checkpoint_path):
             print(f"Loading trained checkpoint from {checkpoint_path}")
