@@ -87,7 +87,7 @@ def load_checkpoint_at_init():
         print("MUSK model already loaded in memory => skip")
         return
 
-    base_path = getattr(cd, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
+    base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
     checkpoint_path = os.path.join(base_path, "checkpoints", "model.safetensors")
     
     print(f"[{NODE_NAME}] Looking for checkpoint at: {checkpoint_path}")
