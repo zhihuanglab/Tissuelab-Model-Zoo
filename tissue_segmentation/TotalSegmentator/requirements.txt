@@ -1,0 +1,13 @@
+TotalSegmentator>=2.0.0
+nibabel>=5.0.0
+numpy>=1.21.0
+scipy>=1.7.0
+SimpleITK>=2.2.0
+pillow>=9.0.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
+requests>=2.31.0
+sse-starlette>=1.6.0
+h5py>=3.8.0
+torch>=2.0.0
+torchvision>=0.15.0

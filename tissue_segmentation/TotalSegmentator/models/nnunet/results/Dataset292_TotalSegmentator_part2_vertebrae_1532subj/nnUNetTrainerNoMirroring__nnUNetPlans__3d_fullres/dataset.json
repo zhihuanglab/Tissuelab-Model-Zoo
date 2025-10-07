@@ -1,0 +1,42 @@
+{
+    "name": "Segmentation of X",
+    "description": "Segmentation",
+    "reference": "Jakob",
+    "licence": "-",
+    "release": "0.0",
+    "labels": {
+        "background": 0,
+        "sacrum": 1,
+        "vertebrae_S1": 2,
+        "vertebrae_L5": 3,
+        "vertebrae_L4": 4,
+        "vertebrae_L3": 5,
+        "vertebrae_L2": 6,
+        "vertebrae_L1": 7,
+        "vertebrae_T12": 8,
+        "vertebrae_T11": 9,
+        "vertebrae_T10": 10,
+        "vertebrae_T9": 11,
+        "vertebrae_T8": 12,
+        "vertebrae_T7": 13,
+        "vertebrae_T6": 14,
+        "vertebrae_T5": 15,
+        "vertebrae_T4": 16,
+        "vertebrae_T3": 17,
+        "vertebrae_T2": 18,
+        "vertebrae_T1": 19,
+        "vertebrae_C7": 20,
+        "vertebrae_C6": 21,
+        "vertebrae_C5": 22,
+        "vertebrae_C4": 23,
+        "vertebrae_C3": 24,
+        "vertebrae_C2": 25,
+        "vertebrae_C1": 26
+    },
+    "numTraining": 1532,
+    "channel_names": {
+        "0": "CT"
+    },
+    "file_ending": ".nii.gz",
+    "overwrite_image_reader_writer": "NibabelIOWithReorient"
+}
