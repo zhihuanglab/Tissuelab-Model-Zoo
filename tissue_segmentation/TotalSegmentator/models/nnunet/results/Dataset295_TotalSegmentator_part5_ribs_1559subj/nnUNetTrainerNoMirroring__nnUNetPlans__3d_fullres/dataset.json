@@ -1,0 +1,42 @@
+{
+    "name": "Segmentation of X",
+    "description": "Segmentation",
+    "reference": "Jakob",
+    "licence": "-",
+    "release": "0.0",
+    "channel_names": {
+        "0": "CT"
+    },
+    "labels": {
+        "background": 0,
+        "rib_left_1": 1,
+        "rib_left_2": 2,
+        "rib_left_3": 3,
+        "rib_left_4": 4,
+        "rib_left_5": 5,
+        "rib_left_6": 6,
+        "rib_left_7": 7,
+        "rib_left_8": 8,
+        "rib_left_9": 9,
+        "rib_left_10": 10,
+        "rib_left_11": 11,
+        "rib_left_12": 12,
+        "rib_right_1": 13,
+        "rib_right_2": 14,
+        "rib_right_3": 15,
+        "rib_right_4": 16,
+        "rib_right_5": 17,
+        "rib_right_6": 18,
+        "rib_right_7": 19,
+        "rib_right_8": 20,
+        "rib_right_9": 21,
+        "rib_right_10": 22,
+        "rib_right_11": 23,
+        "rib_right_12": 24,
+        "sternum": 25,
+        "costal_cartilages": 26
+    },
+    "numTraining": 1559,
+    "file_ending": ".nii.gz",
+    "overwrite_image_reader_writer": "NibabelIOWithReorient"
+}

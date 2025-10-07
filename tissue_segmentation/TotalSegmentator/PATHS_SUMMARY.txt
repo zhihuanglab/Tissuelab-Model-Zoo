@@ -1,0 +1,139 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║         TotalSegmentator 路径配置 - 简明总结                          ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+✅ 确认：原始 TotalSegmentator 代码 **会正确找到** 新下载的权重！
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【路径配置流程】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1️⃣  TaskNode 启动时设置 (totalsegmentator_tasknode.py)
+   ┌─────────────────────────────────────────────────────────┐
+   │ os.environ['TOTALSEG_HOME_DIR'] = "models/"            │
+   └─────────────────────────────────────────────────────────┘
+
+2️⃣  TotalSegmentator 查找权重目录 (config.py)
+   ┌─────────────────────────────────────────────────────────┐
+   │ get_weights_dir():                                      │
+   │   检查 TOTALSEG_HOME_DIR? ✓ 已设置                     │
+   │   返回: TOTALSEG_HOME_DIR + "/nnunet/results"          │
+   └─────────────────────────────────────────────────────────┘
+
+3️⃣  最终权重路径
+   ┌─────────────────────────────────────────────────────────┐
+   │ models/nnunet/results/                                  │
+   │   ├── Dataset297_TotalSegmentator_total_3mm_1559subj/  │
+   │   ├── Dataset298_TotalSegmentator_total_6mm_1559subj/  │
+   │   └── ... (共 9 个模型)                                 │
+   └─────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【路径对应关系】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TaskNode 写的路径 → TotalSegmentator 读的路径 → 实际结果
+─────────────────────────────────────────────────────────────
+LOCAL_MODELS        get_totalseg_dir()         ✓ 一致
+↓                   ↓                          
+models/             models/                    
+
+LOCAL_MODELS        get_weights_dir()          ✓ 一致
++ nnunet/results    ↓                          
+↓                   models/nnunet/results      
+models/nnunet/      
+results/            
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【验证结果】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+环境变量:
+  TOTALSEG_HOME_DIR = .../TotalSegmentator/models ✓
+  nnUNet_results    = .../TotalSegmentator/models/nnunet/results ✓
+
+发现的模型:
+  ✓ Dataset258_lung_vessels_248subj (236 MB)
+  ✓ Dataset291_TotalSegmentator_part1_organs_1559subj (241 MB)
+  ✓ Dataset292_TotalSegmentator_part2_vertebrae_1532subj (241 MB)
+  ✓ Dataset293_TotalSegmentator_part3_cardiac_1559subj (241 MB)
+  ✓ Dataset294_TotalSegmentator_part4_muscles_1559subj (241 MB)
+  ✓ Dataset295_TotalSegmentator_part5_ribs_1559subj (241 MB)
+  ✓ Dataset297_TotalSegmentator_total_3mm_1559subj (158 MB) ⭐
+  ✓ Dataset298_TotalSegmentator_total_6mm_1559subj (158 MB)
+  ✓ Dataset299_body_1559subj (240 MB)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【关键代码】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【1】totalsegmentator_tasknode.py (Line 43):
+    os.environ['TOTALSEG_HOME_DIR'] = str(LOCAL_MODELS)
+    
+    作用：告诉 TotalSegmentator 去哪里找模型
+
+【2】TotalSegmentator-src/totalsegmentator/config.py (Line 17-18):
+    if "TOTALSEG_HOME_DIR" in os.environ:
+        totalseg_dir = Path(os.environ["TOTALSEG_HOME_DIR"])
+    
+    作用：读取我们设置的路径
+
+【3】TotalSegmentator-src/totalsegmentator/config.py (Line 31-32):
+    totalseg_dir = get_totalseg_dir()
+    config_dir = totalseg_dir / "nnunet/results"
+    
+    作用：在基础路径下查找 nnunet/results 子文件夹
+
+【4】TotalSegmentator-src/totalsegmentator/libs.py (Line 136-358):
+    def download_pretrained_weights(task_id):
+        config_dir = get_weights_dir()  # 使用上面的路径
+        ...
+    
+    作用：下载和查找权重都用同一个路径
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【路径查找优先级】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TotalSegmentator 按以下顺序查找权重：
+
+1. TOTALSEG_WEIGHTS_PATH 环境变量（如果设置）
+   └─ 我们没有设置 ✗
+
+2. TOTALSEG_HOME_DIR/nnunet/results（如果设置）
+   └─ 我们设置了这个 ✓ ← 使用这个路径
+
+3. ~/.totalsegmentator/nnunet/results（默认）
+   └─ 不会用到
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【结论】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ 下载到 models/nnunet/results/ 的权重 **完全正确**
+✅ TotalSegmentator **会自动找到** 这些权重
+✅ 无需额外配置
+
+运行时日志会显示:
+  [TotalSegmentator] Using local model weights: .../models
+
+这表示配置成功！
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【验证方法】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# 验证路径配置
+python verify_paths.py
+
+# 测试 TaskNode
+python totalsegmentator_tasknode.py --port 8010 --name TotalSegmentator
+
+# 查看模型文件
+ls -R models/nnunet/results/ | head -50
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+详细文档: PATH_CONFIGURATION.md
+创建时间: 2025-10-07
+验证状态: ✅ 通过
