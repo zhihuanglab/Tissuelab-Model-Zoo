@@ -1,0 +1,40 @@
+{
+    "name": "Segmentation of X",
+    "description": "Segmentation",
+    "reference": "Jakob",
+    "licence": "-",
+    "release": "0.0",
+    "labels": {
+        "background": 0,
+        "spleen": 1,
+        "kidney_right": 2,
+        "kidney_left": 3,
+        "gallbladder": 4,
+        "liver": 5,
+        "stomach": 6,
+        "pancreas": 7,
+        "adrenal_gland_right": 8,
+        "adrenal_gland_left": 9,
+        "lung_upper_lobe_left": 10,
+        "lung_lower_lobe_left": 11,
+        "lung_upper_lobe_right": 12,
+        "lung_middle_lobe_right": 13,
+        "lung_lower_lobe_right": 14,
+        "esophagus": 15,
+        "trachea": 16,
+        "thyroid_gland": 17,
+        "small_bowel": 18,
+        "duodenum": 19,
+        "colon": 20,
+        "urinary_bladder": 21,
+        "prostate": 22,
+        "kidney_cyst_left": 23,
+        "kidney_cyst_right": 24
+    },
+    "numTraining": 1559,
+    "channel_names": {
+        "0": "CT"
+    },
+    "file_ending": ".nii.gz",
+    "overwrite_image_reader_writer": "NibabelIOWithReorient"
+}
