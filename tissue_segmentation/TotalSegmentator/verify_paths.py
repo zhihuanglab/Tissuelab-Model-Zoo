@@ -8,7 +8,7 @@ from pathlib import Path
 
 # Setup paths exactly like the tasknode does
 SCRIPT_DIR = Path(__file__).parent.absolute()
-TOTALSEG_SRC = SCRIPT_DIR / "TotalSegmentator-src"
+TOTALSEG_SRC = SCRIPT_DIR / "TotalSegmentator-master"
 LOCAL_MODELS = SCRIPT_DIR / "models"
 
 print("=" * 70)

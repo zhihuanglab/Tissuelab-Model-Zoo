@@ -1,0 +1,37 @@
+{
+    "name": "Segmentation of X",
+    "description": "Segmentation",
+    "reference": "Jakob",
+    "licence": "-",
+    "release": "0.0",
+    "channel_names": {
+        "0": "MR"
+    },
+    "labels": {
+        "background": 0,
+        "humerus_left": 1,
+        "humerus_right": 2,
+        "scapula_left": 3,
+        "scapula_right": 4,
+        "clavicula_left": 5,
+        "clavicula_right": 6,
+        "femur_left": 7,
+        "femur_right": 8,
+        "hip_left": 9,
+        "hip_right": 10,
+        "gluteus_maximus_left": 11,
+        "gluteus_maximus_right": 12,
+        "gluteus_medius_left": 13,
+        "gluteus_medius_right": 14,
+        "gluteus_minimus_left": 15,
+        "gluteus_minimus_right": 16,
+        "autochthon_left": 17,
+        "autochthon_right": 18,
+        "iliopsoas_left": 19,
+        "iliopsoas_right": 20,
+        "brain": 21
+    },
+    "numTraining": 1088,
+    "file_ending": ".nii.gz",
+    "overwrite_image_reader_writer": "NibabelIOWithReorient"
+}

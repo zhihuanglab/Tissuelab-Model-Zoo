@@ -28,7 +28,7 @@ from PIL import Image
 
 # Setup paths for self-contained mode
 SCRIPT_DIR = Path(__file__).parent.absolute()
-TOTALSEG_SRC = SCRIPT_DIR / "TotalSegmentator-src"
+TOTALSEG_SRC = SCRIPT_DIR / "TotalSegmentator-master"
 LOCAL_MODELS = SCRIPT_DIR / "models"
 
 # Add local TotalSegmentator source to path if it exists
