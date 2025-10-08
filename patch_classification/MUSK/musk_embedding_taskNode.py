@@ -242,7 +242,7 @@ def run_patch_classification(args):
                 raise ValueError("MUSK_MODEL not loaded => please ensure /init is called first.")
             
             # Process WSI and extract patches with embeddings
-            update_progress(10)
+            update_progress(1)
             print(f"[{NODE_NAME}] Starting to process WSI with patch_size={args.patch_size}, level={args.level}")
             
             # Define progress callback function
