@@ -136,7 +136,7 @@ a = Analysis(
     datas=[
         ('safe_h5_utils.py', '.'),
         # Include local TotalSegmentator source if exists
-        ('TotalSegmentator-src', 'TotalSegmentator-src') if os.path.exists('TotalSegmentator-src') else ('safe_h5_utils.py', '.'),  # Dummy if not exists
+        ('TotalSegmentator-master', 'TotalSegmentator-master') if os.path.exists('TotalSegmentator-master') else ('safe_h5_utils.py', '.'),  # Dummy if not exists
         # Include local model weights if exists
         ('models', 'models') if os.path.exists('models') else ('safe_h5_utils.py', '.'),  # Dummy if not exists
         *totalseg_datas,

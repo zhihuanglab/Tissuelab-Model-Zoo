@@ -1,0 +1,17 @@
+{
+    "description": "ct blood segmentation",
+    "labels": {
+        "background": 0,
+        "blood": 1
+    },
+    "licence": "-",
+    "name": "icb blood segmentation",
+    "numTraining": 319,
+    "reference": "Jakob",
+    "release": "0.0",
+    "channel_names": {
+        "0": "CT"
+    },
+    "file_ending": ".nii.gz",
+    "overwrite_image_reader_writer": "NibabelIOWithReorient"
+}
