@@ -144,6 +144,83 @@ class SlideSegmentation():
         self.preload_queue = Queue()
         self.max_cache_size = 4  # Adjust based on memory constraints
         
+        # Parse ROI parameters from frontend (already in Level 0 coordinates)
+        self.roi_bbox = None  # (x, y, width, height) in Level 0 coordinates
+        self.roi_polygon = None  # List of (x, y) tuples in Level 0 coordinates
+        
+        if hasattr(args, 'bbox') and args.bbox:
+            try:
+                parts = [float(p.strip()) for p in str(args.bbox).split(',')]
+                if len(parts) == 4:
+                    self.roi_bbox = tuple(parts)
+                    print(f"ROI bbox: x={self.roi_bbox[0]:.0f}, y={self.roi_bbox[1]:.0f}, size={self.roi_bbox[2]:.0f}×{self.roi_bbox[3]:.0f}")
+                else:
+                    print(f"Warning: bbox has {len(parts)} parts, expected 4")
+            except Exception as e:
+                print(f"Warning: Failed to parse bbox: {e}")
+                
+        if hasattr(args, 'polygon_points') and args.polygon_points:
+            try:
+                if isinstance(args.polygon_points, list):
+                    self.roi_polygon = [(float(p[0]), float(p[1])) for p in args.polygon_points]
+                    print(f"ROI polygon: {len(self.roi_polygon)} vertices")
+            except Exception as e:
+                print(f"Warning: Failed to parse polygon_points: {e}")
+        
+    def point_in_polygon(self, x, y, polygon):
+        """
+        Check if point (x, y) is inside polygon using ray-casting algorithm.
+        polygon: list of (x, y) tuples
+        """
+        n = len(polygon)
+        inside = False
+        
+        p1x, p1y = polygon[0]
+        for i in range(1, n + 1):
+            p2x, p2y = polygon[i % n]
+            if y > min(p1y, p2y):
+                if y <= max(p1y, p2y):
+                    if x <= max(p1x, p2x):
+                        if p1y != p2y:
+                            xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                        if p1x == p2x or x <= xinters:
+                            inside = not inside
+            p1x, p1y = p2x, p2y
+        
+        return inside
+    
+    def should_process_tile(self, tile_x0, tile_y0, tile_x1, tile_y1):
+        """Check if tile intersects with ROI. Coordinates in Level 0 space."""
+        if self.roi_bbox is None and self.roi_polygon is None:
+            return True
+        
+        # If polygon is specified, check polygon intersection
+        if self.roi_polygon:
+            # Check if tile intersects with polygon bounding box first (fast check)
+            poly_xs = [p[0] for p in self.roi_polygon]
+            poly_ys = [p[1] for p in self.roi_polygon]
+            poly_min_x, poly_max_x = min(poly_xs), max(poly_xs)
+            poly_min_y, poly_max_y = min(poly_ys), max(poly_ys)
+            
+            # If tile doesn't intersect polygon's bounding box, skip
+            if tile_x1 < poly_min_x or tile_x0 > poly_max_x or tile_y1 < poly_min_y or tile_y0 > poly_max_y:
+                return False
+            
+            # If tile intersects polygon's bounding box, process it
+            # (We'll do precise point-in-polygon filtering later)
+            return True
+        
+        # If only bbox is specified, check bbox intersection
+        if self.roi_bbox:
+            bbox_x, bbox_y, bbox_w, bbox_h = self.roi_bbox
+            bbox_x1 = bbox_x + bbox_w
+            bbox_y1 = bbox_y + bbox_h
+            
+            if tile_x1 < bbox_x or tile_x0 > bbox_x1 or tile_y1 < bbox_y or tile_y0 > bbox_y1:
+                return False
+            
+        return True
+    
     def read_data(self):
         print("Reading data ...", datetime.now().strftime("%H:%M:%S"))
 
@@ -577,11 +654,49 @@ class SlideSegmentation():
                 self.prob_all = prob
                 
                 # Apply post-processing for simple images too
-                self.post_process_remove_duplicates_fixed(debug=True)
+                self.post_process_remove_duplicates_fixed(debug=False)
                 
-                # Get final count after deduplication
+                print(f"After deduplication: {len(self.final_points)} nuclei")
+                
+                # Filter centroids to ROI if specified
+                if self.roi_polygon is not None:
+                    # Use polygon for filtering
+                    x_coords = self.final_points[:, 0]
+                    y_coords = self.final_points[:, 1]
+                    
+                    # Check each point against polygon
+                    within_roi = np.array([self.point_in_polygon(x, y, self.roi_polygon) 
+                                          for x, y in zip(x_coords, y_coords)])
+                    
+                    n_before = len(self.final_points)
+                    self.final_points = self.final_points[within_roi]
+                    self.final_coord = self.final_coord[within_roi]
+                    self.prob_all = self.prob_all[within_roi]
+                    n_after = len(self.final_points)
+                    
+                    print(f"ROI polygon filtering: {n_before} → {n_after} nuclei ({n_before - n_after} removed)")
+                    
+                elif self.roi_bbox is not None:
+                    # Use bounding box for filtering
+                    bbox_x, bbox_y, bbox_w, bbox_h = self.roi_bbox
+                    roi_x0, roi_y0 = bbox_x, bbox_y
+                    roi_x1, roi_y1 = bbox_x + bbox_w, bbox_y + bbox_h
+                    
+                    x_coords = self.final_points[:, 0]
+                    y_coords = self.final_points[:, 1]
+                    within_roi = (x_coords >= roi_x0) & (x_coords <= roi_x1) & (y_coords >= roi_y0) & (y_coords <= roi_y1)
+                    
+                    n_before = len(self.final_points)
+                    self.final_points = self.final_points[within_roi]
+                    self.final_coord = self.final_coord[within_roi]
+                    self.prob_all = self.prob_all[within_roi]
+                    n_after = len(self.final_points)
+                    
+                    print(f"ROI bbox filtering: {n_before} → {n_after} nuclei ({n_before - n_after} removed)")
+                
+                # Get final count after all processing
                 total_nuclei = len(self.final_points)
-                print(f"Total detected {total_nuclei} nuclei after deduplication")
+                print(f"Total: {total_nuclei} nuclei")
                 
                 if self.progress_callback:
                     self.progress_callback(100)
@@ -619,30 +734,39 @@ class SlideSegmentation():
 
         pbar = tqdm(total=total_tiles, mininterval=0.1)
         
-        # Print status before starting loop
-        print(f"Starting segmentation process - Total tiles: {n_row}x{n_col}={n_row*n_col}")
+        print(f"Starting segmentation: {n_row}x{n_col}={n_row*n_col} tiles")
+        if self.roi_polygon:
+            print(f"ROI polygon filtering enabled: {len(self.roi_polygon)} vertices")
+        elif self.roi_bbox:
+            bbox_x, bbox_y, bbox_w, bbox_h = self.roi_bbox
+            print(f"ROI bbox filtering enabled: region [{bbox_x:.0f}, {bbox_y:.0f}] size {bbox_w:.0f}×{bbox_h:.0f}")
+        
+        tiles_skipped_roi = 0
         
         for ir in range(n_row):
             for ic in range(n_col):
                 # Update progress bar
                 iter += 1
                 pbar.update(1)
+                
+                # Calculate tile position in Level 0 coordinates
+                x_0 = ic*(self.tile_size-self.overlap)
+                y_0 = ir*(self.tile_size-self.overlap)
+                x_1 = np.min((x_0 + self.tile_size, self.dim[0]))
+                y_1 = np.min((y_0 + self.tile_size, self.dim[1]))
+                
+                # Check if tile intersects with ROI
+                if not self.should_process_tile(x_0, y_0, x_1, y_1):
+                    tiles_skipped_roi += 1
+                    continue
+                
                 processed_tiles += 1
                 progress = int((processed_tiles / total_tiles) * 100)
                 if self.progress_callback:
                     self.progress_callback(progress)
                 
-                # Calculate current tile position
-                x_0 = ic*(self.tile_size-self.overlap)
-                y_0 = ir*(self.tile_size-self.overlap)
-                
-                print(f"Processing tile r{ir} c{ic} (x={x_0}, y={y_0}) - {processed_tiles}/{total_tiles}")
-                
                 # Record tile processing start time
                 patch_start_time = time.time()
-                
-                x_1 = np.min((x_0 + self.tile_size, self.dim[0]))
-                y_1 = np.min((y_0 + self.tile_size, self.dim[1]))
                 
                 w_col = x_1 - x_0
                 h_row = y_1 - y_0
@@ -739,14 +863,9 @@ class SlideSegmentation():
                 patch_duration = patch_end_time - patch_start_time
                 compute_duration = patch_duration - read_duration
                 
-                # Print nuclei detection results for each tile
-                print("\n========================================")
-                print(f"Tile r{ir} c{ic} (x={x_0}, y={y_0}) detected {len(points)} nuclei")
-                print("========================================\n")
-                
-                # Print processing time information
-                print(f"Tile r{ir} c{ic} processing time: {patch_duration:.4f}s (read: {read_duration:.4f}s, compute: {compute_duration:.4f}s)")
-                print(f"Start: {datetime.fromtimestamp(patch_start_time).strftime('%H:%M:%S')} - End: {datetime.fromtimestamp(patch_end_time).strftime('%H:%M:%S')}")
+                # Log tile results
+                if len(points) > 0:
+                    print(f"Tile r{ir}c{ic}: {len(points)} nuclei ({patch_duration:.2f}s)")
                 
                 # Note here: correctly accumulate results from all tiles instead of overwriting
                 if points_all is None:
@@ -757,6 +876,13 @@ class SlideSegmentation():
                     points_all = pd.concat((points_all, points), axis=0, ignore_index=True)
                     coord_all = np.concatenate((coord_all, coord), axis=0)
                     prob_all = np.concatenate((prob_all, prob), axis=0)
+        
+        # Print ROI processing summary
+        if self.roi_bbox or tiles_skipped_roi > 0:
+            print(f"\n📊 ROI Processing Summary:")
+            print(f"   Total tiles in grid: {total_tiles}")
+            print(f"   Tiles skipped (outside ROI): {tiles_skipped_roi}")
+            print(f"   Tiles processed (inside ROI): {processed_tiles}")
         
         # Print clear information before generating final_points
         if points_all is None or len(points_all) == 0:
@@ -782,19 +908,56 @@ class SlideSegmentation():
                 self.prob_all = prob_all
                 
                 if self.args.magnification is not None:
-                    # Need to scale back to original size since calculations were at 20x
+                    # Scale centroids back to Level 0 coordinates
                     resize_factor = self.reference_magnification / self.args.magnification
                     self.final_points = (self.final_points/resize_factor).astype(np.int32)
                     self.final_coord = (self.final_coord/resize_factor).astype(np.int32)
                 
-                print(f"Before deduplication: {len(self.final_points)} detected nuclei")
+                print(f"Before deduplication: {len(self.final_points)} nuclei")
                 
                 # Apply post-processing to remove duplicates
-                self.post_process_remove_duplicates_fixed(debug=True)
+                self.post_process_remove_duplicates_fixed(debug=False)
                 
-                # Update total count after deduplication
+                print(f"After deduplication: {len(self.final_points)} nuclei")
+                
+                # Filter centroids to ROI if specified
+                if self.roi_polygon is not None:
+                    # Use polygon for filtering
+                    x_coords = self.final_points[:, 0]
+                    y_coords = self.final_points[:, 1]
+                    
+                    # Check each point against polygon
+                    within_roi = np.array([self.point_in_polygon(x, y, self.roi_polygon) 
+                                          for x, y in zip(x_coords, y_coords)])
+                    
+                    n_before = len(self.final_points)
+                    self.final_points = self.final_points[within_roi]
+                    self.final_coord = self.final_coord[within_roi]
+                    self.prob_all = self.prob_all[within_roi]
+                    n_after = len(self.final_points)
+                    
+                    print(f"ROI polygon filtering: {n_before} → {n_after} nuclei ({n_before - n_after} removed)")
+                    
+                elif self.roi_bbox is not None:
+                    # Use bounding box for filtering
+                    bbox_x, bbox_y, bbox_w, bbox_h = self.roi_bbox
+                    roi_x0, roi_y0 = bbox_x, bbox_y
+                    roi_x1, roi_y1 = bbox_x + bbox_w, bbox_y + bbox_h
+                    
+                    x_coords = self.final_points[:, 0]
+                    y_coords = self.final_points[:, 1]
+                    within_roi = (x_coords >= roi_x0) & (x_coords <= roi_x1) & (y_coords >= roi_y0) & (y_coords <= roi_y1)
+                    
+                    n_before = len(self.final_points)
+                    self.final_points = self.final_points[within_roi]
+                    self.final_coord = self.final_coord[within_roi]
+                    self.prob_all = self.prob_all[within_roi]
+                    n_after = len(self.final_points)
+                    
+                    print(f"ROI bbox filtering: {n_before} → {n_after} nuclei ({n_before - n_after} removed)")
+                
+                # Update total count after all processing
                 total_nuclei = len(self.final_points)
-                print(f"After deduplication: {total_nuclei} nuclei")
                 
             except Exception as e:
                 print(f"Failed to generate final_points: {str(e)}")
