@@ -1,181 +1,152 @@
 # TotalSegmentator TaskNode
 
-A TissueLab TaskNode wrapper for [TotalSegmentator](https://github.com/wasserth/TotalSegmentator) - automatic segmentation of 104 anatomical structures in CT and MR images.
-
-## Overview
-
-TotalSegmentator is a deep learning tool for segmenting anatomical structures in medical images. This TaskNode integrates it into the TissueLab workflow system for parallel processing with other segmentation methods.
+A FastAPI-based tasknode for TotalSegmentator medical image segmentation, supporting DICOM and NIfTI inputs with H5 output storage.
 
 ## Features
 
-- **Multiple Task Types**: Support for various segmentation tasks (total body, lung vessels, cerebral bleed, etc.)
-- **Fast Mode**: Option for faster processing with slightly lower accuracy
-- **ROI Subset**: Segment only specific regions of interest
-- **Multilabel Output**: Support for multilabel segmentation format
-- **Progress Tracking**: Real-time progress updates via SSE
-- **H5 Integration**: Seamless integration with TissueLab's H5 workflow data format
-
-## Installation
-
-### Prerequisites
-
-- Python 3.9 or higher
-- CUDA-capable GPU (recommended) or CPU
-- Conda environment (recommended)
-
-### Setup
-
-1. **Create a Conda environment** (recommended):
-   ```bash
-   conda create -n totalsegmentator python=3.9 -y
-   conda activate totalsegmentator
-   ```
-
-2. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Install TotalSegmentator** (if not already installed):
-   ```bash
-   pip install TotalSegmentator
-   ```
-
-4. **Download models** (optional, will download on first run):
-   ```bash
-   totalsegmentator_download_weights -t total
-   ```
-
-## Usage
-
-### As a TissueLab TaskNode
-
-1. **Register the node in TissueLab**:
-   - Open TissueLab
-   - Navigate to AI Model Zoo
-   - Click "Add Custom Node"
-   - Select this script file (`totalsegmentator_tasknode.py`)
-   - Choose the conda environment
-   - Set a port (default: 8010)
-   - Click "Activate"
-
-2. **Use in workflows**:
-   - The node will appear in the "Tissue Segmentation" category
-   - Add it to your workflow alongside other nodes
-   - Configure parameters through the workflow UI
-
-### Standalone Mode
-
-Run the node directly:
-
-```bash
-python totalsegmentator_tasknode.py --port 8010 --name TotalSegmentator --manager_host http://localhost:5001
-```
-
-## Supported Tasks
-
-- `total`: Full body segmentation (104 structures)
-- `body`: Body composition segmentation
-- `lung_vessels`: Lung vessel segmentation
-- `cerebral_bleed`: Cerebral hemorrhage detection
-- `hip_implant`: Hip implant segmentation
-- `coronary_arteries`: Coronary artery segmentation
-- `pleural_pericard_effusion`: Effusion detection
-
-## Configuration Parameters
-
-Parameters can be set through the H5 file's `userData` group:
-
-- **path**: Input image file path (required)
-- **task**: Segmentation task type (default: "total")
-- **fast**: Enable fast mode for quicker processing (default: false)
-- **ml**: Use multilabel format (default: false)
-- **roi_subset**: Comma-separated list of specific ROIs to segment (optional)
-
-## Output Format
-
-Results are stored in the H5 file under the specified group (default: "TotalSegmentator"):
-
-```
-TotalSegmentator/
-├── masks (ndarray): Segmentation masks for each ROI [N, H, W]
-├── roi_names (array of strings): Names of segmented ROIs
-├── output (string): JSON string with execution results
-└── userData/ (optional user parameters)
-```
+- **Multiple Model Support**: 7 different TotalSegmentator models (total_3mm, total_6mm, body, lung_vessels, total_mr, total_mr_fast, cerebral_bleed)
+- **Input Formats**: DICOM folders and NIfTI files (.nii, .nii.gz)
+- **ROI Filtering**: Process only specified organs (e.g., liver, spleen, kidneys)
+- **Parallel Processing**: Concurrent processing of multiple organs
+- **H5 Storage**: Results stored in SegmentorNode with compression
+- **Progress Tracking**: Real-time progress updates with SSE
+- **Metadata Storage**: Comprehensive metadata for each organ
 
 ## API Endpoints
 
-- `GET /status`: Check node status and TotalSegmentator installation
-- `POST /init`: Initialize the node and check dependencies
-- `POST /read`: Read parameters from H5 file
-- `POST /execute`: Run the segmentation
-- `GET /progress`: SSE endpoint for real-time progress updates
-
-## Integration with TissueLab
-
-This TaskNode:
-- ✅ Follows TissueLab's TaskNode protocol
-- ✅ Supports parallel execution with other nodes
-- ✅ Integrates with H5 workflow data format
-- ✅ Provides real-time progress updates
-- ✅ Can be combined with downstream classification nodes
-
-## Example Workflow
-
-```
-Input Image → TotalSegmentator → [Region Masks] → Custom Analysis Scripts
-                      ↓
-              Organ Statistics
-              Spatial Analysis
-              Volume Measurements
-```
-
-## Troubleshooting
-
-### Installation Issues
-
-If you encounter installation problems:
-
-1. Ensure you're using Python 3.9+
-2. Try installing in a clean conda environment
-3. Check CUDA compatibility if using GPU
-
-### Memory Issues
-
-For large images:
-- Use `--fast` mode
-- Reduce image resolution
-- Use `--roi_subset` to segment only specific regions
-
-### Common Errors
-
-- **"TotalSegmentator not found"**: Run `pip install TotalSegmentator`
-- **"CUDA out of memory"**: Reduce batch size or use CPU mode
-- **"Model weights not found"**: Run `totalsegmentator_download_weights`
-
-## References
-
-- [TotalSegmentator GitHub](https://github.com/wasserth/TotalSegmentator)
-- [TotalSegmentator Paper](https://arxiv.org/abs/2208.05868)
-- TissueLab Documentation
-
-## License
-
-This wrapper follows TissueLab's license. TotalSegmentator itself is licensed under Apache 2.0.
-
-## Citation
-
-If you use TotalSegmentator in your research, please cite:
-
-```bibtex
-@article{wasserthal2023totalsegmentator,
-  title={TotalSegmentator: Robust Segmentation of 104 Anatomic Structures in CT Images},
-  author={Wasserthal, Jakob and Breit, Hanns-Christian and Meyer, Manfred T and Pradella, Maurice and Hinck, Daniel and Sauter, Alexander W and Heye, Tobias and Boll, Daniel T and Cyriac, Joshy and Yang, Shan and others},
-  journal={Radiology: Artificial Intelligence},
-  volume={5},
-  number={5},
-  year={2023},
-  publisher={Radiological Society of North America}
+### 1. Initialize Model (`POST /init`)
+```json
+{
+  "model": "total_3mm",
+  "device": "gpu",
+  "h5_path": "/path/to/output.h5",
+  "node_name": "SegmentorNode"
 }
 ```
+
+### 2. Get Input Requirements (`GET /read`)
+Returns supported input formats, available models, and ROI options.
+
+### 3. Execute Segmentation (`POST /execute`)
+```json
+{
+  "input_path": "/path/to/dicom/folder",
+  "roi_subset": ["liver", "spleen", "kidney_left", "kidney_right"]
+}
+```
+
+### 4. Get Progress (`GET /progress`)
+Returns current processing status and progress percentage.
+
+### 5. Stream Progress (`GET /progress/stream`)
+Server-Sent Events for real-time progress updates.
+
+### 6. Get Status (`GET /status`)
+Returns node status and configuration.
+
+## Available Models
+
+| Model | Description | Resolution | Speed |
+|-------|-------------|------------|-------|
+| `total_3mm` | Whole body segmentation (high precision) | 3mm | Slow |
+| `total_6mm` | Whole body segmentation (fast) | 6mm | Fast |
+| `body` | Body segmentation | 1.5mm | Medium |
+| `lung_vessels` | Lung vessels segmentation | Native | Medium |
+| `total_mr` | MR image whole body segmentation | 1.5mm | Slow |
+| `total_mr_fast` | MR image whole body segmentation (fast) | 3mm | Fast |
+| `cerebral_bleed` | Intracranial hemorrhage (CT) | Native | Medium |
+
+## ROI Options
+
+Common organs that can be segmented:
+- `liver`
+- `spleen` 
+- `kidney_left`, `kidney_right`
+- `lung_upper_lobe_left`, `lung_upper_lobe_right`
+- `lung_lower_lobe_left`, `lung_lower_lobe_right`
+- `heart`
+- `brain`
+- `stomach`
+- `pancreas`
+- `bladder`
+- `prostate`
+
+## H5 Output Structure
+
+```
+SegmentorNode/
+├── liver/          # 3D segmentation data for liver
+├── spleen/         # 3D segmentation data for spleen
+├── kidney_left/    # 3D segmentation data for left kidney
+├── kidney_right/   # 3D segmentation data for right kidney
+└── ...             # Other segmented organs
+
+Attributes:
+- model: TotalSegmentator model used
+- task_id: Model task ID
+- input_path: Original input path
+- input_type: Input format (dicom/nifti)
+- processing_time: Time taken for segmentation
+- timestamp: Processing timestamp
+- roi_subset: Organs that were segmented
+- last_updated: Last update timestamp
+- total_organs: Number of organs in the dataset
+```
+
+## Usage Example
+
+```python
+import requests
+
+# 1. Initialize model
+init_response = requests.post("http://localhost:8000/init", json={
+    "model": "total_3mm",
+    "device": "gpu",
+    "h5_path": "/path/to/output.h5",
+    "node_name": "SegmentorNode"
+})
+
+# 2. Execute segmentation
+execute_response = requests.post("http://localhost:8000/execute", json={
+    "input_path": "/path/to/dicom/folder",
+    "roi_subset": ["liver", "spleen"]
+})
+
+# 3. Monitor progress
+progress_response = requests.get("http://localhost:8000/progress")
+print(f"Progress: {progress_response.json()['progress']}%")
+```
+
+## Installation
+
+1. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+2. Ensure TotalSegmentator is properly installed with models:
+```bash
+pip install totalsegmentator
+# Download models (this will happen automatically on first use)
+```
+
+3. Run the tasknode:
+```bash
+python totalsegmentator_tasknode.py --host 0.0.0.0 --port 8000
+```
+
+## Configuration
+
+The tasknode expects TotalSegmentator models to be available. You can:
+
+1. Let TotalSegmentator download models automatically (first run will be slow)
+2. Pre-download models to a local directory and set `TOTALSEG_HOME_DIR` environment variable
+3. Place models in `./models/` directory relative to the script
+
+## Notes
+
+- The tasknode processes only the organs specified in `roi_subset`. If not provided, it processes all available organs.
+- Each organ is stored as a separate dataset in the H5 file with compression.
+- Processing is done in parallel for multiple organs to improve performance.
+- The tasknode handles DICOM validation issues automatically by relaxing validation rules.
+- Progress tracking is available both via polling (`/progress`) and streaming (`/progress/stream`).
