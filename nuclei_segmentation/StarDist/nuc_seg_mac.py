@@ -745,9 +745,14 @@ class SlideSegmentation():
         
         for ir in range(n_row):
             for ic in range(n_col):
-                # Update progress bar
+                # Update progress bar and callback
                 iter += 1
                 pbar.update(1)
+                
+                # Report progress based on tiles checked (not just processed)
+                progress = int((iter / total_tiles) * 100)
+                if self.progress_callback:
+                    self.progress_callback(progress)
                 
                 # Calculate tile position in Level 0 coordinates
                 x_0 = ic*(self.tile_size-self.overlap)
@@ -761,9 +766,6 @@ class SlideSegmentation():
                     continue
                 
                 processed_tiles += 1
-                progress = int((processed_tiles / total_tiles) * 100)
-                if self.progress_callback:
-                    self.progress_callback(progress)
                 
                 # Record tile processing start time
                 patch_start_time = time.time()
@@ -876,6 +878,10 @@ class SlideSegmentation():
                     points_all = pd.concat((points_all, points), axis=0, ignore_index=True)
                     coord_all = np.concatenate((coord_all, coord), axis=0)
                     prob_all = np.concatenate((prob_all, prob), axis=0)
+        
+        # Ensure progress reaches 100% after tile processing
+        if self.progress_callback:
+            self.progress_callback(100)
         
         # Print ROI processing summary
         if self.roi_bbox or tiles_skipped_roi > 0:
