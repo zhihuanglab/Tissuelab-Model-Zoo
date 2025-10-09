@@ -196,6 +196,7 @@ def run_segmentation(args):
 
         # Step C: generate embedding if dont have cached
         embedding_data = None
+        temp_h5_path = None
         if centroids is not None and len(centroids) > 0: # Ensure centroids exist and are not empty
             # create a temp H5 file path
             h5_dir = os.path.dirname(H5_PATH)
@@ -271,6 +272,14 @@ def run_segmentation(args):
 
                 hf.flush()
             time.sleep(0.5) # Reduced sleep time
+            
+            # Clean up temp embedding file after successful write
+            if temp_h5_path and os.path.exists(temp_h5_path):
+                try:
+                    os.remove(temp_h5_path)
+                    print(f"[CLEANUP] Successfully removed temp embedding file: {temp_h5_path}")
+                except Exception as e:
+                    print(f"[CLEANUP] Warning: Could not remove temp file {temp_h5_path}: {str(e)}")
         else:
             print("[H5 WRITE] Centroids are None after segmentation step, nothing to write to H5 for this node.")
 
