@@ -57,19 +57,26 @@ class SlideSegmentation():
         else:
             print("No GPUs found. Running on CPU.")
         
-        # Configure TensorFlow CPU threading to limit total workers to 15
+        # Configure TensorFlow CPU threading dynamically
         try:
-            # Calculate max TensorFlow threads based on n_tiles
-            if isinstance(n_tiles, tuple) and len(n_tiles) >= 2:
-                stardist_workers = n_tiles[0] * n_tiles[1] * (n_tiles[2] if len(n_tiles) > 2 else 1)
-                # Reserve some threads for other processes, limit TensorFlow to 10 threads max
-                tf_threads = min(10, 15 - stardist_workers)
-            else:
-                tf_threads = 10
+            import multiprocessing
+            cpu_count = multiprocessing.cpu_count()
             
-            tf.config.threading.set_intra_op_parallelism_threads(tf_threads)
-            tf.config.threading.set_inter_op_parallelism_threads(2)
-            print(f"TensorFlow CPU threading configured: intra_op={tf_threads}, inter_op=2")
+            if gpus:
+                # With GPU: TensorFlow can use more threads since GPU does heavy lifting
+                # Allow TensorFlow to use available cores minus a small reserve
+                tf_intra_threads = max(8, min(cpu_count - 4, 32))  # Cap at 32 for efficiency
+                tf_inter_threads = max(2, min(cpu_count // 8, 4))  # Inter-op parallelism
+                print(f"GPU mode: TensorFlow threading - intra_op={tf_intra_threads}, inter_op={tf_inter_threads}")
+            else:
+                # Without GPU: Still allow reasonable threading but be more conservative
+                tf_intra_threads = max(4, min(cpu_count // 2, 16))
+                tf_inter_threads = 2
+                print(f"CPU mode: TensorFlow threading - intra_op={tf_intra_threads}, inter_op={tf_inter_threads}")
+            
+            tf.config.threading.set_intra_op_parallelism_threads(tf_intra_threads)
+            tf.config.threading.set_inter_op_parallelism_threads(tf_inter_threads)
+            print(f"System CPUs: {cpu_count}, TensorFlow configured for optimal performance")
         except Exception as e:
             print(f"Warning: Could not configure TensorFlow threading: {e}")
             
@@ -107,17 +114,37 @@ class SlideSegmentation():
         self.prob_thresh = prob_thresh
         self.nms_thresh = nms_thresh
         
-        # Limit n_tiles to ensure total workers <= 15
+        # Dynamic worker scaling based on system resources
+        import multiprocessing
+        cpu_count = multiprocessing.cpu_count()
+        
         if isinstance(n_tiles, tuple) and len(n_tiles) >= 2:
-            total_workers = n_tiles[0] * n_tiles[1] * (n_tiles[2] if len(n_tiles) > 2 else 1)
-            if total_workers > 15:
-                # Scale down to (3,3,1) = 9 workers max
-                self.n_tiles = (3, 3, 1)
-                print(f"Worker limit: Changed n_tiles from {n_tiles} to {self.n_tiles} (max 15 workers)")
+            requested_workers = n_tiles[0] * n_tiles[1] * (n_tiles[2] if len(n_tiles) > 2 else 1)
+            
+            # On servers with GPUs, allow more workers
+            if gpus:
+                # With GPU: allow up to 80% of CPU cores for n_tiles
+                max_workers = max(16, int(cpu_count * 0.8))
+                print(f"GPU detected: Allowing up to {max_workers} StarDist workers")
+            else:
+                # Without GPU: be more conservative but still scale with CPU count
+                max_workers = max(15, int(cpu_count * 0.5))
+                print(f"CPU-only mode: Allowing up to {max_workers} StarDist workers")
+            
+            if requested_workers > max_workers:
+                # Scale down proportionally
+                scale_factor = (max_workers / requested_workers) ** 0.5
+                new_n0 = max(2, int(n_tiles[0] * scale_factor))
+                new_n1 = max(2, int(n_tiles[1] * scale_factor))
+                self.n_tiles = (new_n0, new_n1, 1)
+                actual_workers = new_n0 * new_n1
+                print(f"Scaled n_tiles from {n_tiles} to {self.n_tiles} ({requested_workers} → {actual_workers} workers)")
             else:
                 self.n_tiles = n_tiles
+                print(f"Using requested n_tiles={n_tiles} ({requested_workers} workers)")
         else:
             self.n_tiles = n_tiles
+            print(f"Using n_tiles={n_tiles}")
             
         self.isIHC = isIHC
         
@@ -472,6 +499,8 @@ class SlideSegmentation():
                 pbar.update(curr_idx-last_idx)
                 last_idx = curr_idx
                 
+                # Time the StarDist prediction to identify GPU vs CPU performance
+                predict_start = time.time()
                 labels, dicts = self.model.predict_instances(img_norm,
                                                         prob_thresh=self.prob_thresh,
                                                         nms_thresh=self.nms_thresh,
@@ -479,6 +508,14 @@ class SlideSegmentation():
                                                         show_tile_progress=False,
                                                         return_predict=False
                                                         )
+                predict_duration = time.time() - predict_start
+                
+                # GPU check: if prediction takes >5s, likely running on CPU
+                if predict_duration > 5.0:
+                    print(f"⚠️  WARNING: StarDist prediction took {predict_duration:.2f}s (likely CPU-only mode)")
+                    print(f"    Expected GPU time: 0.5-2s. Check TensorFlow GPU installation!")
+                else:
+                    print(f"✅ StarDist prediction: {predict_duration:.2f}s (GPU acceleration confirmed)")
                 
                 points = dicts['points'] # y,x
                 points[:, [1, 0]] = points[:, [0, 1]] # x,y
@@ -592,6 +629,12 @@ class SlideSegmentation():
         
         # Record overall start time
         overall_start_time = time.time()
+        
+        # Performance profiling accumulators
+        total_read_time = 0
+        total_normalize_time = 0
+        total_predict_time = 0
+        total_postprocess_time = 0
         
         self.normalize_template = self.get_normalized_template()
         
@@ -742,17 +785,20 @@ class SlideSegmentation():
             print(f"ROI bbox filtering enabled: region [{bbox_x:.0f}, {bbox_y:.0f}] size {bbox_w:.0f}×{bbox_h:.0f}")
         
         tiles_skipped_roi = 0
+        last_reported_progress = -1  # Track last reported progress to avoid redundant updates
         
         for ir in range(n_row):
             for ic in range(n_col):
-                # Update progress bar and callback
+                # Update progress bar
                 iter += 1
                 pbar.update(1)
                 
-                # Report progress based on tiles checked (not just processed)
+                # Throttle progress callback: only update when progress changes by at least 1%
+                # This reduces SSE overhead significantly for large slide tiles
                 progress = int((iter / total_tiles) * 100)
-                if self.progress_callback:
+                if self.progress_callback and progress != last_reported_progress:
                     self.progress_callback(progress)
+                    last_reported_progress = progress
                 
                 # Calculate tile position in Level 0 coordinates
                 x_0 = ic*(self.tile_size-self.overlap)
@@ -788,6 +834,7 @@ class SlideSegmentation():
                 # Record image reading end time
                 read_end_time = time.time()
                 read_duration = read_end_time - read_start_time
+                total_read_time += read_duration
                 
                 if self.args.magnification is not None:
                     st = time.time()
@@ -821,6 +868,8 @@ class SlideSegmentation():
                 else:
                     help_with_norm = False
 
+                # Track normalization time
+                norm_start_time = time.time()
                 if help_with_norm:
                     normalize_template2 = normalize_template[:img_np.shape[0],:img_np.shape[1],:]
                     joint_normalize = np.concatenate((img_np, normalize_template2), axis=1)
@@ -828,6 +877,8 @@ class SlideSegmentation():
                     img_norm = img_norm[:img_np.shape[0],:img_np.shape[1],:]
                 else:
                     img_norm = normalize(img_np)
+                norm_end_time = time.time()
+                total_normalize_time += (norm_end_time - norm_start_time)
 
                 # Skip if mostly white pixels (>240)
                 n_dark_pixels = np.sum(np.any(img_np < 240, axis=2))  # Count pixels with any RGB channel < 240
@@ -838,7 +889,8 @@ class SlideSegmentation():
                     print("Values too large, skipping this batch")
                     continue
                 
-                
+                # Track StarDist prediction time (the main bottleneck)
+                predict_start_time = time.time()
                 labels, dicts = self.model.predict_instances(img_norm,
                                                             prob_thresh=self.prob_thresh,
                                                             nms_thresh=self.nms_thresh,
@@ -846,6 +898,16 @@ class SlideSegmentation():
                                                             show_tile_progress=False,
                                                             return_predict=False
                                                             )
+                predict_end_time = time.time()
+                predict_duration = predict_end_time - predict_start_time
+                total_predict_time += predict_duration
+                
+                # GPU check: if prediction takes >5s, likely running on CPU
+                if predict_duration > 5.0:
+                    print(f"⚠️  WARNING: StarDist prediction took {predict_duration:.2f}s (likely CPU-only mode)")
+                    print(f"    Expected GPU time: 0.5-2s. Check TensorFlow GPU installation!")
+                elif predict_duration < 1.0:
+                    print(f"✅ StarDist prediction: {predict_duration:.2f}s (GPU acceleration likely active)")
                                                             
                 points = dicts['points'] # y,x
                 points[:, [1, 0]] = points[:, [0, 1]] # x,y
@@ -989,11 +1051,35 @@ class SlideSegmentation():
         overall_end_time = time.time()
         overall_duration = overall_end_time - overall_start_time
         
-        print(f"\nTotal processing time: {overall_duration:.2f}s ({overall_duration/60:.2f}min)")
+        print(f"\n{'='*80}")
+        print(f"SEGMENTATION PERFORMANCE SUMMARY")
+        print(f"{'='*80}")
+        print(f"Total processing time: {overall_duration:.2f}s ({overall_duration/60:.2f}min)")
         print(f"Start time: {datetime.fromtimestamp(overall_start_time).strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"End time: {datetime.fromtimestamp(overall_end_time).strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Total nuclei count: {total_nuclei}")  # This now shows the deduplicated count
-
+        print(f"\nProcessed {processed_tiles} tiles (skipped {tiles_skipped_roi} outside ROI)")
+        print(f"Total nuclei count: {total_nuclei}")
+        
+        # Performance breakdown
+        if processed_tiles > 0:
+            print(f"\n{'─'*80}")
+            print(f"TIME BREAKDOWN (per tile averages):")
+            print(f"{'─'*80}")
+            avg_read = total_read_time / processed_tiles
+            avg_normalize = total_normalize_time / processed_tiles
+            avg_predict = total_predict_time / processed_tiles
+            
+            print(f"  Image reading:      {avg_read:.3f}s/tile  (Total: {total_read_time:.1f}s, {total_read_time/overall_duration*100:.1f}%)")
+            print(f"  Normalization:      {avg_normalize:.3f}s/tile  (Total: {total_normalize_time:.1f}s, {total_normalize_time/overall_duration*100:.1f}%)")
+            print(f"  StarDist prediction: {avg_predict:.3f}s/tile  (Total: {total_predict_time:.1f}s, {total_predict_time/overall_duration*100:.1f}%)")
+            
+            other_time = overall_duration - (total_read_time + total_normalize_time + total_predict_time)
+            print(f"  Other (dedup, etc): {other_time/processed_tiles:.3f}s/tile  (Total: {other_time:.1f}s, {other_time/overall_duration*100:.1f}%)")
+            
+            print(f"\n  Average per tile:   {overall_duration/processed_tiles:.3f}s")
+            print(f"  Throughput:         {processed_tiles/(overall_duration/60):.1f} tiles/min")
+        
+        print(f"{'='*80}")
         print("---- Segmentation successfully completed ----")
         
         # Add final validation
