@@ -157,13 +157,25 @@ def run_segmentation(args):
             # Add max_workers to args if not present
             if not hasattr(args, 'max_workers'):
                 args.max_workers = 15
+            
+            # Use higher n_tiles for better performance with GPUs
+            # The SlideSegmentation class will auto-scale based on available resources
+            import torch
+            if torch.cuda.is_available():
+                # With GPU: use more aggressive tiling for parallelization
+                n_tiles_config = (4, 4, 1)  # 16 workers - will be auto-adjusted by SlideSegmentation
+                print(f"GPU available: Using n_tiles={n_tiles_config} for StarDist (will auto-scale)")
+            else:
+                # Without GPU: more conservative
+                n_tiles_config = (3, 3, 1)  # 9 workers
+                print(f"CPU mode: Using n_tiles={n_tiles_config} for StarDist (will auto-scale)")
                 
             ss = SlideSegmentation(args,
                                    tile_size=4096,
                                    overlap=256,
                                    prob_thresh=0.3,
                                    nms_thresh=0.3,
-                                   n_tiles=(2, 2, 1),
+                                   n_tiles=n_tiles_config,
                                    stardist_pretrain=args.stardist_pretrain,
                                    isIHC=args.isIHC,
                                    progress_callback=lambda x: update_progress(x, "segmentation"))
