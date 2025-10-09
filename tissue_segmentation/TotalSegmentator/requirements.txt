@@ -1,44 +1,10 @@
-# =============================================================================
-# TotalSegmentator 依赖 (Python 3.9, Windows + CUDA)
-# 官方要求: Python >= 3.9, PyTorch >= 2.0.0 and < 2.4.0 (Windows)
-# =============================================================================
-
-# 深度学习框架 (Windows 限制: PyTorch < 2.4, CUDA 11.8)
-# 如果只需要 CPU，运行: pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cpu
-torch==2.3.1+cu118
-torchvision==0.18.1+cu118
---extra-index-url https://download.pytorch.org/whl/cu118
-
-# 医学图像处理
-nibabel==5.2.1
-SimpleITK==2.3.1
-pydicom>=2.4.0
-pylibjpeg>=2.0.0
-pylibjpeg-libjpeg>=2.0.0
-pylibjpeg-openjpeg>=2.0.0
-python-gdcm>=3.0.0
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+pydantic>=2.4.0
+sse-starlette>=1.6.5
+h5py>=3.9.0
+numpy>=1.24.0
+nibabel>=5.1.0
 dicom2nifti>=2.4.0
-
-# 数据处理
-numpy==1.26.4
-scipy==1.13.0
-pillow==10.3.0
-h5py==3.11.0
-blosc2>=2.5.0
-
-# nnUNet 框架及其依赖
-nnunetv2==2.2
-acvl-utils==0.2
-
-# TaskNode API
-fastapi==0.111.0
-uvicorn==0.29.0
-sse-starlette==2.1.0
-pydantic==2.7.1
-
-# 其他依赖
-requests==2.27.1
-tqdm>=4.65.0
-pandas>=2.0.0
-
-# 注意: 不要安装 TotalSegmentator 包，我们使用本地 TotalSegmentator-master 源码
+totalsegmentator>=1.5.0
+pathlib2>=2.3.7

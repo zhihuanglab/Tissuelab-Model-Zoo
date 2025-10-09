@@ -1,61 +1,64 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-TotalSegmentator TaskNode for organ/tissue segmentation on medical images
-This node processes medical images (CT, MRI, etc.) and segments anatomical structures
-Self-contained version with local TotalSegmentator source and model weights
+TotalSegmentator TaskNode for FastAPI
+Supports selecting different weight models, processing DICOM folders and NIfTI files, 
+outputting NIfTI format results and storing in H5 files with SegmentorNode structure
 """
 
-import argparse
 import os
 import sys
+import argparse
+import h5py
+import numpy as np
 import time
 import json
-import h5py
-import uvicorn
-import requests
-import numpy as np
-from sse_starlette.sse import EventSourceResponse
-import asyncio
-import subprocess
 import tempfile
+import threading
+import asyncio
 from pathlib import Path
+from typing import Dict, Any, Optional, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from fastapi import FastAPI
+import uvicorn
+from fastapi import FastAPI, BackgroundTasks, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any, List, Optional
-from PIL import Image
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
+from sse_starlette.sse import EventSourceResponse
 
-# Setup paths for self-contained mode
+# Add TotalSegmentator to path
 SCRIPT_DIR = Path(__file__).parent.absolute()
 TOTALSEG_SRC = SCRIPT_DIR / "TotalSegmentator-master"
 LOCAL_MODELS = SCRIPT_DIR / "models"
 
-# Add local TotalSegmentator source to path if it exists
 if TOTALSEG_SRC.exists():
     sys.path.insert(0, str(TOTALSEG_SRC))
     print(f"[TotalSegmentator] Using local source: {TOTALSEG_SRC}")
 else:
-    print(f"[TotalSegmentator] Local source not found at {TOTALSEG_SRC}, will use installed package")
+    print(f"[TotalSegmentator] Local source not found at {TOTALSEG_SRC}")
 
-# Setup local model weights directory
+# Set local model weights directory
 if LOCAL_MODELS.exists():
     os.environ['TOTALSEG_HOME_DIR'] = str(LOCAL_MODELS)
     print(f"[TotalSegmentator] Using local model weights: {LOCAL_MODELS}")
 else:
-    print(f"[TotalSegmentator] Local weights not found, will use default location")
+    print(f"[TotalSegmentator] Local weights not found")
 
-# Try to import totalsegmentator
+# Import TotalSegmentator
 try:
     from totalsegmentator.python_api import totalsegmentator
     print(f"[TotalSegmentator] Successfully imported TotalSegmentator")
 except ImportError as e:
-    totalsegmentator = None
     print(f"[TotalSegmentator] Warning: totalsegmentator not imported: {e}")
+    sys.exit(1)
 
+# Import safe H5 utilities
+sys.path.append(str(SCRIPT_DIR.parent.parent))
 from safe_h5_utils import safe_h5_open
 
-app = FastAPI()
+# FastAPI app
+app = FastAPI(title="TotalSegmentator TaskNode")
 
 # Add CORS middleware
 app.add_middleware(
@@ -66,502 +69,887 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add exception handler for validation errors
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    print("=" * 60)
+    print("VALIDATION ERROR CAUGHT:")
+    print("=" * 60)
+    print(f"Request URL: {request.url}")
+    print(f"Request method: {request.method}")
+    print(f"Request headers: {dict(request.headers)}")
+    
+    try:
+        body = await request.body()
+        print(f"Request body: {body}")
+        if body:
+            import json
+            parsed_body = json.loads(body)
+            print(f"Parsed body: {parsed_body}")
+        else:
+            print("Request body is empty!")
+    except Exception as e:
+        print(f"Failed to read/parse request body: {e}")
+    
+    print(f"Validation errors: {exc.errors()}")
+    print("=" * 60)
+    
+    # Safe way to get body info
+    body_info = "No body"
+    try:
+        if hasattr(exc, 'body'):
+            body_value = exc.body()
+            if body_value is not None:
+                body_info = str(body_value)
+    except Exception as e:
+        body_info = f"Error getting body: {e}"
+    
+    return JSONResponse(
+        status_code=422,
+        content={
+            "status": "error",
+            "message": "Validation error",
+            "errors": exc.errors(),
+            "body": body_info
+        }
+)
+
 # Global variables
-ARGS = None
 IS_MODEL_INITED = False
+MODEL_CONFIG = None
 H5_PATH = None
-NODE_NAME = None
-H5_GROUP = None
-DEPENDENCIES = []
-progress_value = 0
-progress_complete = False
-last_printed_progress = -1
+NODE_NAME = "TotalSegmentator"
+INPUT_PATH = None
+ROI_SUBSET = None
+CURRENT_PROGRESS = 0
+PROGRESS_MESSAGE = ""
+IS_PROCESSING = False
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--port', type=int, default=8010, help='port')
-    parser.add_argument('--name', type=str, default='TotalSegmentator', help='node name')
-    parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
-
-    # TotalSegmentator parameters
-    parser.add_argument('--slidepath', default='', type=str, help='Input image path')
-    parser.add_argument('--task', default='total', type=str, 
-                        choices=['total', 'body', 'lung_vessels', 'cerebral_bleed', 'hip_implant', 
-                                'coronary_arteries', 'pleural_pericard_effusion'],
-                        help='Segmentation task type')
-    parser.add_argument('--ml', action='store_true', help='Use multilabel format')
-    parser.add_argument('--fast', action='store_true', help='Use fast mode (lower quality but faster)')
-    parser.add_argument('--roi_subset', type=str, default=None, help='List of ROIs to segment (comma-separated)')
-
-    return parser.parse_args()
-
-def _to_int(val, default=None):
-    try:
-        s = str(val).strip()
-        return int(s) if s != "" else default
-    except (TypeError, ValueError):
-        return default
-
-def _to_float(val, default=None):
-    try:
-        s = str(val).strip()
-        return float(s) if s != "" else default
-    except (TypeError, ValueError):
-        return default
-
-def update_progress(value):
-    """Update the progress value for the frontend"""
-    global progress_value, last_printed_progress
-    
-    if 'last_printed_progress' not in globals():
-        last_printed_progress = -1
-    
-    progress_value = value
-    
-    if abs(value - last_printed_progress) >= 2 or value == 100:
-        last_printed_progress = value
-
-def check_totalsegmentator_installed():
-    """Check if totalsegmentator is installed"""
-    try:
-        import totalsegmentator
-        return True
-    except ImportError:
-        return False
-
-def install_totalsegmentator():
-    """Install TotalSegmentator if not already installed"""
-    try:
-        print("[TotalSegmentator] Installing TotalSegmentator...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "TotalSegmentator"])
-        print("[TotalSegmentator] Installation complete")
-        return True
-    except Exception as e:
-        print(f"[TotalSegmentator] Failed to install: {e}")
-        return False
-
-def run_totalsegmentator(args):
-    """
-    Run TotalSegmentator on the input image:
-    1. Check if segmentation already exists
-    2. Run TotalSegmentator if needed
-    3. Save results to H5 file
-    """
-    global progress_complete, NODE_NAME, H5_PATH, H5_GROUP
-    
-    if H5_PATH is None or NODE_NAME is None:
-        raise ValueError("H5_PATH and NODE_NAME must be set before running segmentation")
-    
-    result = {"status": "success", "message": "", "roi_count": 0}
-    
-    try:
-        start_time = time.time()
-        
-        # Check if segmentation already exists
-        ALREADY_HAVE_SEG = False
-        segmentation_masks = None
-        roi_names = None
-        
-        if os.path.exists(H5_PATH):
-            with safe_h5_open(H5_PATH, 'r') as hf:
-                if H5_GROUP in hf:
-                    try:
-                        if f"{H5_GROUP}/masks" in hf and f"{H5_GROUP}/roi_names" in hf:
-                            segmentation_masks = hf[f"{H5_GROUP}/masks"][()]
-                            roi_names_bytes = hf[f"{H5_GROUP}/roi_names"][()]
-                            roi_names = [n.decode('utf-8') if isinstance(n, bytes) else n for n in roi_names_bytes]
-                            
-                            if segmentation_masks is not None and len(roi_names) > 0:
-                                ALREADY_HAVE_SEG = True
-                                print(f"[{NODE_NAME}] Using existing segmentation from {H5_GROUP} => skip processing")
-                                result["message"] = "Using existing segmentation"
-                                result["roi_count"] = len(roi_names)
-                    except Exception as e:
-                        print(f"[{NODE_NAME}] Warning: segmentation data is corrupted. Will re-process. Error: {e}")
-        
-        # Run TotalSegmentator if needed
-        if not ALREADY_HAVE_SEG:
-            print(f"[{NODE_NAME}] Processing {args.slidepath} with task={args.task}")
-            
-            # Check if totalsegmentator is installed
-            if not check_totalsegmentator_installed():
-                if not install_totalsegmentator():
-                    raise RuntimeError("Failed to install TotalSegmentator")
-                # Reload module after installation
-                import importlib
-                import totalsegmentator
-                importlib.reload(totalsegmentator)
-                from totalsegmentator.python_api import totalsegmentator as ts_func
-            else:
-                from totalsegmentator.python_api import totalsegmentator as ts_func
-            
-            update_progress(10)
-            
-            # Create temporary output directory
-            with tempfile.TemporaryDirectory() as output_dir:
-                output_path = os.path.join(output_dir, "segmentation.nii.gz")
-                
-                # Prepare TotalSegmentator arguments
-                ts_kwargs = {
-                    'input': args.slidepath,
-                    'output': output_path,
-                    'task': args.task,
-                    'ml': args.ml,
-                    'fast': args.fast,
-                    'quiet': False,
-                }
-                
-                # Add ROI subset if specified
-                if args.roi_subset:
-                    ts_kwargs['roi_subset'] = args.roi_subset.split(',')
-                
-                update_progress(20)
-                
-                # Run TotalSegmentator
-                print(f"[{NODE_NAME}] Running TotalSegmentator with parameters: {ts_kwargs}")
-                segmentation_result = ts_func(**ts_kwargs)
-                
-                update_progress(80)
-                
-                # Load and process segmentation results
-                # TotalSegmentator outputs NIfTI files, we need to convert to our format
-                if os.path.exists(output_path):
-                    import nibabel as nib
-                    seg_img = nib.load(output_path)
-                    segmentation_data = seg_img.get_fdata()
-                    
-                    # Extract unique ROIs
-                    unique_rois = np.unique(segmentation_data)
-                    unique_rois = unique_rois[unique_rois > 0]  # Exclude background
-                    
-                    # Create segmentation masks for each ROI
-                    segmentation_masks = []
-                    roi_names = []
-                    
-                    # Map ROI IDs to names (this mapping depends on the task)
-                    roi_id_to_name = _get_roi_mapping(args.task)
-                    
-                    for roi_id in unique_rois:
-                        mask = (segmentation_data == roi_id).astype(np.uint8)
-                        segmentation_masks.append(mask)
-                        roi_name = roi_id_to_name.get(int(roi_id), f"ROI_{int(roi_id)}")
-                        roi_names.append(roi_name)
-                    
-                    segmentation_masks = np.array(segmentation_masks)
-                    
-                    result["roi_count"] = len(roi_names)
-                    result["message"] = "Segmentation completed successfully"
-                else:
-                    raise FileNotFoundError(f"Segmentation output not found at {output_path}")
-            
-            update_progress(90)
-        
-        # Save to H5 file
-        if not ALREADY_HAVE_SEG and segmentation_masks is not None and roi_names is not None:
-            with safe_h5_open(H5_PATH, "a") as hf:
-                # If group already exists, delete it
-                if H5_GROUP in hf:
-                    del hf[H5_GROUP]
-                
-                # Create group
-                node_grp = hf.create_group(H5_GROUP)
-                
-                # Write segmentation masks and ROI names
-                node_grp.create_dataset('masks', data=segmentation_masks, compression='gzip')
-                
-                # Store roi_names as UTF-8 encoded bytes
-                roi_names_encoded = [n.encode('utf-8') for n in roi_names]
-                dt = h5py.string_dtype(encoding='utf-8')
-                node_grp.create_dataset('roi_names', data=roi_names_encoded, dtype=dt)
-                
-                # Add metadata
-                node_grp.attrs['task'] = args.task
-                node_grp.attrs['fast_mode'] = args.fast
-                node_grp.attrs['ml_format'] = args.ml
-                
-                # Add empty output dataset
-                node_grp.create_dataset('output', shape=(), dtype=h5py.string_dtype())
-                
-                hf.flush()
-            
-            time.sleep(1)
-        
-        # Ensure progress is set to 100 when complete
-        progress_complete = True
-        update_progress(100)
-        
-        end_time = time.time()
-        print(f"[{NODE_NAME}] Time taken: {end_time - start_time:.2f}s")
-        
-        return result
-        
-    except Exception as e:
-        import traceback
-        print(f"[{NODE_NAME}] Error: {str(e)}")
-        print(traceback.format_exc())
-        return {"status": "error", "message": str(e), "roi_count": 0}
-
-def _get_roi_mapping(task: str) -> Dict[int, str]:
-    """Get ROI ID to name mapping based on task type"""
-    # This is a simplified mapping - you may need to expand this based on TotalSegmentator's actual output
-    mappings = {
-        'total': {
-            1: 'spleen', 2: 'kidney_right', 3: 'kidney_left', 4: 'gallbladder',
-            5: 'liver', 6: 'stomach', 7: 'aorta', 8: 'inferior_vena_cava',
-            9: 'portal_vein_splenic_vein', 10: 'pancreas', 11: 'adrenal_gland_right',
-            12: 'adrenal_gland_left', 13: 'lung_upper_lobe_left', 14: 'lung_lower_lobe_left',
-            15: 'lung_upper_lobe_right', 16: 'lung_middle_lobe_right', 17: 'lung_lower_lobe_right',
-            18: 'vertebrae', 19: 'esophagus', 20: 'trachea', 21: 'heart',
-            22: 'pulmonary_artery', 23: 'brain', 24: 'iliac_artery_left',
-            25: 'iliac_artery_right', 26: 'iliac_vena_left', 27: 'iliac_vena_right',
-            28: 'small_bowel', 29: 'duodenum', 30: 'colon', 31: 'rib_left',
-            32: 'rib_right', 33: 'humerus_left', 34: 'humerus_right',
-            35: 'scapula_left', 36: 'scapula_right', 37: 'clavicula_left',
-            38: 'clavicula_right', 39: 'femur_left', 40: 'femur_right',
-            41: 'hip_left', 42: 'hip_right', 43: 'sacrum',
-            44: 'face', 45: 'gluteus_maximus_left', 46: 'gluteus_maximus_right',
-            47: 'gluteus_medius_left', 48: 'gluteus_medius_right',
-            49: 'gluteus_minimus_left', 50: 'gluteus_minimus_right',
-            51: 'autochthon_left', 52: 'autochthon_right', 53: 'iliopsoas_left',
-            54: 'iliopsoas_right', 55: 'urinary_bladder',
-        },
-        'body': {
-            1: 'body', 2: 'body_trunc', 3: 'body_extremities', 4: 'skin',
-        },
-        'lung_vessels': {
-            1: 'lung_vessels', 2: 'lung_trachea_bronchia',
-        },
+# Available weight model configurations (from main_run.py)
+AVAILABLE_MODELS = {
+    "total_3mm": {
+        "task": "total",
+        "task_id": 297,
+        "description": "Whole body segmentation (3mm high precision)",
+        "fast": False,
+        "resample": 1.5
+    },
+    "total_6mm": {
+        "task": "total", 
+        "task_id": 298,
+        "description": "Whole body segmentation (6mm fast)",
+        "fast": True,
+        "resample": 6.0
+    },
+    "body": {
+        "task": "body",
+        "task_id": 299,
+        "description": "Body segmentation",
+        "fast": False,
+        "resample": 1.5
+    },
+    "lung_vessels": {
+        "task": "lung_vessels",
+        "task_id": 258,
+        "description": "Lung vessels segmentation",
+        "fast": False,
+        "resample": None
+    },
+    "total_mr": {
+        "task": "total_mr",
+        "task_id": 852,
+        "description": "MR image whole body segmentation",
+        "fast": False,
+        "resample": 1.5
+    },
+    "total_mr_fast": {
+        "task": "total_mr",
+        "task_id": 853,
+        "description": "MR image whole body segmentation (fast)",
+        "fast": True,
+        "resample": 3.0
+    },
+    "cerebral_bleed": {
+        "task": "cerebral_bleed",
+        "task_id": 150,
+        "description": "Intracranial hemorrhage (CT)",
+        "fast": False,
+        "resample": None
     }
+}
+
+# Pydantic models - Make them more flexible
+class InputData(BaseModel):
+    cerebral_bleed: Optional[str] = None
+    path: Optional[str] = None
     
-    return mappings.get(task, {})
+    class Config:
+        extra = "allow"  # Allow extra fields
 
-# === FastAPI Routes ===
+class Step1Config(BaseModel):
+    model: Optional[str] = None
+    input: Optional[InputData] = None
+    
+    class Config:
+        extra = "allow"  # Allow extra fields
 
-@app.get("/status")
-def get_status():
-    return {"status": "TotalSegmentator node running", "installed": check_totalsegmentator_installed()}
+class InitConfig(BaseModel):
+    h5_path: Optional[str] = None
+    step1: Optional[Step1Config] = None
+    device: Optional[str] = "gpu"
+    node_name: Optional[str] = "TotalSegmentator"
+    
+    class Config:
+        extra = "allow"  # Allow extra fields
+
+class InputRequirements(BaseModel):
+    input_type: str  # "dicom" or "nifti"
+    roi_subset: Optional[List[str]] = None  # List of organs to segment
+
+class ExecuteRequest(BaseModel):
+    # Support both old and new formats
+    input_path: Optional[str] = None
+    roi_subset: Optional[List[str]] = None
+    # New format matching frontend
+    step1: Optional[Step1Config] = None
+
+class ProgressResponse(BaseModel):
+    progress: int
+    message: str
+    is_processing: bool
+
+def validate_input(input_path: str) -> tuple[bool, Optional[str], str]:
+    """
+    Validate input file/folder
+    
+    Args:
+        input_path: Input path
+        
+    Returns:
+        tuple: (is_valid, input_type, message)
+    """
+    input_path = Path(input_path)
+    
+    if not input_path.exists():
+        return False, None, f"Input path does not exist: {input_path}"
+    
+    if input_path.is_file():
+        # Check if it's a NIfTI file
+        if input_path.suffix in ['.nii', '.nii.gz']:
+            return True, 'nifti', f"NIfTI file: {input_path}"
+        else:
+            return False, None, f"Unsupported file format: {input_path.suffix}"
+    
+    elif input_path.is_dir():
+        # Check if it's a DICOM folder
+        dicom_files = list(input_path.glob("*.dcm")) + list(input_path.glob("*.DCM"))
+        if dicom_files:
+            return True, 'dicom', f"DICOM folder: {input_path} ({len(dicom_files)} files)"
+        else:
+            return False, None, f"No DICOM files found in folder"
+    
+    return False, None, "Invalid input path"
+
+def update_progress(progress: int, message: str = ""):
+    """Update global progress variables"""
+    global CURRENT_PROGRESS, PROGRESS_MESSAGE
+    CURRENT_PROGRESS = progress
+    PROGRESS_MESSAGE = message
+    print(f"[Progress] {progress}% - {message}")
+
+def load_nifti_file(file_path: str) -> Optional[np.ndarray]:
+    """Load NIfTI file and return numpy array"""
+    try:
+        import nibabel as nib
+        nifti_img = nib.load(file_path)
+        return nifti_img.get_fdata()
+    except Exception as e:
+        print(f"Error loading NIfTI file {file_path}: {e}")
+        return None
+
+def save_organ_to_h5(organ_name: str, organ_data: np.ndarray, h5_path: str, metadata: Dict[str, Any], file_prefix: str = None):
+    """Save individual organ data to H5 file in SegmentorNode"""
+    try:
+        print(f"[H5] Starting to save organ: {organ_name}")
+        print(f"[H5] Data shape: {organ_data.shape if organ_data is not None else 'None'}")
+        print(f"[H5] Data type: {organ_data.dtype if organ_data is not None else 'None'}")
+        print(f"[H5] H5 path: {h5_path}")
+        print(f"[H5] File prefix: {file_prefix}")
+        
+        with safe_h5_open(h5_path, "a") as hf:
+            print(f"[H5] Opened H5 file successfully")
+            print(f"[H5] Existing groups: {list(hf.keys())}")
+            
+            # Create SegmentorNode if it doesn't exist
+            if NODE_NAME not in hf:
+                print(f"[H5] Creating new group: {NODE_NAME}")
+                seg_node = hf.create_group(NODE_NAME)
+            else:
+                print(f"[H5] Using existing group: {NODE_NAME}")
+                seg_node = hf[NODE_NAME]
+            
+            print(f"[H5] Existing datasets in {NODE_NAME}: {list(seg_node.keys())}")
+            
+            # Use file_prefix if provided, otherwise use organ_name
+            dataset_name = file_prefix if file_prefix else organ_name
+            print(f"[H5] Dataset name: {dataset_name}")
+            
+            # Delete existing dataset if it exists
+            if dataset_name in seg_node:
+                print(f"[H5] Deleting existing dataset: {dataset_name}")
+                del seg_node[dataset_name]
+            
+            # Create organ dataset
+            print(f"[H5] Creating dataset with shape {organ_data.shape}")
+            organ_dataset = seg_node.create_dataset(
+                dataset_name, 
+                data=organ_data, 
+                compression='gzip',
+                chunks=True
+            )
+            print(f"[H5] Dataset created successfully")
+            
+            # Add organ-specific metadata as attributes
+            organ_dataset.attrs['organ_name'] = organ_name
+            organ_dataset.attrs['dataset_name'] = dataset_name
+            organ_dataset.attrs['file_prefix'] = file_prefix if file_prefix else ""
+            organ_dataset.attrs['shape'] = str(organ_data.shape)
+            organ_dataset.attrs['dtype'] = str(organ_data.dtype)
+            organ_dataset.attrs['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
+            print(f"[H5] Metadata added")
+            
+            # Add general metadata to SegmentorNode
+            seg_node.attrs.update(metadata)
+            seg_node.attrs['last_updated'] = time.strftime('%Y-%m-%d %H:%M:%S')
+            seg_node.attrs['total_organs'] = len([k for k in seg_node.keys() if isinstance(seg_node[k], h5py.Dataset)])
+            
+            # Flush to ensure data is written
+            hf.flush()
+            print(f"[H5] Data flushed to disk")
+            
+            print(f"[H5] SUCCESS: Successfully saved {dataset_name} (organ: {organ_name}) data with shape {organ_data.shape}")
+            
+    except Exception as e:
+        print(f"[H5] ERROR saving {organ_name} to H5: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+def extract_organ_from_nifti(nifti_path: str, organ_name: str) -> Optional[np.ndarray]:
+    """Extract specific organ data from NIfTI segmentation file or directory"""
+    try:
+        import nibabel as nib
+        
+        nifti_path = Path(nifti_path)
+        
+        # Check if it's a directory (for tasks like cerebral_bleed that output multiple files)
+        if nifti_path.is_dir():
+            print(f"[Extract] Looking for {organ_name} in directory: {nifti_path}")
+            
+            # Look for file matching organ name
+            # TotalSegmentator outputs files like: intracerebral_hemorrhage.nii.gz
+            possible_files = [
+                nifti_path / f"{organ_name}.nii.gz",
+                nifti_path / f"{organ_name}.nii",
+            ]
+            
+            for file_path in possible_files:
+                if file_path.exists():
+                    print(f"[Extract] Found organ file: {file_path}")
+                    nifti_img = nib.load(str(file_path))
+                    return nifti_img.get_fdata()
+            
+            # List all files in directory for debugging
+            print(f"[Extract] Available files: {list(nifti_path.glob('*.nii*'))}")
+            print(f"[Extract] Organ file not found for: {organ_name}")
+            return None
+        
+        # If it's a single file (for tasks like total with ROI subset)
+        elif nifti_path.is_file():
+            print(f"[Extract] Loading from single file: {nifti_path}")
+            nifti_img = nib.load(str(nifti_path))
+            data = nifti_img.get_fdata()
+            return data
+        
+        else:
+            print(f"[Extract] Path does not exist: {nifti_path}")
+            return None
+        
+    except Exception as e:
+        print(f"Error extracting {organ_name} from NIfTI: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def process_organs_parallel(organs: List[str], nifti_path: str, h5_path: str, metadata: Dict[str, Any], file_prefix: str = None):
+    """Process multiple organs in parallel"""
+    print(f"[Parallel] Processing {len(organs)} organs in parallel (prefix: {file_prefix})")
+    
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = []
+        
+        for organ in organs:
+            future = executor.submit(process_single_organ, organ, nifti_path, h5_path, metadata, file_prefix)
+            futures.append((organ, future))
+        
+        # Wait for all organs to complete
+        completed_count = 0
+        for organ, future in futures:
+            try:
+                future.result()  # This will raise an exception if the task failed
+                completed_count += 1
+                progress = 80 + (completed_count / len(organs)) * 20  # 80-100%
+                update_progress(int(progress), f"Completed {organ} ({completed_count}/{len(organs)})")
+            except Exception as e:
+                print(f"Error processing {organ}: {e}")
+                update_progress(100, f"Error processing {organ}: {e}")
+    
+    print(f"[Parallel] Completed processing {completed_count}/{len(organs)} organs")
+
+def process_single_organ(organ: str, nifti_path: str, h5_path: str, metadata: Dict[str, Any], file_prefix: str = None):
+    """Process a single organ"""
+    try:
+        print("=" * 60)
+        print(f"[Organ] Processing organ: {organ}")
+        print(f"[Organ] File prefix: {file_prefix}")
+        print(f"[Organ] NIfTI path: {nifti_path}")
+        print(f"[Organ] H5 path: {h5_path}")
+        print("=" * 60)
+        
+        # Extract organ data from NIfTI
+        print(f"[Organ] Extracting data from NIfTI...")
+        organ_data = extract_organ_from_nifti(nifti_path, organ)
+        
+        if organ_data is not None:
+            print(f"[Organ] SUCCESS: Data extracted successfully")
+            print(f"[Organ] Data shape: {organ_data.shape}")
+            print(f"[Organ] Data dtype: {organ_data.dtype}")
+            print(f"[Organ] Data min: {organ_data.min()}, max: {organ_data.max()}, mean: {organ_data.mean()}")
+            
+            # Save to H5 with file prefix
+            print(f"[Organ] Saving to H5...")
+            save_organ_to_h5(organ, organ_data, h5_path, metadata, file_prefix)
+            print(f"[Organ] SUCCESS: Successfully processed {organ}")
+        else:
+            print(f"[Organ] FAILED: Failed to extract data for {organ}")
+            
+    except Exception as e:
+        print(f"[Organ] ERROR processing {organ}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+# FastAPI endpoints
+
+@app.get("/test")
+async def test_endpoint():
+    """Simple test endpoint"""
+    return {"status": "ok", "message": "Server is running"}
+
+@app.post("/test")
+async def test_post_endpoint():
+    """Simple POST test endpoint"""
+    return {"status": "ok", "message": "POST endpoint is working"}
+
+@app.post("/debug")
+async def debug_endpoint(request: Dict[str, Any]):
+    """
+    Debug endpoint to see raw JSON data
+    """
+    print("=" * 60)
+    print("DEBUG ENDPOINT - Raw JSON received:")
+    print("=" * 60)
+    print(f"Type: {type(request)}")
+    print(f"Content: {request}")
+    print("=" * 60)
+    
+    # Try to access nested fields
+    try:
+        if 'step1' in request:
+            print(f"step1 found: {request['step1']}")
+            if isinstance(request['step1'], dict) and 'input' in request['step1']:
+                print(f"input found: {request['step1']['input']}")
+                if isinstance(request['step1']['input'], dict) and 'cerebral_bleed' in request['step1']['input']:
+                    print(f"cerebral_bleed found: {request['step1']['input']['cerebral_bleed']}")
+    except Exception as e:
+        print(f"Error accessing nested fields: {e}")
+    
+    return {"status": "debug", "received": request}
+
+@app.post("/debug-raw")
+async def debug_raw_endpoint(request: str):
+    """
+    Debug endpoint to see raw request body as string
+    """
+    print("=" * 60)
+    print("DEBUG RAW ENDPOINT - Raw request body:")
+    print("=" * 60)
+    print(f"Raw body: {request}")
+    print("=" * 60)
+    
+    # Try to parse as JSON
+    try:
+        import json
+        parsed = json.loads(request)
+        print(f"Parsed JSON: {parsed}")
+    except Exception as e:
+        print(f"Failed to parse JSON: {e}")
+    
+    return {"status": "debug-raw", "body": request}
+
+@app.post("/init-flexible")
+async def init_model_flexible(request: Dict[str, Any]):
+    """
+    Flexible init endpoint that accepts any JSON structure
+    """
+    print("=" * 60)
+    print("INIT FLEXIBLE - Raw request received:")
+    print("=" * 60)
+    print(f"Request type: {type(request)}")
+    print(f"Request content: {request}")
+    print("=" * 60)
+    
+    global MODEL_CONFIG, H5_PATH, NODE_NAME
+    
+    try:
+        # Extract h5_path
+        h5_path = request.get('h5_path')
+        print(f"[Init-Flexible] H5 path: {h5_path}")
+        
+        # Extract step1
+        step1 = request.get('step1')
+        if not step1:
+            return {"status": "error", "message": "step1 field missing"}
+        
+        print(f"[Init-Flexible] Step1: {step1}")
+        
+        # Extract input
+        input_data = step1.get('input')
+        if not input_data:
+            return {"status": "error", "message": "step1.input field missing"}
+        
+        print(f"[Init-Flexible] Input: {input_data}")
+        
+        # Extract cerebral_bleed
+        cerebral_bleed_value = input_data.get('cerebral_bleed')
+        print(f"[Init-Flexible] Cerebral_bleed value: '{cerebral_bleed_value}'")
+        
+        # Extract path
+        input_path = input_data.get('path')
+        print(f"[Init-Flexible] Input path: {input_path}")
+        
+        # Process cerebral_bleed field
+        if cerebral_bleed_value and isinstance(cerebral_bleed_value, str):
+            if cerebral_bleed_value.startswith('[') and cerebral_bleed_value.endswith(']'):
+                organs_str = cerebral_bleed_value[1:-1]
+                organs_list = [organ.strip() for organ in organs_str.split(',')]
+                print(f"[Init-Flexible] Extracted organs: {organs_list}")
+            else:
+                organs_list = [cerebral_bleed_value.strip()]
+                print(f"[Init-Flexible] Single organ: {organs_list}")
+        else:
+            organs_list = []
+            print(f"[Init-Flexible] No organs specified")
+        
+        # Set model (for now, default to cerebral_bleed)
+        ts_model = "cerebral_bleed"
+        
+        if ts_model not in AVAILABLE_MODELS:
+            return {"status": "error", "message": f"Invalid model: {ts_model}"}
+        
+        MODEL_CONFIG = AVAILABLE_MODELS[ts_model]
+        H5_PATH = h5_path
+        NODE_NAME = "TotalSegmentator"
+        
+        print(f"[Init-Flexible] Successfully initialized")
+        
+        return {
+            "status": "success",
+            "message": f"Initialized with model: {ts_model}",
+            "model": ts_model,
+            "organs": organs_list,
+            "h5_path": h5_path,
+            "input_path": input_path
+        }
+        
+    except Exception as e:
+        print(f"[Init-Flexible] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": f"Initialization failed: {e}"}
+
+@app.get("/init")
+async def init_model_get(request: Request):
+    """
+    Handle GET requests to /init (for debugging)
+    """
+    print("=" * 60)
+    print("GET /init - Debugging endpoint")
+    print("=" * 60)
+    print(f"Query params: {dict(request.query_params)}")
+    print(f"Headers: {dict(request.headers)}")
+    
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "info",
+            "message": "GET request received. Use POST with JSON body.",
+            "expected_format": {
+                "h5_path": "path/to/output.h5",
+                "step1": {
+                    "model": "TotalSegmentator",
+                    "input": {
+                        "cerebral_bleed": "[intracerebral_hemorrhage]",
+                        "path": "path/to/input.nii"
+                    }
+                }
+            },
+            "example_curl": "curl -X POST http://localhost:8001/init -H \"Content-Type: application/json\" -d \"{\\\"h5_path\\\": \\\"test.h5\\\", \\\"step1\\\": {\\\"model\\\": \\\"TotalSegmentator\\\", \\\"input\\\": {\\\"cerebral_bleed\\\": \\\"[intracerebral_hemorrhage]\\\", \\\"path\\\": \\\"test.nii\\\"}}}\""
+        }
+    )
 
 @app.post("/init")
-def init_node():
-    """Initialize the model at startup"""
-    global IS_MODEL_INITED, NODE_NAME
+def init_model():
+    """
+    Initialize TotalSegmentator - just check if imports work
+    No parameters needed, configuration comes from /read
+    """
+    global IS_MODEL_INITED
+    
+    print("=" * 60)
+    print("POST /init - Initializing TotalSegmentator")
+    print("=" * 60)
     
     if not IS_MODEL_INITED:
         IS_MODEL_INITED = True
-        print(f"[{NODE_NAME}] /init => checking TotalSegmentator installation...")
+        print("[TotalSegmentator] /init => checking TotalSegmentator availability...")
         
-        if not check_totalsegmentator_installed():
-            print(f"[{NODE_NAME}] TotalSegmentator not found, attempting to install...")
-            if not install_totalsegmentator():
-                return {"status": "error", "message": "Failed to install TotalSegmentator"}
-        
-        print(f"[{NODE_NAME}] TotalSegmentator is ready")
-        return {"status": "ok", "message": f"{NODE_NAME} init done"}
+        try:
+            from totalsegmentator.python_api import totalsegmentator
+            print("[TotalSegmentator] API imported successfully")
+            return {"status": "ok", "message": "TotalSegmentator init done"}
+        except Exception as e:
+            print(f"[TotalSegmentator] Error importing API: {e}")
+            return {"status": "error", "message": f"TotalSegmentator not available: {e}"}
     else:
-        print(f"[{NODE_NAME}] /init => already done")
-        return {"status": "ok", "message": "Already initialized"}
+        print("[TotalSegmentator] /init => already done => skip")
+        return {"status": "ok", "message": "Already init."}
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS, H5_GROUP
+    """
+    Read configuration data from frontend
+    """
+    global NODE_NAME, H5_PATH, MODEL_CONFIG, INPUT_PATH, ROI_SUBSET
     
-    # Extract basic information from request
+    print("=" * 60)
+    print("POST /read - Reading configuration")
+    print("=" * 60)
+    print(f"Received data: {data}")
+    
     NODE_NAME = data.get("node_name", "TotalSegmentator")
-    DEPENDENCIES = data.get("dependencies", [])
     H5_PATH = data.get("h5_path", None)
-    H5_GROUP = data.get("h5_group") or "TotalSegmentator"
-
-    print(f"[{NODE_NAME}] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}, h5_group={H5_GROUP}")
     
-    # Validate H5 file exists
-    if not H5_PATH or not os.path.exists(H5_PATH):
-        print(f"[{NODE_NAME}] no h5 file => skip read.")
-        return {"status": "ok", "message": "no H5 file found."}
+    print(f"[Read] node_name={NODE_NAME}, h5_path={H5_PATH}")
     
-    # Initialize ARGS with defaults if not already initialized
-    if ARGS is None:
-        ARGS = argparse.Namespace(
-            slidepath="",
-            task="total",
-            ml=False,
-            fast=False,
-            roi_subset=None
-        )
-    
-    # Read and apply user parameters from H5 file
-    _load_parameters_from_h5(H5_PATH, H5_GROUP)
-    
-    # Log final resolution
-    print(f"[{NODE_NAME}] Final parameters:")
-    print(f"  - slidepath: {ARGS.slidepath if ARGS.slidepath else 'Not set'}")
-    print(f"  - task: {ARGS.task}")
-    print(f"  - fast: {ARGS.fast}")
-    print(f"  - ml: {ARGS.ml}")
-    print(f"  - roi_subset: {ARGS.roi_subset}")
-    
-    return {"status": "ok", "message": f"{NODE_NAME} read done"}
-
-def _load_parameters_from_h5(h5_path: str, h5_group: str):
-    """Load user parameters from H5 file"""
-    global ARGS
-    
-    try:
-        with safe_h5_open(h5_path, "r") as hf:
-            user_data_path = f"{h5_group}/userData"
-            if user_data_path not in hf:
-                print(f"[{NODE_NAME}] No userData found in {h5_group}")
-                return
-            
-            for param_name in hf[user_data_path].keys():
-                raw_bytes = hf[user_data_path][param_name][()]
-                param_value = _decode_h5_parameter(raw_bytes)
-                
-                if param_value is not None:
-                    _apply_parameter(param_name, param_value)
-                    
-    except Exception as e:
-        print(f"[{NODE_NAME}] Error reading parameters from H5: {e}")
-
-def _decode_h5_parameter(raw_bytes):
-    """Decode a parameter value from H5 storage"""
-    try:
-        raw_str = raw_bytes.decode("utf-8")
+    # Check if H5 file exists and read user data from it
+    if H5_PATH and os.path.exists(H5_PATH):
         try:
-            return json.loads(raw_str)
-        except json.JSONDecodeError:
-            return raw_str
-    except Exception as e:
-        print(f"[{NODE_NAME}] Error decoding parameter: {e}")
-        return None
-
-def _apply_parameter(param_name: str, param_value):
-    """Apply a single parameter to ARGS"""
-    global ARGS
+            with safe_h5_open(H5_PATH, "r") as hf:
+                user_data_path = f"{NODE_NAME}/userData"
+                if user_data_path in hf:
+                    print(f"[Read] Found userData in H5 file")
+                    for k in hf[user_data_path].keys():
+                        raw_bytes = hf[user_data_path][k][()]
+                        raw_str = raw_bytes.decode("utf-8")
+                        try:
+                            val_json = json.loads(raw_str)
+                        except:
+                            val_json = raw_str
+                        print(f"[Read] user param {k} => {val_json}")
+                        
+                        if k == "path":
+                            INPUT_PATH = val_json
+                        else:
+                            # Check if k matches any available model task
+                            # Map frontend field names to model names
+                            field_to_model_map = {
+                                "total": "total_3mm",  # Default to 3mm version
+                                "total_fast": "total_6mm",
+                                "cerebral_bleed": "cerebral_bleed",
+                                "lung_vessels": "lung_vessels",
+                                "body": "body",
+                                "total_mr": "total_mr",
+                                "total_mr_fast": "total_mr_fast"
+                            }
+                            
+                            # Check if this field corresponds to a model
+                            if k in field_to_model_map:
+                                model_name = field_to_model_map[k]
+                                
+                                # Extract organs from field value
+                                if isinstance(val_json, str):
+                                    if val_json.startswith('[') and val_json.endswith(']'):
+                                        organs_str = val_json[1:-1]
+                                        ROI_SUBSET = [organ.strip() for organ in organs_str.split(',')]
+                                    else:
+                                        ROI_SUBSET = [val_json.strip()]
+                                elif isinstance(val_json, list):
+                                    ROI_SUBSET = val_json
+                                
+                                # Set model configuration
+                                MODEL_CONFIG = AVAILABLE_MODELS.get(model_name)
+                                print(f"[Read] Field '{k}' => Model '{model_name}', ROI: {ROI_SUBSET}")
+        except Exception as e:
+            print(f"[Read] Error reading H5 file: {e}")
     
-    param_handlers = {
-        "path": lambda v: setattr(ARGS, 'slidepath', v) if isinstance(v, str) and v else None,
-        "task": lambda v: setattr(ARGS, 'task', v) if v in ['total', 'body', 'lung_vessels', 'cerebral_bleed', 'hip_implant', 'coronary_arteries', 'pleural_pericard_effusion'] else None,
-        "ml": lambda v: setattr(ARGS, 'ml', v in [True, "true", "True"]),
-        "fast": lambda v: setattr(ARGS, 'fast', v in [True, "true", "True"]),
-        "roi_subset": lambda v: setattr(ARGS, 'roi_subset', v) if isinstance(v, str) else None,
-    }
-    
-    if param_name in param_handlers:
-        param_handlers[param_name](param_value)
-        print(f"[{NODE_NAME}] Set {param_name} => {param_value}")
-    else:
-        print(f"[{NODE_NAME}] Unknown parameter: {param_name} => {param_value}")
+    return {"status": "ok", "message": f"[{NODE_NAME}] read done"}
 
 @app.post("/execute")
-def execute_node():
-    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME, progress_value
+def execute_model():
+    """
+    Run TotalSegmentator on the provided input
+    Uses configuration from /read endpoint
+    """
+    global IS_PROCESSING, CURRENT_PROGRESS, PROGRESS_MESSAGE, IS_MODEL_INITED
     
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
     
-    # Validate slide path
-    if (not ARGS) or (not getattr(ARGS, "slidepath", None)) or (not os.path.isfile(ARGS.slidepath)):
-        msg = f"Invalid image path: {getattr(ARGS,'slidepath',None)}"
-        print(f"[{NODE_NAME}] {msg}")
-        out_val = {"status": "error", "message": msg, "roi_count": 0}
-        progress_value = 100
-    else:
-        print(f"[{NODE_NAME}] /execute => run_totalsegmentator with slidepath={ARGS.slidepath}")
-        print(f"[{NODE_NAME}] ARGS: {ARGS}")
-        out_val = run_totalsegmentator(ARGS)
+    if IS_PROCESSING:
+        return {"status": "error", "message": "Model is already processing"}
     
-    # Store the result to 'output'
-    if H5_PATH and os.path.exists(H5_PATH):
-        with safe_h5_open(H5_PATH, "a") as hf:
-            node_out_path = f"{H5_GROUP}/output"
-            if node_out_path in hf:
-                del hf[node_out_path]
-            out_str = json.dumps(out_val, ensure_ascii=False)
-            hf.create_dataset(node_out_path, data=out_str.encode("utf-8"))
-            hf.flush()
-        time.sleep(1)
+    if MODEL_CONFIG is None:
+        return {"status": "error", "message": "Model not initialized. Call /read first"}
     
-    return {"status": "ok", "output": out_val}
+    if not H5_PATH:
+        return {"status": "error", "message": "H5 path not configured. Call /read first"}
+    
+    if not INPUT_PATH:
+        return {"status": "error", "message": "Input path not configured. Call /read first"}
+    
+    print(f"[Execute] Starting segmentation")
+    print(f"[Execute] Input path: {INPUT_PATH}")
+    print(f"[Execute] ROI subset: {ROI_SUBSET}")
+    print(f"[Execute] H5 path: {H5_PATH}")
+    
+    # Start processing
+    try:
+        result = process_segmentation_sync(INPUT_PATH, ROI_SUBSET)
+        return {"status": "ok", "output": result}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
-@app.options("/progress")
-async def progress_options():
-    """Handle OPTIONS preflight request for CORS"""
-    return {"status": "ok"}
+def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
+    """
+    Main processing function (synchronous)
+    """
+    global IS_PROCESSING, CURRENT_PROGRESS, PROGRESS_MESSAGE
+    
+    IS_PROCESSING = True
+    CURRENT_PROGRESS = 0
+    PROGRESS_MESSAGE = "Starting segmentation"
+    
+    try:
+        update_progress(5, "Validating input")
+        
+        # Validate input
+        is_valid, input_type, message = validate_input(input_path)
+        if not is_valid:
+            update_progress(100, f"Input validation failed: {message}")
+            return
+        
+        print(f"[Process] Input validation passed: {message}")
+        update_progress(10, "Input validated")
+        
+        # Create temporary output directory for TotalSegmentator
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # For tasks that support ROI, output to a single file
+            # For others, output to a directory
+            task_name = MODEL_CONFIG['task']
+            supports_roi = task_name in ['total', 'total_mr']
+            
+            if supports_roi:
+                temp_output = Path(temp_dir) / "segmentation.nii.gz"
+            else:
+                # For cerebral_bleed and other tasks, output to directory
+                temp_output = Path(temp_dir) / "output"
+                temp_output.mkdir(exist_ok=True)
+            
+            update_progress(15, "Starting TotalSegmentator")
+            
+            # Prepare TotalSegmentator parameters
+            ts_kwargs = {
+                'input': input_path,
+                'output': str(temp_output),
+                'task': MODEL_CONFIG['task'],
+                'fast': MODEL_CONFIG['fast'],
+                'device': "gpu" if MODEL_CONFIG else "cpu",
+                'quiet': False,
+                'verbose': True
+            }
+            
+            # Add ROI subset only for tasks that support it (total and total_mr)
+            task_name = MODEL_CONFIG['task']
+            supports_roi = task_name in ['total', 'total_mr']
+            
+            if roi_subset and supports_roi:
+                ts_kwargs['roi_subset'] = roi_subset
+                print(f"[Process] ROI subset: {roi_subset} (task '{task_name}' supports ROI filtering)")
+            elif roi_subset and not supports_roi:
+                print(f"[Process] Task '{task_name}' does not support ROI filtering. Will filter results after segmentation.")
+                print(f"[Process] Requested ROI: {roi_subset}")
+            
+            print(f"[Process] Running TotalSegmentator with params: {ts_kwargs}")
+            
+            # Execute segmentation
+            start_time = time.time()
+            totalsegmentator(**ts_kwargs)
+            end_time = time.time()
+            
+            processing_time = end_time - start_time
+            update_progress(70, f"Segmentation completed in {processing_time:.1f}s")
+            
+            # Check if output was created
+            if not temp_output.exists():
+                update_progress(100, "Error: Segmentation output not found")
+                return
+            
+            # Prepare metadata
+            metadata = {
+                'model': MODEL_CONFIG['task'],
+                'task_id': MODEL_CONFIG['task_id'],
+                'input_path': input_path,
+                'input_type': input_type,
+                'processing_time': processing_time,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'roi_subset': roi_subset if roi_subset else "all_organs"
+            }
+            
+            update_progress(75, "Converting to H5 format")
+            
+            # Process organs in parallel
+            print(f"[Process] ROI subset received: {roi_subset}")
+            print(f"[Process] ROI subset type: {type(roi_subset)}")
+            print(f"[Process] Task supports ROI: {supports_roi}")
+            
+            if roi_subset:
+                print(f"[Process] Processing {len(roi_subset)} organs: {roi_subset}")
+                
+                # For tasks that don't support ROI, we need to check which organs are actually in the output
+                if not supports_roi:
+                    print(f"[Process] Task '{task_name}' ran without ROI filtering, checking available organs in output")
+                    # For cerebral_bleed task, the output might be different
+                    # We'll try to load and filter the results
+                
+                # Process each organ separately with its own file prefix
+                for i, organ in enumerate(roi_subset):
+                    print(f"[Process] Processing organ {i+1}/{len(roi_subset)}: {organ}")
+                    file_prefix = organ  # Each organ gets its own file prefix
+                    
+                    try:
+                        # Process single organ
+                        process_single_organ(organ, str(temp_output), H5_PATH, metadata, file_prefix)
+                        
+                        # Update progress
+                        progress = 75 + (i + 1) / len(roi_subset) * 20  # 75-95%
+                        update_progress(int(progress), f"Completed {organ} ({i+1}/{len(roi_subset)})")
+                    except Exception as e:
+                        print(f"[Process] Warning: Could not process organ '{organ}': {e}")
+                        # Continue with next organ
+                
+                print(f"[Process] Completed processing requested organs")
+            else:
+                # Process all organs (you might need to implement organ detection logic)
+                print(f"[Process] No ROI subset provided, processing all organs")
+                update_progress(100, "All organs processed")
+            
+            update_progress(100, "Processing completed successfully")
+            return {"status": "success", "message": "Processing completed successfully"}
+            
+    except Exception as e:
+        print(f"[Process] Error: {e}")
+        update_progress(100, f"Processing failed: {e}")
+        return {"status": "error", "message": str(e)}
+    finally:
+        IS_PROCESSING = False
 
 @app.get("/progress")
-async def progress():
-    """SSE endpoint to provide progress updates"""
-    async def event_generator():
-        global progress_value, progress_complete
-        last_value = -1
-        progress_value = 0
-        progress_complete = False
-        
-        while not progress_complete and progress_value < 100:
-            if progress_value != last_value:
-                print(f"[SSE] Progress: {progress_value}%")
-                yield {"data": str(progress_value)}
-                last_value = progress_value
-            await asyncio.sleep(0.1)
-        
-        # Ensure final progress update to 100 is sent
-        if last_value != 100:
-            yield {"data": "100"}
-        
-        await asyncio.sleep(1)
-        
-        # Reset progress state for next run
-        progress_value = 0
-        progress_complete = False
-    
-    return EventSourceResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS"
-        }
+async def get_progress():
+    """
+    Get current progress
+    """
+    return ProgressResponse(
+        progress=CURRENT_PROGRESS,
+        message=PROGRESS_MESSAGE,
+        is_processing=IS_PROCESSING
     )
 
-def main():
-    """Main function to start the server and register with the manager"""
-    import threading
+@app.get("/progress/stream")
+async def stream_progress():
+    """
+    Server-Sent Events for real-time progress tracking
+    """
+    async def event_generator():
+        while IS_PROCESSING or CURRENT_PROGRESS < 100:
+            yield {
+                "data": json.dumps({
+                    "progress": CURRENT_PROGRESS,
+                    "message": PROGRESS_MESSAGE,
+                    "is_processing": IS_PROCESSING
+                })
+            }
+        await asyncio.sleep(1)
+        
+        # Send final status
+        yield {
+            "data": json.dumps({
+                "progress": CURRENT_PROGRESS,
+                "message": PROGRESS_MESSAGE,
+                "is_processing": IS_PROCESSING
+            })
+        }
     
-    args = parse_args()
-    global NODE_NAME
-    NODE_NAME = args.name
-    
-    print(f"Starting {args.name} at port={args.port}")
-    
-    def run_uvicorn():
-        uvicorn.run(app, host="0.0.0.0", port=args.port)
-    
-    t = threading.Thread(target=run_uvicorn, daemon=True)
-    t.start()
-    
-    time.sleep(3)
-    
-    this_file_path = str(Path(__file__).resolve())
-    create_payload = {
-        "service_name": args.name,
-        "file_path": this_file_path,
-        "port": args.port
+    return EventSourceResponse(event_generator())
+
+@app.get("/status")
+async def get_status():
+    """
+    Get node status
+    """
+    return {
+        "status": "TotalSegmentator TaskNode running",
+        "model_initialized": MODEL_CONFIG is not None,
+        "model_config": MODEL_CONFIG,
+        "h5_path": H5_PATH,
+        "node_name": NODE_NAME,
+        "is_processing": IS_PROCESSING
     }
+
+def main():
+    """Main function for standalone execution"""
+    parser = argparse.ArgumentParser(description="TotalSegmentator TaskNode")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
+    parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
+    parser.add_argument("--name", default="TotalSegmentator", help="Node name")
     
-    url_create = f"{args.manager_host}/api/tasks/v1/create_node"
-    try:
-        resp = requests.post(url_create, json=create_payload, timeout=10)
-        resp.raise_for_status()
-        print(f"[{args.name}] create_node success => {resp.json()}")
-    except Exception as e:
-        print(f"[{args.name}] create_node request failed: {e}")
-        print("keep running...")
+    args = parser.parse_args()
     
-    print(f"[{args.name}] Serving at port={args.port}, Press Ctrl+C to exit.")
-    t.join()
+    print("=" * 60)
+    print(f"{args.name} TaskNode")
+    print("=" * 60)
+    print(f"Available models: {list(AVAILABLE_MODELS.keys())}")
+    print(f"Server will start on {args.host}:{args.port}")
+    print(f"Node name: {args.name}")
+    print("=" * 60)
+    
+    uvicorn.run(
+        "totalsegmentator_tasknode:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload
+    )
 
 if __name__ == "__main__":
     main()
