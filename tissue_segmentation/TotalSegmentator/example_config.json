@@ -1,102 +1,56 @@
 {
-  "node_name": "TotalSegmentator",
-  "display_name": "TotalSegmentator (Organ/Tissue)",
-  "category": "TissueSeg",
-  "h5_group": "TotalSegmentator",
-  "description": "Automatic segmentation of 104+ anatomical structures in CT and MR images",
-  "version": "2.0.0",
-  "runtime": {
-    "env_name": "totalsegmentator_tissuelab",
-    "service_path": "E:\\Tissuelab-Model-Zoo\\tissue_segmentation\\TotalSegmentator\\totalsegmentator_tasknode.py",
-    "python_version": "3.9",
-    "port": 8010
+  "init_config": {
+    "model": "total_3mm",
+    "device": "gpu",
+    "h5_path": "/path/to/output.h5",
+    "node_name": "SegmentorNode"
   },
-  "parameters": {
-    "path": {
-      "type": "string",
-      "required": true,
-      "description": "Input medical image path (NIfTI or DICOM)",
-      "example": "/path/to/ct_scan.nii.gz"
+  "execute_configs": [
+    {
+      "name": "Liver and Spleen Segmentation",
+      "input_path": "/path/to/dicom/folder",
+      "roi_subset": ["liver", "spleen"]
     },
-    "task": {
-      "type": "string",
-      "required": false,
-      "default": "total",
-      "options": [
-        "total",
-        "body",
-        "lung_vessels",
-        "cerebral_bleed",
-        "hip_implant",
-        "coronary_arteries",
-        "pleural_pericard_effusion"
-      ],
-      "description": "Segmentation task type"
+    {
+      "name": "Full Body Segmentation",
+      "input_path": "/path/to/nifti/file.nii.gz",
+      "roi_subset": null
     },
-    "fast": {
-      "type": "boolean",
-      "required": false,
-      "default": false,
-      "description": "Use fast mode (faster but slightly lower quality)"
+    {
+      "name": "Kidney Segmentation Only",
+      "input_path": "/path/to/dicom/folder",
+      "roi_subset": ["kidney_left", "kidney_right"]
     },
-    "ml": {
-      "type": "boolean",
-      "required": false,
-      "default": false,
-      "description": "Use multilabel format"
-    },
-    "roi_subset": {
-      "type": "string",
-      "required": false,
-      "default": null,
-      "description": "Comma-separated list of specific ROIs to segment (e.g., 'liver,spleen,kidney_right')",
-      "example": "liver,spleen,kidney_right,kidney_left"
+    {
+      "name": "Lung Vessels (Specialized Model)",
+      "model": "lung_vessels",
+      "input_path": "/path/to/ct/scan",
+      "roi_subset": null
     }
+  ],
+  "available_models": {
+    "total_3mm": "Whole body segmentation (3mm high precision)",
+    "total_6mm": "Whole body segmentation (6mm fast)",
+    "body": "Body segmentation",
+    "lung_vessels": "Lung vessels segmentation",
+    "total_mr": "MR image whole body segmentation",
+    "total_mr_fast": "MR image whole body segmentation (fast)",
+    "cerebral_bleed": "Intracranial hemorrhage (CT)"
   },
-  "inputs": {
-    "type": "Medical image",
-    "format": ["NIfTI", "DICOM"],
-    "modality": ["CT", "MRI"],
-    "description": "3D medical imaging data"
-  },
-  "outputs": {
-    "masks": {
-      "type": "ndarray",
-      "shape": "[N, H, W, D]",
-      "description": "Segmentation masks for each anatomical structure"
-    },
-    "roi_names": {
-      "type": "list of strings",
-      "description": "Names of segmented anatomical structures"
-    }
-  },
-  "dependencies": {
-    "python": ">=3.9",
-    "packages": [
-      "TotalSegmentator>=2.0.0",
-      "nibabel>=5.0.0",
-      "torch>=2.0.0"
-    ],
-    "optional": {
-      "gpu": "NVIDIA GPU with CUDA support (recommended for performance)"
-    }
-  },
-  "performance": {
-    "fast_mode": {
-      "speed_improvement": "3-5x faster",
-      "accuracy_impact": "Slightly lower (~2-5% IoU decrease)"
-    },
-    "typical_runtime": {
-      "cpu": "10-30 minutes per CT scan",
-      "gpu": "2-5 minutes per CT scan (with fast mode: <1 minute)"
-    }
-  },
-  "use_cases": [
-    "Organ volume measurements",
-    "Radiotherapy planning",
-    "Surgical planning",
-    "Disease progression tracking",
-    "Body composition analysis",
-    "Vascular analysis"
+  "common_roi_options": [
+    "liver",
+    "spleen",
+    "kidney_left",
+    "kidney_right",
+    "lung_upper_lobe_left",
+    "lung_upper_lobe_right",
+    "lung_lower_lobe_left",
+    "lung_lower_lobe_right",
+    "heart",
+    "brain",
+    "stomach",
+    "pancreas",
+    "bladder",
+    "prostate"
   ]
 }
