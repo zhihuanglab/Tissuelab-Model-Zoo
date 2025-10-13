@@ -124,6 +124,7 @@ ROI_SUBSET = None
 CURRENT_PROGRESS = 0
 PROGRESS_MESSAGE = ""
 IS_PROCESSING = False
+progress_complete = False  # Flag to indicate completion
 
 # Available weight model configurations (from main_run.py)
 AVAILABLE_MODELS = {
@@ -252,9 +253,11 @@ def validate_input(input_path: str) -> tuple[bool, Optional[str], str]:
 
 def update_progress(progress: int, message: str = ""):
     """Update global progress variables"""
-    global CURRENT_PROGRESS, PROGRESS_MESSAGE
+    global CURRENT_PROGRESS, PROGRESS_MESSAGE, progress_complete
     CURRENT_PROGRESS = progress
     PROGRESS_MESSAGE = message
+    if progress >= 100:
+        progress_complete = True
     print(f"[Progress] {progress}% - {message}")
 
 def load_nifti_file(file_path: str) -> Optional[np.ndarray]:
@@ -268,7 +271,7 @@ def load_nifti_file(file_path: str) -> Optional[np.ndarray]:
         return None
 
 def save_organ_to_h5(organ_name: str, organ_data: np.ndarray, h5_path: str, metadata: Dict[str, Any], file_prefix: str = None):
-    """Save individual organ data to H5 file in SegmentorNode"""
+    """Save individual organ data to H5 file in SegmentorNode with voxel sub-group"""
     try:
         print(f"[H5] Starting to save organ: {organ_name}")
         print(f"[H5] Data shape: {organ_data.shape if organ_data is not None else 'None'}")
@@ -288,20 +291,28 @@ def save_organ_to_h5(organ_name: str, organ_data: np.ndarray, h5_path: str, meta
                 print(f"[H5] Using existing group: {NODE_NAME}")
                 seg_node = hf[NODE_NAME]
             
-            print(f"[H5] Existing datasets in {NODE_NAME}: {list(seg_node.keys())}")
+            # Create voxel sub-group if it doesn't exist
+            if "voxel" not in seg_node:
+                print(f"[H5] Creating new sub-group: {NODE_NAME}/voxel")
+                voxel_group = seg_node.create_group("voxel")
+            else:
+                print(f"[H5] Using existing sub-group: {NODE_NAME}/voxel")
+                voxel_group = seg_node["voxel"]
+            
+            print(f"[H5] Existing datasets in {NODE_NAME}/voxel: {list(voxel_group.keys())}")
             
             # Use file_prefix if provided, otherwise use organ_name
             dataset_name = file_prefix if file_prefix else organ_name
             print(f"[H5] Dataset name: {dataset_name}")
             
             # Delete existing dataset if it exists
-            if dataset_name in seg_node:
+            if dataset_name in voxel_group:
                 print(f"[H5] Deleting existing dataset: {dataset_name}")
-                del seg_node[dataset_name]
+                del voxel_group[dataset_name]
             
-            # Create organ dataset
+            # Create organ dataset in voxel group
             print(f"[H5] Creating dataset with shape {organ_data.shape}")
-            organ_dataset = seg_node.create_dataset(
+            organ_dataset = voxel_group.create_dataset(
                 dataset_name, 
                 data=organ_data, 
                 compression='gzip',
@@ -321,13 +332,16 @@ def save_organ_to_h5(organ_name: str, organ_data: np.ndarray, h5_path: str, meta
             # Add general metadata to SegmentorNode
             seg_node.attrs.update(metadata)
             seg_node.attrs['last_updated'] = time.strftime('%Y-%m-%d %H:%M:%S')
-            seg_node.attrs['total_organs'] = len([k for k in seg_node.keys() if isinstance(seg_node[k], h5py.Dataset)])
+            
+            # Count total organs in voxel group
+            total_organs = len([k for k in voxel_group.keys() if isinstance(voxel_group[k], h5py.Dataset)])
+            seg_node.attrs['total_organs'] = total_organs
             
             # Flush to ensure data is written
             hf.flush()
             print(f"[H5] Data flushed to disk")
             
-            print(f"[H5] SUCCESS: Successfully saved {dataset_name} (organ: {organ_name}) data with shape {organ_data.shape}")
+            print(f"[H5] SUCCESS: Successfully saved {dataset_name} (organ: {organ_name}) data with shape {organ_data.shape} to {NODE_NAME}/voxel/")
             
     except Exception as e:
         print(f"[H5] ERROR saving {organ_name} to H5: {e}")
@@ -744,11 +758,12 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
     """
     Main processing function (synchronous)
     """
-    global IS_PROCESSING, CURRENT_PROGRESS, PROGRESS_MESSAGE
+    global IS_PROCESSING, CURRENT_PROGRESS, PROGRESS_MESSAGE, progress_complete
     
     IS_PROCESSING = True
     CURRENT_PROGRESS = 0
     PROGRESS_MESSAGE = "Starting segmentation"
+    progress_complete = False  # Reset completion flag at start
     
     try:
         update_progress(5, "Validating input")
@@ -802,11 +817,43 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             
             print(f"[Process] Running TotalSegmentator with params: {ts_kwargs}")
             
-            # Execute segmentation
+            # Execute segmentation in background thread with progress simulation
             start_time = time.time()
-            totalsegmentator(**ts_kwargs)
-            end_time = time.time()
             
+            # Run TotalSegmentator in a separate thread
+            seg_exception = None
+            def run_segmentation():
+                nonlocal seg_exception
+                try:
+                    totalsegmentator(**ts_kwargs)
+                except Exception as e:
+                    seg_exception = e
+            
+            seg_thread = threading.Thread(target=run_segmentation)
+            seg_thread.start()
+            
+            # Simulate progress while segmentation is running (15% -> 68%)
+            # Update every 1 second with small increments for smoother progress
+            current_sim_progress = 15
+            update_interval = 1.0  # Update every 1 second
+            progress_increment = 2  # Increment by 2% each time
+            
+            while seg_thread.is_alive():
+                seg_thread.join(timeout=update_interval)
+                if seg_thread.is_alive() and current_sim_progress < 68:
+                    current_sim_progress = min(current_sim_progress + progress_increment, 68)
+                    elapsed = time.time() - start_time
+                    update_progress(current_sim_progress, f"Running segmentation... ({elapsed:.0f}s elapsed)")
+                elif current_sim_progress >= 68:
+                    # Stay at 68% and just update time
+                    elapsed = time.time() - start_time
+                    update_progress(68, f"Finalizing segmentation... ({elapsed:.0f}s elapsed)")
+            
+            # Check if there was an exception
+            if seg_exception:
+                raise seg_exception
+            
+            end_time = time.time()
             processing_time = end_time - start_time
             update_progress(70, f"Segmentation completed in {processing_time:.1f}s")
             
@@ -865,19 +912,56 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
                 update_progress(100, "All organs processed")
             
             update_progress(100, "Processing completed successfully")
+            progress_complete = True  # Mark completion
             return {"status": "success", "message": "Processing completed successfully"}
             
     except Exception as e:
         print(f"[Process] Error: {e}")
         update_progress(100, f"Processing failed: {e}")
+        progress_complete = True  # Mark completion even on error
         return {"status": "error", "message": str(e)}
     finally:
         IS_PROCESSING = False
 
 @app.get("/progress")
-async def get_progress():
+async def progress():
     """
-    Get current progress
+    SSE endpoint to provide progress updates (primary endpoint for frontend)
+    """
+    async def event_generator():
+        global CURRENT_PROGRESS, PROGRESS_MESSAGE, IS_PROCESSING, progress_complete
+        last_value = -1
+        
+        # Don't reset CURRENT_PROGRESS here as it would override the actual processing progress!
+        print(f"[SSE] /progress stream started, current progress: {CURRENT_PROGRESS}%")
+        
+        while True:
+            # Check if progress changed or if it's the final 100% update
+            if CURRENT_PROGRESS != last_value or (CURRENT_PROGRESS == 100 and progress_complete):
+                if last_value > CURRENT_PROGRESS:
+                    yield {"data": str(-1)}
+                print(f"[SSE] Progress: {CURRENT_PROGRESS}% - {PROGRESS_MESSAGE}")
+                yield {"data": str(CURRENT_PROGRESS)}
+                last_value = CURRENT_PROGRESS
+                
+                # If progress reaches 100 and completion flag is set, wait a bit before breaking
+                if CURRENT_PROGRESS == 100 and progress_complete:
+                    print("Progress complete, closing connection.")
+                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
+                    break
+            
+            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+        
+        # Keep the connection open for a short time to ensure the client receives the final update
+        await asyncio.sleep(1)
+        print("Progress reset to 0.")
+    
+    return EventSourceResponse(event_generator())
+
+@app.get("/progress-json")
+async def get_progress_json():
+    """
+    Get current progress as JSON (alternative endpoint)
     """
     return ProgressResponse(
         progress=CURRENT_PROGRESS,
@@ -891,24 +975,36 @@ async def stream_progress():
     Server-Sent Events for real-time progress tracking
     """
     async def event_generator():
-        while IS_PROCESSING or CURRENT_PROGRESS < 100:
-            yield {
-                "data": json.dumps({
-                    "progress": CURRENT_PROGRESS,
-                    "message": PROGRESS_MESSAGE,
-                    "is_processing": IS_PROCESSING
-                })
-            }
-        await asyncio.sleep(1)
+        global CURRENT_PROGRESS, PROGRESS_MESSAGE, IS_PROCESSING, progress_complete
+        last_value = -1
         
-        # Send final status
-        yield {
-            "data": json.dumps({
-                "progress": CURRENT_PROGRESS,
-                "message": PROGRESS_MESSAGE,
-                "is_processing": IS_PROCESSING
-            })
-        }
+        # Don't reset CURRENT_PROGRESS here as it would override the actual processing progress!
+        # Only reset the completion flag if starting fresh
+        if not IS_PROCESSING and CURRENT_PROGRESS == 0:
+            progress_complete = False
+        
+        print(f"[SSE] Stream started, current progress: {CURRENT_PROGRESS}%")
+        
+        while True:
+            # Check if progress changed or if it's the final 100% update
+            if CURRENT_PROGRESS != last_value or (CURRENT_PROGRESS == 100 and progress_complete):
+                if last_value > CURRENT_PROGRESS:
+                    yield {"data": str(-1)}
+                print(f"[SSE] Progress: {CURRENT_PROGRESS}% - {PROGRESS_MESSAGE}")
+                yield {"data": str(CURRENT_PROGRESS)}
+                last_value = CURRENT_PROGRESS
+                
+                # If progress reaches 100 and completion flag is set, wait a bit before breaking
+                if CURRENT_PROGRESS == 100 and progress_complete:
+                    print("Progress complete, closing SSE connection.")
+                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
+                    break
+            
+            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+        
+        # Keep the connection open for a short time to ensure the client receives the final update
+        await asyncio.sleep(1)
+        print("[SSE] Connection closed.")
     
     return EventSourceResponse(event_generator())
 
