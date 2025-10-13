@@ -475,7 +475,7 @@ def main():
     # Configuration
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     input_size = 768
-    pretrained_weights = "Ark6_swinLarge768_ep50.pth.tar"
+    pretrained_weights = "./checkpoints/Ark6_swinLarge768_ep50.pth.tar"
     img_dir = "./data"
     output_file = "predictions_data.csv"
     batch_size = 4
