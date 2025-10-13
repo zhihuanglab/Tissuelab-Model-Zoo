@@ -249,13 +249,13 @@ def save_segmentation_to_h5(segmentation_data: np.ndarray, original_image: sitk.
                 print(f"[H5] Using existing group: {NODE_NAME}")
                 cardiac_node = hf[NODE_NAME]
             
-            # Create voxel sub-group if it doesn't exist
-            if "voxel" not in cardiac_node:
-                print(f"[H5] Creating new sub-group: {NODE_NAME}/voxel")
-                voxel_group = cardiac_node.create_group("voxel")
+            # Create voxel_mask sub-group if it doesn't exist
+            if "voxel_mask" not in cardiac_node:
+                print(f"[H5] Creating new sub-group: {NODE_NAME}/voxel_mask")
+                voxel_group = cardiac_node.create_group("voxel_mask")
             else:
-                print(f"[H5] Using existing sub-group: {NODE_NAME}/voxel")
-                voxel_group = cardiac_node["voxel"]
+                print(f"[H5] Using existing sub-group: {NODE_NAME}/voxel_mask")
+                voxel_group = cardiac_node["voxel_mask"]
             
             # Use view name as dataset name
             dataset_name = view_name
