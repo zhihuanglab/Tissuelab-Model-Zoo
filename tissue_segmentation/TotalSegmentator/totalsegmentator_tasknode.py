@@ -271,7 +271,7 @@ def load_nifti_file(file_path: str) -> Optional[np.ndarray]:
         return None
 
 def save_organ_to_h5(organ_name: str, organ_data: np.ndarray, h5_path: str, metadata: Dict[str, Any], file_prefix: str = None):
-    """Save individual organ data to H5 file in SegmentorNode with voxel sub-group"""
+    """Save individual organ data to H5 file in SegmentorNode with voxel_mask sub-group"""
     try:
         print(f"[H5] Starting to save organ: {organ_name}")
         print(f"[H5] Data shape: {organ_data.shape if organ_data is not None else 'None'}")
@@ -291,15 +291,15 @@ def save_organ_to_h5(organ_name: str, organ_data: np.ndarray, h5_path: str, meta
                 print(f"[H5] Using existing group: {NODE_NAME}")
                 seg_node = hf[NODE_NAME]
             
-            # Create voxel sub-group if it doesn't exist
-            if "voxel" not in seg_node:
-                print(f"[H5] Creating new sub-group: {NODE_NAME}/voxel")
-                voxel_group = seg_node.create_group("voxel")
+            # Create voxel_mask sub-group if it doesn't exist
+            if "voxel_mask" not in seg_node:
+                print(f"[H5] Creating new sub-group: {NODE_NAME}/voxel_mask")
+                voxel_group = seg_node.create_group("voxel_mask")
             else:
-                print(f"[H5] Using existing sub-group: {NODE_NAME}/voxel")
-                voxel_group = seg_node["voxel"]
+                print(f"[H5] Using existing sub-group: {NODE_NAME}/voxel_mask")
+                voxel_group = seg_node["voxel_mask"]
             
-            print(f"[H5] Existing datasets in {NODE_NAME}/voxel: {list(voxel_group.keys())}")
+            print(f"[H5] Existing datasets in {NODE_NAME}/voxel_mask: {list(voxel_group.keys())}")
             
             # Use file_prefix if provided, otherwise use organ_name
             dataset_name = file_prefix if file_prefix else organ_name
@@ -310,7 +310,7 @@ def save_organ_to_h5(organ_name: str, organ_data: np.ndarray, h5_path: str, meta
                 print(f"[H5] Deleting existing dataset: {dataset_name}")
                 del voxel_group[dataset_name]
             
-            # Create organ dataset in voxel group
+            # Create organ dataset in voxel_mask group
             print(f"[H5] Creating dataset with shape {organ_data.shape}")
             organ_dataset = voxel_group.create_dataset(
                 dataset_name, 
@@ -333,7 +333,7 @@ def save_organ_to_h5(organ_name: str, organ_data: np.ndarray, h5_path: str, meta
             seg_node.attrs.update(metadata)
             seg_node.attrs['last_updated'] = time.strftime('%Y-%m-%d %H:%M:%S')
             
-            # Count total organs in voxel group
+            # Count total organs in voxel_mask group
             total_organs = len([k for k in voxel_group.keys() if isinstance(voxel_group[k], h5py.Dataset)])
             seg_node.attrs['total_organs'] = total_organs
             
@@ -341,7 +341,7 @@ def save_organ_to_h5(organ_name: str, organ_data: np.ndarray, h5_path: str, meta
             hf.flush()
             print(f"[H5] Data flushed to disk")
             
-            print(f"[H5] SUCCESS: Successfully saved {dataset_name} (organ: {organ_name}) data with shape {organ_data.shape} to {NODE_NAME}/voxel/")
+            print(f"[H5] SUCCESS: Successfully saved {dataset_name} (organ: {organ_name}) data with shape {organ_data.shape} to {NODE_NAME}/voxel_mask/")
             
     except Exception as e:
         print(f"[H5] ERROR saving {organ_name} to H5: {e}")
