@@ -328,7 +328,12 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
         except Exception as e:
             print(f"Error loading or updating classifier: {e}")
-            # continue to create a new classifier
+            # continue to create a new classifier if we have annotations
+    
+    # Check if we have annotations to create a new classifier
+    if annotations.empty:
+        print("Cannot create classifier: no annotations provided and failed to load existing classifier")
+        return None  # Signal to caller to use zero-shot instead
     
     unique_classes = annotations['tissue_class'].unique().tolist()
     if len(unique_classes) < 1:
@@ -465,9 +470,15 @@ def run_classification(args) -> Dict[str, Any]:
             print(f"[{NODE_NAME}] Using tissue_classes: {tissue_classes}")
             print(f"[{NODE_NAME}] tissue_classes type: {type(tissue_classes)}, length: {len(tissue_classes) if tissue_classes else 0}")
 
+            # Try supervised classification if we have classifier path or annotations
+            classifier_result = None
             if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
+                classifier_result = train_linear_classifier(cell_embeddings, annotations_data)
+            
+            # Check if supervised classification succeeded
+            if classifier_result is not None:
                 clf, class_names, class_colors, predictions, prediction_probs, \
-                    coef_, intercept_, train_time, test_time = train_linear_classifier(cell_embeddings, annotations_data)
+                    coef_, intercept_, train_time, test_time = classifier_result
                 final_class_names = class_names
                 final_class_colors = class_colors
                 classification_method = "supervised"
