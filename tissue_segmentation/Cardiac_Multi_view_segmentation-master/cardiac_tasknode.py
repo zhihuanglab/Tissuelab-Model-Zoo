@@ -282,11 +282,16 @@ def save_segmentation_to_h5(segmentation_data: np.ndarray, original_image: sitk.
             seg_dataset.attrs['dtype'] = str(segmentation_data.dtype)
             seg_dataset.attrs['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
             
-            # Add image spacing and origin if available
-            if original_image:
-                seg_dataset.attrs['spacing'] = str(original_image.GetSpacing())
-                seg_dataset.attrs['origin'] = str(original_image.GetOrigin())
-                seg_dataset.attrs['direction'] = str(original_image.GetDirection())
+            # Add image spacing and origin if available (only for SimpleITK Image objects)
+            if original_image is not None:
+                try:
+                    # Check if it's a SimpleITK Image object
+                    if hasattr(original_image, 'GetSpacing'):
+                        seg_dataset.attrs['spacing'] = str(original_image.GetSpacing())
+                        seg_dataset.attrs['origin'] = str(original_image.GetOrigin())
+                        seg_dataset.attrs['direction'] = str(original_image.GetDirection())
+                except Exception as e:
+                    print(f"[H5] Warning: Could not extract image metadata: {e}")
             
             # Add class information
             view_config = AVAILABLE_VIEWS[view_name]
