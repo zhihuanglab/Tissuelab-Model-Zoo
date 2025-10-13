@@ -1,0 +1,52 @@
+{   "name": "Composite",
+    "data": {
+      "dataset_name":"ACDC" ,
+      "readable_frames": [ "ES"],
+      "train_dir": "/vol/biomedic3/cc215/data/ACDC/semi_supervised_learning/labelled",
+      "validate_dir": "/vol/biomedic3/cc215/data/ACDC/semi_supervised_learning/validate",
+      "image_format_name": "{frame}_img.nrrd",
+      "label_format_name": "{frame}_seg.nrrd",
+      "data_aug_policy" :"UKBB_advancedv4",
+      "if_resample": true,
+      "new_spacing": [1.36719, 1.36719, -1],
+      "keep_z_spacing": true,
+      "image_size":[224,224,1],
+      "label_size":[224,224],
+      "pad_size":  [192,192,1],
+      "crop_size" :[192,192,1],
+      "num_classes": 4,
+      "use_cache": true,
+      "myocardium_only": false,
+      "ignore_black_slices": true
+
+    },
+
+ "segmentation_model": {
+        "network_type": "UNet_16",
+        "num_classes": 4,
+        "resume_path":"",
+        "lr": 0.0001,
+        "optimizer_name": "adam",
+        "n_epochs": 600,
+        "max_iteration": 500000,
+        "batch_size": 20,
+        "use_gpu": true,
+        "decoder_dropout":false
+    },
+
+  "adversarial_augmentation":
+  {
+    "transformation_type":"bias",
+    "divergence_types":["ce"],
+    "divergence_weights":[1],
+    "optimization_mode": "chain",
+    "n_iter":1,
+    "power_iteration":true
+  }
+  ,
+  "output":
+  {
+    "save_epoch_every_num_epochs":1,
+     "save_dir":"./result/Composite"
+  }
+}
