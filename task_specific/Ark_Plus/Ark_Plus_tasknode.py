@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Ark+ Zero-shot Prediction TaskNode
+This node performs zero-shot inference using the Ark+ model on medical images.
+"""
+
+import argparse
+import os
+import sys
+import json
+import time
+import uvicorn
+import requests
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL import Image
+from sse_starlette.sse import EventSourceResponse
+import asyncio
+import threading
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Dict, Any
+
+# Import timm components for model
+import timm.models.swin_transformer as swin
+
+# Import safe H5 utilities
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+from safe_h5_utils import safe_h5_open
+
+app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global variables
+ARGS = None
+IS_MODEL_INITED = False
+H5_PATH = None
+NODE_NAME = None
+DEPENDENCIES = []
+ARK_MODEL = None
+progress_value = 0
+progress_complete = False
+last_printed_progress = -1
+H5_GROUP = None
+DEP_H5_GROUPS = {}
+
+# ======================== Model Definition ========================
+
+class OmniSwinTransformer(swin.SwinTransformer):
+    def __init__(self, num_classes_list, projector_features=None, use_mlp=False, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert num_classes_list is not None
+        
+        self.projector = None 
+        if projector_features:
+            encoder_features = self.num_features
+            self.num_features = projector_features
+            if use_mlp:
+                self.projector = nn.Sequential(
+                    nn.Linear(encoder_features, self.num_features), 
+                    nn.ReLU(inplace=True), 
+                    nn.Linear(self.num_features, self.num_features)
+                )
+            else:
+                self.projector = nn.Linear(encoder_features, self.num_features)
+
+        self.omni_heads = []
+        for num_classes in num_classes_list:
+            self.omni_heads.append(
+                nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+            )
+        self.omni_heads = nn.ModuleList(self.omni_heads)
+
+    def forward(self, x, head_n=None):
+        x = self.forward_features(x)
+        if self.projector:
+            x = self.projector(x)
+        if head_n is not None:
+            return x, self.omni_heads[head_n](x)
+        else:
+            return [head(x) for head in self.omni_heads]
+
+
+# ======================== Utility Functions ========================
+
+def get_disease_list():
+    """Get the complete list of diseases predicted by the model."""
+    mimic_diseases = ['No Finding', 'Enlarged Cardiomediastinum', 'Cardiomegaly', 'Lung Opacity', 
+                      'Lung Lesion', 'Edema', 'Consolidation', 'Pneumonia', 'Atelectasis', 
+                      'Pneumothorax', 'Pleural Effusion', 'Pleural Other', 'Fracture', 'Support Devices']
+    chexpert_diseases = ['No Finding', 'Enlarged Cardiomediastinum', 'Cardiomegaly', 'Lung Opacity', 
+                         'Lung Lesion', 'Edema', 'Consolidation', 'Pneumonia', 'Atelectasis', 
+                         'Pneumothorax', 'Pleural Effusion', 'Pleural Other', 'Fracture', 'Support Devices']
+    nih14_diseases = ['Atelectasis', 'Cardiomegaly', 'Effusion', 'Infiltration', 'Mass', 'Nodule', 
+                      'Pneumonia', 'Pneumothorax', 'Consolidation', 'Edema', 'Emphysema', 
+                      'Fibrosis', 'Pleural_Thickening', 'Hernia']
+    rsna_diseases = ['No Lung Opacity/Not Normal', 'Normal', 'Lung Opacity']
+    vindr_diseases = ['PE', 'Lung tumor', 'Pneumonia', 'Tuberculosis', 'Other diseases', 'No finding']
+    shenzhen_diseases = ['TB']
+    
+    return mimic_diseases + chexpert_diseases + nih14_diseases + rsna_diseases + vindr_diseases + shenzhen_diseases
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--port', type=int, default=8008, help='port')
+    parser.add_argument('--name', type=str, default='ArkPlusZeroShot', help='node name')
+    parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
+    
+    return parser.parse_args()
+
+
+def _to_int(val, default=None):
+    try:
+        s = str(val).strip()
+        return int(s) if s != "" else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(val, default=None):
+    try:
+        s = str(val).strip()
+        return float(s) if s != "" else default
+    except (TypeError, ValueError):
+        return default
+
+
+def update_progress(value):
+    """Update the progress value for the frontend"""
+    global progress_value, last_printed_progress
+    
+    progress_value = value
+    
+    # Print progress at 10% intervals
+    if int(value / 10) > int(last_printed_progress / 10):
+        print(f"[{NODE_NAME}] Progress: {value:.1f}%")
+        last_printed_progress = value
+
+
+def preprocess_image(image_path, input_size=768):
+    """Load and preprocess a single image"""
+    try:
+        # Handle DICOM files
+        if image_path.lower().endswith('.dcm'):
+            import pydicom
+            ds = pydicom.dcmread(image_path)
+            image_array = ds.pixel_array
+            imageData = Image.fromarray(image_array).convert('RGB')
+        else:
+            imageData = Image.open(image_path).convert('RGB')
+        
+        # Resize to input size
+        imageData = imageData.resize((input_size, input_size))
+        image = np.array(imageData) / 255.0
+        
+        # ImageNet normalization
+        mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        image = (image - mean) / std
+        image = image.transpose(2, 0, 1).astype('float32')
+        
+        return torch.from_numpy(image).unsqueeze(0)  # Add batch dimension
+    except Exception as e:
+        print(f"[{NODE_NAME}] Error loading image {image_path}: {e}")
+        raise
+
+
+def load_model_at_init():
+    """Load the Ark+ model at initialization"""
+    global ARK_MODEL
+    
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    print(f"[{NODE_NAME}] Using device: {device}")
+    
+    # Fixed model configuration
+    model_path = "checkpoints/Ark6_swinLarge768_ep50.pth.tar"
+    input_size = 768
+    
+    # Check if running from bundled executable
+    if getattr(sys, 'frozen', False):
+        base_path = sys._MEIPASS
+        model_path = os.path.join(base_path, model_path)
+    
+    # Check if model file exists
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+    
+    print(f"[{NODE_NAME}] Loading model from: {model_path}")
+    
+    # Define model architecture
+    num_classes_list = [14, 14, 14, 3, 6, 1]
+    key = "teacher"
+    
+    model = OmniSwinTransformer(
+        num_classes_list, 
+        projector_features=1376, 
+        use_mlp=False, 
+        img_size=input_size, 
+        patch_size=4, 
+        window_size=12, 
+        embed_dim=192, 
+        depths=(2, 2, 18, 2), 
+        num_heads=(6, 12, 24, 48)
+    )
+    
+    # Load checkpoint
+    checkpoint = torch.load(model_path, map_location=torch.device('cpu'), weights_only=False)
+    state_dict = checkpoint[key]
+    
+    # Remove 'module.' prefix if present
+    if any([True if 'module.' in k else False for k in state_dict.keys()]):
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items() if k.startswith('module.')}
+    
+    msg = model.load_state_dict(state_dict, strict=False)
+    print(f'[{NODE_NAME}] Loaded model with msg: {msg}')
+    
+    model.to(device)
+    model.eval()
+    
+    ARK_MODEL = model
+    print(f"[{NODE_NAME}] Model loaded successfully")
+
+
+def run_inference(args):
+    """Run inference on a single image"""
+    global progress_complete, ARK_MODEL, H5_PATH, H5_GROUP
+    
+    result = {"status": "success", "message": "", "predictions": None}
+    
+    try:
+        start_time = time.time()
+        update_progress(10)
+        
+        # Validate image path
+        if not os.path.exists(args.image_path):
+            raise FileNotFoundError(f"Image not found: {args.image_path}")
+        
+        print(f"[{NODE_NAME}] Processing image: {args.image_path}")
+        
+        # Get device
+        device = next(ARK_MODEL.parameters()).device
+        
+        # Load and preprocess image
+        update_progress(30)
+        image_tensor = preprocess_image(args.image_path, input_size=768)  # Fixed input size
+        image_tensor = image_tensor.to(device)
+        
+        # Run inference
+        update_progress(50)
+        print(f"[{NODE_NAME}] Running zero-shot inference...")
+        
+        with torch.no_grad():
+            pre_logits = ARK_MODEL(image_tensor)
+            preds = [torch.sigmoid(out) for out in pre_logits]
+            predictions = torch.cat(preds, dim=1)
+        
+        # Convert to numpy
+        predictions = predictions.cpu().numpy()[0]  # Remove batch dimension
+        
+        update_progress(80)
+        
+        # Get disease list
+        disease_list = get_disease_list()
+        
+        # Create predictions dictionary
+        predictions_dict = {disease: float(pred) for disease, pred in zip(disease_list, predictions)}
+        
+        # Get top 5 predictions
+        top5_indices = np.argsort(predictions)[-5:][::-1]
+        top5_predictions = {disease_list[idx]: float(predictions[idx]) for idx in top5_indices}
+        
+        print(f"[{NODE_NAME}] Top 5 predictions:")
+        for disease, prob in top5_predictions.items():
+            print(f"  {disease}: {prob:.4f}")
+        
+        # Save results to H5 file
+        if H5_PATH and os.path.exists(H5_PATH):
+            _save_results_to_h5(predictions, disease_list, os.path.basename(args.image_path))
+        
+        update_progress(95)
+        
+        # Prepare result
+        elapsed_time = time.time() - start_time
+        result["message"] = f"Inference completed in {elapsed_time:.2f}s"
+        result["predictions"] = predictions_dict
+        result["top5"] = top5_predictions
+        result["image_name"] = os.path.basename(args.image_path)
+        
+        update_progress(100)
+        progress_complete = True
+        
+        print(f"[{NODE_NAME}] Inference completed successfully in {elapsed_time:.2f}s")
+        
+    except Exception as e:
+        import traceback
+        error_msg = f"Error during inference: {str(e)}\n{traceback.format_exc()}"
+        print(f"[{NODE_NAME}] {error_msg}")
+        result["status"] = "error"
+        result["message"] = error_msg
+        progress_value = 100
+        progress_complete = True
+    
+    return result
+
+
+def _save_results_to_h5(predictions, disease_list, image_name):
+    """Save predictions to H5 file"""
+    global H5_PATH, H5_GROUP
+    
+    try:
+        with safe_h5_open(H5_PATH, "a") as hf:
+            # Create group if it doesn't exist
+            if H5_GROUP not in hf:
+                hf.create_group(H5_GROUP)
+            
+            group = hf[H5_GROUP]
+            
+            # Save predictions
+            if "predictions" in group:
+                del group["predictions"]
+            group.create_dataset("predictions", data=predictions.astype(np.float32), compression="gzip")
+            
+            # Save image name
+            if "image_name" in group:
+                del group["image_name"]
+            group.create_dataset("image_name", data=image_name.encode('utf-8'))
+            
+            # Save disease list
+            if "disease_list" in group:
+                del group["disease_list"]
+            group.create_dataset("disease_list", data=np.array(disease_list, dtype='S'))
+            
+            print(f"[{NODE_NAME}] Results saved to H5: {H5_GROUP}")
+            
+    except Exception as e:
+        print(f"[{NODE_NAME}] Error saving results to H5: {e}")
+
+
+# ======================== FastAPI Endpoints ========================
+
+@app.post("/init")
+def init_node():
+    """Initialize the model at startup"""
+    global IS_MODEL_INITED
+    
+    if not IS_MODEL_INITED:
+        IS_MODEL_INITED = True
+        print(f"[{NODE_NAME}] /init => loading Ark+ model...")
+        try:
+            load_model_at_init()
+            return {"status": "ok", "message": f"{NODE_NAME} init done, model loaded"}
+        except Exception as e:
+            IS_MODEL_INITED = False
+            return {"status": "error", "message": f"Failed to initialize: {str(e)}"}
+    else:
+        return {"status": "ok", "message": f"{NODE_NAME} already initialized"}
+
+
+@app.post("/read")
+def read_node(data: Dict[str, Any]):
+    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS, H5_GROUP, DEP_H5_GROUPS
+    
+    # Extract basic information from request
+    NODE_NAME = data.get("node_name", "ArkPlusZeroShot")
+    DEPENDENCIES = data.get("dependencies", [])
+    H5_PATH = data.get("h5_path", None)
+    H5_GROUP = data.get("h5_group") or "ArkPlusNode"
+    DEP_H5_GROUPS = data.get("dependencies_h5_groups", {})
+
+    print(f"[{NODE_NAME}] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}, h5_group={H5_GROUP}")
+    
+    # Validate H5 file exists
+    if not H5_PATH or not os.path.exists(H5_PATH):
+        print(f"[{NODE_NAME}] no h5 file => skip read.")
+        return {"status": "ok", "message": "no H5 file found."}
+    
+    # Initialize ARGS with fixed defaults if not already initialized
+    if ARGS is None:
+        ARGS = argparse.Namespace(
+            image_path="",
+            input_size=768,  # Fixed: model input size
+            model_path="checkpoints/Ark6_swinLarge768_ep50.pth.tar"  # Fixed: model checkpoint path
+        )
+    
+    # Read and apply user parameters from H5 file (only image_path)
+    _load_parameters_from_h5(H5_PATH, H5_GROUP)
+    
+    # Log final parameters
+    print(f"[{NODE_NAME}] Configuration:")
+    print(f"  - image_path: {ARGS.image_path if ARGS.image_path else 'Not set'}")
+    print(f"  - input_size: {ARGS.input_size} (fixed)")
+    print(f"  - model_path: {ARGS.model_path} (fixed)")
+    
+    return {"status": "ok", "message": f"{NODE_NAME} read done"}
+
+
+def _load_parameters_from_h5(h5_path: str, h5_group: str):
+    """Load user parameters from H5 file"""
+    global ARGS
+    
+    try:
+        with safe_h5_open(h5_path, "r") as hf:
+            user_data_path = f"{h5_group}/userData"
+            if user_data_path not in hf:
+                print(f"[{NODE_NAME}] No userData found in {h5_group}")
+                return
+            
+            # Read each parameter and apply it
+            for param_name in hf[user_data_path].keys():
+                raw_bytes = hf[user_data_path][param_name][()]
+                param_value = _decode_h5_parameter(raw_bytes)
+                
+                if param_value is not None:
+                    _apply_parameter(param_name, param_value)
+                    
+    except Exception as e:
+        print(f"[{NODE_NAME}] Error reading parameters from H5: {e}")
+
+
+def _decode_h5_parameter(raw_bytes):
+    """Decode a parameter value from H5 storage"""
+    try:
+        raw_str = raw_bytes.decode("utf-8")
+        # Try to parse as JSON first
+        try:
+            return json.loads(raw_str)
+        except json.JSONDecodeError:
+            # If not JSON, return as string
+            return raw_str
+    except Exception as e:
+        print(f"[{NODE_NAME}] Error decoding parameter: {e}")
+        return None
+
+
+def _apply_parameter(param_name: str, param_value):
+    """Apply a single parameter to ARGS"""
+    global ARGS
+    
+    param_handlers = {
+        "path": lambda v: _set_image_path(v),
+        "image_path": lambda v: _set_image_path(v),
+        # input_size and model_path are fixed and not configurable by user
+    }
+    
+    if param_name in param_handlers:
+        param_handlers[param_name](param_value)
+        print(f"[{NODE_NAME}] Set {param_name} => {param_value}")
+    else:
+        print(f"[{NODE_NAME}] Ignoring user parameter: {param_name} (not configurable)")
+
+
+def _set_image_path(value):
+    """Set the image path if it's valid"""
+    global ARGS
+    if isinstance(value, str) and value:
+        if os.path.exists(value):
+            ARGS.image_path = value
+        else:
+            print(f"[{NODE_NAME}] Warning: Image path does not exist: {value}")
+
+
+@app.post("/execute")
+def execute_node():
+    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME, progress_value
+    
+    if not IS_MODEL_INITED:
+        return {"status": "error", "message": "Please /init first."}
+    
+    # Validate image path
+    if (not ARGS) or (not getattr(ARGS, "image_path", None)) or (not os.path.isfile(ARGS.image_path)):
+        msg = f"Invalid image path: {getattr(ARGS,'image_path',None)}"
+        print(f"[{NODE_NAME}] {msg}")
+        out_val = {"status": "error", "message": msg}
+        progress_value = 100
+    else:
+        print(f"[{NODE_NAME}] /execute => run_inference with image_path={ARGS.image_path}")
+        print(f"[{NODE_NAME}] ARGS: {ARGS}")
+        out_val = run_inference(ARGS)
+    
+    # Store the result to 'output'
+    if H5_PATH and os.path.exists(H5_PATH):
+        with safe_h5_open(H5_PATH, "a") as hf:
+            node_out_path = f"{H5_GROUP}/output"
+            if node_out_path in hf:
+                del hf[node_out_path]
+            out_str = json.dumps(out_val, ensure_ascii=False)
+            hf.create_dataset(node_out_path, data=out_str.encode("utf-8"))
+            hf.flush()
+        time.sleep(1)
+    
+    return {"status": "ok", "output": out_val}
+
+
+@app.options("/progress")
+async def progress_options():
+    """Handle OPTIONS preflight request for CORS"""
+    return {"status": "ok"}
+
+
+@app.get("/progress")
+async def progress():
+    """SSE endpoint to provide progress updates"""
+    async def event_generator():
+        global progress_value, progress_complete
+        last_value = -1
+        progress_value = 0
+        progress_complete = False
+        
+        while not progress_complete and progress_value < 100:
+            if progress_value != last_value:
+                print(f"[SSE] Progress: {progress_value}%")
+                yield {"data": str(progress_value)}
+                last_value = progress_value
+            await asyncio.sleep(0.1)
+        
+        # Ensure final progress update to 100 is sent
+        if last_value != 100:
+            yield {"data": "100"}
+        
+        # Keep connection open briefly to ensure client receives final update
+        await asyncio.sleep(1)
+        
+        # Reset progress state for next run
+        progress_value = 0
+        progress_complete = False
+    
+    return EventSourceResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS"
+        }
+    )
+
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "ok",
+        "node_name": NODE_NAME,
+        "model_initialized": IS_MODEL_INITED
+    }
+
+
+def main():
+    """Main function to start the server and register with the manager"""
+    args = parse_args()
+    global NODE_NAME, ARGS
+    NODE_NAME = args.name
+    ARGS = args
+    
+    print(f"Starting {args.name} at port={args.port}")
+    
+    def run_uvicorn():
+        uvicorn.run(app, host="0.0.0.0", port=args.port)
+    
+    t = threading.Thread(target=run_uvicorn, daemon=True)
+    t.start()
+    
+    time.sleep(3)
+    
+    this_file_path = str(Path(__file__).resolve())
+    create_payload = {
+        "service_name": args.name,
+        "file_path": this_file_path,
+        "port": args.port
+    }
+    
+    url_create = f"{args.manager_host}/api/tasks/v1/create_node"
+    try:
+        resp = requests.post(url_create, json=create_payload, timeout=10)
+        resp.raise_for_status()
+        print(f"[{args.name}] create_node success => {resp.json()}")
+    except Exception as e:
+        print(f"[{args.name}] create_node request failed: {e}")
+        print("keep running...")
+    
+    print(f"[{args.name}] Serving at port={args.port}, Press Ctrl+C to exit.")
+    t.join()
+
+
+if __name__ == "__main__":
+    main()
+
