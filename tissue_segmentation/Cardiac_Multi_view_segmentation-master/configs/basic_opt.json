@@ -1,0 +1,40 @@
+{   "name": "train_UKBB",
+    "data": {
+      "dataset_name":"Demo" ,
+      "readable_frames": ["ED", "ES"],
+      "train_dir": "demo_dataset/train",
+      "validate_dir": "demo_dataset/validate",
+      "image_format_name": "sa_{frame}.nii.gz",
+      "label_format_name": "label_sa_{frame}.nii.gz",
+      "data_aug_policy" :"UKBB_affine_elastic",
+      "if_resample": true,
+      "new_spacing": [1.25, 1.25, 10],
+      "keep_z_spacing": true,
+      "image_size":[256,256,1],
+      "label_size":[256,256],
+      "pad_size":  [256,256,1],
+      "crop_size" :[256, 256,1],
+      "num_classes": 4,
+      "use_cache": true,
+      "myocardium_only": false,
+      "ignore_black_slices": true
+
+    },
+
+ "segmentation_model": {
+        "network_type": "UNet_64",
+        "num_classes": 4,
+        "resume_path":"./checkpoints/Unet_LVSA_best.pkl",
+        "lr": 0.0001,
+        "n_epochs": 1000,
+        "max_iteration": 10000,
+        "batch_size": 20,
+        "use_gpu": true,
+        "decoder_dropout": false
+    },
+  "output":
+  {
+    "save_epoch_every_num_epochs":50,
+     "save_dir":"./result"
+  }
+}
