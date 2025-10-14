@@ -1041,6 +1041,12 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             
             print(f"[Process] Running TotalSegmentator with params: {ts_kwargs}")
             
+            # Verify output path before running
+            print(f"[Process] Verifying output path...")
+            print(f"[Process] Output path: {temp_output}")
+            print(f"[Process] Output path exists: {temp_output.exists()}")
+            print(f"[Process] Output path absolute: {temp_output.absolute()}")
+            
             # Execute segmentation in background thread with progress simulation
             start_time = time.time()
             
@@ -1049,9 +1055,16 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             def run_segmentation():
                 nonlocal seg_exception
                 try:
-                    totalsegmentator(**ts_kwargs)
+                    result = totalsegmentator(**ts_kwargs)
+                    print(f"[Process] TotalSegmentator returned: {result}")
+                    # Force sync to ensure files are written
+                    import os
+                    os.sync() if hasattr(os, 'sync') else None
                 except Exception as e:
                     seg_exception = e
+                    print(f"[Process] TotalSegmentator exception: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             seg_thread = threading.Thread(target=run_segmentation)
             seg_thread.start()
@@ -1085,6 +1098,26 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             if not temp_output.exists():
                 update_progress(100, "Error: Segmentation output not found")
                 return
+            
+            # Debug: Check what files were actually created
+            print(f"[Debug] Checking temp_output: {temp_output}")
+            print(f"[Debug] temp_output exists: {temp_output.exists()}")
+            print(f"[Debug] temp_output is_dir: {temp_output.is_dir()}")
+            print(f"[Debug] temp_output is_file: {temp_output.is_file()}")
+            
+            if temp_output.is_dir():
+                all_files = list(temp_output.iterdir())
+                print(f"[Debug] Files in temp_output directory ({len(all_files)} total):")
+                for f in all_files[:20]:  # Show first 20 files
+                    print(f"[Debug]   - {f.name} ({f.stat().st_size} bytes)")
+                
+                # Check for .nii.gz files specifically
+                nii_files = list(temp_output.glob("*.nii.gz")) + list(temp_output.glob("*.nii"))
+                print(f"[Debug] NIfTI files found: {len(nii_files)}")
+                for nf in nii_files:
+                    print(f"[Debug]   NIfTI: {nf.name} ({nf.stat().st_size} bytes)")
+            elif temp_output.is_file():
+                print(f"[Debug] temp_output is a file: {temp_output.name} ({temp_output.stat().st_size} bytes)")
             
             # Prepare metadata
             metadata = {
