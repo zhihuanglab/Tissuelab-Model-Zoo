@@ -235,7 +235,13 @@ def save_segmentation_to_h5(segmentation_data: np.ndarray, original_image: sitk.
         print(f"[H5] Starting to save segmentation to H5")
         print(f"[H5] Data shape: {segmentation_data.shape}")
         print(f"[H5] Data type: {segmentation_data.dtype}")
+        print(f"[H5] Data min: {segmentation_data.min()}, max: {segmentation_data.max()}, non-zero count: {np.count_nonzero(segmentation_data)}")
         print(f"[H5] H5 path: {h5_path}")
+        
+        # Ensure data is uint8
+        if segmentation_data.dtype != np.uint8:
+            print(f"[H5] Converting data from {segmentation_data.dtype} to uint8")
+            segmentation_data = segmentation_data.astype(np.uint8)
         
         with safe_h5_open(h5_path, "a") as hf:
             print(f"[H5] Opened H5 file successfully")
@@ -452,6 +458,30 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
             return {"status": "error", "message": "Segmentation output not found"}
         
         update_progress(80, "Saving to H5 format")
+        
+        # Validate segmentation result
+        print(f"[Process] Validating segmentation result...")
+        print(f"[Process] Prediction shape: {prediction_result.shape}")
+        print(f"[Process] Prediction dtype: {prediction_result.dtype}")
+        print(f"[Process] Prediction min: {prediction_result.min()}, max: {prediction_result.max()}")
+        
+        # Convert to uint8 if needed
+        if prediction_result.dtype != np.uint8:
+            print(f"[Process] Converting prediction from {prediction_result.dtype} to uint8")
+            prediction_result = prediction_result.astype(np.uint8)
+            print(f"[Process] After conversion - min: {prediction_result.min()}, max: {prediction_result.max()}")
+        
+        # Check if result is all zeros
+        non_zero_count = np.count_nonzero(prediction_result)
+        total_voxels = prediction_result.size
+        print(f"[Process] Non-zero voxels: {non_zero_count} / {total_voxels} ({100*non_zero_count/total_voxels:.2f}%)")
+        
+        if non_zero_count == 0:
+            print(f"[Process] WARNING: Segmentation result is all zeros!")
+            print(f"[Process] This could mean:")
+            print(f"[Process]   - No cardiac structures detected")
+            print(f"[Process]   - Segmentation model failed")
+            print(f"[Process]   - Wrong view/model selected")
         
         # Prepare metadata
         metadata = {
