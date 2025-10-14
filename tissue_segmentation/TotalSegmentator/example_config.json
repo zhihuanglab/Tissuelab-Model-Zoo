@@ -1,0 +1,56 @@
+{
+  "init_config": {
+    "model": "total_3mm",
+    "device": "gpu",
+    "h5_path": "/path/to/output.h5",
+    "node_name": "SegmentorNode"
+  },
+  "execute_configs": [
+    {
+      "name": "Liver and Spleen Segmentation",
+      "input_path": "/path/to/dicom/folder",
+      "roi_subset": ["liver", "spleen"]
+    },
+    {
+      "name": "Full Body Segmentation",
+      "input_path": "/path/to/nifti/file.nii.gz",
+      "roi_subset": null
+    },
+    {
+      "name": "Kidney Segmentation Only",
+      "input_path": "/path/to/dicom/folder",
+      "roi_subset": ["kidney_left", "kidney_right"]
+    },
+    {
+      "name": "Lung Vessels (Specialized Model)",
+      "model": "lung_vessels",
+      "input_path": "/path/to/ct/scan",
+      "roi_subset": null
+    }
+  ],
+  "available_models": {
+    "total_3mm": "Whole body segmentation (3mm high precision)",
+    "total_6mm": "Whole body segmentation (6mm fast)",
+    "body": "Body segmentation",
+    "lung_vessels": "Lung vessels segmentation",
+    "total_mr": "MR image whole body segmentation",
+    "total_mr_fast": "MR image whole body segmentation (fast)",
+    "cerebral_bleed": "Intracranial hemorrhage (CT)"
+  },
+  "common_roi_options": [
+    "liver",
+    "spleen",
+    "kidney_left",
+    "kidney_right",
+    "lung_upper_lobe_left",
+    "lung_upper_lobe_right",
+    "lung_lower_lobe_left",
+    "lung_lower_lobe_right",
+    "heart",
+    "brain",
+    "stomach",
+    "pancreas",
+    "bladder",
+    "prostate"
+  ]
+}
