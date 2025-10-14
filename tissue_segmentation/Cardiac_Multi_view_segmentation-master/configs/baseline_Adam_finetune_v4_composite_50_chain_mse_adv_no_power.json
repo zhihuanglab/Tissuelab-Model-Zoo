@@ -1,0 +1,50 @@
+{   "name": "Composite",
+    "data": {
+      "dataset_name":"UKBB" ,
+      "readable_frames": ["ED", "ES"],
+      "train_dir": "/vol/medic02/users/wbai/data/cardiac_atlas/UKBB_2964/sa/train",
+      "validate_dir": "/vol/medic02/users/wbai/data/cardiac_atlas/UKBB_2964/sa/validation",
+      "image_format_name": "sa_{frame}.nii.gz",
+      "label_format_name": "label_sa_{frame}.nii.gz",
+      "data_aug_policy" :"UKBB_advancedv4",
+      "if_resample": true,
+      "new_spacing": [1.25, 1.25, 10],
+      "keep_z_spacing": true,
+      "image_size":[224,224,1],
+      "label_size":[224,224],
+      "pad_size":  [192,192,1],
+      "crop_size" :[192,192,1],
+      "num_classes": 4,
+      "use_cache": false,
+      "myocardium_only": false,
+      "ignore_black_slices": true
+
+    },
+
+ "segmentation_model": {
+        "network_type": "UNet_64",
+        "num_classes": 4,
+        "resume_path":"./checkpoints/Unet_LVSA_trained_from_UKBB.pkl",
+        "lr": 0.00001,
+        "optimizer_name": "adam",
+        "n_epochs": 50,
+        "max_iteration": 500000,
+        "batch_size": 20,
+        "use_gpu": true,
+        "decoder_dropout": 0.1
+    },
+
+  "adversarial_augmentation":
+  {
+    "transformation_type":"composite",
+    "divergence_types":["mse","contour"],
+    "divergence_weights":[1,0.5],
+    "n_iter":1
+  }
+  ,
+  "output":
+  {
+    "save_epoch_every_num_epochs":1,
+     "save_dir":"./result/Composite"
+  }
+}
