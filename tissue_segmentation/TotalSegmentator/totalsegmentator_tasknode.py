@@ -40,14 +40,22 @@ else:
 
 # Set local model weights directory
 if LOCAL_MODELS.exists():
+    # Set both environment variables to ensure correct paths
     os.environ['TOTALSEG_HOME_DIR'] = str(LOCAL_MODELS)
+    # TOTALSEG_WEIGHTS_PATH should point directly to nnunet/results
+    weights_path = LOCAL_MODELS / "nnunet" / "results"
+    weights_path.mkdir(parents=True, exist_ok=True)
+    os.environ['TOTALSEG_WEIGHTS_PATH'] = str(weights_path)
+    os.environ['nnUNet_results'] = str(weights_path)
     print(f"[TotalSegmentator] Using local model weights: {LOCAL_MODELS}")
+    print(f"[TotalSegmentator] Weights path: {weights_path}")
 else:
     print(f"[TotalSegmentator] Local weights not found")
 
 # Import TotalSegmentator
 try:
     from totalsegmentator.python_api import totalsegmentator
+    from totalsegmentator.libs import download_pretrained_weights
     print(f"[TotalSegmentator] Successfully imported TotalSegmentator")
 except ImportError as e:
     print(f"[TotalSegmentator] Warning: totalsegmentator not imported: {e}")
@@ -219,6 +227,164 @@ class ProgressResponse(BaseModel):
     message: str
     is_processing: bool
 
+def check_and_download_model(task_id: int, task_name: str) -> bool:
+    """
+    Check if model weights exist and are complete, download if missing
+    
+    Args:
+        task_id: Task ID number
+        task_name: Task name for logging
+        
+    Returns:
+        bool: True if model is ready, False if download failed
+    """
+    try:
+        # Map task IDs to expected model paths
+        task_to_dataset = {
+            150: "Dataset150_icb_v0",
+            258: "Dataset258_lung_vessels_248subj",
+            291: "Dataset291_TotalSegmentator_part1_organs_1559subj",
+            292: "Dataset292_TotalSegmentator_part2_vertebrae_1532subj",
+            297: "Dataset297_TotalSegmentator_total_3mm_1559subj",
+            298: "Dataset298_TotalSegmentator_total_6mm_1559subj",
+            299: "Dataset299_body_1559subj",
+            300: "Dataset300_body_6mm_1559subj",
+            850: "Dataset850_TotalSegMRI_part1_organs_1088subj",
+            852: "Dataset852_TotalSegMRI_total_3mm_1088subj",
+            853: "Dataset853_TotalSegMRI_total_6mm_1088subj",
+        }
+        
+        if task_id not in task_to_dataset:
+            print(f"[Model Check] Unknown task ID {task_id}, skipping check")
+            return True
+        
+        dataset_name = task_to_dataset[task_id]
+        
+        # Check in local models directory first
+        if LOCAL_MODELS.exists():
+            model_path = LOCAL_MODELS / "nnunet" / "results" / dataset_name
+            
+            # Check if model directory exists and contains required files
+            if model_path.exists():
+                # Check for essential files (dataset.json, plans.json, or fold_0 directory)
+                has_files = False
+                
+                # Look for trainer directories
+                trainer_dirs = list(model_path.glob("nnUNet*"))
+                if trainer_dirs:
+                    for trainer_dir in trainer_dirs:
+                        # Check for dataset.json or plans.json or fold_0
+                        if (trainer_dir / "dataset.json").exists() or \
+                           (trainer_dir / "plans.json").exists() or \
+                           (trainer_dir / "fold_0").exists():
+                            has_files = True
+                            break
+                
+                if has_files:
+                    print(f"[Model Check] OK: {task_name} (Task {task_id}) model found and appears complete")
+                    return True
+                else:
+                    print(f"[Model Check] WARNING: {task_name} (Task {task_id}) directory exists but appears incomplete")
+            else:
+                print(f"[Model Check] MISSING: {task_name} (Task {task_id}) model not found at {model_path}")
+        
+        # Model is missing or incomplete, download it
+        print(f"[Model Download] Downloading {task_name} (Task {task_id})...")
+        print(f"[Model Download] This may take a few minutes depending on your internet speed...")
+        
+        # Ensure environment variables are set before download
+        import os
+        import shutil
+        results_dir = LOCAL_MODELS / "nnunet" / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        
+        target_model_path = results_dir / dataset_name
+        print(f"[Model Download] Target directory: {target_model_path}")
+        
+        # If directory exists but is incomplete, remove it so download_pretrained_weights will re-download
+        if target_model_path.exists():
+            print(f"[Model Download] Removing incomplete model directory...")
+            try:
+                shutil.rmtree(target_model_path)
+                print(f"[Model Download] Removed: {target_model_path}")
+            except Exception as remove_error:
+                print(f"[Model Download] Warning: Could not remove directory: {remove_error}")
+        
+        os.environ['TOTALSEG_HOME_DIR'] = str(LOCAL_MODELS)
+        os.environ['TOTALSEG_WEIGHTS_PATH'] = str(results_dir)
+        os.environ['nnUNet_results'] = str(results_dir)
+        
+        print(f"[Model Download] TOTALSEG_HOME_DIR: {os.environ.get('TOTALSEG_HOME_DIR')}")
+        print(f"[Model Download] TOTALSEG_WEIGHTS_PATH: {os.environ.get('TOTALSEG_WEIGHTS_PATH')}")
+        print(f"[Model Download] nnUNet_results: {os.environ.get('nnUNet_results')}")
+        
+        try:
+            print(f"[Model Download] Starting download from GitHub...")
+            download_pretrained_weights(task_id)
+            print(f"[Model Download] Download function completed")
+        except Exception as download_error:
+            print(f"[Model Download] Download function error: {download_error}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+        # Verify download was successful
+        print(f"[Model Download] Verifying download...")
+        model_path = LOCAL_MODELS / "nnunet" / "results" / dataset_name
+        
+        if not model_path.exists():
+            print(f"[Model Download] ERROR: Model directory not created at {model_path}")
+            print(f"[Model Download] The download_pretrained_weights function may have failed silently")
+            return False
+        
+        # Check for trainer directories
+        trainer_dirs = list(model_path.glob("nnUNet*"))
+        if not trainer_dirs:
+            print(f"[Model Download] ERROR: No trainer directories found in {model_path}")
+            all_contents = list(model_path.iterdir()) if model_path.exists() else []
+            print(f"[Model Download] Directory contents: {[item.name for item in all_contents]}")
+            return False
+        
+        # Check for required files
+        has_files = False
+        for trainer_dir in trainer_dirs:
+            # List all files in trainer directory for debugging
+            trainer_contents = list(trainer_dir.iterdir()) if trainer_dir.exists() else []
+            print(f"[Model Download] Checking {trainer_dir.name}: {len(trainer_contents)} items")
+            
+            if (trainer_dir / "dataset.json").exists() or \
+               (trainer_dir / "plans.json").exists() or \
+               (trainer_dir / "fold_0").exists():
+                has_files = True
+                print(f"[Model Download] SUCCESS: Found valid trainer directory: {trainer_dir.name}")
+                # Show some key files
+                if (trainer_dir / "dataset.json").exists():
+                    print(f"[Model Download]   - dataset.json found")
+                if (trainer_dir / "plans.json").exists():
+                    print(f"[Model Download]   - plans.json found")
+                if (trainer_dir / "fold_0").exists():
+                    print(f"[Model Download]   - fold_0 directory found")
+                break
+        
+        if not has_files:
+            print(f"[Model Download] ERROR: Downloaded but missing required files")
+            print(f"[Model Download] Trainer directories found: {[d.name for d in trainer_dirs]}")
+            for trainer_dir in trainer_dirs:
+                trainer_contents = list(trainer_dir.iterdir()) if trainer_dir.exists() else []
+                print(f"[Model Download] Contents of {trainer_dir.name}:")
+                for item in trainer_contents[:20]:  # Show first 20 items
+                    print(f"[Model Download]   - {item.name}")
+            return False
+        
+        print(f"[Model Download] SUCCESS: {task_name} (Task {task_id}) downloaded and verified")
+        return True
+        
+    except Exception as e:
+        print(f"[Model Download] ERROR: Failed to download {task_name} (Task {task_id}): {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 def validate_input(input_path: str) -> tuple[bool, Optional[str], str]:
     """
     Validate input file/folder
@@ -276,8 +442,14 @@ def save_organ_to_h5(organ_name: str, organ_data: np.ndarray, h5_path: str, meta
         print(f"[H5] Starting to save organ: {organ_name}")
         print(f"[H5] Data shape: {organ_data.shape if organ_data is not None else 'None'}")
         print(f"[H5] Data type: {organ_data.dtype if organ_data is not None else 'None'}")
+        print(f"[H5] Data min: {organ_data.min()}, max: {organ_data.max()}, non-zero count: {np.count_nonzero(organ_data)}")
         print(f"[H5] H5 path: {h5_path}")
         print(f"[H5] File prefix: {file_prefix}")
+        
+        # Ensure data is uint8
+        if organ_data.dtype != np.uint8:
+            print(f"[H5] Converting data from {organ_data.dtype} to uint8")
+            organ_data = organ_data.astype(np.uint8)
         
         with safe_h5_open(h5_path, "a") as hf:
             print(f"[H5] Opened H5 file successfully")
@@ -371,7 +543,13 @@ def extract_organ_from_nifti(nifti_path: str, organ_name: str) -> Optional[np.nd
                 if file_path.exists():
                     print(f"[Extract] Found organ file: {file_path}")
                     nifti_img = nib.load(str(file_path))
-                    return nifti_img.get_fdata()
+                    # Convert to uint8 for segmentation masks
+                    data = nifti_img.get_fdata()
+                    print(f"[Extract] Original dtype: {data.dtype}, shape: {data.shape}")
+                    print(f"[Extract] Data range: min={data.min()}, max={data.max()}, unique values: {len(np.unique(data))}")
+                    data_uint8 = data.astype(np.uint8)
+                    print(f"[Extract] Converted to uint8, range: min={data_uint8.min()}, max={data_uint8.max()}")
+                    return data_uint8
             
             # List all files in directory for debugging
             print(f"[Extract] Available files: {list(nifti_path.glob('*.nii*'))}")
@@ -383,7 +561,11 @@ def extract_organ_from_nifti(nifti_path: str, organ_name: str) -> Optional[np.nd
             print(f"[Extract] Loading from single file: {nifti_path}")
             nifti_img = nib.load(str(nifti_path))
             data = nifti_img.get_fdata()
-            return data
+            print(f"[Extract] Original dtype: {data.dtype}, shape: {data.shape}")
+            print(f"[Extract] Data range: min={data.min()}, max={data.max()}, unique values: {len(np.unique(data))}")
+            data_uint8 = data.astype(np.uint8)
+            print(f"[Extract] Converted to uint8, range: min={data_uint8.min()}, max={data_uint8.max()}")
+            return data_uint8
         
         else:
             print(f"[Extract] Path does not exist: {nifti_path}")
@@ -440,7 +622,19 @@ def process_single_organ(organ: str, nifti_path: str, h5_path: str, metadata: Di
             print(f"[Organ] Data dtype: {organ_data.dtype}")
             print(f"[Organ] Data min: {organ_data.min()}, max: {organ_data.max()}, mean: {organ_data.mean()}")
             
-            # Save to H5 with file prefix
+            # Check if data is all zeros
+            non_zero_count = np.count_nonzero(organ_data)
+            total_voxels = organ_data.size
+            print(f"[Organ] Non-zero voxels: {non_zero_count} / {total_voxels} ({100*non_zero_count/total_voxels:.2f}%)")
+            
+            if non_zero_count == 0:
+                print(f"[Organ] WARNING: Data is all zeros! No {organ} detected in the image.")
+                print(f"[Organ] This could mean:")
+                print(f"[Organ]   - The organ is not present in this image")
+                print(f"[Organ]   - The segmentation failed to detect it")
+                print(f"[Organ]   - Wrong organ name requested")
+            
+            # Save to H5 with file prefix (even if all zeros, for consistency)
             print(f"[Organ] Saving to H5...")
             save_organ_to_h5(organ, organ_data, h5_path, metadata, file_prefix)
             print(f"[Organ] SUCCESS: Successfully processed {organ}")
@@ -775,7 +969,37 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             return
         
         print(f"[Process] Input validation passed: {message}")
-        update_progress(10, "Input validated")
+        update_progress(7, "Input validated")
+        
+        # Check and download required models
+        task_name = MODEL_CONFIG['task']
+        task_id = MODEL_CONFIG['task_id']
+        
+        update_progress(8, "Checking model weights...")
+        print(f"[Process] Checking models for task '{task_name}' (ID: {task_id})")
+        
+        # Check main task model
+        if not check_and_download_model(task_id, task_name):
+            update_progress(100, f"Failed to download model for {task_name}")
+            return
+        
+        # For tasks that require cropping, also check the cropping model
+        # cerebral_bleed needs total_6mm (298) for cropping to brain region
+        # Other tasks may also need cropping models
+        tasks_needing_crop_model = {
+            150: (298, "total_6mm"),  # cerebral_bleed needs total for brain cropping
+            260: (298, "total_6mm"),  # hip_implant needs total for cropping
+            258: (298, "total_6mm"),  # lung_vessels needs total for cropping
+        }
+        
+        if task_id in tasks_needing_crop_model:
+            crop_task_id, crop_task_name = tasks_needing_crop_model[task_id]
+            print(f"[Process] Task '{task_name}' requires cropping model '{crop_task_name}'")
+            if not check_and_download_model(crop_task_id, crop_task_name):
+                update_progress(100, f"Failed to download cropping model {crop_task_name}")
+                return
+        
+        update_progress(10, "Models ready")
         
         # Create temporary output directory for TotalSegmentator
         with tempfile.TemporaryDirectory() as temp_dir:
