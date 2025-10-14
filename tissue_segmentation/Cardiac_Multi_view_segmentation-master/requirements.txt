@@ -1,0 +1,14 @@
+statsmodels
+numpy
+scipy
+pandas
+tqdm
+MedPy
+torchvision
+seaborn
+matplotlib
+nipy
+scikit-image
+SimpleITK
+torch
+scikit-image
