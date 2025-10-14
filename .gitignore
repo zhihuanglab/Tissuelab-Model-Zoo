@@ -174,3 +174,7 @@ cython_debug/
 !task_specific/Ark_Plus/checkpoints/**
 !patch_classification/MUSK/checkpoints/
 !patch_classification/MUSK/checkpoints/**
+
+# TotalSegmentator model weights (very large files)
+tissue_segmentation/TotalSegmentator/models/nnunet/results/
+tissue_segmentation/TotalSegmentator/TotalSegmentator-master/tests/

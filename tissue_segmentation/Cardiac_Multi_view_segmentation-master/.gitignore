@@ -1,0 +1,14 @@
+.idea/
+*.xml
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyc
+# C extensions
+*.so
+test_results/*
+result/
+log/
+runs/
+.vscode/

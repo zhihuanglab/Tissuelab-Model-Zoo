@@ -1,0 +1,1 @@
+python predict.py --sequence LVSA --model_path './checkpoints/UNet_LVSA_Adv_Compose.pth' --root_dir 'test_data/' --image_format 'LVSA/LVSA_img_{}.nii.gz' --roi_size 192 --save_folder_path 'test_results/' --save_name_format 'Adv_Compose_pred_{}.nii.gz'
