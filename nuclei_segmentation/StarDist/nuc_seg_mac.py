@@ -138,7 +138,7 @@ class SlideSegmentation():
                 new_n1 = max(2, int(n_tiles[1] * scale_factor))
                 self.n_tiles = (new_n0, new_n1, 1)
                 actual_workers = new_n0 * new_n1
-                print(f"Scaled n_tiles from {n_tiles} to {self.n_tiles} ({requested_workers} → {actual_workers} workers)")
+                print(f"Scaled n_tiles from {n_tiles} to {self.n_tiles} ({requested_workers} -> {actual_workers} workers)")
             else:
                 self.n_tiles = n_tiles
                 print(f"Using requested n_tiles={n_tiles} ({requested_workers} workers)")
@@ -180,7 +180,7 @@ class SlideSegmentation():
                 parts = [float(p.strip()) for p in str(args.bbox).split(',')]
                 if len(parts) == 4:
                     self.roi_bbox = tuple(parts)
-                    print(f"ROI bbox: x={self.roi_bbox[0]:.0f}, y={self.roi_bbox[1]:.0f}, size={self.roi_bbox[2]:.0f}×{self.roi_bbox[3]:.0f}")
+                    print(f"ROI bbox: x={self.roi_bbox[0]:.0f}, y={self.roi_bbox[1]:.0f}, size={self.roi_bbox[2]:.0f}x{self.roi_bbox[3]:.0f}")
                 else:
                     print(f"Warning: bbox has {len(parts)} parts, expected 4")
             except Exception as e:
@@ -512,10 +512,10 @@ class SlideSegmentation():
                 
                 # GPU check: if prediction takes >5s, likely running on CPU
                 if predict_duration > 5.0:
-                    print(f"⚠️  WARNING: StarDist prediction took {predict_duration:.2f}s (likely CPU-only mode)")
-                    print(f"    Expected GPU time: 0.5-2s. Check TensorFlow GPU installation!")
+                    print(f"[WARNING] StarDist prediction took {predict_duration:.2f}s (likely CPU-only mode)")
+                    print(f"          Expected GPU time: 0.5-2s. Check TensorFlow GPU installation!")
                 else:
-                    print(f"✅ StarDist prediction: {predict_duration:.2f}s (GPU acceleration confirmed)")
+                    print(f"[GPU OK] StarDist prediction: {predict_duration:.2f}s (GPU acceleration confirmed)")
                 
                 points = dicts['points'] # y,x
                 points[:, [1, 0]] = points[:, [0, 1]] # x,y
@@ -717,7 +717,7 @@ class SlideSegmentation():
                     self.prob_all = self.prob_all[within_roi]
                     n_after = len(self.final_points)
                     
-                    print(f"ROI polygon filtering: {n_before} → {n_after} nuclei ({n_before - n_after} removed)")
+                    print(f"ROI polygon filtering: {n_before} -> {n_after} nuclei ({n_before - n_after} removed)")
                     
                 elif self.roi_bbox is not None:
                     # Use bounding box for filtering
@@ -735,7 +735,7 @@ class SlideSegmentation():
                     self.prob_all = self.prob_all[within_roi]
                     n_after = len(self.final_points)
                     
-                    print(f"ROI bbox filtering: {n_before} → {n_after} nuclei ({n_before - n_after} removed)")
+                    print(f"ROI bbox filtering: {n_before} -> {n_after} nuclei ({n_before - n_after} removed)")
                 
                 # Get final count after all processing
                 total_nuclei = len(self.final_points)
@@ -782,7 +782,7 @@ class SlideSegmentation():
             print(f"ROI polygon filtering enabled: {len(self.roi_polygon)} vertices")
         elif self.roi_bbox:
             bbox_x, bbox_y, bbox_w, bbox_h = self.roi_bbox
-            print(f"ROI bbox filtering enabled: region [{bbox_x:.0f}, {bbox_y:.0f}] size {bbox_w:.0f}×{bbox_h:.0f}")
+            print(f"ROI bbox filtering enabled: region [{bbox_x:.0f}, {bbox_y:.0f}] size {bbox_w:.0f}x{bbox_h:.0f}")
         
         tiles_skipped_roi = 0
         last_reported_progress = -1  # Track last reported progress to avoid redundant updates
@@ -904,10 +904,10 @@ class SlideSegmentation():
                 
                 # GPU check: if prediction takes >5s, likely running on CPU
                 if predict_duration > 5.0:
-                    print(f"⚠️  WARNING: StarDist prediction took {predict_duration:.2f}s (likely CPU-only mode)")
-                    print(f"    Expected GPU time: 0.5-2s. Check TensorFlow GPU installation!")
+                    print(f"[WARNING] StarDist prediction took {predict_duration:.2f}s (likely CPU-only mode)")
+                    print(f"          Expected GPU time: 0.5-2s. Check TensorFlow GPU installation!")
                 elif predict_duration < 1.0:
-                    print(f"✅ StarDist prediction: {predict_duration:.2f}s (GPU acceleration likely active)")
+                    print(f"[GPU OK] StarDist prediction: {predict_duration:.2f}s (GPU acceleration likely active)")
                                                             
                 points = dicts['points'] # y,x
                 points[:, [1, 0]] = points[:, [0, 1]] # x,y
@@ -947,7 +947,7 @@ class SlideSegmentation():
         
         # Print ROI processing summary
         if self.roi_bbox or tiles_skipped_roi > 0:
-            print(f"\n📊 ROI Processing Summary:")
+            print(f"\n[ROI Summary]")
             print(f"   Total tiles in grid: {total_tiles}")
             print(f"   Tiles skipped (outside ROI): {tiles_skipped_roi}")
             print(f"   Tiles processed (inside ROI): {processed_tiles}")
@@ -1004,7 +1004,7 @@ class SlideSegmentation():
                     self.prob_all = self.prob_all[within_roi]
                     n_after = len(self.final_points)
                     
-                    print(f"ROI polygon filtering: {n_before} → {n_after} nuclei ({n_before - n_after} removed)")
+                    print(f"ROI polygon filtering: {n_before} -> {n_after} nuclei ({n_before - n_after} removed)")
                     
                 elif self.roi_bbox is not None:
                     # Use bounding box for filtering
@@ -1022,7 +1022,7 @@ class SlideSegmentation():
                     self.prob_all = self.prob_all[within_roi]
                     n_after = len(self.final_points)
                     
-                    print(f"ROI bbox filtering: {n_before} → {n_after} nuclei ({n_before - n_after} removed)")
+                    print(f"ROI bbox filtering: {n_before} -> {n_after} nuclei ({n_before - n_after} removed)")
                 
                 # Update total count after all processing
                 total_nuclei = len(self.final_points)
@@ -1062,9 +1062,9 @@ class SlideSegmentation():
         
         # Performance breakdown
         if processed_tiles > 0:
-            print(f"\n{'─'*80}")
+            print(f"\n{'-'*80}")
             print(f"TIME BREAKDOWN (per tile averages):")
-            print(f"{'─'*80}")
+            print(f"{'-'*80}")
             avg_read = total_read_time / processed_tiles
             avg_normalize = total_normalize_time / processed_tiles
             avg_predict = total_predict_time / processed_tiles
@@ -1118,7 +1118,7 @@ class SlideSegmentation():
             print(f"   - Overlap: {self.overlap}")
             print(f"   - Half overlap: {half_overlap}")
             print(f"   - Stride: {stride}")
-            print(f"   - Grid: {n_rows}×{n_cols}")
+            print(f"   - Grid: {n_rows}x{n_cols}")
         
         # Only keep nuclei in "core" regions of tiles
         keep_mask = np.zeros(len(self.final_points), dtype=bool)
@@ -1167,7 +1167,7 @@ class SlideSegmentation():
                 self.final_points,
                 self.final_coord,
                 self.prob_all,
-                distance_threshold=6,  # try 6–8 pixels for histology images
+                distance_threshold=6,  # try 6-8 pixels for histology images
                 debug=debug
             )
         print(f"   - Final nuclei count: {len(self.final_points)}")
@@ -1319,7 +1319,7 @@ class SlideSegmentation():
         ax.set_ylim(-100, min(3 * self.tile_size, self.dim[1]) + 100)
         ax.set_aspect('equal')
         ax.invert_yaxis()
-        ax.set_title(f'Tile Effective Regions\nBlue: Full tile ({self.tile_size}×{self.tile_size}), ' + 
+        ax.set_title(f'Tile Effective Regions\nBlue: Full tile ({self.tile_size}x{self.tile_size}), ' + 
                     f'Green: Effective region, Red: Overlap regions ({self.overlap}px)')
         ax.set_xlabel('X (pixels)')
         ax.set_ylabel('Y (pixels)')
@@ -1369,7 +1369,7 @@ class SlideSegmentation():
         n_cols = int(np.ceil(self.dim[0] / stride))
         n_rows = int(np.ceil(self.dim[1] / stride))
         
-        print(f"Grid: {n_rows}×{n_cols} tiles")
+        print(f"Grid: {n_rows}x{n_cols} tiles")
         print(f"Tile size: {self.tile_size}, Overlap: {self.overlap}, Stride: {stride}")
         
         # Count nuclei in different regions
