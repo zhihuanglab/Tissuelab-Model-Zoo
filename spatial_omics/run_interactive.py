@@ -80,41 +80,50 @@ def main():
     print("-" * 80)
     
     while True:
-        base_dir = get_user_input(
-            "Base directory containing VisiumHD data",
-            default="."
+        data_dir = get_user_input(
+            "Data directory containing all input files",
+            default="E:/Spatial_Omics"
         )
-        if validate_path(base_dir):
+        if validate_path(data_dir):
             break
         retry = get_user_input("Try again? (y/n)", default="y")
         if retry.lower() != 'y':
             sys.exit(1)
     
-    while True:
-        bins_dir = get_user_input(
-            "Binned data directory (e.g., binned_outputs/square_002um)",
-            default=os.path.join(base_dir, "binned_outputs/square_002um")
-        )
-        if validate_path(bins_dir):
-            break
-        retry = get_user_input("Try again? (y/n)", default="y")
-        if retry.lower() != 'y':
-            sys.exit(1)
+    sample_name = get_user_input(
+        "Sample name (e.g., 'kidney' for kidney.filtered_feature_bc_matrix.h5)",
+        default="kidney"
+    )
     
-    while True:
-        segmentation_h5 = get_user_input(
-            "Segmentation H5 file path",
-            default=os.path.join(base_dir, "segmentation.h5")
-        )
-        if validate_path(segmentation_h5):
-            break
-        retry = get_user_input("Try again? (y/n)", default="y")
-        if retry.lower() != 'y':
-            sys.exit(1)
+    # Validate that required files exist
+    print("\nValidating required files...")
+    required_files = [
+        f"{sample_name}.filtered_feature_bc_matrix.h5",
+        f"{sample_name}.tissue_positions.parquet",
+        f"{sample_name}.contours_global.h5"
+    ]
+    
+    missing_files = []
+    for file in required_files:
+        file_path = Path(data_dir) / file
+        if file_path.exists():
+            print(f"  ✓ Found: {file}")
+        else:
+            print(f"  ✗ Missing: {file}")
+            missing_files.append(file)
+    
+    if missing_files:
+        print(f"\nError: Missing {len(missing_files)} required file(s).")
+        print("Please ensure all files follow the naming convention:")
+        print(f"  - {{sample}}.filtered_feature_bc_matrix.h5")
+        print(f"  - {{sample}}.tissue_positions.parquet")
+        print(f"  - {{sample}}.contours_global.h5")
+        print("\nYou can use rename_files_to_standard.py to rename your files.")
+        sys.exit(1)
     
     output_dir = get_user_input(
         "Output directory for results",
-        default=os.path.join(base_dir, "clustering_results")
+        default=os.path.join(data_dir, "results")
     )
     
     # ========================================================================
@@ -181,10 +190,13 @@ def main():
     print("\n" + "="*80)
     print("CONFIGURATION SUMMARY")
     print("="*80)
-    print(f"Base directory:       {base_dir}")
-    print(f"Binned data:          {bins_dir}")
-    print(f"Segmentation file:    {segmentation_h5}")
+    print(f"Data directory:       {data_dir}")
+    print(f"Sample name:          {sample_name}")
     print(f"Output directory:     {output_dir}")
+    print(f"\nInput files:")
+    print(f"  - {sample_name}.filtered_feature_bc_matrix.h5")
+    print(f"  - {sample_name}.tissue_positions.parquet")
+    print(f"  - {sample_name}.contours_global.h5")
     print(f"\nNumber of clusters:   {n_clusters}")
     print(f"Highly variable genes:{n_top_genes}")
     print(f"PCA components:       {n_pcs}")
@@ -207,9 +219,8 @@ def main():
     # ========================================================================
     
     config = {
-        'base_dir': base_dir,
-        'bins_dir': bins_dir,
-        'segmentation_h5': segmentation_h5,
+        'data_dir': data_dir,
+        'sample_name': sample_name,
         'n_clusters': n_clusters,
         'output_dir': output_dir,
         'n_top_genes': n_top_genes,
@@ -231,12 +242,12 @@ def main():
         print("="*80)
         print(f"\nResults saved to: {output_dir}")
         print(f"\nOutput files:")
-        print(f"  - clustering_results_k{n_clusters}.h5ad")
-        print(f"  - cluster_assignments_k{n_clusters}.csv")
-        print(f"  - top_markers_k{n_clusters}.txt")
+        print(f"  - {sample_name}.cellcharter_results_k{n_clusters}.h5ad")
+        print(f"  - {sample_name}.cluster_assignments_k{n_clusters}.csv")
+        print(f"  - {sample_name}.top_markers_k{n_clusters}.txt")
         print("\nYou can now load the results in Python:")
         print(f"  import scanpy as sc")
-        print(f"  adata = sc.read_h5ad('{output_dir}/clustering_results_k{n_clusters}.h5ad')")
+        print(f"  adata = sc.read_h5ad('{output_dir}/{sample_name}.cellcharter_results_k{n_clusters}.h5ad')")
         print("")
         
         return adata

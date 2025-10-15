@@ -9,28 +9,45 @@ cd E:\Tissuelab-Model-Zoo\spatial_omics
 pip install -r requirements.txt
 ```
 
-## Step 2: Choose Your Running Method
+## Step 2: Prepare Your Files
 
-### Option A: Interactive Mode (Easiest)
+**Important**: Files must follow the naming convention:
+- `{sample}.filtered_feature_bc_matrix.h5`
+- `{sample}.tissue_positions.parquet`
+- `{sample}.contours_global.h5`
+
+Example for "kidney" sample:
+- `kidney.filtered_feature_bc_matrix.h5`
+- `kidney.tissue_positions.parquet`
+- `kidney.contours_global.h5`
+
+### Rename existing files (if needed):
 
 ```bash
-python run_interactive.py
+# Preview what will be renamed (dry run)
+python rename_files_to_standard.py --data-dir E:/Spatial_Omics --sample-name kidney
+
+# Actually rename files
+python rename_files_to_standard.py --data-dir E:/Spatial_Omics --sample-name kidney --execute
 ```
 
-Then follow the prompts to specify:
-- Your data directory
-- Number of clusters (domains) you want
-- Output location
+## Step 3: Choose Your Running Method
+
+### Option A: Batch Script (Easiest)
+
+Edit `run_kidney_example.bat` with your paths, then run:
+```bash
+run_kidney_example.bat
+```
 
 ### Option B: Command Line (Quick)
 
 ```bash
 python visiumhd_clustering_pipeline.py \
-  --base-dir /path/to/your/data \
-  --bins-dir /path/to/your/data/binned_outputs/square_002um \
-  --segmentation-h5 /path/to/your/segmentation.h5 \
+  --data-dir E:/Spatial_Omics \
+  --sample-name kidney \
   --n-clusters 9 \
-  --output-dir /path/to/output
+  --output-dir E:/Spatial_Omics/results
 ```
 
 ### Option C: Python API (Flexible)
@@ -39,24 +56,28 @@ python visiumhd_clustering_pipeline.py \
 from visiumhd_clustering_pipeline import VisiumHDClusteringPipeline
 
 config = {
-    'base_dir': '/path/to/data',
-    'bins_dir': '/path/to/data/binned_outputs/square_002um',
-    'segmentation_h5': '/path/to/segmentation.h5',
+    'data_dir': 'E:/Spatial_Omics',
+    'sample_name': 'kidney',
     'n_clusters': 9,
-    'output_dir': '/path/to/output'
+    'output_dir': 'E:/Spatial_Omics/results'
 }
 
 pipeline = VisiumHDClusteringPipeline(config)
 adata = pipeline.run()
 ```
 
-## Step 3: View Results
+## Step 4: View Results
 
 ### Check the output directory for:
 
-1. **`clustering_results_k9.h5ad`** - Full results in AnnData format
-2. **`cluster_assignments_k9.csv`** - Simple table with cluster assignments
-3. **`top_markers_k9.txt`** - Top 10 marker genes per cluster
+1. **`{sample}.cellcharter_results_k9.h5ad`** - Full results in AnnData format
+2. **`{sample}.cluster_assignments_k9.csv`** - Simple table with cluster assignments
+3. **`{sample}.top_markers_k9.txt`** - Top 10 marker genes per cluster
+
+Example for kidney sample with K=9:
+- `kidney.cellcharter_results_k9.h5ad`
+- `kidney.cluster_assignments_k9.csv`
+- `kidney.top_markers_k9.txt`
 
 ### Load results in Python:
 
@@ -64,7 +85,7 @@ adata = pipeline.run()
 import scanpy as sc
 
 # Load the results
-adata = sc.read_h5ad('output/clustering_results_k9.h5ad')
+adata = sc.read_h5ad('results/kidney.cellcharter_results_k9.h5ad')
 
 # View cluster distribution
 print(adata.obs['cluster_k9'].value_counts())
@@ -79,13 +100,16 @@ sc.pl.embedding(adata, basis='spatial', color='cluster_k9')
 ## Example: Kidney Dataset
 
 ```bash
-# Example with the kidney data from the notebook
+# Make sure files are named correctly:
+# - kidney.filtered_feature_bc_matrix.h5
+# - kidney.tissue_positions.parquet
+# - kidney.contours_global.h5
+
 python visiumhd_clustering_pipeline.py \
-  --base-dir /path/to/Kidney \
-  --bins-dir /path/to/Kidney/binned_outputs/square_002um \
-  --segmentation-h5 /path/to/Kidney/kidney_contours_global.tiff.h5 \
+  --data-dir E:/Spatial_Omics \
+  --sample-name kidney \
   --n-clusters 9 \
-  --output-dir /path/to/Kidney/clustering_output
+  --output-dir E:/Spatial_Omics/results
 ```
 
 Expected output:
@@ -140,17 +164,20 @@ python run_multiple_k_example.py
 
 ## File Requirements
 
-Your data directory should contain:
+Your data directory should contain files following this naming convention:
 
 ```
-your_data/
-├── binned_outputs/
-│   └── square_002um/
-│       ├── filtered_feature_bc_matrix.h5
-│       └── spatial/
-│           └── tissue_positions.parquet
-└── segmentation.h5  (with SegmentationNode datasets)
+E:/Spatial_Omics/
+├── kidney.filtered_feature_bc_matrix.h5
+├── kidney.tissue_positions.parquet
+└── kidney.contours_global.h5
 ```
+
+Where:
+- `kidney` is your sample name
+- Each file follows the pattern: `{sample_name}.{file_type}`
+
+See [FILE_NAMING_CONVENTION.md](FILE_NAMING_CONVENTION.md) for more details.
 
 ## Support
 
