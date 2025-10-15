@@ -101,7 +101,7 @@ class VisiumHDClusteringPipeline:
             coords[["pxl_col_in_fullres", "pxl_row_in_fullres"]]
         )
         
-        print(f"✓ Loaded {adata_bins.shape[0]:,} bins × {adata_bins.shape[1]:,} genes")
+        print(f"[OK] Loaded {adata_bins.shape[0]:,} bins x {adata_bins.shape[1]:,} genes")
         return adata_bins
     
     def step2_load_segmentation(self):
@@ -140,7 +140,7 @@ class VisiumHDClusteringPipeline:
         }).set_index('nucleus_id')
         gdf_nuclei.dropna(inplace=True)
         
-        print(f"✓ Created {len(gdf_nuclei):,} valid polygons")
+        print(f"[OK] Created {len(gdf_nuclei):,} valid polygons")
         
         return gdf_nuclei, centroids_global
     
@@ -172,7 +172,7 @@ class VisiumHDClusteringPipeline:
         unique_barcodes = barcode_counts[barcode_counts == 1].index
         unique_joined_gdf = joined_gdf.loc[unique_barcodes]
         
-        print(f"✓ Found {len(unique_barcodes):,} bins with unique nucleus mapping")
+        print(f"[OK] Found {len(unique_barcodes):,} bins with unique nucleus mapping")
         print(f"  ({100*len(unique_barcodes)/len(adata_bins):.1f}% of total bins)")
         
         return unique_joined_gdf
@@ -241,7 +241,7 @@ class VisiumHDClusteringPipeline:
         # Add spatial key for squidpy
         nuc_adata.uns['spatial'] = {'sample': {}}
         
-        print(f"✓ Created AnnData with {nuc_adata.n_obs:,} nuclei × {nuc_adata.n_vars:,} genes")
+        print(f"[OK] Created AnnData with {nuc_adata.n_obs:,} nuclei x {nuc_adata.n_vars:,} genes")
         
         return nuc_adata
     
@@ -281,7 +281,7 @@ class VisiumHDClusteringPipeline:
         n_pcs = self.config.get('n_pcs', 30)
         sc.pp.pca(adata, n_comps=n_pcs, use_highly_variable=True)
         
-        print(f"✓ Preprocessing complete")
+        print(f"[OK] Preprocessing complete")
         print(f"  - {adata.var['highly_variable'].sum()} highly variable genes selected")
         print(f"  - PCA with {n_pcs} components computed")
         
@@ -306,7 +306,7 @@ class VisiumHDClusteringPipeline:
         )
         
         n_neighbors = (adata.obsp['spatial_connectivities'] > 0).sum() / adata.n_obs
-        print(f"✓ Spatial graph constructed")
+        print(f"[OK] Spatial graph constructed")
         print(f"  - Average neighbors per nucleus: {n_neighbors:.1f}")
         
         return adata
@@ -349,7 +349,7 @@ class VisiumHDClusteringPipeline:
         )
         adata.obs[f'cluster_k{n_clusters}'] = adata.obs[f'cluster_k{n_clusters}'].astype('category')
         
-        print(f"✓ Clustering complete - {n_clusters} clusters identified")
+        print(f"[OK] Clustering complete - {n_clusters} clusters identified")
         
         # Find marker genes
         print("Identifying marker genes for each cluster...")
@@ -426,7 +426,7 @@ class VisiumHDClusteringPipeline:
                 markers_str = ', '.join(top_markers)
                 f.write(f"Cluster {cluster_id}: {markers_str}\n")
         
-        print(f"\n✓ All results saved to: {output_dir}")
+        print(f"\n[OK] All results saved to: {output_dir}")
         
         return adata
     
