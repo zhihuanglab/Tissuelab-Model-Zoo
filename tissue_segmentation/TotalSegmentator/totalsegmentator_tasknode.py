@@ -274,17 +274,35 @@ def check_and_download_model(task_id: int, task_name: str) -> bool:
                 if trainer_dirs:
                     for trainer_dir in trainer_dirs:
                         # Check for dataset.json or plans.json or fold_0
-                        if (trainer_dir / "dataset.json").exists() or \
-                           (trainer_dir / "plans.json").exists() or \
+                        if (trainer_dir / "dataset.json").exists() and \
+                           (trainer_dir / "plans.json").exists() and \
                            (trainer_dir / "fold_0").exists():
-                            has_files = True
-                            break
+                            # Also check that fold_0 is not empty
+                            fold_0_files = list((trainer_dir / "fold_0").iterdir()) if (trainer_dir / "fold_0").is_dir() else []
+                            if len(fold_0_files) > 0:
+                                has_files = True
+                                print(f"[Model Check] OK: {task_name} (Task {task_id}) model found and appears complete")
+                                print(f"[Model Check]   Trainer: {trainer_dir.name}")
+                                print(f"[Model Check]   Files in fold_0: {len(fold_0_files)}")
+                                break
                 
                 if has_files:
-                    print(f"[Model Check] OK: {task_name} (Task {task_id}) model found and appears complete")
                     return True
                 else:
                     print(f"[Model Check] WARNING: {task_name} (Task {task_id}) directory exists but appears incomplete")
+                    print(f"[Model Check] Directory: {model_path}")
+                    if trainer_dirs:
+                        for trainer_dir in trainer_dirs:
+                            print(f"[Model Check]   Checking {trainer_dir.name}:")
+                            print(f"[Model Check]     - dataset.json: {(trainer_dir / 'dataset.json').exists()}")
+                            print(f"[Model Check]     - plans.json: {(trainer_dir / 'plans.json').exists()}")
+                            print(f"[Model Check]     - fold_0 dir: {(trainer_dir / 'fold_0').exists()}")
+                            if (trainer_dir / "fold_0").exists():
+                                fold_0_files = list((trainer_dir / "fold_0").iterdir()) if (trainer_dir / "fold_0").is_dir() else []
+                                print(f"[Model Check]     - fold_0 files: {len(fold_0_files)}")
+                    else:
+                        print(f"[Model Check]   No trainer directories found!")
+                    print(f"[Model Check] Will attempt to re-download...")
             else:
                 print(f"[Model Check] MISSING: {task_name} (Task {task_id}) model not found at {model_path}")
         
@@ -402,7 +420,9 @@ def validate_input(input_path: str) -> tuple[bool, Optional[str], str]:
     
     if input_path.is_file():
         # Check if it's a NIfTI file
-        if input_path.suffix in ['.nii', '.nii.gz']:
+        # Use suffixes to handle .nii.gz properly (Path.suffix only returns last extension)
+        file_str = str(input_path).lower()
+        if file_str.endswith('.nii.gz') or file_str.endswith('.nii'):
             return True, 'nifti', f"NIfTI file: {input_path}"
         else:
             return False, None, f"Unsupported file format: {input_path.suffix}"
@@ -998,6 +1018,34 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             if not check_and_download_model(crop_task_id, crop_task_name):
                 update_progress(100, f"Failed to download cropping model {crop_task_name}")
                 return
+        
+        # For total tasks with roi_subset, also check part models
+        # These are required for organ-specific segmentation
+        if task_name in ['total', 'total_mr'] and roi_subset:
+            print(f"[Process] Task '{task_name}' with ROI subset requires part models")
+            
+            # Check part1_organs model (Dataset291 for CT, Dataset850 for MR)
+            if task_name == 'total':
+                part1_id, part1_name = 291, "total_part1_organs"
+                part2_id, part2_name = 292, "total_part2_vertebrae"
+            else:  # total_mr
+                part1_id, part1_name = 850, "total_mr_part1_organs"
+                part2_id, part2_name = None, None  # MR doesn't have part2 yet
+            
+            print(f"[Process] Checking part1 model: {part1_name} (ID: {part1_id})")
+            if not check_and_download_model(part1_id, part1_name):
+                update_progress(100, f"Failed to download part1 model {part1_name}")
+                return
+            
+            # Check if any ROI needs vertebrae (part2)
+            vertebrae_keywords = ['vertebrae', 'vertebra', 'spinal']
+            needs_part2 = any(any(kw in organ.lower() for kw in vertebrae_keywords) for organ in roi_subset)
+            
+            if needs_part2 and part2_id:
+                print(f"[Process] ROI includes vertebrae, checking part2 model: {part2_name} (ID: {part2_id})")
+                if not check_and_download_model(part2_id, part2_name):
+                    update_progress(100, f"Failed to download part2 model {part2_name}")
+                    return
         
         update_progress(10, "Models ready")
         
