@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 """
-CellCharter TaskNode for FastAPI - TissueLab Version
+CellCharter TaskNode for FastAPI
 Performs spatial clustering on VisiumHD data and stores results in H5 files
-
-Input Requirements:
-- H5 file containing SegmentationNode with centroids and contours
-- Matrix file: {sample_name}.filtered_feature_bc_matrix.h5 (user-provided)
-- Parquet file: {sample_name}.tissue_positions.parquet (user-provided)
-
-Output:
-- Creates 'cellchart' group in H5 file with codes, categories, and num_bins
 """
 
 import os
@@ -41,49 +33,8 @@ from safe_h5_utils import safe_h5_open
 # Import VisiumHD pipeline
 from visiumhd_clustering_pipeline import VisiumHDClusteringPipeline
 
-class CustomVisiumHDClusteringPipeline(VisiumHDClusteringPipeline):
-    """
-    Custom VisiumHD clustering pipeline that reads centroids and contours from H5 SegmentationNode
-    instead of external contours_global.h5 file
-    """
-    
-    def validate_config(self):
-        """Validate configuration, but skip contours_global.h5 file validation"""
-        required_keys = [
-            'data_dir', 'sample_name', 'n_clusters', 'output_dir'
-        ]
-        for key in required_keys:
-            if key not in self.config:
-                raise ValueError(f"Missing required configuration key: {key}")
-        
-        # Build file paths based on sample name
-        from pathlib import Path
-        data_dir = Path(self.config['data_dir'])
-        sample = self.config['sample_name']
-        
-        self.config['counts_h5'] = data_dir / f"{sample}.filtered_feature_bc_matrix.h5"
-        self.config['spatial_parquet'] = data_dir / f"{sample}.tissue_positions.parquet"
-        
-        # Skip contours_h5 validation if it's provided in config (from temporary file)
-        if 'contours_h5' in self.config:
-            print(f"[Custom Pipeline] Using contours from config: {self.config['contours_h5']}")
-        else:
-            self.config['contours_h5'] = data_dir / f"{sample}.contours_global.h5"
-        
-        # Validate only matrix and parquet files exist
-        for key in ['counts_h5', 'spatial_parquet']:
-            if not self.config[key].exists():
-                raise FileNotFoundError(f"Required file not found: {self.config[key]}")
-        
-        # Validate contours file if it exists, but don't fail if it doesn't
-        contours_file = self.config['contours_h5']
-        contours_path = Path(contours_file)
-        if not contours_path.exists():
-            print(f"[Custom Pipeline] Warning: contours file not found: {contours_file}")
-            print(f"[Custom Pipeline] Will use contours from temporary file or H5 SegmentationNode")
-
 # FastAPI app
-app = FastAPI(title="CellCharter TaskNode - TissueLab Version")
+app = FastAPI(title="CellCharter TaskNode")
 
 # Add CORS middleware
 app.add_middleware(
@@ -117,7 +68,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 # Global variables
 IS_MODEL_INITED = False
 H5_PATH = None
-NODE_NAME = "cellchart"
+NODE_NAME = "CellCharterNode"
 DATA_DIR = None
 SAMPLE_NAME = None
 N_CLUSTERS = 9
@@ -156,56 +107,21 @@ def update_progress(progress: int, message: str = ""):
         progress_complete = True
     print(f"[Progress] {progress}% - {message}")
 
-def read_centroids_and_contours_from_h5(h5_path: str):
-    """
-    Read centroids and contours from SegmentationNode group in H5 file
-    Similar to how classification tasknode reads data
-    """
-    print(f"[H5] Reading centroids and contours from H5 SegmentationNode: {h5_path}")
-    
-    try:
-        with safe_h5_open(h5_path, "r") as hf:
-            # Check if SegmentationNode exists
-            if 'SegmentationNode' not in hf:
-                raise ValueError("no SegmentationNode group found in h5 file")
-            
-            seg_grp = hf['SegmentationNode']
-            
-            # Read centroids
-            if 'centroids' not in seg_grp:
-                raise ValueError("centroids dataset not found in SegmentationNode")
-            centroids = seg_grp['centroids'][()]
-            print(f"[H5] Loaded centroids: {centroids.shape}")
-            
-            # Read contours
-            if 'contours' not in seg_grp:
-                raise ValueError("contours dataset not found in SegmentationNode")
-            contours = seg_grp['contours'][()]
-            print(f"[H5] Loaded contours: {contours.shape}")
-            
-            # Read metadata if available
-            metadata = {}
-            if seg_grp.attrs:
-                for key in seg_grp.attrs:
-                    metadata[key] = seg_grp.attrs[key]
-                print(f"[H5] Loaded metadata: {metadata}")
-            
-            return centroids, contours, metadata
-            
-    except Exception as e:
-        print(f"[H5] Error reading centroids and contours: {e}")
-        raise
-
 def save_cellcharter_results_to_h5(adata, h5_path: str, sample_name: str, n_clusters: int):
     """
-    Save CellCharter clustering results to H5 file in cellchart structure
-    Following the same pattern as classification tasknode
+    Save CellCharter clustering results to H5 file in CellCharterNode structure
     
     Structure:
-        cellchart/
+        CellCharterNode/
+            centroids (N x 2): x, y coordinates of each nucleus
             codes (N,): cluster assignment codes (0 to K-1)
             categories (K,): top marker genes for each cluster (comma-separated strings)
             num_bins (N,): number of bins per nucleus
+    
+    Example categories for K=9:
+        ["NPHS2, PODXL, SYNE1, IGFBP5, ...",
+         "VIM, CD74, TAGLN, MGP, ...",
+         ...]
     """
     try:
         print(f"[H5] Saving CellCharter results to H5")
@@ -215,6 +131,10 @@ def save_cellcharter_results_to_h5(adata, h5_path: str, sample_name: str, n_clus
         
         # Extract data from AnnData
         cluster_key = f'cluster_k{n_clusters}'
+        
+        # Centroids (x, y coordinates)
+        centroids = adata.obs[['x_centroid', 'y_centroid']].values
+        print(f"[H5] Centroids shape: {centroids.shape}")
         
         # Cluster codes
         cluster_series = adata.obs[cluster_key]
@@ -248,12 +168,30 @@ def save_cellcharter_results_to_h5(adata, h5_path: str, sample_name: str, n_clus
         with safe_h5_open(h5_path, "a") as hf:
             print(f"[H5] Opened H5 file successfully")
             
-            # Create cellchart group if it doesn't exist
-            if NODE_NAME in hf:
-                del hf[NODE_NAME]
-            node_group = hf.create_group(NODE_NAME)
+            # Create CellCharterNode if it doesn't exist
+            if NODE_NAME not in hf:
+                print(f"[H5] Creating new group: {NODE_NAME}")
+                node_group = hf.create_group(NODE_NAME)
+            else:
+                print(f"[H5] Using existing group: {NODE_NAME}")
+                node_group = hf[NODE_NAME]
+            
+            # Save centroids
+            if "centroids" in node_group:
+                del node_group["centroids"]
+            centroid_dataset = node_group.create_dataset(
+                "centroids",
+                data=centroids,
+                compression='gzip',
+                chunks=True
+            )
+            centroid_dataset.attrs['description'] = 'Nucleus centroids (x, y coordinates)'
+            centroid_dataset.attrs['shape'] = str(centroids.shape)
+            print(f"[H5] Saved centroids: {centroids.shape}")
             
             # Save codes
+            if "codes" in node_group:
+                del node_group["codes"]
             codes_dataset = node_group.create_dataset(
                 "codes",
                 data=codes.astype(np.int32),
@@ -265,6 +203,9 @@ def save_cellcharter_results_to_h5(adata, h5_path: str, sample_name: str, n_clus
             print(f"[H5] Saved codes: {codes.shape}")
             
             # Save categories as variable-length strings (marker genes for each cluster)
+            if "categories" in node_group:
+                del node_group["categories"]
+            
             # Use h5py string dtype for variable-length strings
             dt = h5py.string_dtype('utf-8')
             categories_dataset = node_group.create_dataset(
@@ -279,6 +220,8 @@ def save_cellcharter_results_to_h5(adata, h5_path: str, sample_name: str, n_clus
             print(f"[H5] Saved categories with marker genes: {len(categories)} clusters")
             
             # Save num_bins
+            if "num_bins" in node_group:
+                del node_group["num_bins"]
             num_bins_dataset = node_group.create_dataset(
                 "num_bins",
                 data=num_bins.astype(np.int32),
@@ -292,7 +235,7 @@ def save_cellcharter_results_to_h5(adata, h5_path: str, sample_name: str, n_clus
             # Add metadata to node group
             node_group.attrs['sample_name'] = sample_name
             node_group.attrs['n_clusters'] = n_clusters
-            node_group.attrs['n_nuclei'] = len(codes)
+            node_group.attrs['n_nuclei'] = len(centroids)
             node_group.attrs['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
             node_group.attrs['cluster_key'] = cluster_key
             
@@ -308,32 +251,9 @@ def save_cellcharter_results_to_h5(adata, h5_path: str, sample_name: str, n_clus
         traceback.print_exc()
         raise
 
-def create_temp_contours_file(contours, centroids, temp_dir: str):
-    """
-    Create a temporary H5 file with contours and centroids in the format expected by VisiumHDClusteringPipeline
-    """
-    temp_contours_path = os.path.join(temp_dir, "temp_contours.h5")
-    
-    print(f"[TEMP] Creating temporary contours file: {temp_contours_path}")
-    
-    with h5py.File(temp_contours_path, 'w') as f:
-        # Create SegmentationNode group
-        seg_grp = f.create_group('SegmentationNode')
-        
-        # Store contours as contours_global (original format)
-        seg_grp.create_dataset('contours_global', data=contours)
-        
-        # Store centroids as centroids_global (original format)
-        seg_grp.create_dataset('centroids_global', data=centroids)
-        
-        print(f"[TEMP] Created temporary file with contours: {contours.shape} and centroids: {centroids.shape}")
-    
-    return temp_contours_path
-
 def process_clustering_sync(data_dir: str, sample_name: str, n_clusters: int, h5_path: str):
     """
     Main processing function for CellCharter clustering
-    Modified to read centroids and contours from H5 SegmentationNode
     """
     global IS_PROCESSING, CURRENT_PROGRESS, PROGRESS_MESSAGE, progress_complete
     
@@ -343,18 +263,14 @@ def process_clustering_sync(data_dir: str, sample_name: str, n_clusters: int, h5
     progress_complete = False
     
     try:
-        update_progress(5, "Reading centroids and contours from H5 SegmentationNode")
+        update_progress(5, "Validating input files")
         
-        # Read centroids and contours from H5 SegmentationNode
-        centroids, contours, metadata = read_centroids_and_contours_from_h5(h5_path)
-        
-        update_progress(10, "Validating input files")
-        
-        # Validate that required files exist
+        # Validate input files exist
         data_path = Path(data_dir)
         required_files = [
             data_path / f"{sample_name}.filtered_feature_bc_matrix.h5",
-            data_path / f"{sample_name}.tissue_positions.parquet"
+            data_path / f"{sample_name}.tissue_positions.parquet",
+            data_path / f"{sample_name}.contours_global.h5"
         ]
         
         for file in required_files:
@@ -362,16 +278,13 @@ def process_clustering_sync(data_dir: str, sample_name: str, n_clusters: int, h5
                 raise FileNotFoundError(f"Required file not found: {file}")
         
         print(f"[Process] All input files validated")
-        update_progress(15, "Input files validated")
+        update_progress(10, "Input files validated")
         
         # Create temporary output directory
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_output = Path(temp_dir)
             
-            # Create temporary contours file in the format expected by VisiumHDClusteringPipeline
-            temp_contours_path = create_temp_contours_file(contours, centroids, temp_dir)
-            
-            # Configure pipeline - exactly like original cellcharter_tasknode.py
+            # Configure pipeline
             config = {
                 'data_dir': data_dir,
                 'sample_name': sample_name,
@@ -380,71 +293,70 @@ def process_clustering_sync(data_dir: str, sample_name: str, n_clusters: int, h5
                 'n_top_genes': 2000,
                 'n_pcs': 30,
                 'n_layers': 3,
-                'random_seed': 42,
-                'contours_h5': temp_contours_path  # Use temporary contours file
+                'random_seed': 42
             }
             
-            update_progress(20, "Initializing CellCharter pipeline")
+            update_progress(15, "Initializing CellCharter pipeline")
             print(f"[Process] Pipeline config: {config}")
             
-            # Use custom VisiumHDClusteringPipeline that skips contours_global.h5 validation
-            pipeline = CustomVisiumHDClusteringPipeline(config)
+            # Run pipeline with progress updates
+            pipeline = VisiumHDClusteringPipeline(config)
             
-            # Override pipeline methods to add progress updates - exactly like cellcharter_tasknode.py
+            # Override pipeline methods to add progress updates
             original_step1 = pipeline.step1_load_binned_data
             def step1_with_progress():
                 result = original_step1()
-                update_progress(30, "Loaded binned data")
+                update_progress(25, "Loaded binned data")
                 return result
             pipeline.step1_load_binned_data = step1_with_progress
             
             original_step2 = pipeline.step2_load_segmentation
             def step2_with_progress():
                 result = original_step2()
-                update_progress(40, "Loaded segmentation data")
+                update_progress(35, "Loaded segmentation data")
                 return result
             pipeline.step2_load_segmentation = step2_with_progress
             
             original_step3 = pipeline.step3_spatial_join
             def step3_with_progress(adata_bins, gdf_nuclei):
                 result = original_step3(adata_bins, gdf_nuclei)
-                update_progress(50, "Completed spatial join")
+                update_progress(45, "Completed spatial join")
                 return result
             pipeline.step3_spatial_join = step3_with_progress
             
             original_step4 = pipeline.step4_aggregate_expression
             def step4_with_progress(adata_bins, unique_joined_gdf, centroids_global):
                 result = original_step4(adata_bins, unique_joined_gdf, centroids_global)
-                update_progress(60, "Aggregated expression data")
+                update_progress(55, "Aggregated expression data")
                 return result
             pipeline.step4_aggregate_expression = step4_with_progress
             
             original_step5 = pipeline.step5_preprocessing
             def step5_with_progress(adata):
                 result = original_step5(adata)
-                update_progress(70, "Preprocessing complete")
+                update_progress(65, "Preprocessing complete")
                 return result
             pipeline.step5_preprocessing = step5_with_progress
             
             original_step6 = pipeline.step6_spatial_graph
             def step6_with_progress(adata):
                 result = original_step6(adata)
-                update_progress(80, "Built spatial graph")
+                update_progress(75, "Built spatial graph")
                 return result
             pipeline.step6_spatial_graph = step6_with_progress
             
             original_step7 = pipeline.step7_cellcharter_clustering
             def step7_with_progress(adata):
                 result = original_step7(adata)
-                update_progress(90, "Clustering complete")
+                update_progress(85, "Clustering complete")
                 return result
             pipeline.step7_cellcharter_clustering = step7_with_progress
             
             # Run pipeline
-            update_progress(25, "Running CellCharter pipeline")
+            update_progress(20, "Running CellCharter pipeline")
             adata = pipeline.run()
             
-            update_progress(95, "Saving results to H5")
+            update_progress(90, "Saving results to H5")
             
             # Save results to H5 file
             save_cellcharter_results_to_h5(adata, h5_path, sample_name, n_clusters)
@@ -468,7 +380,7 @@ def process_clustering_sync(data_dir: str, sample_name: str, n_clusters: int, h5
 @app.get("/test")
 async def test_endpoint():
     """Simple test endpoint"""
-    return {"status": "ok", "message": "CellCharter TaskNode - TissueLab Version is running"}
+    return {"status": "ok", "message": "CellCharter TaskNode is running"}
 
 @app.post("/init")
 def init_model():
@@ -478,7 +390,7 @@ def init_model():
     global IS_MODEL_INITED
     
     print("=" * 60)
-    print("POST /init - Initializing CellCharter - TissueLab Version")
+    print("POST /init - Initializing CellCharter")
     print("=" * 60)
     
     if not IS_MODEL_INITED:
@@ -504,12 +416,14 @@ def init_model():
 def read_node(data: Dict[str, Any]):
     """
     Read configuration data from frontend
-    Modified to read from H5 file and validate required files
+    
+    Frontend format: num_cluster:9 (similar to TotalSegmentator's total:liver format)
+    Only requires num_cluster in userData - file paths are auto-detected from H5 path
     """
     global NODE_NAME, H5_PATH, DATA_DIR, SAMPLE_NAME, N_CLUSTERS
     
     print("=" * 60)
-    print("POST /read - Reading configuration - TissueLab Version")
+    print("POST /read - Reading configuration")
     print("=" * 60)
     print(f"Received data: {data}")
     
@@ -525,6 +439,9 @@ def read_node(data: Dict[str, Any]):
         DATA_DIR = str(h5_path.parent)
         
         # Sample name is extracted from H5 filename (without extension)
+        # Example: kidney.h5 -> kidney
+        #          kidney.tiff.h5 -> kidney  
+        #          kidney_output.h5 -> kidney
         h5_filename = h5_path.stem  # filename without .h5 extension
         
         # Remove common suffixes like .tiff, .svs, etc.
@@ -558,7 +475,8 @@ def read_node(data: Dict[str, Any]):
                             val_json = raw_str
                         print(f"[Read] user param {k} => {val_json}")
                         
-                        # Read num_cluster from userData
+                        # Read num_cluster from userData (matching frontend format)
+                        # data_dir and sample_name are auto-detected
                         if k == "num_cluster":
                             N_CLUSTERS = int(val_json)
                             print(f"[Read] Using num_cluster from userData: {N_CLUSTERS}")
@@ -570,7 +488,8 @@ def read_node(data: Dict[str, Any]):
         data_path = Path(DATA_DIR)
         required_files = [
             data_path / f"{SAMPLE_NAME}.filtered_feature_bc_matrix.h5",
-            data_path / f"{SAMPLE_NAME}.tissue_positions.parquet"
+            data_path / f"{SAMPLE_NAME}.tissue_positions.parquet",
+            data_path / f"{SAMPLE_NAME}.contours_global.h5"
         ]
         
         print(f"[Read] Validating required files for sample '{SAMPLE_NAME}':")
@@ -607,7 +526,7 @@ def execute_model():
     if not DATA_DIR or not SAMPLE_NAME:
         return {"status": "error", "message": "Data directory and sample name not configured. Call /read first"}
     
-    print(f"[Execute] Starting CellCharter clustering - TissueLab Version")
+    print(f"[Execute] Starting CellCharter clustering")
     print(f"[Execute] Data dir: {DATA_DIR}")
     print(f"[Execute] Sample: {SAMPLE_NAME}")
     print(f"[Execute] Clusters: {N_CLUSTERS}")
@@ -668,7 +587,7 @@ async def get_status():
     Get node status
     """
     return {
-        "status": "CellCharter TaskNode - TissueLab Version running",
+        "status": "CellCharter TaskNode running",
         "model_initialized": IS_MODEL_INITED,
         "h5_path": H5_PATH,
         "node_name": NODE_NAME,
@@ -682,7 +601,7 @@ async def get_status():
 
 def main():
     """Main function for standalone execution"""
-    parser = argparse.ArgumentParser(description="CellCharter TaskNode - TissueLab Version")
+    parser = argparse.ArgumentParser(description="CellCharter TaskNode")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8002, help="Port to bind to")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
@@ -691,14 +610,14 @@ def main():
     args = parser.parse_args()
     
     print("=" * 60)
-    print(f"{args.name} TaskNode - TissueLab Version")
+    print(f"{args.name} TaskNode")
     print("=" * 60)
     print(f"Server will start on {args.host}:{args.port}")
     print(f"Node name: {args.name}")
     print("=" * 60)
     
     uvicorn.run(
-        "cellcharter_TL_tasknode:app",
+        "cellcharter_tasknode:app",
         host=args.host,
         port=args.port,
         reload=args.reload
@@ -706,3 +625,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

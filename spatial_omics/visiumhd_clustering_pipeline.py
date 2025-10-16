@@ -119,8 +119,8 @@ class VisiumHDClusteringPipeline:
         
         print(f"Reading from: {contours_h5}")
         with h5py.File(str(contours_h5), 'r') as f:
-            contours_global = f['SegmentationNode/contours_global'][:]
-            centroids_global = f['SegmentationNode/centroids_global'][:]
+            contours_global = f['SegmentationNode/contours'][:]
+            centroids_global = f['SegmentationNode/centroids'][:]
         
         num_nuclei = contours_global.shape[0]
         print(f"Found {num_nuclei:,} nuclei")
