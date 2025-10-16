@@ -187,10 +187,156 @@ AVAILABLE_MODELS = {
     }
 }
 
-# Pydantic models - Make them more flexible
+# Mapping from tissue classes to appropriate TotalSegmentator models
+# Based on TotalSegmentator documentation: https://github.com/wasserth/TotalSegmentator
+TISSUE_CLASS_TO_MODEL_MAPPING = {
+    # Cerebral bleed specific classes
+    "intracerebral_hemorrhage": "cerebral_bleed",
+    "intracerebral_hemorrhage_left": "cerebral_bleed", 
+    "intracerebral_hemorrhage_right": "cerebral_bleed",
+    "subarachnoid_hemorrhage": "cerebral_bleed",
+    "subdural_hemorrhage": "cerebral_bleed",
+    "epidural_hemorrhage": "cerebral_bleed",
+    
+    # Lung vessel specific classes
+    "pulmonary_vein": "lung_vessels",
+    "pulmonary_artery": "lung_vessels",
+    "lung_vessels": "lung_vessels",
+    
+    # Body/thorax specific classes
+    "body": "body",
+    "thorax": "body",
+    "abdomen": "body",
+    
+    # All other anatomical structures use total model
+    # Organs (from TotalSegmentator class map)
+    "spleen": "total_3mm",
+    "kidney_right": "total_3mm",
+    "kidney_left": "total_3mm", 
+    "gallbladder": "total_3mm",
+    "liver": "total_3mm",
+    "stomach": "total_3mm",
+    "pancreas": "total_3mm",
+    "adrenal_gland_right": "total_3mm",
+    "adrenal_gland_left": "total_3mm",
+    "lung_left": "total_3mm",
+    "lung_right": "total_3mm",
+    "esophagus": "total_3mm",
+    "small_bowel": "total_3mm",
+    "duodenum": "total_3mm",
+    "colon": "total_3mm",
+    "urinary_bladder": "total_3mm",
+    "prostate": "total_3mm",
+    "brain": "total_3mm",
+    "skull": "total_3mm",
+    "heart": "total_3mm",
+    "aorta": "total_3mm",
+    "inferior_vena_cava": "total_3mm",
+    "portal_vein_and_splenic_vein": "total_3mm",
+    "iliac_artery_left": "total_3mm",
+    "iliac_artery_right": "total_3mm",
+    "iliac_vena_left": "total_3mm",
+    "iliac_vena_right": "total_3mm",
+    "humerus_left": "total_3mm",
+    "humerus_right": "total_3mm",
+    "scapula_left": "total_3mm",
+    "scapula_right": "total_3mm",
+    "clavicula_left": "total_3mm",
+    "clavicula_right": "total_3mm",
+    "femur_left": "total_3mm",
+    "femur_right": "total_3mm",
+    "hip_left": "total_3mm",
+    "hip_right": "total_3mm",
+    "spinal_cord": "total_3mm",
+    "sacrum": "total_3mm",
+    "vertebrae": "total_3mm",
+    "intervertebral_discs": "total_3mm",
+    "sternum": "total_3mm",
+    "costal_cartilages": "total_3mm",
+    
+    # Muscle groups
+    "gluteus_maximus_left": "total_3mm",
+    "gluteus_maximus_right": "total_3mm",
+    "gluteus_medius_left": "total_3mm",
+    "gluteus_medius_right": "total_3mm",
+    "gluteus_minimus_left": "total_3mm",
+    "gluteus_minimus_right": "total_3mm",
+    "autochthon_left": "total_3mm",
+    "autochthon_right": "total_3mm",
+    "iliopsoas_left": "total_3mm",
+    "iliopsoas_right": "total_3mm",
+    
+    # Ribs
+    "rib_left_1": "total_3mm",
+    "rib_left_2": "total_3mm",
+    "rib_left_3": "total_3mm",
+    "rib_left_4": "total_3mm",
+    "rib_left_5": "total_3mm",
+    "rib_left_6": "total_3mm",
+    "rib_left_7": "total_3mm",
+    "rib_left_8": "total_3mm",
+    "rib_left_9": "total_3mm",
+    "rib_left_10": "total_3mm",
+    "rib_left_11": "total_3mm",
+    "rib_left_12": "total_3mm",
+    "rib_right_1": "total_3mm",
+    "rib_right_2": "total_3mm",
+    "rib_right_3": "total_3mm",
+    "rib_right_4": "total_3mm",
+    "rib_right_5": "total_3mm",
+    "rib_right_6": "total_3mm",
+    "rib_right_7": "total_3mm",
+    "rib_right_8": "total_3mm",
+    "rib_right_9": "total_3mm",
+    "rib_right_10": "total_3mm",
+    "rib_right_11": "total_3mm",
+    "rib_right_12": "total_3mm",
+    
+    # Blood vessels
+    "common_carotid_artery_left": "total_3mm",
+    "common_carotid_artery_right": "total_3mm",
+    "brachiocephalic_vein_left": "total_3mm",
+    "brachiocephalic_vein_right": "total_3mm",
+    "atrial_appendage_left": "total_3mm",
+    "superior_vena_cava": "total_3mm",
+}
+
+def determine_model_from_tissue_classes(tissue_classes: List[str]) -> str:
+    """
+    Determine the appropriate TotalSegmentator model based on tissue classes
+    
+    Args:
+        tissue_classes: List of tissue/organ classes requested
+        
+    Returns:
+        str: Model name to use
+    """
+    if not tissue_classes:
+        return "total_3mm"  # Default to total model
+    
+    # Check if any class requires a specific model
+    for tissue_class in tissue_classes:
+        if tissue_class.lower() in TISSUE_CLASS_TO_MODEL_MAPPING:
+            model = TISSUE_CLASS_TO_MODEL_MAPPING[tissue_class.lower()]
+            print(f"[Model Selection] Tissue class '{tissue_class}' maps to model '{model}'")
+            return model
+    
+    # Default to total model for unmapped classes
+    print(f"[Model Selection] No specific model mapping found, using default 'total_3mm'")
+    return "total_3mm"
+
+# Pydantic models - Updated to match new frontend structure
 class InputData(BaseModel):
-    cerebral_bleed: Optional[str] = None
+    prompt: Optional[str] = None
     path: Optional[str] = None
+    bbox: Optional[List[int]] = None  # [x, y, width, height]
+    tissue_classes: Optional[List[str]] = None  # List of tissue/organ classes
+    tissue_colors: Optional[List[str]] = None  # List of colors for visualization
+    classifier_path: Optional[str] = None
+    save_classifier_path: Optional[str] = None
+    
+    # Legacy fields for backward compatibility
+    cerebral_bleed: Optional[str] = None
     
     class Config:
         extra = "allow"  # Allow extra fields
@@ -729,6 +875,7 @@ async def debug_raw_endpoint(request: str):
 async def init_model_flexible(request: Dict[str, Any]):
     """
     Flexible init endpoint that accepts any JSON structure
+    Updated to handle new frontend format with tissue_classes
     """
     print("=" * 60)
     print("INIT FLEXIBLE - Raw request received:")
@@ -737,7 +884,7 @@ async def init_model_flexible(request: Dict[str, Any]):
     print(f"Request content: {request}")
     print("=" * 60)
     
-    global MODEL_CONFIG, H5_PATH, NODE_NAME
+    global MODEL_CONFIG, H5_PATH, NODE_NAME, INPUT_PATH, ROI_SUBSET
     
     try:
         # Extract h5_path
@@ -758,38 +905,54 @@ async def init_model_flexible(request: Dict[str, Any]):
         
         print(f"[Init-Flexible] Input: {input_data}")
         
-        # Extract cerebral_bleed
-        cerebral_bleed_value = input_data.get('cerebral_bleed')
-        print(f"[Init-Flexible] Cerebral_bleed value: '{cerebral_bleed_value}'")
-        
         # Extract path
         input_path = input_data.get('path')
         print(f"[Init-Flexible] Input path: {input_path}")
         
-        # Process cerebral_bleed field
-        if cerebral_bleed_value and isinstance(cerebral_bleed_value, str):
+        # Extract tissue_classes (new format)
+        tissue_classes = input_data.get('tissue_classes', [])
+        print(f"[Init-Flexible] Tissue classes: {tissue_classes}")
+        
+        # Extract legacy cerebral_bleed field for backward compatibility
+        cerebral_bleed_value = input_data.get('cerebral_bleed')
+        print(f"[Init-Flexible] Cerebral_bleed value (legacy): '{cerebral_bleed_value}'")
+        
+        # Determine tissue classes from either new format or legacy format
+        if tissue_classes:
+            # Use new format
+            organs_list = tissue_classes
+            print(f"[Init-Flexible] Using new format tissue_classes: {organs_list}")
+        elif cerebral_bleed_value and isinstance(cerebral_bleed_value, str):
+            # Use legacy format
             if cerebral_bleed_value.startswith('[') and cerebral_bleed_value.endswith(']'):
                 organs_str = cerebral_bleed_value[1:-1]
                 organs_list = [organ.strip() for organ in organs_str.split(',')]
-                print(f"[Init-Flexible] Extracted organs: {organs_list}")
+                print(f"[Init-Flexible] Extracted organs from legacy format: {organs_list}")
             else:
                 organs_list = [cerebral_bleed_value.strip()]
-                print(f"[Init-Flexible] Single organ: {organs_list}")
+                print(f"[Init-Flexible] Single organ from legacy format: {organs_list}")
         else:
             organs_list = []
             print(f"[Init-Flexible] No organs specified")
         
-        # Set model (for now, default to cerebral_bleed)
-        ts_model = "cerebral_bleed"
+        # Determine appropriate model based on tissue classes
+        ts_model = determine_model_from_tissue_classes(organs_list)
+        print(f"[Init-Flexible] Selected model: {ts_model}")
         
         if ts_model not in AVAILABLE_MODELS:
             return {"status": "error", "message": f"Invalid model: {ts_model}"}
         
+        # Set global variables
         MODEL_CONFIG = AVAILABLE_MODELS[ts_model]
         H5_PATH = h5_path
         NODE_NAME = "TotalSegmentator"
+        INPUT_PATH = input_path
+        ROI_SUBSET = organs_list
         
         print(f"[Init-Flexible] Successfully initialized")
+        print(f"[Init-Flexible] Model: {ts_model}")
+        print(f"[Init-Flexible] Organs: {organs_list}")
+        print(f"[Init-Flexible] Input path: {input_path}")
         
         return {
             "status": "success",
@@ -797,7 +960,8 @@ async def init_model_flexible(request: Dict[str, Any]):
             "model": ts_model,
             "organs": organs_list,
             "h5_path": h5_path,
-            "input_path": input_path
+            "input_path": input_path,
+            "tissue_classes": organs_list
         }
         
     except Exception as e:
@@ -822,7 +986,22 @@ async def init_model_get(request: Request):
         content={
             "status": "info",
             "message": "GET request received. Use POST with JSON body.",
-            "expected_format": {
+            "new_format": {
+                "h5_path": "path/to/output.h5",
+                "step1": {
+                    "model": "TotalSegmentatorClassification",
+                    "input": {
+                        "prompt": "classes=liver",
+                        "path": "path/to/input.nii.gz",
+                        "bbox": [0, 0, 512, 512],
+                        "tissue_classes": ["liver", "spleen"],
+                        "tissue_colors": ["#bd8479", "#ff6b6b"],
+                        "classifier_path": None,
+                        "save_classifier_path": None
+                    }
+                }
+            },
+            "legacy_format": {
                 "h5_path": "path/to/output.h5",
                 "step1": {
                     "model": "TotalSegmentator",
@@ -832,7 +1011,8 @@ async def init_model_get(request: Request):
                     }
                 }
             },
-            "example_curl": "curl -X POST http://localhost:8001/init -H \"Content-Type: application/json\" -d \"{\\\"h5_path\\\": \\\"test.h5\\\", \\\"step1\\\": {\\\"model\\\": \\\"TotalSegmentator\\\", \\\"input\\\": {\\\"cerebral_bleed\\\": \\\"[intracerebral_hemorrhage]\\\", \\\"path\\\": \\\"test.nii\\\"}}}\""
+            "example_curl_new": "curl -X POST http://localhost:8001/init-flexible -H \"Content-Type: application/json\" -d \"{\\\"h5_path\\\": \\\"test.h5\\\", \\\"step1\\\": {\\\"model\\\": \\\"TotalSegmentatorClassification\\\", \\\"input\\\": {\\\"tissue_classes\\\": [\\\"liver\\\"], \\\"path\\\": \\\"test.nii.gz\\\"}}}\"",
+            "example_curl_legacy": "curl -X POST http://localhost:8001/init-flexible -H \"Content-Type: application/json\" -d \"{\\\"h5_path\\\": \\\"test.h5\\\", \\\"step1\\\": {\\\"model\\\": \\\"TotalSegmentator\\\", \\\"input\\\": {\\\"cerebral_bleed\\\": \\\"[intracerebral_hemorrhage]\\\", \\\"path\\\": \\\"test.nii\\\"}}}\""
         }
     )
 
@@ -867,6 +1047,7 @@ def init_model():
 def read_node(data: Dict[str, Any]):
     """
     Read configuration data from frontend
+    Updated to handle new frontend format with tissue_classes
     """
     global NODE_NAME, H5_PATH, MODEL_CONFIG, INPUT_PATH, ROI_SUBSET
     
@@ -887,6 +1068,8 @@ def read_node(data: Dict[str, Any]):
                 user_data_path = f"{NODE_NAME}/userData"
                 if user_data_path in hf:
                     print(f"[Read] Found userData in H5 file")
+                    tissue_classes_found = []
+                    
                     for k in hf[user_data_path].keys():
                         raw_bytes = hf[user_data_path][k][()]
                         raw_str = raw_bytes.decode("utf-8")
@@ -898,8 +1081,15 @@ def read_node(data: Dict[str, Any]):
                         
                         if k == "path":
                             INPUT_PATH = val_json
+                        elif k == "tissue_classes":
+                            # New format: tissue_classes is a list
+                            if isinstance(val_json, list):
+                                tissue_classes_found = val_json
+                                print(f"[Read] Found tissue_classes: {tissue_classes_found}")
+                            else:
+                                print(f"[Read] tissue_classes is not a list: {type(val_json)}")
                         else:
-                            # Check if k matches any available model task
+                            # Legacy format handling
                             # Map frontend field names to model names
                             field_to_model_map = {
                                 "total": "total_3mm",  # Default to 3mm version
@@ -928,6 +1118,16 @@ def read_node(data: Dict[str, Any]):
                                 # Set model configuration
                                 MODEL_CONFIG = AVAILABLE_MODELS.get(model_name)
                                 print(f"[Read] Field '{k}' => Model '{model_name}', ROI: {ROI_SUBSET}")
+                    
+                    # If we found tissue_classes in new format, use that instead
+                    if tissue_classes_found:
+                        ROI_SUBSET = tissue_classes_found
+                        # Determine model based on tissue classes
+                        selected_model = determine_model_from_tissue_classes(tissue_classes_found)
+                        MODEL_CONFIG = AVAILABLE_MODELS.get(selected_model)
+                        print(f"[Read] Using new format tissue_classes: {ROI_SUBSET}")
+                        print(f"[Read] Selected model: {selected_model}")
+                        
         except Exception as e:
             print(f"[Read] Error reading H5 file: {e}")
     
@@ -1103,6 +1303,7 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             def run_segmentation():
                 nonlocal seg_exception
                 try:
+                    print(f"[Process] Starting TotalSegmentator (no timeout)")
                     result = totalsegmentator(**ts_kwargs)
                     print(f"[Process] TotalSegmentator returned: {result}")
                     # Force sync to ensure files are written
@@ -1117,22 +1318,40 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             seg_thread = threading.Thread(target=run_segmentation)
             seg_thread.start()
             
-            # Simulate progress while segmentation is running (15% -> 68%)
-            # Update every 1 second with small increments for smoother progress
+            # Simulate progress while segmentation is running (15% -> 85%)
+            # Update every 2 seconds with small increments for smoother progress
             current_sim_progress = 15
-            update_interval = 1.0  # Update every 1 second
-            progress_increment = 2  # Increment by 2% each time
+            update_interval = 2.0  # Update every 2 seconds
+            progress_increment = 1  # Increment by 1% each time
+            max_progress = 85  # Increase max progress to 85%
             
             while seg_thread.is_alive():
                 seg_thread.join(timeout=update_interval)
-                if seg_thread.is_alive() and current_sim_progress < 68:
-                    current_sim_progress = min(current_sim_progress + progress_increment, 68)
-                    elapsed = time.time() - start_time
-                    update_progress(current_sim_progress, f"Running segmentation... ({elapsed:.0f}s elapsed)")
-                elif current_sim_progress >= 68:
-                    # Stay at 68% and just update time
-                    elapsed = time.time() - start_time
-                    update_progress(68, f"Finalizing segmentation... ({elapsed:.0f}s elapsed)")
+                elapsed = time.time() - start_time
+                
+                if seg_thread.is_alive():
+                    if current_sim_progress < max_progress:
+                        current_sim_progress = min(current_sim_progress + progress_increment, max_progress)
+                    
+                    # Provide more informative messages based on elapsed time
+                    if elapsed < 30:
+                        message = f"Initializing segmentation... ({elapsed:.0f}s elapsed)"
+                    elif elapsed < 120:
+                        message = f"Running segmentation... ({elapsed:.0f}s elapsed)"
+                    elif elapsed < 300:
+                        message = f"Processing large image... ({elapsed:.0f}s elapsed)"
+                    elif elapsed < 600:
+                        message = f"Processing very large image... ({elapsed:.0f}s elapsed)"
+                    elif elapsed < 1800:  # 30 minutes
+                        message = f"Processing complex image... ({elapsed:.0f}s elapsed)"
+                    else:
+                        message = f"Finalizing segmentation... ({elapsed:.0f}s elapsed)"
+                    
+                    update_progress(current_sim_progress, message)
+                    
+                    # Log progress every 30 seconds for debugging
+                    if int(elapsed) % 30 == 0:
+                        print(f"[Process] Still running... {elapsed:.0f}s elapsed, progress: {current_sim_progress}%")
             
             # Check if there was an exception
             if seg_exception:
@@ -1324,7 +1543,31 @@ async def get_status():
         "model_config": MODEL_CONFIG,
         "h5_path": H5_PATH,
         "node_name": NODE_NAME,
-        "is_processing": IS_PROCESSING
+        "is_processing": IS_PROCESSING,
+        "current_progress": CURRENT_PROGRESS,
+        "progress_message": PROGRESS_MESSAGE,
+        "progress_complete": progress_complete
+    }
+
+@app.get("/debug/threads")
+async def debug_threads():
+    """
+    Debug endpoint to check active threads
+    """
+    import threading
+    active_threads = []
+    for thread in threading.enumerate():
+        active_threads.append({
+            "name": thread.name,
+            "daemon": thread.daemon,
+            "alive": thread.is_alive(),
+            "ident": thread.ident
+        })
+    
+    return {
+        "active_threads": active_threads,
+        "thread_count": len(active_threads),
+        "main_thread": threading.current_thread().name
     }
 
 def main():
