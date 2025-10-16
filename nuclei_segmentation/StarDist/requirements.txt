@@ -15,7 +15,7 @@ einops>=0.7.0  # Required for transformers
 
 # Dependencies for feature pre-calculation:
 tensorflow==2.14.0; platform_system != "Darwin"  # for Windows and Linux
-tensorflow==2.16.1; platform_system == "Darwin"  # for macOS
+tensorflow==2.14.1; platform_system == "Darwin"  # for macOS
 stardist==0.9.1
 fastdist==1.1.6
 sse-starlette
