@@ -301,6 +301,120 @@ TISSUE_CLASS_TO_MODEL_MAPPING = {
     "superior_vena_cava": "total_3mm",
 }
 
+def parse_prompt_for_tissue_classes(prompt: str) -> List[str]:
+    """
+    Parse prompt field to extract tissue class names
+    Handles formats like "classes=Intracranial hemorrhage" or "Intracranial hemorrhage"
+    
+    Args:
+        prompt: Prompt string that may contain tissue class information
+        
+    Returns:
+        List[str]: Extracted tissue class names
+    """
+    if not prompt:
+        return []
+    
+    print(f"[Parse Prompt] Input prompt: '{prompt}'")
+    
+    # Look for "classes=" pattern
+    if "classes=" in prompt.lower():
+        # Extract everything after "classes="
+        parts = prompt.split("=", 1)
+        if len(parts) > 1:
+            classes_str = parts[1].strip()
+            print(f"[Parse Prompt] Found classes string: '{classes_str}'")
+            
+            # Split by comma if multiple classes
+            if "," in classes_str:
+                classes = [cls.strip() for cls in classes_str.split(",")]
+            else:
+                classes = [classes_str.strip()]
+            
+            print(f"[Parse Prompt] Extracted classes: {classes}")
+            return classes
+    
+    # If no "classes=" pattern, treat the entire prompt as a single class name
+    # (after removing common prefixes)
+    clean_prompt = prompt.strip()
+    if clean_prompt.lower().startswith("class:"):
+        clean_prompt = clean_prompt[6:].strip()
+    elif clean_prompt.lower().startswith("tissue:"):
+        clean_prompt = clean_prompt[7:].strip()
+    
+    if clean_prompt:
+        print(f"[Parse Prompt] Treating entire prompt as single class: '{clean_prompt}'")
+        return [clean_prompt]
+    
+    return []
+
+def validate_tissue_classes(tissue_classes: List[str]) -> tuple[List[str], List[str]]:
+    """
+    Validate tissue class names against TotalSegmentator's class map
+    Assumes input is already normalized (lowercase, underscores)
+    
+    Args:
+        tissue_classes: List of normalized tissue/organ classes to validate
+        
+    Returns:
+        tuple: (valid_classes, invalid_classes)
+    """
+    if not tissue_classes:
+        return [], []
+    
+    # Get all valid class names from our mapping
+    valid_class_names = set(TISSUE_CLASS_TO_MODEL_MAPPING.keys())
+    
+    valid_classes = []
+    invalid_classes = []
+    
+    for tissue_class in tissue_classes:
+        # Input should already be normalized, but double-check
+        normalized_class = tissue_class.lower().strip()
+        if normalized_class in valid_class_names:
+            valid_classes.append(normalized_class)
+        else:
+            invalid_classes.append(tissue_class)
+            print(f"[Validation] WARNING: '{tissue_class}' is not a valid TotalSegmentator class name")
+    
+    if invalid_classes:
+        print(f"[Validation] Invalid classes: {invalid_classes}")
+        print(f"[Validation] Valid classes: {valid_classes}")
+    
+    return valid_classes, invalid_classes
+
+def normalize_tissue_classes(tissue_classes: List[str]) -> List[str]:
+    """
+    Normalize tissue class names to lowercase for TotalSegmentator compatibility
+    Also validates the class names and filters out invalid ones
+    Converts spaces to underscores for proper mapping
+    
+    Args:
+        tissue_classes: List of tissue/organ classes (may have mixed case and spaces)
+        
+    Returns:
+        List[str]: Normalized and validated tissue class names in lowercase with underscores
+    """
+    if not tissue_classes:
+        return []
+    
+    # First normalize: convert to lowercase and replace spaces with underscores
+    normalized_input = []
+    for tissue_class in tissue_classes:
+        # Convert to lowercase and replace spaces with underscores
+        normalized_class = tissue_class.lower().strip().replace(' ', '_')
+        normalized_input.append(normalized_class)
+        print(f"[Normalize] '{tissue_class}' -> '{normalized_class}'")
+    
+    # Then validate and filter
+    valid_classes, invalid_classes = validate_tissue_classes(normalized_input)
+    
+    if invalid_classes:
+        print(f"[Normalize] Filtered out invalid classes: {invalid_classes}")
+        print(f"[Normalize] Using valid classes: {valid_classes}")
+    
+    return valid_classes
+
 def determine_model_from_tissue_classes(tissue_classes: List[str]) -> str:
     """
     Determine the appropriate TotalSegmentator model based on tissue classes
@@ -314,10 +428,13 @@ def determine_model_from_tissue_classes(tissue_classes: List[str]) -> str:
     if not tissue_classes:
         return "total_3mm"  # Default to total model
     
+    # Normalize tissue classes to lowercase first
+    normalized_classes = normalize_tissue_classes(tissue_classes)
+    
     # Check if any class requires a specific model
-    for tissue_class in tissue_classes:
-        if tissue_class.lower() in TISSUE_CLASS_TO_MODEL_MAPPING:
-            model = TISSUE_CLASS_TO_MODEL_MAPPING[tissue_class.lower()]
+    for tissue_class in normalized_classes:
+        if tissue_class in TISSUE_CLASS_TO_MODEL_MAPPING:
+            model = TISSUE_CLASS_TO_MODEL_MAPPING[tissue_class]
             print(f"[Model Selection] Tissue class '{tissue_class}' maps to model '{model}'")
             return model
     
@@ -935,6 +1052,10 @@ async def init_model_flexible(request: Dict[str, Any]):
             organs_list = []
             print(f"[Init-Flexible] No organs specified")
         
+        # Normalize tissue class names to lowercase for TotalSegmentator compatibility
+        organs_list = normalize_tissue_classes(organs_list)
+        print(f"[Init-Flexible] Normalized organs: {organs_list}")
+        
         # Determine appropriate model based on tissue classes
         ts_model = determine_model_from_tissue_classes(organs_list)
         print(f"[Init-Flexible] Selected model: {ts_model}")
@@ -1043,6 +1164,18 @@ def read_node(data: Dict[str, Any]):
                                 print(f"[Read] Found tissue_classes: {tissue_classes_found}")
                             else:
                                 print(f"[Read] tissue_classes is not a list: {type(val_json)}")
+                        elif k == "prompt":
+                            # Extract tissue classes from prompt field
+                            prompt_classes = parse_prompt_for_tissue_classes(val_json)
+                            if prompt_classes:
+                                print(f"[Read] Found classes in prompt: {prompt_classes}")
+                                # If we don't have tissue_classes yet, use prompt classes
+                                if not tissue_classes_found:
+                                    tissue_classes_found = prompt_classes
+                                else:
+                                    # Merge with existing tissue_classes
+                                    tissue_classes_found.extend(prompt_classes)
+                                    print(f"[Read] Merged prompt classes with existing: {tissue_classes_found}")
                         else:
                             # Legacy format handling
                             # Map frontend field names to model names
@@ -1076,9 +1209,10 @@ def read_node(data: Dict[str, Any]):
                     
                     # If we found tissue_classes in new format, use that instead
                     if tissue_classes_found:
-                        ROI_SUBSET = tissue_classes_found
+                        # Normalize tissue class names to lowercase
+                        ROI_SUBSET = normalize_tissue_classes(tissue_classes_found)
                         # Determine model based on tissue classes
-                        selected_model = determine_model_from_tissue_classes(tissue_classes_found)
+                        selected_model = determine_model_from_tissue_classes(ROI_SUBSET)
                         MODEL_CONFIG = AVAILABLE_MODELS.get(selected_model)
                         print(f"[Read] Using new format tissue_classes: {ROI_SUBSET}")
                         print(f"[Read] Selected model: {selected_model}")
@@ -1236,8 +1370,10 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             supports_roi = task_name in ['total', 'total_mr']
             
             if roi_subset and supports_roi:
-                ts_kwargs['roi_subset'] = roi_subset
-                print(f"[Process] ROI subset: {roi_subset} (task '{task_name}' supports ROI filtering)")
+                # Ensure ROI subset is normalized to lowercase
+                normalized_roi_subset = normalize_tissue_classes(roi_subset)
+                ts_kwargs['roi_subset'] = normalized_roi_subset
+                print(f"[Process] ROI subset: {normalized_roi_subset} (task '{task_name}' supports ROI filtering)")
             elif roi_subset and not supports_roi:
                 print(f"[Process] Task '{task_name}' does not support ROI filtering. Will filter results after segmentation.")
                 print(f"[Process] Requested ROI: {roi_subset}")
