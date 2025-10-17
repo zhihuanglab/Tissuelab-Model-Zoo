@@ -970,51 +970,6 @@ async def init_model_flexible(request: Dict[str, Any]):
         traceback.print_exc()
         return {"status": "error", "message": f"Initialization failed: {e}"}
 
-@app.get("/init")
-async def init_model_get(request: Request):
-    """
-    Handle GET requests to /init (for debugging)
-    """
-    print("=" * 60)
-    print("GET /init - Debugging endpoint")
-    print("=" * 60)
-    print(f"Query params: {dict(request.query_params)}")
-    print(f"Headers: {dict(request.headers)}")
-    
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "info",
-            "message": "GET request received. Use POST with JSON body.",
-            "new_format": {
-                "h5_path": "path/to/output.h5",
-                "step1": {
-                    "model": "TotalSegmentatorClassification",
-                    "input": {
-                        "prompt": "classes=liver",
-                        "path": "path/to/input.nii.gz",
-                        "bbox": [0, 0, 512, 512],
-                        "tissue_classes": ["liver", "spleen"],
-                        "tissue_colors": ["#bd8479", "#ff6b6b"],
-                        "classifier_path": None,
-                        "save_classifier_path": None
-                    }
-                }
-            },
-            "legacy_format": {
-                "h5_path": "path/to/output.h5",
-                "step1": {
-                    "model": "TotalSegmentator",
-                    "input": {
-                        "cerebral_bleed": "[intracerebral_hemorrhage]",
-                        "path": "path/to/input.nii"
-                    }
-                }
-            },
-            "example_curl_new": "curl -X POST http://localhost:8001/init-flexible -H \"Content-Type: application/json\" -d \"{\\\"h5_path\\\": \\\"test.h5\\\", \\\"step1\\\": {\\\"model\\\": \\\"TotalSegmentatorClassification\\\", \\\"input\\\": {\\\"tissue_classes\\\": [\\\"liver\\\"], \\\"path\\\": \\\"test.nii.gz\\\"}}}\"",
-            "example_curl_legacy": "curl -X POST http://localhost:8001/init-flexible -H \"Content-Type: application/json\" -d \"{\\\"h5_path\\\": \\\"test.h5\\\", \\\"step1\\\": {\\\"model\\\": \\\"TotalSegmentator\\\", \\\"input\\\": {\\\"cerebral_bleed\\\": \\\"[intracerebral_hemorrhage]\\\", \\\"path\\\": \\\"test.nii\\\"}}}\""
-        }
-    )
 
 @app.post("/init")
 def init_model():
@@ -1447,40 +1402,51 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
     finally:
         IS_PROCESSING = False
 
+@app.options("/progress")
+async def progress_options():
+    """Handle OPTIONS preflight request for CORS"""
+    return {"status": "ok"}
+
 @app.get("/progress")
 async def progress():
-    """
-    SSE endpoint to provide progress updates (primary endpoint for frontend)
-    """
+    """SSE endpoint to provide progress updates"""
     async def event_generator():
         global CURRENT_PROGRESS, PROGRESS_MESSAGE, IS_PROCESSING, progress_complete
         last_value = -1
         
-        # Don't reset CURRENT_PROGRESS here as it would override the actual processing progress!
-        print(f"[SSE] /progress stream started, current progress: {CURRENT_PROGRESS}%")
+        # Reset progress to 0 for each new connection
+        CURRENT_PROGRESS = 0
+        progress_complete = False  # Reset completion flag
         
-        while True:
-            # Check if progress changed or if it's the final 100% update
-            if CURRENT_PROGRESS != last_value or (CURRENT_PROGRESS == 100 and progress_complete):
-                if last_value > CURRENT_PROGRESS:
-                    yield {"data": str(-1)}
-                print(f"[SSE] Progress: {CURRENT_PROGRESS}% - {PROGRESS_MESSAGE}")
+        while not progress_complete and CURRENT_PROGRESS < 100:
+            if CURRENT_PROGRESS != last_value:
+                print(f"[SSE] Progress: {CURRENT_PROGRESS}%")
                 yield {"data": str(CURRENT_PROGRESS)}
                 last_value = CURRENT_PROGRESS
-                
-                # If progress reaches 100 and completion flag is set, wait a bit before breaking
-                if CURRENT_PROGRESS == 100 and progress_complete:
-                    print("Progress complete, closing connection.")
-                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
-                    break
-            
-            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+            await asyncio.sleep(0.1)
         
-        # Keep the connection open for a short time to ensure the client receives the final update
+        # Ensure final progress update to 100 is sent
+        if last_value != 100:
+            yield {"data": "100"}
+        
+        # Keep connection open briefly to ensure client receives final update
         await asyncio.sleep(1)
-        print("Progress reset to 0.")
+        
+        # Reset progress state for next run
+        CURRENT_PROGRESS = 0
+        progress_complete = False
     
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS"
+        }
+    )
 
 @app.get("/progress-json")
 async def get_progress_json():
