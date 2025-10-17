@@ -170,6 +170,8 @@ cython_debug/
 #.idea/
 
 **/checkpoints/
+!task_specific/Ark_Plus/checkpoints/
+!task_specific/Ark_Plus/checkpoints/**
 !patch_classification/MUSK/checkpoints/
 !patch_classification/MUSK/checkpoints/**
 

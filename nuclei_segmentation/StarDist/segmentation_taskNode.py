@@ -157,13 +157,25 @@ def run_segmentation(args):
             # Add max_workers to args if not present
             if not hasattr(args, 'max_workers'):
                 args.max_workers = 15
+            
+            # Use higher n_tiles for better performance with GPUs
+            # The SlideSegmentation class will auto-scale based on available resources
+            import torch
+            if torch.cuda.is_available():
+                # With GPU: use more aggressive tiling for parallelization
+                n_tiles_config = (4, 4, 1)  # 16 workers - will be auto-adjusted by SlideSegmentation
+                print(f"GPU available: Using n_tiles={n_tiles_config} for StarDist (will auto-scale)")
+            else:
+                # Without GPU: more conservative
+                n_tiles_config = (3, 3, 1)  # 9 workers
+                print(f"CPU mode: Using n_tiles={n_tiles_config} for StarDist (will auto-scale)")
                 
             ss = SlideSegmentation(args,
                                    tile_size=4096,
                                    overlap=256,
                                    prob_thresh=0.3,
                                    nms_thresh=0.3,
-                                   n_tiles=(2, 2, 1),
+                                   n_tiles=n_tiles_config,
                                    stardist_pretrain=args.stardist_pretrain,
                                    isIHC=args.isIHC,
                                    progress_callback=lambda x: update_progress(x, "segmentation"))
@@ -196,6 +208,7 @@ def run_segmentation(args):
 
         # Step C: generate embedding if dont have cached
         embedding_data = None
+        temp_h5_path = None
         if centroids is not None and len(centroids) > 0: # Ensure centroids exist and are not empty
             # create a temp H5 file path
             h5_dir = os.path.dirname(H5_PATH)
@@ -271,6 +284,14 @@ def run_segmentation(args):
 
                 hf.flush()
             time.sleep(0.5) # Reduced sleep time
+            
+            # Clean up temp embedding file after successful write
+            if temp_h5_path and os.path.exists(temp_h5_path):
+                try:
+                    os.remove(temp_h5_path)
+                    print(f"[CLEANUP] Successfully removed temp embedding file: {temp_h5_path}")
+                except Exception as e:
+                    print(f"[CLEANUP] Warning: Could not remove temp file {temp_h5_path}: {str(e)}")
         else:
             print("[H5 WRITE] Centroids are None after segmentation step, nothing to write to H5 for this node.")
 

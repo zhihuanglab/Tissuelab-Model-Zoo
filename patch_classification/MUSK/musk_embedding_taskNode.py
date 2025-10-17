@@ -70,7 +70,7 @@ def parse_args():
     # === patch classification parameters ===
     parser.add_argument('--slidepath', default='', type=str)
     parser.add_argument('--patch_size', default=224, type=int)
-    parser.add_argument('--level', default=1, type=int)
+    parser.add_argument('--level', default=0, type=int)
     parser.add_argument('--tissue_threshold', default=0.1, type=float)
     parser.add_argument('--batch_size', default=4, type=int)
     parser.add_argument('--model_path', default='model/model.safetensors', type=str)
@@ -242,7 +242,7 @@ def run_patch_classification(args):
                 raise ValueError("MUSK_MODEL not loaded => please ensure /init is called first.")
             
             # Process WSI and extract patches with embeddings
-            update_progress(10)
+            update_progress(1)
             print(f"[{NODE_NAME}] Starting to process WSI with patch_size={args.patch_size}, level={args.level}")
             
             # Define progress callback function
@@ -376,7 +376,7 @@ def read_node(data: Dict[str, Any]):
         ARGS = argparse.Namespace(
             slidepath="",
             patch_size=224,
-            level=1,
+            level=0,
             tissue_threshold=0.1,
             batch_size=4,
             model_path="model/model.safetensors"

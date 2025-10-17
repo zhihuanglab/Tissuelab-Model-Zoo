@@ -44,7 +44,7 @@ start_time = time.time()
 patch_embeddings, patch_coordinates = musk.process_whole_wsi(
     wsi_path=wsi_path,
     patch_size=patch_size,
-    level=1,
+    level=0,
     batch_size=8,
     use_tiffslide=True,
     tissue_threshold=0.1
@@ -82,7 +82,7 @@ if patch_embeddings is not None and len(patch_coordinates) > 0:
         # save metadata
         musk_node.attrs['wsi_path'] = wsi_path
         musk_node.attrs['patch_size'] = patch_size
-        musk_node.attrs['level'] = 1
+        musk_node.attrs['level'] = 0
         musk_node.attrs['embedding_dim'] = patch_embeddings.shape[1]
         musk_node.attrs['num_patches'] = len(patch_coordinates)
 
