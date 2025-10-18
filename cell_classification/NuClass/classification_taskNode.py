@@ -329,8 +329,29 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         save_classifier_params(clf, class_names, class_colors, train_data)
                         print("Classifier updated with user annotations and saved")
                 
-                predictions = clf.predict(cell_embeddings)
-                prediction_probs = clf.predict_proba(cell_embeddings)
+                # predict in batches to avoid memory issues
+                batch_size = 50000  # Process 50k cells at a time
+                n_cells = cell_embeddings.shape[0]
+                
+                predictions = np.zeros(n_cells, dtype=np.int32)
+                prediction_probs = np.zeros((n_cells, len(class_names)), dtype=np.float32)
+                
+                for i in range(0, n_cells, batch_size):
+                    end_idx = min(i + batch_size, n_cells)
+                    batch_embeddings = cell_embeddings[i:end_idx]
+                    
+                    # Predict batch
+                    batch_predictions = clf.predict(batch_embeddings)
+                    batch_probs = clf.predict_proba(batch_embeddings)
+                    
+                    # Store results
+                    predictions[i:end_idx] = batch_predictions
+                    prediction_probs[i:end_idx] = batch_probs
+                    
+                    # Clear batch data from memory
+                    del batch_embeddings, batch_predictions, batch_probs
+                
+                print(f"Completed prediction for {n_cells} cells")
                 
                 return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
         except Exception as e:
@@ -390,9 +411,29 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     clf = xgb.XGBClassifier(**xgb_params)
     clf.fit(X_train, y_train)
 
-    # predict
-    predictions = clf.predict(cell_embeddings)
-    prediction_probs = clf.predict_proba(cell_embeddings)
+    # predict in batches to avoid memory issues
+    batch_size = 50000  # Process 50k cells at a time
+    n_cells = cell_embeddings.shape[0]
+    
+    predictions = np.zeros(n_cells, dtype=np.int32)
+    prediction_probs = np.zeros((n_cells, len(class_names)), dtype=np.float32)
+    
+    for i in range(0, n_cells, batch_size):
+        end_idx = min(i + batch_size, n_cells)
+        batch_embeddings = cell_embeddings[i:end_idx]
+        
+        # Predict batch
+        batch_predictions = clf.predict(batch_embeddings)
+        batch_probs = clf.predict_proba(batch_embeddings)
+        
+        # Store results
+        predictions[i:end_idx] = batch_predictions
+        prediction_probs[i:end_idx] = batch_probs
+        
+        # Clear batch data from memory
+        del batch_embeddings, batch_predictions, batch_probs
+    
+    print(f"Completed prediction for {n_cells} cells")
 
     # save classifier parameters
     train_data = {
@@ -641,18 +682,14 @@ def read_node(data: Dict[str, Any]):
                     ARGS.organ = val_json
                 elif k == "classifier_path":
                     CLASSIFIER_PATH = val_json
-                    print(f"[ClassificationNode] classifier_path: {CLASSIFIER_PATH}")
                 elif k == "save_classifier_path":
                     SAVE_CLASSIFIER_PATH = val_json
-                    print(f"[ClassificationNode] save_classifier_path: {SAVE_CLASSIFIER_PATH}")
                 elif k == "nuclei_classes":
                     if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.nuclei_classes = val_json
-                        print(f"[ClassificationNode] nuclei_classes: {ARGS.nuclei_classes}")
                 elif k == "nuclei_colors":
                     if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.nuclei_colors = val_json
-                        print(f"[ClassificationNode] nuclei_colors: {ARGS.nuclei_colors}")
 
     return {"status": "ok", "message": "ClassificationNode read done"}
 
