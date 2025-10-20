@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from typing import List, Union, Tuple
+from typing import Optional
 from torch.utils.data import DataLoader
 import torchvision
 import PIL
@@ -23,6 +24,142 @@ import h5py
 import tiffslide
 from PIL import ImageOps
 from skimage import morphology
+from collections import OrderedDict
+
+
+class WsiPatchDataset(torch.utils.data.Dataset):
+    def __init__(self, wsi_path: str, mask: np.ndarray, width: int, height: int,
+                 patch_size: int, level: int, tissue_threshold: float,
+                 transform=None, macro_tile_factor: int = 1, profile: bool = False,
+                 use_tiffslide: bool = True, wsi_cache_mb: int = 0,
+                 strict_io: bool = True):
+        self.wsi_path = wsi_path
+        self.use_tiffslide = use_tiffslide
+        self.wsi_cache_mb = int(wsi_cache_mb) if wsi_cache_mb is not None else 0
+        self._slide_local = None  # lazily opened per-worker
+        self._fallback_image_local = None  # lazily opened per-worker
+        self.mask = mask
+        self.width = width
+        self.height = height
+        self.patch_size = patch_size
+        self.level = level
+        self.tissue_threshold = tissue_threshold
+        self.transform = transform
+        self.macro_tile_factor = max(1, int(macro_tile_factor))
+        self.profile = profile
+        self._macro_cache = OrderedDict()
+        self._macro_cache_capacity = 8
+        self.strict_io = bool(strict_io)
+
+        # Precompute accepted patch coordinates
+        coords = []
+        ps = patch_size
+        for y in range(0, height - ps + 1, ps):
+            for x in range(0, width - ps + 1, ps):
+                # 统一采用覆盖率策略，避免依赖源类型
+                patch_mask = self.mask[y:y + ps, x:x + ps]
+                if patch_mask.size == 0:
+                    continue
+                coverage = float(np.mean(patch_mask))
+                if coverage < float(self.tissue_threshold):
+                    continue
+                coords.append((x, y, x + ps, y + ps))
+        self.coords = coords
+
+    def __len__(self):
+        return len(self.coords)
+
+    def _ensure_sources(self):
+        if self._slide_local is None and self._fallback_image_local is None:
+            if self.use_tiffslide:
+                try:
+                    s = tiffslide.TiffSlide(self.wsi_path)
+                    if self.wsi_cache_mb and hasattr(s, 'with_cache'):
+                        try:
+                            s = s.with_cache(size_mb=self.wsi_cache_mb)
+                        except Exception:
+                            pass
+                    self._slide_local = s
+                except Exception:
+                    self._slide_local = None
+                    try:
+                        self._fallback_image_local = Image.open(self.wsi_path).convert("RGB")
+                    except Exception:
+                        self._fallback_image_local = None
+            else:
+                try:
+                    self._fallback_image_local = Image.open(self.wsi_path).convert("RGB")
+                except Exception:
+                    self._fallback_image_local = None
+
+    def _read_macro_tile(self, tile_x: int, tile_y: int, tile_w: int, tile_h: int) -> Image.Image:
+        self._ensure_sources()
+        key = (tile_x, tile_y, tile_w, tile_h)
+        img = self._macro_cache.get(key)
+        if img is not None:
+            # move to end (recently used)
+            self._macro_cache.move_to_end(key)
+            return img
+        try:
+            if self._slide_local is not None:
+                img = self._slide_local.read_region((tile_x, tile_y), self.level, (tile_w, tile_h)).convert("RGB")
+            else:
+                img = self._fallback_image_local.crop((tile_x, tile_y, tile_x + tile_w, tile_y + tile_h)).convert("RGB")
+        except Exception as e:
+            msg = f"Macro read failed: path={self.wsi_path}, level={self.level}, loc=({tile_x},{tile_y}), size=({tile_w},{tile_h}), macro_factor={self.macro_tile_factor}"
+            if self.strict_io:
+                raise RuntimeError(msg) from e
+            else:
+                # 非严格模式才返回空白占位
+                return Image.new('RGB', (tile_w, tile_h))
+        self._macro_cache[key] = img
+        if len(self._macro_cache) > self._macro_cache_capacity:
+            self._macro_cache.popitem(last=False)
+        return img
+
+    def _read_patch(self, x: int, y: int) -> Image.Image:
+        self._ensure_sources()
+        ps = self.patch_size
+        if self.macro_tile_factor > 1 and self._slide_local is not None:
+            step = self.macro_tile_factor * ps
+            tile_x = (x // step) * step
+            tile_y = (y // step) * step
+            tile_w = min(step, self.width - tile_x)
+            tile_h = min(step, self.height - tile_y)
+            big = self._read_macro_tile(tile_x, tile_y, tile_w, tile_h)
+            local_x = x - tile_x
+            local_y = y - tile_y
+            return big.crop((local_x, local_y, local_x + ps, local_y + ps)).convert("RGB")
+        else:
+            if self._slide_local is not None:
+                try:
+                    return self._slide_local.read_region((x, y), self.level, (ps, ps)).convert("RGB")
+                except Exception as e:
+                    msg = f"Patch read failed: path={self.wsi_path}, level={self.level}, loc=({x},{y}), size=({ps},{ps}), macro_factor={self.macro_tile_factor}"
+                    if self.strict_io:
+                        raise RuntimeError(msg) from e
+                    else:
+                        return Image.new('RGB', (ps, ps))
+            if self._fallback_image_local is not None:
+                try:
+                    return self._fallback_image_local.crop((x, y, x + ps, y + ps)).convert("RGB")
+                except Exception as e:
+                    msg = f"Patch crop failed: path={self.wsi_path}, loc=({x},{y}), size=({ps},{ps})"
+                    if self.strict_io:
+                        raise RuntimeError(msg) from e
+                    else:
+                        return Image.new('RGB', (ps, ps))
+            raise RuntimeError("No readable source (slide or fallback image) available in worker")
+
+    def __getitem__(self, idx: int):
+        x1, y1, x2, y2 = self.coords[idx]
+        img = self._read_patch(x1, y1)
+        if self.transform is not None:
+            tensor = self.transform(img)
+        else:
+            tensor = transforms.ToTensor()(img)
+        coord = torch.tensor([x1, y1, x2, y2], dtype=torch.int64)
+        return tensor, coord
 
 
 class MUSK:
@@ -58,7 +195,7 @@ class MUSK:
         )
         return model
 
-    def encode_images(self, images: Union[List[str], List[PIL.Image.Image]], batch_size: int, progress_callback=None):
+    def encode_images(self, images: Union[List[str], List[PIL.Image.Image]], batch_size: int, progress_callback=None, profile: bool = False, profile_acc: Optional[dict] = None):
         """Optimized image encoding method
         Args:
             images: List of image paths or PIL images
@@ -70,6 +207,14 @@ class MUSK:
         num_images = len(images)
         num_batches = (num_images + batch_size - 1) // batch_size
         image_embeddings = []
+        if profile and profile_acc is not None:
+            profile_acc.setdefault('encode_batches', 0)
+            profile_acc.setdefault('encode_preprocess_s', 0.0)
+            profile_acc.setdefault('encode_h2d_s', 0.0)
+            profile_acc.setdefault('encode_forward_s', 0.0)
+            profile_acc.setdefault('encode_d2h_s', 0.0)
+            profile_acc.setdefault('encode_empty_cache_s', 0.0)
+            profile_acc.setdefault('encode_load_s', 0.0)
 
         # make sure model is on GPU
         self.model = self.model.to(self.device)
@@ -78,8 +223,12 @@ class MUSK:
         with torch.cuda.amp.autocast():  # use automatic mixed precision
             with torch.no_grad():  # do not calculate gradient
                 for i in range(0, num_images, batch_size):
-                    # Clear GPU cache
+                    batch_index = (i // batch_size) + 1
+                    # Clear GPU cache (optional; can introduce overhead)
+                    t_empty0 = time.time()
                     torch.cuda.empty_cache()
+                    if profile and profile_acc is not None:
+                        profile_acc['encode_empty_cache_s'] += (time.time() - t_empty0)
                     
                     batch_slice = slice(i, min(i + batch_size, num_images))
                     batch_images = images[batch_slice]
@@ -93,6 +242,7 @@ class MUSK:
                     # If input is a list of paths, load images
                     if isinstance(batch_images[0], str):
                         loaded_images = []
+                        t_l0 = time.time() if profile else None
                         for img_path in batch_images:
                             try:
                                 img = Image.open(img_path).convert('RGB')
@@ -100,14 +250,41 @@ class MUSK:
                             except Exception as e:
                                 self.logger.warning(f"Error loading image {img_path}: {str(e)}")
                                 loaded_images.append(Image.new('RGB', (384, 384)))
+                        if profile and profile_acc is not None:
+                            profile_acc['encode_load_s'] += (time.time() - t_l0)
+                            try:
+                                from tqdm import tqdm as _tqdm
+                                _tqdm.write(f"[encode.detail] batch {batch_index}: load {time.time() - t_l0:.3f}s for {len(loaded_images)} images")
+                            except Exception:
+                                print(f"[encode.detail] batch {batch_index}: load {time.time() - t_l0:.3f}s for {len(loaded_images)} images")
                         batch_images = loaded_images
 
-                    # Preprocess batch as float32 and move to GPU
-                    processed_images = torch.stack([
+                    # Preprocess batch on CPU
+                    t_p0 = time.time()
+                    processed_images_cpu = torch.stack([
                         self.preprocess(img) for img in batch_images
-                    ]).to(self.device, dtype=torch.float32)
+                    ])
+                    if self.device == 'cuda':
+                        try:
+                            processed_images_cpu = processed_images_cpu.pin_memory()
+                        except Exception:
+                            pass
+                    t_p1 = time.time()
+                    if profile and profile_acc is not None:
+                        profile_acc['encode_preprocess_s'] += (t_p1 - t_p0)
+
+                    # Move to GPU (H2D)
+                    t_h0 = time.time()
+                    processed_images = processed_images_cpu.to(self.device, dtype=torch.float32, non_blocking=True)
+                    if profile and self.device == 'cuda':
+                        torch.cuda.synchronize()
+                    t_h1 = time.time()
+                    if profile and profile_acc is not None:
+                        profile_acc['encode_h2d_s'] += (t_h1 - t_h0)
 
                     # Model with DataParallel processing
+                    # Forward pass
+                    t_f0 = time.time()
                     batch_embeddings = self.model(
                         image=processed_images,
                         with_head=True,
@@ -115,16 +292,96 @@ class MUSK:
                         ms_aug=False,
                         return_global=True
                     )[0]
+                    if profile and self.device == 'cuda':
+                        torch.cuda.synchronize()
+                    t_f1 = time.time()
+                    if profile and profile_acc is not None:
+                        profile_acc['encode_forward_s'] += (t_f1 - t_f0)
                     
-                    # 将结果保存在CPU上以节省GPU内存
-                    image_embeddings.append(batch_embeddings.cpu())
+                    # Move embeddings to CPU (D2H) and store to reduce GPU memory pressure
+                    t_d0 = time.time()
+                    cpu_emb = batch_embeddings.detach().to('cpu', non_blocking=True)
+                    if profile and self.device == 'cuda':
+                        torch.cuda.synchronize()
+                    t_d1 = time.time()
+                    if profile and profile_acc is not None:
+                        profile_acc['encode_d2h_s'] += (t_d1 - t_d0)
+                        profile_acc['encode_batches'] += 1
+                        # realtime per-batch breakdown
+                        try:
+                            from tqdm import tqdm as _tqdm
+                            _tqdm.write(
+                                f"[encode.detail] batch {batch_index}: preprocess {t_p1 - t_p0:.3f}s | H2D {t_h1 - t_h0:.3f}s | forward {t_f1 - t_f0:.3f}s | D2H {t_d1 - t_d0:.3f}s | n={len(batch_images)}"
+                            )
+                        except Exception:
+                            print(
+                                f"[encode.detail] batch {batch_index}: preprocess {t_p1 - t_p0:.3f}s | H2D {t_h1 - t_h0:.3f}s | forward {t_f1 - t_f0:.3f}s | D2H {t_d1 - t_d0:.3f}s | n={len(batch_images)}"
+                            )
+                    image_embeddings.append(cpu_emb)
                     
         # Ensure final 100% progress callback
         if progress_callback:
             progress_callback("encode", 100)
             
-        # 最后将所有结果合并
-        return torch.cat(image_embeddings, dim=0).to(self.device)
+        # 最后将所有结果合并（保留在CPU，避免不必要的GPU往返拷贝）
+        return torch.cat(image_embeddings, dim=0)
+
+    def encode_tensors(self, batch_images_cpu: torch.Tensor, profile: bool = False, profile_acc: Optional[dict] = None):
+        """Encode a preprocessed batch of tensors (B, C, H, W) on CPU.
+        Returns CPU embeddings tensor (B, D).
+        """
+        if profile and profile_acc is not None:
+            profile_acc.setdefault('encode_h2d_s', 0.0)
+            profile_acc.setdefault('encode_forward_s', 0.0)
+            profile_acc.setdefault('encode_d2h_s', 0.0)
+            profile_acc.setdefault('encode_batches', 0)
+
+        if self.device == 'cuda':
+            try:
+                if not batch_images_cpu.is_pinned():
+                    batch_images_cpu = batch_images_cpu.pin_memory()
+            except Exception:
+                pass
+
+        self.model = self.model.to(self.device)
+        self.model.eval()
+
+        # H2D
+        t_h0 = time.time() if profile else None
+        images_gpu = batch_images_cpu.to(self.device, dtype=torch.float32, non_blocking=True)
+        if profile and self.device == 'cuda':
+            torch.cuda.synchronize()
+        t_h1 = time.time() if profile else None
+        if profile and profile_acc is not None:
+            profile_acc['encode_h2d_s'] += (t_h1 - t_h0)
+
+        # Forward
+        t_f0 = time.time() if profile else None
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            emb_gpu = self.model(
+                image=images_gpu,
+                with_head=True,
+                out_norm=True,
+                ms_aug=False,
+                return_global=True
+            )[0]
+        if profile and self.device == 'cuda':
+            torch.cuda.synchronize()
+        t_f1 = time.time() if profile else None
+        if profile and profile_acc is not None:
+            profile_acc['encode_forward_s'] += (t_f1 - t_f0)
+
+        # D2H
+        t_d0 = time.time() if profile else None
+        emb_cpu = emb_gpu.detach().to('cpu', non_blocking=True)
+        if profile and self.device == 'cuda':
+            torch.cuda.synchronize()
+        t_d1 = time.time() if profile else None
+        if profile and profile_acc is not None:
+            profile_acc['encode_d2h_s'] += (t_d1 - t_d0)
+            profile_acc['encode_batches'] += 1
+
+        return emb_cpu
 
     def encode_text(self, texts: List[str], batch_size: int):
         """Text encoding method
@@ -134,12 +391,9 @@ class MUSK:
         Returns:
             torch.Tensor: Text feature vectors
         """
-        # Load tokenizer - handle both development and packaged environments
-        import sys
-        import os
-        base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
-        tokenizer_path = os.path.join(base_path, "checkpoints", "tokenizer.spm")
-        tokenizer = XLMRobertaTokenizer(tokenizer_path)
+        # Load tokenizer
+        #tokenizer = XLMRobertaTokenizer("./model/musk/models/tokenizer.spm")
+        tokenizer = XLMRobertaTokenizer("/root/model/musk/models/tokenizer.spm")
         num_texts = len(texts)
         num_batches = (num_texts + batch_size - 1) // batch_size
         text_embeddings = []
@@ -398,7 +652,7 @@ class MUSK:
         
         return patch_embeddings
 
-    def get_tissue_mask(self, slide, edge_width_ratio=0.04, min_area=None, debug_dir=None):
+    def get_tissue_mask(self, slide, edge_width_ratio=0.04, min_area=None, debug_dir="debug"):
         """
         Generate a filled tissue mask for a whole-slide image.
 
@@ -445,21 +699,24 @@ class MUSK:
                 cv2.THRESH_BINARY_INV, 31, 10
             )
             if debug_dir:
-                imageio.imwrite(os.path.join(debug_dir, "debug_01_init_mask.png"), (mask * 255).astype(np.uint8))
+                imageio.imwrite(
+                    os.path.join(debug_dir, "debug_01_init_mask.png"),
+                    (mask * 255).astype(np.uint8)
+                )
 
             # ---------------------------------------------------------------------
             # 3. Morphological closing – bridge small gaps / tears
             # ---------------------------------------------------------------------
             mask = morphology.binary_closing(mask, morphology.disk(8))
             if debug_dir:
-                imageio.imwrite(os.path.join(debug_dir, "debug_02_closed.png"), (mask.astype(np.uint8) * 255).astype(np.uint8))
+                imageio.imwrite(os.path.join(debug_dir, "debug_02_closed.png"), mask.astype(np.uint8) * 255)
 
             # ---------------------------------------------------------------------
             # 4. Fill larger holes inside tissue islands
             # ---------------------------------------------------------------------
             mask = morphology.remove_small_holes(mask, area_threshold=int(0.001 * h * w))
             if debug_dir:
-                imageio.imwrite(os.path.join(debug_dir, "debug_03_holes.png"), (mask.astype(np.uint8) * 255).astype(np.uint8))
+                imageio.imwrite(os.path.join(debug_dir, "debug_03_holes.png"), mask.astype(np.uint8) * 255)
 
             # ---------------------------------------------------------------------
             # 5. Keep only tissue regions whose area exceeds *min_area*
@@ -475,7 +732,10 @@ class MUSK:
 
             mask = mask_clean.astype(np.uint8)
             if debug_dir:
-                imageio.imwrite(os.path.join(debug_dir, "debug_04_area.png"), (mask * 255).astype(np.uint8))
+                imageio.imwrite(
+                    os.path.join(debug_dir, "debug_04_area.png"),
+                    (mask * 255).astype(np.uint8)
+                )
 
             # ---------------------------------------------------------------------
             # 6. Detect and discard shadow / artifact regions along the slide edges
@@ -499,12 +759,18 @@ class MUSK:
                         artifact_mask[label_img2 == region.label] = 1
 
             if debug_dir:
-                imageio.imwrite(os.path.join(debug_dir, "debug_05_artifact_mask.png"), artifact_mask.astype(np.uint8) * 255)
+                imageio.imwrite(
+                    os.path.join(debug_dir, "debug_05_artifact_mask.png"),
+                    (artifact_mask.astype(np.uint8) * 255).astype(np.uint8)
+                )
 
             # Final mask: tissue minus artifacts
             final_mask = (mask.astype(bool) & (~artifact_mask.astype(bool))).astype(np.uint8)
             if debug_dir:
-                imageio.imwrite(os.path.join(debug_dir, "debug_06_final_mask.png"), (final_mask * 255).astype(np.uint8))
+                imageio.imwrite(
+                    os.path.join(debug_dir, "debug_06_final_mask.png"),
+                    (final_mask * 255).astype(np.uint8)
+                )
 
             return final_mask
 
@@ -514,28 +780,69 @@ class MUSK:
             traceback.print_exc()
             return np.ones(dim[::-1], dtype=np.uint8)
 
-    def process_whole_wsi(self, wsi_path: str, patch_size: int = 128, level: int = 0, 
-                          batch_size: int = 16, use_tiffslide: bool = True,
+    def process_whole_wsi(self, wsi_path: str, patch_size: int = 228, level: int = 0, 
+                          batch_size: int = 64, use_tiffslide: bool = True,
                           save_patches: bool = False, output_dir: str = None,
                           output_mask_path: str = None,
-                          tissue_threshold: float = 0.5, progress_callback=None):
+                          tissue_threshold: float = 0.5, progress_callback=None,
+                          profile: bool = False,
+                          wsi_cache_mb: int = 0,
+                          macro_tile_factor: int = 16,
+                          loader_workers: int = 32,
+                          prefetch_factor: int = 2):
         """Process entire WSI by dividing it into patches using streaming approach"""
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {device}")
+        if profile:
+            print("[MUSK] Profiling is enabled")
+        stats = None
+        if profile:
+            stats = {
+                'mask_s': 0.0,
+                'extract_s': 0.0,
+                'extract_count': 0,
+                'batches': 0,
+                'encode_preprocess_s': 0.0,
+                'encode_h2d_s': 0.0,
+                'encode_forward_s': 0.0,
+                'encode_d2h_s': 0.0,
+                'encode_empty_cache_s': 0.0,
+                'encode_load_s': 0.0,
+                'extract_read_s': 0.0,
+                'extract_convert_s': 0.0,
+                'macro_read_s': 0.0,
+                'macro_crop_s': 0.0,
+                'final_cat_s': 0.0,
+            }
         
         # Try WSI via tiffslide; fallback to PIL for regular images (e.g., JPG/PNG)
         slide = None
         fallback_image = None
         try:
             slide = tiffslide.TiffSlide(wsi_path)
+            if wsi_cache_mb and hasattr(slide, 'with_cache'):
+                try:
+                    slide = slide.with_cache(size_mb=int(wsi_cache_mb))
+                    if profile:
+                        print(f"[MUSK] TiffSlide cache enabled: {wsi_cache_mb} MB")
+                except Exception as _cache_err:
+                    print(f"[MUSK] Enabling TiffSlide cache failed: {_cache_err}")
             width, height = slide.dimensions
-            print("Generating tissue mask...")
-            mask = self.get_tissue_mask(slide)
-            if mask is None:
-                print("Failed to generate tissue mask")
-                return None, []
+            # print("Generating tissue mask...")
+            # t_m0 = time.time()
+            # mask = self.get_tissue_mask(slide)
+            # t_m1 = time.time()
+            # print(f"Time taken to generate tissue mask: {t_m1 - t_m0:.3f}s")
+            # if profile:
+            #     stats['mask_s'] = (t_m1 - t_m0)
+            # if mask is None:
+            #     print("Failed to generate tissue mask")
+            #     return None, []
             
+            t_r0 = time.time()
+            mask = self.get_tissue_mask(slide)
             mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+            t_r1 = time.time()
             # Export final mask if requested
             if output_mask_path:
                 try:
@@ -558,141 +865,128 @@ class MUSK:
                     except Exception:
                         pass
                 # Export final mask if requested
-                if output_mask_path:
-                    try:
-                        PILImage.fromarray((mask * 255).astype(np.uint8)).save(output_mask_path)
-                    except Exception:
-                        pass
+                # if output_mask_path:
+                #     try:
+                #         PILImage.fromarray((mask * 255).astype(np.uint8)).save(output_mask_path)
+                #     except Exception:
+                #         pass
             except Exception as pil_err:
                 self.logger.error(f"Failed to open image as WSI and as PIL: {open_err} | {pil_err}")
                 return None, []
         
-        # calculate total patches number for progress bar
-        total_rows = (height - patch_size + 1) // patch_size
-        
-        def patch_generator():
-            """Generator function, generate patches one by one"""
-            valid_patch_count = 0
-            total_patches = (width // patch_size) * (height // patch_size)
-            processed_count = 0
-            
-            # use tqdm to show row processing progress
-            for row_idx, y in enumerate(tqdm(range(0, height - patch_size + 1, patch_size), 
-                        total=total_rows,
-                        desc="Processing WSI rows",
-                        position=0)):
-                patch_batch = []
-                coord_batch = []
-                
-                for x in range(0, width - patch_size + 1, patch_size):
-                    center_x = x + patch_size // 2
-                    center_y = y + patch_size // 2
-                    
-                    if center_x >= width or center_y >= height:
-                        continue
-                        
-                    # Patch acceptance
-                    if fallback_image is not None:
-                        # For flat images, require tissue coverage within the patch (use tissue_threshold)
-                        patch_mask = mask[y:y + patch_size, x:x + patch_size]
-                        if patch_mask.size == 0:
-                            continue
-                        coverage = float(np.mean(patch_mask))
-                        if coverage < float(tissue_threshold):
-                            continue
-                    else:
-                        # For WSI, keep the original, cheaper center-pixel check to avoid level-scaling issues
-                        if mask[center_y, center_x] == 0:
-                            continue
-                    
-                    # Read the patch region
-                    if slide is not None:
-                        patch_data = slide.read_region(
-                            (x, y), level, (patch_size, patch_size)
-                        )
-                    else:
-                        # Crop directly from PIL fallback image
-                        patch_data = fallback_image.crop((x, y, x + patch_size, y + patch_size))
-                    
-                    # Handle both PIL Image and numpy array cases
-                    if isinstance(patch_data, np.ndarray):
-                        # If it's a numpy array, convert to PIL Image
-                        # Assume it's RGB format
-                        if patch_data.ndim == 2:  # Grayscale
-                            patch_img = Image.fromarray(patch_data, mode='L').convert("RGB")
-                        elif patch_data.ndim == 3:
-                            if patch_data.shape[2] == 3:  # RGB
-                                patch_img = Image.fromarray(patch_data, mode='RGB')
-                            elif patch_data.shape[2] == 4:  # RGBA
-                                patch_img = Image.fromarray(patch_data, mode='RGBA').convert("RGB")
-                            else:
-                                # Handle other cases
-                                patch_img = Image.fromarray(patch_data[:,:,:3], mode='RGB')
-                        else:
-                            raise ValueError(f"Unexpected array shape: {patch_data.shape}")
-                    else:
-                        # If it's already a PIL Image, just convert to RGB
-                        patch_img = patch_data.convert("RGB")
-                    
-                    valid_patch_count += 1
-                    patch_batch.append(patch_img)
-                    coord_batch.append((x, y, x + patch_size, y + patch_size))
-                    
-                    if save_patches:
-                        patch_path = os.path.join(output_dir, f"patch_{valid_patch_count:05d}.png")
-                        patch_img.save(patch_path)
-                    
-                    if len(patch_batch) >= batch_size:
-                        yield patch_batch, coord_batch
-                        patch_batch = []
-                        coord_batch = []
-                    
-                    processed_count += 1
-                    if progress_callback and processed_count % max(1, total_patches // 50) == 0:
-                        progress_callback("extract", int((processed_count / total_patches) * 100))
-                
-                if patch_batch:
-                    yield patch_batch, coord_batch
-                if progress_callback:
-                    row_percent = int(((row_idx + 1) / max(1, total_rows)) * 100)
-                    progress_callback("row", row_percent)
-        
+        # Build Dataset and DataLoader
+        dataset = WsiPatchDataset(
+            wsi_path=wsi_path,
+            mask=mask,
+            width=width,
+            height=height,
+            patch_size=patch_size,
+            level=level,
+            tissue_threshold=tissue_threshold,
+            transform=self.preprocess,
+            macro_tile_factor=macro_tile_factor,
+            profile=profile,
+            use_tiffslide=(slide is not None),
+            wsi_cache_mb=wsi_cache_mb
+        )
+
+        def _collate(batch):
+            imgs, coords = zip(*batch)
+            return torch.stack(imgs, dim=0), torch.stack(coords, dim=0)
+
+        pin_mem = (device.type == 'cuda')
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=max(0, int(loader_workers)),
+            pin_memory=pin_mem,
+            drop_last=False,
+            prefetch_factor=(prefetch_factor if loader_workers > 0 else None),
+            persistent_workers=(loader_workers > 0),
+            collate_fn=_collate
+        )
+
         all_embeddings = []
         all_coordinates = []
-        
-        # use generator to process patches
-        print("Starting streaming processing of patches...")
+
+        print("Starting DataLoader streaming of patches...")
         batch_count = 0
+        prev_end = time.time()
         with torch.no_grad():
             self.model = self.model.to(device)
-            
-            # use tqdm to show batch processing progress
-            for patch_batch, coord_batch in tqdm(patch_generator(),
-                                               desc="Processing patch batches",
-                                               position=1,
-                                               leave=True):
+            for imgs_cpu, coords_cpu in tqdm(loader, desc="Processing patch batches", position=1, leave=True):
+                wait_s = time.time() - prev_end
+                if profile:
+                    try:
+                        tqdm.write(f"[loader] batch {batch_count + 1}: wait {wait_s:.3f}s")
+                    except Exception:
+                        print(f"[loader] batch {batch_count + 1}: wait {wait_s:.3f}s")
                 batch_count += 1
-                # encode current batch
-                batch_embeddings = self.encode_images(patch_batch, batch_size, progress_callback)
-                if device.type == 'cuda':
-                    batch_embeddings = batch_embeddings.cpu()
-                
+
+                # Encode
+                t_e0 = time.time() if profile else None
+                batch_embeddings = self.encode_tensors(imgs_cpu, profile=profile, profile_acc=stats)
+                if profile:
+                    elapsed_enc = time.time() - t_e0
+                    try:
+                        tqdm.write(f"[encode] batch {batch_count}: total {elapsed_enc:.3f}s")
+                    except Exception:
+                        print(f"[encode] batch {batch_count}: total {elapsed_enc:.3f}s")
+
+                # Save patches if requested (re-read via dataset cache to avoid tensor -> image de-normalization)
+                if save_patches and output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
+                    for c in coords_cpu.tolist():
+                        x1, y1, x2, y2 = c
+                        img = dataset._read_patch(int(x1), int(y1))
+                        patch_path = os.path.join(output_dir, f"patch_{len(all_coordinates) + 1:05d}.png")
+                        img.save(patch_path)
+
                 all_embeddings.append(batch_embeddings)
-                all_coordinates.extend(coord_batch)
+                all_coordinates.extend(coords_cpu.tolist())
+                prev_end = time.time()
         
         # merge all results
-        if all_embeddings:
-            final_embeddings = torch.cat(all_embeddings, dim=0)
-            print(f"Encoding completed, processed {batch_count} batches, feature dimension: {final_embeddings.shape}")
-        else:
-            print("No valid tissue patches found")
-            return None, []
-        
+        t_cat0 = time.time() if profile else None
+        final_embeddings = torch.cat(all_embeddings, dim=0)
+        if profile:
+            stats['final_cat_s'] = (time.time() - t_cat0)
+            t_cat1 = time.time()
+            print(f"Time taken to merge batches: {t_cat1 - t_cat0:.3f}s")
+        if profile:
+            stats['final_cat_s'] = (t_cat1 - t_cat0)
         if save_patches:
             with open(os.path.join(output_dir, "patch_coordinates.json"), "w") as f:
                 json.dump({
                     "coordinates": all_coordinates,
                     "count": len(all_coordinates)
                 }, f, indent=4)
+        
+        if profile and stats is not None:
+            # Print a concise profiling summary
+            enc_batches = max(1, stats.get('encode_batches', batch_count))
+            print("[MUSK][Profile] mask: {:.3f}s".format(stats['mask_s']))
+            if stats.get('extract_count', 0) > 0:
+                print("[MUSK][Profile] extract.read: total {:.3f}s (~{:.6f}s/patch)".format(
+                    stats['extract_read_s'], stats['extract_read_s'] / max(1, stats['extract_count'])))
+                print("[MUSK][Profile] extract.convert: total {:.3f}s (~{:.6f}s/patch)".format(
+                    stats['extract_convert_s'], stats['extract_convert_s'] / max(1, stats['extract_count'])))
+            if stats.get('macro_read_s', 0.0) > 0.0:
+                print("[MUSK][Profile] macro.read: total {:.3f}s".format(stats['macro_read_s']))
+                print("[MUSK][Profile] macro.crop: total {:.3f}s".format(stats['macro_crop_s']))
+            print("[MUSK][Profile] encode preprocess: total {:.3f}s (~{:.3f}s/batch)".format(
+                stats['encode_preprocess_s'], stats['encode_preprocess_s'] / enc_batches))
+            print("[MUSK][Profile] encode H2D: total {:.3f}s (~{:.3f}s/batch)".format(
+                stats['encode_h2d_s'], stats['encode_h2d_s'] / enc_batches))
+            print("[MUSK][Profile] encode forward: total {:.3f}s (~{:.3f}s/batch)".format(
+                stats['encode_forward_s'], stats['encode_forward_s'] / enc_batches))
+            print("[MUSK][Profile] encode D2H: total {:.3f}s (~{:.3f}s/batch)".format(
+                stats['encode_d2h_s'], stats['encode_d2h_s'] / enc_batches))
+            if stats.get('encode_load_s', 0.0) > 0.0:
+                print("[MUSK][Profile] encode load: total {:.3f}s (~{:.3f}s/batch)".format(
+                    stats['encode_load_s'], stats['encode_load_s'] / enc_batches))
+            print("[MUSK][Profile] encode empty_cache: total {:.6f}s".format(stats['encode_empty_cache_s']))
+            print("[MUSK][Profile] final cat: {:.3f}s".format(stats['final_cat_s']))
         
         return final_embeddings, all_coordinates
