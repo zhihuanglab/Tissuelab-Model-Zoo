@@ -913,6 +913,7 @@ class MUSK:
         print("Starting DataLoader streaming of patches...")
         batch_count = 0
         prev_end = time.time()
+        total_batches = len(loader)
         with torch.no_grad():
             self.model = self.model.to(device)
             for imgs_cpu, coords_cpu in tqdm(loader, desc="Processing patch batches", position=1, leave=True):
@@ -923,6 +924,11 @@ class MUSK:
                     except Exception:
                         print(f"[loader] batch {batch_count + 1}: wait {wait_s:.3f}s")
                 batch_count += 1
+                
+                # Update progress callback
+                if progress_callback:
+                    progress_percent = int((batch_count / max(1, total_batches)) * 100)
+                    progress_callback("row", progress_percent)
 
                 # Encode
                 t_e0 = time.time() if profile else None
