@@ -162,6 +162,12 @@ class WsiPatchDataset(torch.utils.data.Dataset):
         return tensor, coord
 
 
+def _collate_fn(batch):
+    """Collate function for DataLoader - must be at module level for multiprocessing"""
+    imgs, coords = zip(*batch)
+    return torch.stack(imgs, dim=0), torch.stack(coords, dim=0)
+
+
 class MUSK:
     """MUSK model wrapper class"""
     def __init__(self, model_path="abc"):
@@ -890,10 +896,6 @@ class MUSK:
             wsi_cache_mb=wsi_cache_mb
         )
 
-        def _collate(batch):
-            imgs, coords = zip(*batch)
-            return torch.stack(imgs, dim=0), torch.stack(coords, dim=0)
-
         pin_mem = (device.type == 'cuda')
         loader = DataLoader(
             dataset,
@@ -904,7 +906,7 @@ class MUSK:
             drop_last=False,
             prefetch_factor=(prefetch_factor if loader_workers > 0 else None),
             persistent_workers=(loader_workers > 0),
-            collate_fn=_collate
+            collate_fn=_collate_fn
         )
 
         all_embeddings = []
