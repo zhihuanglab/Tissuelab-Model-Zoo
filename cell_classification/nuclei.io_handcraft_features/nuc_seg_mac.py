@@ -815,7 +815,7 @@ class SlideSegmentation():
             print("No nuclei to process for duplicate removal")
             return 0
         
-        print("\n🔍 Starting multi-pass duplicate removal...")
+        print("\n   Starting multi-pass duplicate removal...")
         start_time = time.time()
         original_count = len(self.final_points)
         '''
@@ -829,7 +829,7 @@ class SlideSegmentation():
         half_overlap = self.overlap / 2
         
         if debug:
-            print(f"\n📏 Step 1: Boundary Overlap Removal")
+            print(f"\n   Step 1: Boundary Overlap Removal")
             print(f"   - Image dimensions: {self.dim}")
             print(f"   - Tile size: {self.tile_size}")
             print(f"   - Overlap: {self.overlap}")
@@ -879,7 +879,7 @@ class SlideSegmentation():
         # ========== STEP 2: MULTI-PASS GLOBAL DEDUPLICATION ==========
         total_global_removed = 0
         if len(self.final_points) > 0:
-            print("\n📏 Step 2: Stricter Global Deduplication (Centroid Proximity, Highest Probability Wins)")
+            print("\n   Step 2: Stricter Global Deduplication (Centroid Proximity, Highest Probability Wins)")
             self.final_points, self.final_coord, self.prob_all = self.remove_strict_duplicate_cells_global(
                 self.final_points,
                 self.final_coord,
@@ -897,10 +897,10 @@ class SlideSegmentation():
         total_removed = original_count - len(self.final_points)
         
         print(f"\n✅ Deduplication complete in {time.time() - start_time:.2f}s")
-        print(f"📊 Original nuclei count: {original_count:,}")
-        #print(f"🗑️  Total removed: {total_removed:,} (boundary: {boundary_removed:,}, global: {total_global_removed:,})")
+        print(f"   Original nuclei count: {original_count:,}")
+        #print(f"  ️  Total removed: {total_removed:,} (boundary: {boundary_removed:,}, global: {total_global_removed:,})")
         print(f"✨ Final nuclei count: {len(self.final_points):,}")
-        print(f"📉 Total reduction: {total_removed/original_count*100:.2f}%")
+        print(f"   Total reduction: {total_removed/original_count*100:.2f}%")
         
         return total_removed
 
@@ -1049,7 +1049,7 @@ class SlideSegmentation():
 
     def diagnose_overlap_parameters(self):
         """诊断 overlap 参数和去重效果"""
-        print("\n🔍 诊断 Overlap 参数")
+        print("\n   诊断 Overlap 参数")
         print("="*60)
         
         # 打印实际使用的参数
@@ -1078,7 +1078,7 @@ class SlideSegmentation():
             print("No nuclei to analyze")
             return
         
-        print("\n🔍 OVERLAP DISTRIBUTION ANALYSIS")
+        print("\n   OVERLAP DISTRIBUTION ANALYSIS")
         print("="*60)
         
         # Calculate tile parameters
@@ -1141,7 +1141,7 @@ class SlideSegmentation():
             if in_vert_overlap and in_horiz_overlap:
                 nuclei_in_corner_overlap += 1
         
-        print(f"\n📊 Nuclei distribution:")
+        print(f"\n   Nuclei distribution:")
         print(f"Total nuclei: {len(self.final_points):,}")
         print(f"Nuclei in ANY overlap: {nuclei_in_overlap:,} ({nuclei_in_overlap/len(self.final_points)*100:.1f}%)")
         print(f"Nuclei in vertical overlaps: {nuclei_in_vertical_overlap:,}")
@@ -1154,7 +1154,7 @@ class SlideSegmentation():
         expected_horiz_overlap_fraction = overlap_fraction * (n_rows - 1) / n_rows
         expected_total_overlap = expected_vert_overlap_fraction + expected_horiz_overlap_fraction
         
-        print(f"\n📐 Expected overlap statistics:")
+        print(f"\n   Expected overlap statistics:")
         print(f"Overlap fraction per tile: {overlap_fraction:.3f}")
         print(f"Expected nuclei in overlaps: ~{int(len(self.final_points) * expected_total_overlap):,} ({expected_total_overlap*100:.1f}%)")
         print(f"Expected duplicates to remove: ~{int(len(self.final_points) * expected_total_overlap / 2):,} ({expected_total_overlap*50:.1f}%)")

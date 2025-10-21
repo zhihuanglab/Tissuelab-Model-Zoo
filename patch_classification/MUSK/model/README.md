@@ -22,7 +22,7 @@ Stanford University, Harvard University
 We develop **M**ultimodal transformer with **U**nified ma**SK** modeling (MUSK), a vision-language foundation model designed to leverage large-scale, unlabeled, unpaired image-text data. MUSK is pre-trained on 50 million pathology images and 1 billion pathology-related text tokens using unified masked modeling.  MUSK achieves superior performance across 23 patch-level and slide-level benchmarks, including cross-modal retrieval, visual question answering, and image classification. Importantly, MUSK shows promising performance in outcome prediction, including melanoma relapse prediction, pan-cancer prognosis prediction, and immunotherapy response prediction in lung and gastro-esophageal cancers. MUSK effectively combines complementary information from pathology images and clinical reports and can potentially improve diagnosis and precision cancer therapy.
 
 
-## 📢 News
+##    News
 
 - **Jan 8, 2025**. The [MUSK paper](https://www.nature.com/articles/s41586-024-08378-w) has been published in *Nature*.
 

@@ -792,14 +792,14 @@ class SlideSegmentation():
             print("No nuclei to process for duplicate removal")
             return 0
         
-        print("\n🔍 Starting multi-pass duplicate removal...")
+        print("\n  Starting multi-pass duplicate removal...")
         start_time = time.time()
         original_count = len(self.final_points)
         
         # ========== STEP 2: MULTI-PASS GLOBAL DEDUPLICATION ==========
         total_global_removed = 0
         if len(self.final_points) > 0:
-            print("\n📏 Step 2: Stricter Global Deduplication (Centroid Proximity, Highest Probability Wins)")
+            print("\n  Step 2: Stricter Global Deduplication (Centroid Proximity, Highest Probability Wins)")
             self.final_points, self.final_coord, self.prob_all = self.remove_strict_duplicate_cells_global(
                 self.final_points,
                 self.final_coord,
@@ -817,9 +817,9 @@ class SlideSegmentation():
         total_removed = original_count - len(self.final_points)
         
         print(f"\n✅ Deduplication complete in {time.time() - start_time:.2f}s")
-        print(f"📊 Original nuclei count: {original_count:,}")
+        print(f"  Original nuclei count: {original_count:,}")
         print(f"✨ Final nuclei count: {len(self.final_points):,}")
-        print(f"📉 Total reduction: {total_removed/original_count*100:.2f}%")
+        print(f"  Total reduction: {total_removed/original_count*100:.2f}%")
         
         return total_removed
 

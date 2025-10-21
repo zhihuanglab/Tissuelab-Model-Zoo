@@ -25,8 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from pathlib import Path
 
-from nuc_seg_mac import SlideSegmentation
-from nuc_embedding_mac import NucleiEmbedding
+from nuc_seg import SlideSegmentation
+from nuc_embedding import NucleiEmbedding
 from safe_h5_utils import safe_h5_open
 
 app = FastAPI()
@@ -235,7 +235,7 @@ def run_segmentation(args):
                 # pass the temp file path to the embedding generator
                 result_path = ne.generate_embeddings(temp_h5_path=temp_h5_path)
                 
-                # create a backup - 已禁用
+                # create a backup - disabled
                 # backup_path = os.path.join(h5_dir, f"backup_{slide_basename}_embedding.h5")
                 # try:
                 #     import shutil
@@ -490,7 +490,7 @@ async def progress():
 
 
 def main():
-    # 添加这一行来支持PyInstaller打包的可执行文件中的多进程
+    # Add this line to support multiprocessing in PyInstaller packaged executables
     if __name__ == "__main__":
         multiprocessing.freeze_support()
         multiprocess.freeze_support()

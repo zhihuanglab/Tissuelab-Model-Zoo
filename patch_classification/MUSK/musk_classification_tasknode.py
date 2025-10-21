@@ -236,13 +236,13 @@ def load_classifier_params():
 
 def save_patch_image(slide_path, coords, output_dir, index, label):
     """
-    保存patch图像
+    Save patch image
     Args:
-        slide_path: WSI图像路径
-        coords: patch坐标 [x_start, y_start, x_end, y_end]
-        output_dir: 输出目录
-        index: 样本索引
-        label: 类别标签
+        slide_path: WSI image path
+        coords: patch coordinates [x_start, y_start, x_end, y_end]
+        output_dir: output directory
+        index: sample index
+        label: class label
     """
     try:
         with tiffslide.open_slide(slide_path) as slide:
@@ -250,20 +250,20 @@ def save_patch_image(slide_path, coords, output_dir, index, label):
             width = x_end - x_start
             height = y_end - y_start
             
-            # 从slide中读取patch
+            # Read patch from slide
             patch = slide.read_region((x_start, y_start), 0, (width, height))
             patch = patch.convert('RGB')
             
-            # 创建输出目录
+            # Create output directory
             os.makedirs(output_dir, exist_ok=True)
             
-            # 保存图像
+            # Save image
             output_path = os.path.join(output_dir, 
                 f"patch_{index}_x{x_start}_y{y_start}_{width}x{height}_{label}.png")
             patch.save(output_path)
             return output_path
     except Exception as e:
-        print(f"保存patch图像时出错: {e}")
+        print(f"Error saving patch image: {e}")
         return None
 
 def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
