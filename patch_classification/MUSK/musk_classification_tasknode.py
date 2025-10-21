@@ -321,9 +321,41 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         }
                         save_classifier_params(clf, class_names, class_colors, train_data)
                         print("Classifier updated with user annotations and saved")
+                    else:
+                        print(f"No common classes found between existing ({existing_classes}) and annotated ({annotated_classes}) classes. Retraining classifier...")
+                        # Force retraining by raising an exception to go to the new classifier creation section
+                        raise ValueError("No common classes, need to retrain classifier")
                 
-                predictions = clf.predict(cell_embeddings)
-                prediction_probs = clf.predict_proba(cell_embeddings)
+                # predict in chunks to avoid GPU memory issues
+                batch_size = 10000  # Process 10k samples at a time
+                n_samples = len(cell_embeddings)
+                predictions = np.zeros(n_samples, dtype=int)
+                
+                # Get the actual number of classes from the classifier
+                n_classes = clf.n_classes_
+                prediction_probs = np.zeros((n_samples, n_classes), dtype=np.float32)
+                
+                print(f"Predicting {n_samples} samples in batches of {batch_size}")
+                for i in range(0, n_samples, batch_size):
+                    end_idx = min(i + batch_size, n_samples)
+                    batch_embeddings = cell_embeddings[i:end_idx]
+                    
+                    # Clear GPU memory before each batch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    batch_predictions = clf.predict(batch_embeddings)
+                    batch_probs = clf.predict_proba(batch_embeddings)
+                    
+                    print(f"Debug: batch_probs shape: {batch_probs.shape}, prediction_probs slice shape: {prediction_probs[i:end_idx].shape}")
+                    print(f"Debug: n_classes: {n_classes}, batch_size: {batch_size}")
+                    
+                    predictions[i:end_idx] = batch_predictions
+                    prediction_probs[i:end_idx] = batch_probs
+                    
+                    print(f"Processed batch {i//batch_size + 1}/{(n_samples + batch_size - 1)//batch_size}")
+                
+                print("Prediction completed")
                 
                 return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
         except Exception as e:
@@ -336,7 +368,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         return None  # Signal to caller to use zero-shot instead
     
     unique_classes = annotations['tissue_class'].unique().tolist()
-    if len(unique_classes) < 1:
+    if len(unique_classes) < 2:
         raise ValueError("Need at least 2 classes in annotation => fallback to zero-shot")
 
     class_names = []
@@ -385,9 +417,36 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     clf = xgb.XGBClassifier(**xgb_params)
     clf.fit(X_train, y_train)
 
-    # predict
-    predictions = clf.predict(cell_embeddings)
-    prediction_probs = clf.predict_proba(cell_embeddings)
+    # predict in chunks to avoid GPU memory issues
+    batch_size = 10000  # Process 10k samples at a time
+    n_samples = len(cell_embeddings)
+    predictions = np.zeros(n_samples, dtype=int)
+    
+    # Get the actual number of classes from the classifier
+    n_classes = clf.n_classes_
+    prediction_probs = np.zeros((n_samples, n_classes), dtype=np.float32)
+    
+    print(f"Predicting {n_samples} samples in batches of {batch_size}")
+    for i in range(0, n_samples, batch_size):
+        end_idx = min(i + batch_size, n_samples)
+        batch_embeddings = cell_embeddings[i:end_idx]
+        
+        # Clear GPU memory before each batch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        batch_predictions = clf.predict(batch_embeddings)
+        batch_probs = clf.predict_proba(batch_embeddings)
+        
+        print(f"Debug: batch_probs shape: {batch_probs.shape}, prediction_probs slice shape: {prediction_probs[i:end_idx].shape}")
+        print(f"Debug: n_classes: {n_classes}, batch_size: {batch_size}")
+        
+        predictions[i:end_idx] = batch_predictions
+        prediction_probs[i:end_idx] = batch_probs
+        
+        print(f"Processed batch {i//batch_size + 1}/{(n_samples + batch_size - 1)//batch_size}")
+    
+    print("Prediction completed")
 
     # save classifier parameters
     train_data = {
@@ -666,6 +725,7 @@ def read_node(data: Dict[str, Any]):
                     ARGS.slidepath = val_json
                 elif k == "classifier_path":
                     CLASSIFIER_PATH = val_json
+                    print(f"[{NODE_NAME}] Set CLASSIFIER_PATH to: {CLASSIFIER_PATH}")
                 elif k == "save_classifier_path":
                     SAVE_CLASSIFIER_PATH = val_json
                 elif k == "tissue_classes":
@@ -679,6 +739,10 @@ def read_node(data: Dict[str, Any]):
                     if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.tissue_colors = val_json
                         print(f"[{NODE_NAME}] tissue_colors: {ARGS.tissue_colors}")
+        
+        # Debug: Print final classifier path values
+        print(f"[{NODE_NAME}] Final CLASSIFIER_PATH: {CLASSIFIER_PATH}")
+        print(f"[{NODE_NAME}] Final SAVE_CLASSIFIER_PATH: {SAVE_CLASSIFIER_PATH}")
 
     return {"status": "ok", "message": f"[{NODE_NAME}] read done"}
 
