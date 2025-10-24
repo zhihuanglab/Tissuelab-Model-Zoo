@@ -183,3 +183,13 @@ tissue_segmentation/TotalSegmentator/TotalSegmentator-master/tests/
 tissue_segmentation/TotalSegmentator/models/config.json
 tissue_segmentation/TotalSegmentator/models/config.json
 tissue_segmentation/TotalSegmentator/models/config.json
+# StarDist 测试文件
+nuclei_segmentation/StarDist/diagnose_single_tile.py
+nuclei_segmentation/StarDist/profile_nms.py
+nuclei_segmentation/StarDist/quick_normalize_test.py
+nuclei_segmentation/StarDist/test_10_tiles.py
+nuclei_segmentation/StarDist/test_multithreaded.py
+nuclei_segmentation/StarDist/test_single_thread.py
+nuclei_segmentation/StarDist/test_thread_local.py
+nuclei_segmentation/StarDist/test_nms_sweep.py
+nuclei_segmentation/StarDist/test_parallel_nms.py
