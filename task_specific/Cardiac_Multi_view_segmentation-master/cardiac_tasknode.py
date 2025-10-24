@@ -10,6 +10,10 @@ import os
 import sys
 import io
 import argparse
+import logging
+import shutil
+import requests
+from urllib.parse import urlparse
 
 # Fix Windows console encoding for emoji and special characters
 if sys.platform == 'win32':
@@ -20,6 +24,18 @@ if sys.platform == 'win32':
         # Python < 3.7
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('cardiac_tasknode.log', encoding='utf-8')
+    ]
+)
+logger = logging.getLogger(__name__)
+
 import h5py
 import numpy as np
 import time
@@ -43,6 +59,7 @@ SCRIPT_DIR = Path(__file__).parent.absolute()
 sys.path.insert(0, str(SCRIPT_DIR))
 
 # Import cardiac segmentation modules
+predict_import_error = None
 try:
     import torch
     import SimpleITK as sitk
@@ -50,6 +67,10 @@ try:
     print(f"[Cardiac] Successfully imported dependencies")
 except ImportError as e:
     print(f"[Cardiac] Warning: Failed to import dependencies: {e}")
+    predict_import_error = str(e)
+    # Define a dummy predict function if import fails
+    def predict(*args, **kwargs):
+        raise ImportError(f"Failed to import predict function: {predict_import_error}")
 
 # Import safe H5 utilities
 sys.path.append(str(SCRIPT_DIR.parent.parent))
@@ -93,7 +114,8 @@ AVAILABLE_VIEWS = {
         "num_classes": 4,
         "class_names": ["Background", "LV cavity", "Myocardium", "RV cavity"],
         "default_batch_size": 8,
-        "multi_slice": True
+        "multi_slice": True,
+        "model_url": "https://github.com/TissueLab-AI/cardiac-models/releases/download/v1.0/Unet_LVSA_trained_from_UKBB.pkl"
     },
     "4CH": {
         "name": "4-Chamber View",
@@ -102,7 +124,8 @@ AVAILABLE_VIEWS = {
         "num_classes": 2,
         "class_names": ["Background", "Myocardium"],
         "default_batch_size": 1,
-        "multi_slice": False
+        "multi_slice": False,
+        "model_url": "https://github.com/TissueLab-AI/cardiac-models/releases/download/v1.0/Unet_4CH_best.pkl"
     },
     "VLA": {
         "name": "Vertical Long Axis",
@@ -111,7 +134,8 @@ AVAILABLE_VIEWS = {
         "num_classes": 2,
         "class_names": ["Background", "Myocardium"],
         "default_batch_size": 1,
-        "multi_slice": False
+        "multi_slice": False,
+        "model_url": "https://github.com/TissueLab-AI/cardiac-models/releases/download/v1.0/Unet_VLA_best.pkl"
     },
     "LVOT": {
         "name": "Left Ventricular Outflow Tract",
@@ -120,8 +144,17 @@ AVAILABLE_VIEWS = {
         "num_classes": 2,
         "class_names": ["Background", "Myocardium"],
         "default_batch_size": 1,
-        "multi_slice": False
+        "multi_slice": False,
+        "model_url": "https://github.com/TissueLab-AI/cardiac-models/releases/download/v1.0/Unet_LVOT_best.pkl"
     }
+}
+
+# Model download configuration
+MODEL_DOWNLOAD_CONFIG = {
+    "timeout": 300,  # 5 minutes timeout
+    "chunk_size": 8192,  # 8KB chunks
+    "retry_attempts": 3,
+    "retry_delay": 5  # seconds
 }
 
 # Pydantic models
@@ -141,7 +174,144 @@ def update_progress(progress: int, message: str = ""):
     PROGRESS_MESSAGE = message
     if progress >= 100:
         progress_complete = True
+    logger.info(f"[Progress] {progress}% - {message}")
     print(f"[Progress] {progress}% - {message}")
+
+def download_model(model_url: str, model_path: Path, progress_callback=None) -> bool:
+    """
+    Download model file from URL
+    
+    Args:
+        model_url: URL to download model from
+        model_path: Local path to save model
+        progress_callback: Optional callback for progress updates
+        
+    Returns:
+        bool: True if download successful, False otherwise
+    """
+    logger.info(f"[Model Download] Starting download from {model_url}")
+    logger.info(f"[Model Download] Saving to {model_path}")
+    
+    try:
+        # Create directory if it doesn't exist
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Download with progress tracking
+        response = requests.get(model_url, stream=True, timeout=MODEL_DOWNLOAD_CONFIG["timeout"])
+        response.raise_for_status()
+        
+        total_size = int(response.headers.get('content-length', 0))
+        downloaded_size = 0
+        
+        logger.info(f"[Model Download] Total size: {total_size / (1024*1024):.2f} MB")
+        
+        with open(model_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=MODEL_DOWNLOAD_CONFIG["chunk_size"]):
+                if chunk:
+                    f.write(chunk)
+                    downloaded_size += len(chunk)
+                    
+                    if progress_callback and total_size > 0:
+                        progress_percent = int((downloaded_size / total_size) * 100)
+                        progress_callback(progress_percent, f"Downloading model... {downloaded_size / (1024*1024):.1f}MB / {total_size / (1024*1024):.1f}MB")
+        
+        logger.info(f"[Model Download] Download completed successfully")
+        return True
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"[Model Download] Failed to download model: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"[Model Download] Unexpected error during download: {e}")
+        return False
+
+def ensure_model_available(view_name: str) -> bool:
+    """
+    Ensure model file is available, download if missing
+    
+    Args:
+        view_name: Name of the view (LVSA, 4CH, VLA, LVOT)
+        
+    Returns:
+        bool: True if model is available, False otherwise
+    """
+    logger.info(f"[Model Check] Checking model availability for view: {view_name}")
+    
+    if view_name not in AVAILABLE_VIEWS:
+        logger.error(f"[Model Check] Invalid view name: {view_name}")
+        return False
+    
+    view_config = AVAILABLE_VIEWS[view_name]
+    model_path = SCRIPT_DIR / view_config['model_path']
+    
+    logger.info(f"[Model Check] Model path: {model_path}")
+    
+    # Check if model file exists
+    if model_path.exists():
+        file_size = model_path.stat().st_size
+        logger.info(f"[Model Check] Model file exists, size: {file_size / (1024*1024):.2f} MB")
+        
+        # Check if file is not empty
+        if file_size > 0:
+            logger.info(f"[Model Check] Model file is valid")
+            return True
+        else:
+            logger.warning(f"[Model Check] Model file is empty, will re-download")
+    
+    # Model file doesn't exist or is empty, try to download
+    logger.info(f"[Model Check] Model file missing, attempting download...")
+    
+    if 'model_url' not in view_config:
+        logger.error(f"[Model Check] No download URL configured for view: {view_name}")
+        return False
+    
+    # Try to copy from tissue_segmentation version first
+    tissue_seg_model_path = Path("E:/Tissuelab-Model-Zoo/tissue_segmentation/Cardiac_Multi_view_segmentation-master") / view_config['model_path']
+    if tissue_seg_model_path.exists():
+        logger.info(f"[Model Check] Found model in tissue_segmentation version, copying...")
+        try:
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(tissue_seg_model_path, model_path)
+            logger.info(f"[Model Check] Successfully copied model from tissue_segmentation version")
+            return True
+        except Exception as e:
+            logger.warning(f"[Model Check] Failed to copy from tissue_segmentation: {e}")
+    
+    # If copy failed, try downloading from URL
+    logger.info(f"[Model Check] Attempting to download from URL...")
+    success = download_model(
+        view_config['model_url'], 
+        model_path,
+        lambda p, m: logger.info(f"[Model Download] {p}% - {m}")
+    )
+    
+    if success:
+        logger.info(f"[Model Check] Model download completed successfully")
+        return True
+    else:
+        logger.error(f"[Model Check] Failed to download model for view: {view_name}")
+        return False
+
+def check_all_models() -> Dict[str, bool]:
+    """
+    Check availability of all models
+    
+    Returns:
+        Dict mapping view names to availability status
+    """
+    logger.info(f"[Model Check] Checking all available models...")
+    model_status = {}
+    
+    for view_name in AVAILABLE_VIEWS.keys():
+        logger.info(f"[Model Check] Checking model for view: {view_name}")
+        model_status[view_name] = ensure_model_available(view_name)
+        logger.info(f"[Model Check] View {view_name}: {'Available' if model_status[view_name] else 'Not Available'}")
+    
+    available_count = sum(model_status.values())
+    total_count = len(model_status)
+    logger.info(f"[Model Check] Model availability summary: {available_count}/{total_count} models available")
+    
+    return model_status
 
 def validate_input(input_path: str) -> tuple[bool, Optional[str], str]:
     """
@@ -235,7 +405,13 @@ def save_segmentation_to_h5(segmentation_data: np.ndarray, original_image: sitk.
         print(f"[H5] Starting to save segmentation to H5")
         print(f"[H5] Data shape: {segmentation_data.shape}")
         print(f"[H5] Data type: {segmentation_data.dtype}")
+        print(f"[H5] Data min: {segmentation_data.min()}, max: {segmentation_data.max()}, non-zero count: {np.count_nonzero(segmentation_data)}")
         print(f"[H5] H5 path: {h5_path}")
+        
+        # Ensure data is uint8
+        if segmentation_data.dtype != np.uint8:
+            print(f"[H5] Converting data from {segmentation_data.dtype} to uint8")
+            segmentation_data = segmentation_data.astype(np.uint8)
         
         with safe_h5_open(h5_path, "a") as hf:
             print(f"[H5] Opened H5 file successfully")
@@ -331,10 +507,13 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
     """
     global IS_PROCESSING, CURRENT_PROGRESS, PROGRESS_MESSAGE, progress_complete
     
+
     IS_PROCESSING = True
     CURRENT_PROGRESS = 0
     PROGRESS_MESSAGE = "Starting segmentation"
     progress_complete = False
+    
+    print(f"[Process] Starting new segmentation task - progress reset to 0%")
     
     temp_file = None
     
@@ -344,13 +523,18 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
         # Validate input
         is_valid, input_type, message = validate_input(input_path)
         if not is_valid:
+            logger.error(f"[Process] Input validation failed: {message}")
+            print(f"[Process] Input validation failed: {message}")
             update_progress(100, f"Input validation failed: {message}")
             return {"status": "error", "message": message}
         
+        logger.info(f"[Process] Input validation passed: {message}")
         print(f"[Process] Input validation passed: {message}")
         
         # Convert DICOM to NIfTI if needed
         if input_type == 'dicom':
+            logger.info("[Process] Converting DICOM to NIfTI...")
+            print("[Process] Converting DICOM to NIfTI...")
             converted_path = convert_dicom_to_nifti(input_path)
             temp_file = converted_path
         else:
@@ -360,28 +544,41 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
         
         # Get view configuration
         view_config = AVAILABLE_VIEWS[view_name]
+        logger.info(f"[Process] View: {view_config['name']}")
+        logger.info(f"[Process] Description: {view_config['description']}")
         print(f"[Process] View: {view_config['name']}")
         print(f"[Process] Description: {view_config['description']}")
         
         # Check model file exists
         model_path = SCRIPT_DIR / view_config['model_path']
+        logger.info(f"[Process] Checking model path: {model_path}")
+        print(f"[Process] Checking model path: {model_path}")
+        
         if not model_path.exists():
+            logger.error(f"[Process] Model file not found: {model_path}")
+            print(f"[Process] Model file not found: {model_path}")
             raise FileNotFoundError(f"Model file not found: {model_path}")
         
-        print(f"[Process] Model: {model_path}")
+        file_size = model_path.stat().st_size
+        logger.info(f"[Process] Model file found, size: {file_size / (1024*1024):.2f} MB")
+        print(f"[Process] Model file found, size: {file_size / (1024*1024):.2f} MB")
         
         # Setup device
         if device == "gpu" and torch.cuda.is_available():
             os.environ["CUDA_VISIBLE_DEVICES"] = "0"
             use_gpu = True
+            logger.info(f"[Process] Using GPU")
             print(f"[Process] Using GPU")
         else:
             use_gpu = False
+            logger.info(f"[Process] Using CPU")
             print(f"[Process] Using CPU")
         
         # Create temporary output file
         temp_output = Path(tempfile.gettempdir()) / "cardiac_seg_temp" / f"output_{view_name}.nii.gz"
         temp_output.parent.mkdir(exist_ok=True)
+        logger.info(f"[Process] Temporary output path: {temp_output}")
+        print(f"[Process] Temporary output path: {temp_output}")
         
         update_progress(25, "Running segmentation")
         
@@ -396,12 +593,18 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
         def run_segmentation():
             nonlocal seg_exception, model_result, original_image_result, prediction_result
             try:
+                logger.info("[Process] Starting segmentation thread...")
+                print("[Process] Starting segmentation thread...")
+                
                 # Set UTF-8 encoding for stdout to handle emoji characters
                 import sys
                 import io
                 if sys.platform == 'win32':
                     # On Windows, wrap stdout with UTF-8 encoding
                     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+                
+                logger.info(f"[Process] Calling predict function...")
+                print(f"[Process] Calling predict function...")
                 
                 model, original_image, prediction = predict(
                     model_path=str(model_path),
@@ -417,7 +620,14 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
                 model_result = model
                 original_image_result = original_image
                 prediction_result = prediction
+                
+                logger.info("[Process] Segmentation thread completed successfully")
+                print("[Process] Segmentation thread completed successfully")
             except Exception as e:
+                logger.error(f"[Process] Segmentation thread failed: {e}")
+                print(f"[Process] Segmentation thread failed: {e}")
+                import traceback
+                logger.error(f"[Process] Segmentation thread traceback: {traceback.format_exc()}")
                 seg_exception = e
         
         seg_thread = threading.Thread(target=run_segmentation)
@@ -440,18 +650,60 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
         
         # Check if there was an exception
         if seg_exception:
+            logger.error(f"[Process] Segmentation failed with exception: {seg_exception}")
+            print(f"[Process] Segmentation failed with exception: {seg_exception}")
             raise seg_exception
         
         end_time = time.time()
         processing_time = end_time - start_time
+        logger.info(f"[Process] Segmentation completed in {processing_time:.1f}s")
+        print(f"[Process] Segmentation completed in {processing_time:.1f}s")
         update_progress(75, f"Segmentation completed in {processing_time:.1f}s")
         
         # Check if output was created
         if not temp_output.exists():
+            logger.error("[Process] Segmentation output not found")
+            print("[Process] Segmentation output not found")
             update_progress(100, "Error: Segmentation output not found")
             return {"status": "error", "message": "Segmentation output not found"}
         
         update_progress(80, "Saving to H5 format")
+        
+        # Validate segmentation result
+        logger.info(f"[Process] Validating segmentation result...")
+        logger.info(f"[Process] Prediction shape: {prediction_result.shape}")
+        logger.info(f"[Process] Prediction dtype: {prediction_result.dtype}")
+        logger.info(f"[Process] Prediction min: {prediction_result.min()}, max: {prediction_result.max()}")
+        print(f"[Process] Validating segmentation result...")
+        print(f"[Process] Prediction shape: {prediction_result.shape}")
+        print(f"[Process] Prediction dtype: {prediction_result.dtype}")
+        print(f"[Process] Prediction min: {prediction_result.min()}, max: {prediction_result.max()}")
+        
+        # Convert to uint8 if needed
+        if prediction_result.dtype != np.uint8:
+            logger.info(f"[Process] Converting prediction from {prediction_result.dtype} to uint8")
+            print(f"[Process] Converting prediction from {prediction_result.dtype} to uint8")
+            prediction_result = prediction_result.astype(np.uint8)
+            logger.info(f"[Process] After conversion - min: {prediction_result.min()}, max: {prediction_result.max()}")
+            print(f"[Process] After conversion - min: {prediction_result.min()}, max: {prediction_result.max()}")
+        
+        # Check if result is all zeros
+        non_zero_count = np.count_nonzero(prediction_result)
+        total_voxels = prediction_result.size
+        logger.info(f"[Process] Non-zero voxels: {non_zero_count} / {total_voxels} ({100*non_zero_count/total_voxels:.2f}%)")
+        print(f"[Process] Non-zero voxels: {non_zero_count} / {total_voxels} ({100*non_zero_count/total_voxels:.2f}%)")
+        
+        if non_zero_count == 0:
+            logger.warning("[Process] Segmentation result is all zeros!")
+            logger.warning("[Process] This could mean:")
+            logger.warning("[Process]   - No cardiac structures detected")
+            logger.warning("[Process]   - Segmentation model failed")
+            logger.warning("[Process]   - Wrong view/model selected")
+            print("[Process] WARNING: Segmentation result is all zeros!")
+            print("[Process] This could mean:")
+            print("[Process]   - No cardiac structures detected")
+            print("[Process]   - Segmentation model failed")
+            print("[Process]   - Wrong view/model selected")
         
         # Prepare metadata
         metadata = {
@@ -466,6 +718,7 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
         }
         
         # Save to H5
+        logger.info(f"[Process] Saving segmentation to H5...")
         print(f"[Process] Saving segmentation to H5...")
         save_segmentation_to_h5(
             prediction_result,
@@ -491,12 +744,13 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
                     'percentage': round(percentage, 2)
                 }
         
+        logger.info(f"[Process] Class statistics: {class_stats}")
         print(f"[Process] Class statistics: {class_stats}")
         
         update_progress(100, "Processing completed successfully")
         progress_complete = True
         
-        return {
+        result = {
             "status": "success",
             "message": "Segmentation completed successfully",
             "view": view_name,
@@ -505,9 +759,16 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
             "class_statistics": class_stats
         }
         
+        logger.info(f"[Process] Final result: {result}")
+        print(f"[Process] Final result: {result}")
+        
+        return result
+        
     except Exception as e:
+        logger.error(f"[Process] Error: {e}")
         print(f"[Process] Error: {e}")
         import traceback
+        logger.error(f"[Process] Traceback: {traceback.format_exc()}")
         traceback.print_exc()
         update_progress(100, f"Processing failed: {e}")
         progress_complete = True
@@ -520,6 +781,7 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
         if temp_file and Path(temp_file).exists():
             try:
                 Path(temp_file).unlink()
+                logger.info(f"[Process] Cleaned up temporary file: {temp_file}")
                 print(f"[Process] Cleaned up temporary file: {temp_file}")
             except:
                 pass
@@ -536,25 +798,52 @@ def init_model():
     """Initialize Cardiac Segmentation model"""
     global IS_MODEL_INITED
     
+    logger.info("=" * 60)
+    logger.info("POST /init - Initializing Cardiac Segmentation")
+    logger.info("=" * 60)
     print("=" * 60)
     print("POST /init - Initializing Cardiac Segmentation")
     print("=" * 60)
     
     if not IS_MODEL_INITED:
-        IS_MODEL_INITED = True
+        logger.info("[Cardiac] Checking dependencies...")
         print("[Cardiac] Checking dependencies...")
         
         try:
             import torch
             import SimpleITK as sitk
             from predict_single_LVSA import predict
+            logger.info("[Cardiac] Dependencies OK")
             print("[Cardiac] Dependencies OK")
-            print(f"[Cardiac] Available views: {list(AVAILABLE_VIEWS.keys())}")
-            return {"status": "ok", "message": "Cardiac Segmentation init done", "views": list(AVAILABLE_VIEWS.keys())}
+            
+            # Check and download models
+            logger.info("[Cardiac] Checking model availability...")
+            print("[Cardiac] Checking model availability...")
+            
+            model_status = check_all_models()
+            available_views = [view for view, available in model_status.items() if available]
+            
+            if not available_views:
+                logger.error("[Cardiac] No models available!")
+                print("[Cardiac] No models available!")
+                return {"status": "error", "message": "No models available. Please check model files."}
+            
+            logger.info(f"[Cardiac] Available views: {available_views}")
+            print(f"[Cardiac] Available views: {available_views}")
+            
+            IS_MODEL_INITED = True
+            return {
+                "status": "ok", 
+                "message": "Cardiac Segmentation init done", 
+                "views": available_views,
+                "model_status": model_status
+            }
         except Exception as e:
+            logger.error(f"[Cardiac] Error: {e}")
             print(f"[Cardiac] Error: {e}")
             return {"status": "error", "message": f"Initialization failed: {e}"}
     else:
+        logger.info("[Cardiac] Already initialized")
         print("[Cardiac] Already initialized")
         return {"status": "ok", "message": "Already init."}
 
@@ -607,24 +896,56 @@ def execute_model():
     """Run Cardiac Segmentation"""
     global IS_PROCESSING, CURRENT_PROGRESS, PROGRESS_MESSAGE, IS_MODEL_INITED
     
+    logger.info("=" * 60)
+    logger.info("POST /execute - Starting Cardiac Segmentation")
+    logger.info("=" * 60)
+    print("=" * 60)
+    print("POST /execute - Starting Cardiac Segmentation")
+    print("=" * 60)
+    
     if not IS_MODEL_INITED:
+        logger.error("[Execute] Model not initialized. Please call /init first.")
+        print("[Execute] Model not initialized. Please call /init first.")
         return {"status": "error", "message": "Please /init first."}
     
     if IS_PROCESSING:
+        logger.warning("[Execute] Model is already processing")
+        print("[Execute] Model is already processing")
         return {"status": "error", "message": "Model is already processing"}
     
     if not H5_PATH:
+        logger.error("[Execute] H5 path not configured. Call /read first")
+        print("[Execute] H5 path not configured. Call /read first")
         return {"status": "error", "message": "H5 path not configured. Call /read first"}
     
     if not INPUT_PATH:
+        logger.error("[Execute] Input path not configured. Call /read first")
+        print("[Execute] Input path not configured. Call /read first")
         return {"status": "error", "message": "Input path not configured. Call /read first"}
     
     if not SELECTED_VIEW:
+        logger.error("[Execute] View not selected. Call /read first")
+        print("[Execute] View not selected. Call /read first")
         return {"status": "error", "message": "View not selected. Call /read first"}
     
     if SELECTED_VIEW not in AVAILABLE_VIEWS:
+        logger.error(f"[Execute] Invalid view: {SELECTED_VIEW}. Available: {list(AVAILABLE_VIEWS.keys())}")
+        print(f"[Execute] Invalid view: {SELECTED_VIEW}. Available: {list(AVAILABLE_VIEWS.keys())}")
         return {"status": "error", "message": f"Invalid view: {SELECTED_VIEW}. Available: {list(AVAILABLE_VIEWS.keys())}"}
     
+    # Ensure model is available before processing
+    logger.info(f"[Execute] Ensuring model is available for view: {SELECTED_VIEW}")
+    print(f"[Execute] Ensuring model is available for view: {SELECTED_VIEW}")
+    
+    if not ensure_model_available(SELECTED_VIEW):
+        logger.error(f"[Execute] Model not available for view: {SELECTED_VIEW}")
+        print(f"[Execute] Model not available for view: {SELECTED_VIEW}")
+        return {"status": "error", "message": f"Model not available for view: {SELECTED_VIEW}"}
+    
+    logger.info(f"[Execute] Starting segmentation")
+    logger.info(f"[Execute] Input path: {INPUT_PATH}")
+    logger.info(f"[Execute] Selected view: {SELECTED_VIEW}")
+    logger.info(f"[Execute] H5 path: {H5_PATH}")
     print(f"[Execute] Starting segmentation")
     print(f"[Execute] Input path: {INPUT_PATH}")
     print(f"[Execute] Selected view: {SELECTED_VIEW}")
@@ -632,9 +953,17 @@ def execute_model():
     
     # Start processing
     try:
+        logger.info("[Execute] Calling process_segmentation_sync...")
+        print("[Execute] Calling process_segmentation_sync...")
         result = process_segmentation_sync(INPUT_PATH, SELECTED_VIEW, device="gpu")
+        logger.info(f"[Execute] Processing completed with result: {result}")
+        print(f"[Execute] Processing completed with result: {result}")
         return {"status": "ok", "output": result}
     except Exception as e:
+        logger.error(f"[Execute] Processing failed with error: {e}")
+        print(f"[Execute] Processing failed with error: {e}")
+        import traceback
+        logger.error(f"[Execute] Traceback: {traceback.format_exc()}")
         return {"status": "error", "message": str(e)}
 
 @app.get("/progress")
@@ -649,20 +978,20 @@ async def progress():
         while True:
             if CURRENT_PROGRESS != last_value or (CURRENT_PROGRESS == 100 and progress_complete):
                 if last_value > CURRENT_PROGRESS:
-                    yield {"data": str(-1)}
+                    yield {"data": str(-1)}  # Reset signal
                 print(f"[SSE] Progress: {CURRENT_PROGRESS}% - {PROGRESS_MESSAGE}")
                 yield {"data": str(CURRENT_PROGRESS)}
                 last_value = CURRENT_PROGRESS
                 
                 if CURRENT_PROGRESS == 100 and progress_complete:
-                    print("Progress complete, closing connection.")
+                    print("[SSE] Progress complete, closing connection.")
                     await asyncio.sleep(0.5)
                     break
             
             await asyncio.sleep(0.1)
         
         await asyncio.sleep(1)
-        print("Progress reset to 0.")
+        print("[SSE] Progress stream ended.")
     
     return EventSourceResponse(event_generator())
 

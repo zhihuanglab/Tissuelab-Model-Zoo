@@ -137,11 +137,51 @@ python totalsegmentator_tasknode.py --host 0.0.0.0 --port 8000
 
 ## Configuration
 
-The tasknode expects TotalSegmentator models to be available. You can:
+### Automatic Model Download (Recommended)
 
-1. Let TotalSegmentator download models automatically (first run will be slow)
-2. Pre-download models to a local directory and set `TOTALSEG_HOME_DIR` environment variable
-3. Place models in `./models/` directory relative to the script
+The tasknode now **automatically detects and downloads missing models**! No manual setup required.
+
+When you run a segmentation task:
+1. The system checks if required models exist
+2. If missing, models are automatically downloaded from GitHub releases
+3. Progress is shown in the console
+
+**Example output:**
+```
+[Process] Checking models for task 'cerebral_bleed' (ID: 150)
+[Model Check] MISSING: cerebral_bleed (Task 150) model not found
+[Model Download] Downloading cerebral_bleed (Task 150)...
+[Model Download] This may take a few minutes depending on your internet speed...
+[Model Download] SUCCESS: cerebral_bleed (Task 150) downloaded successfully
+```
+
+**Dependencies:** Some tasks require multiple models:
+- `cerebral_bleed`: Downloads both Dataset150 (detection) + Dataset298 (brain localization)
+- `lung_vessels`: Downloads Dataset258 + Dataset298 (cropping)
+- `hip_implant`: Downloads Dataset260 + Dataset298 (cropping)
+
+All dependencies are handled automatically!
+
+### Manual Model Download (Optional)
+
+If you prefer to pre-download models:
+
+```bash
+# Option 1: Use the download script
+python download_to_results.py
+
+# Option 2: Set environment variable for custom location
+export TOTALSEG_HOME_DIR=/path/to/models
+```
+
+### Git Configuration
+
+Model weights are excluded from version control (`.gitignore` configured):
+```
+tissue_segmentation/TotalSegmentator/models/nnunet/results/
+```
+
+This keeps the repository lightweight (few MB instead of several GB).
 
 ## Notes
 
