@@ -43,6 +43,7 @@ SCRIPT_DIR = Path(__file__).parent.absolute()
 sys.path.insert(0, str(SCRIPT_DIR))
 
 # Import cardiac segmentation modules
+predict_import_error = None
 try:
     import torch
     import SimpleITK as sitk
@@ -50,6 +51,10 @@ try:
     print(f"[Cardiac] Successfully imported dependencies")
 except ImportError as e:
     print(f"[Cardiac] Warning: Failed to import dependencies: {e}")
+    predict_import_error = str(e)
+    # Define a dummy predict function if import fails
+    def predict(*args, **kwargs):
+        raise ImportError(f"Failed to import predict function: {predict_import_error}")
 
 # Import safe H5 utilities
 sys.path.append(str(SCRIPT_DIR.parent.parent))
@@ -337,10 +342,13 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
     """
     global IS_PROCESSING, CURRENT_PROGRESS, PROGRESS_MESSAGE, progress_complete
     
+    # Reset progress for new task
     IS_PROCESSING = True
     CURRENT_PROGRESS = 0
     PROGRESS_MESSAGE = "Starting segmentation"
     progress_complete = False
+    
+    print(f"[Process] Starting new segmentation task - progress reset to 0%")
     
     temp_file = None
     
@@ -679,20 +687,20 @@ async def progress():
         while True:
             if CURRENT_PROGRESS != last_value or (CURRENT_PROGRESS == 100 and progress_complete):
                 if last_value > CURRENT_PROGRESS:
-                    yield {"data": str(-1)}
+                    yield {"data": str(-1)}  # Reset signal
                 print(f"[SSE] Progress: {CURRENT_PROGRESS}% - {PROGRESS_MESSAGE}")
                 yield {"data": str(CURRENT_PROGRESS)}
                 last_value = CURRENT_PROGRESS
                 
                 if CURRENT_PROGRESS == 100 and progress_complete:
-                    print("Progress complete, closing connection.")
+                    print("[SSE] Progress complete, closing connection.")
                     await asyncio.sleep(0.5)
                     break
             
             await asyncio.sleep(0.1)
         
         await asyncio.sleep(1)
-        print("Progress reset to 0.")
+        print("[SSE] Progress stream ended.")
     
     return EventSourceResponse(event_generator())
 

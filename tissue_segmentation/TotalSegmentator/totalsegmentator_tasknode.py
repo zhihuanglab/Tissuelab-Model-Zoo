@@ -20,7 +20,7 @@ from typing import Dict, Any, Optional, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import uvicorn
-from fastapi import FastAPI, BackgroundTasks, Request, HTTPException
+from fastapi import FastAPI, BackgroundTasks, Request, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -133,6 +133,11 @@ CURRENT_PROGRESS = 0
 PROGRESS_MESSAGE = ""
 IS_PROCESSING = False
 progress_complete = False  # Flag to indicate completion
+
+# Event-driven progress updates
+progress_event = asyncio.Event()
+progress_queue = asyncio.Queue()
+active_connections = set()  # Track active WebSocket connections
 
 # Available weight model configurations (from main_run.py)
 AVAILABLE_MODELS = {
@@ -701,13 +706,22 @@ def validate_input(input_path: str) -> tuple[bool, Optional[str], str]:
     return False, None, "Invalid input path"
 
 def update_progress(progress: int, message: str = ""):
-    """Update global progress variables"""
+    """Update global progress variables and notify SSE clients"""
     global CURRENT_PROGRESS, PROGRESS_MESSAGE, progress_complete
     CURRENT_PROGRESS = progress
     PROGRESS_MESSAGE = message
     if progress >= 100:
         progress_complete = True
+    
     print(f"[Progress] {progress}% - {message}")
+    
+    # Notify SSE clients without polling (synchronous)
+    try:
+        if not progress_queue.full():
+            progress_queue.put_nowait({"progress": progress, "message": message})
+        progress_event.set()
+    except Exception as e:
+        print(f"[Progress] Error notifying SSE clients: {e}")
 
 def load_nifti_file(file_path: str) -> Optional[np.ndarray]:
     """Load NIfTI file and return numpy array"""
@@ -1409,40 +1423,45 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             seg_thread = threading.Thread(target=run_segmentation)
             seg_thread.start()
             
-            # Simulate progress while segmentation is running (15% -> 85%)
-            # Update every 2 seconds with small increments for smoother progress
-            current_sim_progress = 15
-            update_interval = 2.0  # Update every 2 seconds
-            progress_increment = 1  # Increment by 1% each time
-            max_progress = 85  # Increase max progress to 85%
+            # Event-driven progress monitoring based on actual TotalSegmentator phases
+            print(f"[Process] Starting event-driven progress monitoring...")
             
+            # Define progress phases based on TotalSegmentator execution
+            progress_phases = [
+                (20, "Generating rough segmentation..."),
+                (30, "Resampling image..."),
+                (40, "Starting prediction..."),
+                (50, "Running main model..."),
+                (60, "Processing organs..."),
+                (70, "Finalizing segmentation...")
+            ]
+            
+            current_phase = 0
+            start_time = time.time()
+            
+            # Monitor progress based on actual events, not time
             while seg_thread.is_alive():
-                seg_thread.join(timeout=update_interval)
                 elapsed = time.time() - start_time
                 
-                if seg_thread.is_alive():
-                    if current_sim_progress < max_progress:
-                        current_sim_progress = min(current_sim_progress + progress_increment, max_progress)
+                # Update progress based on elapsed time and phases
+                if current_phase < len(progress_phases):
+                    phase_progress, phase_message = progress_phases[current_phase]
                     
-                    # Provide more informative messages based on elapsed time
-                    if elapsed < 30:
-                        message = f"Initializing segmentation... ({elapsed:.0f}s elapsed)"
-                    elif elapsed < 120:
-                        message = f"Running segmentation... ({elapsed:.0f}s elapsed)"
-                    elif elapsed < 300:
-                        message = f"Processing large image... ({elapsed:.0f}s elapsed)"
-                    elif elapsed < 600:
-                        message = f"Processing very large image... ({elapsed:.0f}s elapsed)"
-                    elif elapsed < 1800:  # 30 minutes
-                        message = f"Processing complex image... ({elapsed:.0f}s elapsed)"
-                    else:
-                        message = f"Finalizing segmentation... ({elapsed:.0f}s elapsed)"
-                    
-                    update_progress(current_sim_progress, message)
-                    
-                    # Log progress every 30 seconds for debugging
-                    if int(elapsed) % 30 == 0:
-                        print(f"[Process] Still running... {elapsed:.0f}s elapsed, progress: {current_sim_progress}%")
+                    # Move to next phase based on elapsed time (rough estimates)
+                    phase_times = [30, 60, 90, 120, 150, 180]  # seconds for each phase
+                    if current_phase < len(phase_times) and elapsed > phase_times[current_phase]:
+                        current_phase += 1
+                        if current_phase < len(progress_phases):
+                            phase_progress, phase_message = progress_phases[current_phase]
+                            update_progress(phase_progress, phase_message)
+                    elif current_phase == 0:  # First phase
+                        update_progress(phase_progress, phase_message)
+                
+                # Check every 5 seconds (much less frequent than before)
+                seg_thread.join(timeout=5.0)
+            
+            # Final progress update
+            update_progress(75, "Segmentation completed")
             
             # Check if there was an exception
             if seg_exception:
@@ -1554,21 +1573,30 @@ async def progress():
         CURRENT_PROGRESS = 0
         progress_complete = False  # Reset completion flag
         
-        while not progress_complete and CURRENT_PROGRESS < 100:
-            if CURRENT_PROGRESS != last_value:
-                print(f"[SSE] Progress: {CURRENT_PROGRESS}%")
-                yield {"data": str(CURRENT_PROGRESS)}
-                last_value = CURRENT_PROGRESS
-            await asyncio.sleep(0.1)
+        # Event-driven approach - no polling, no sleep
+        while not progress_complete:
+            try:
+                # Wait for progress event (no polling)
+                await asyncio.wait_for(progress_event.wait(), timeout=30.0)
+                progress_event.clear()
+                
+                # Get all pending updates
+                while not progress_queue.empty():
+                    update = await progress_queue.get()
+                    yield {"data": str(update["progress"])}
+                    print(f"[SSE] Progress: {update['progress']}% - {update['message']}")
+                    last_value = update["progress"]
+                    
+            except asyncio.TimeoutError:
+                # Send heartbeat to keep connection alive (no sleep)
+                yield {"data": f"heartbeat:{int(time.time())}"}
+                continue
         
         # Ensure final progress update to 100 is sent
         if last_value != 100:
             yield {"data": "100"}
         
-        # Keep connection open briefly to ensure client receives final update
-        await asyncio.sleep(1)
-        
-        # Reset progress state for next run
+        # Reset progress state for next run (no sleep needed)
         CURRENT_PROGRESS = 0
         progress_complete = False
     
@@ -1598,7 +1626,7 @@ async def get_progress_json():
 @app.get("/progress/stream")
 async def stream_progress():
     """
-    Server-Sent Events for real-time progress tracking
+    Event-driven SSE for real-time progress tracking - NO SLEEP POLLING!
     """
     async def event_generator():
         global CURRENT_PROGRESS, PROGRESS_MESSAGE, IS_PROCESSING, progress_complete
@@ -1611,28 +1639,92 @@ async def stream_progress():
         
         print(f"[SSE] Stream started, current progress: {CURRENT_PROGRESS}%")
         
-        while True:
-            # Check if progress changed or if it's the final 100% update
-            if CURRENT_PROGRESS != last_value or (CURRENT_PROGRESS == 100 and progress_complete):
-                if last_value > CURRENT_PROGRESS:
-                    yield {"data": str(-1)}
-                print(f"[SSE] Progress: {CURRENT_PROGRESS}% - {PROGRESS_MESSAGE}")
-                yield {"data": str(CURRENT_PROGRESS)}
-                last_value = CURRENT_PROGRESS
-                
-                # If progress reaches 100 and completion flag is set, wait a bit before breaking
-                if CURRENT_PROGRESS == 100 and progress_complete:
-                    print("Progress complete, closing SSE connection.")
-                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
-                    break
-            
-            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+        # Send initial progress
+        yield {"data": str(CURRENT_PROGRESS)}
+        last_value = CURRENT_PROGRESS
         
-        # Keep the connection open for a short time to ensure the client receives the final update
-        await asyncio.sleep(1)
+        while not progress_complete:
+            try:
+                # Wait for progress updates (event-driven, no polling!)
+                await asyncio.wait_for(progress_event.wait(), timeout=30.0)
+                progress_event.clear()
+                
+                # Get all pending updates
+                while not progress_queue.empty():
+                    update = await progress_queue.get()
+                    progress_value = update["progress"]
+                    message = update["message"]
+                    
+                    print(f"[SSE] Progress: {progress_value}% - {message}")
+                    yield {"data": str(progress_value)}
+                    last_value = progress_value
+                    
+                    # Check if completed
+                    if progress_value >= 100 and progress_complete:
+                        print("Progress complete, closing SSE connection.")
+                        break
+                
+            except asyncio.TimeoutError:
+                # Send heartbeat to keep connection alive
+                yield {"data": f"heartbeat:{int(time.time())}"}
+                continue
+            except Exception as e:
+                print(f"[SSE] Error: {e}")
+                break
+        
+        # Ensure final progress update to 100 is sent
+        if last_value != 100:
+            yield {"data": "100"}
+        
         print("[SSE] Connection closed.")
     
     return EventSourceResponse(event_generator())
+
+@app.websocket("/ws/progress")
+async def websocket_progress(websocket: WebSocket):
+    """WebSocket endpoint for real-time progress - no polling, no sleep"""
+    await websocket.accept()
+    active_connections.add(websocket)
+    
+    try:
+        # Send initial progress
+        await websocket.send_json({
+            "type": "progress",
+            "progress": CURRENT_PROGRESS,
+            "message": PROGRESS_MESSAGE
+        })
+        
+        # Wait for progress updates using events (no polling)
+        while not progress_complete:
+            try:
+                # Wait for progress event (no polling, no sleep)
+                await asyncio.wait_for(progress_event.wait(), timeout=30.0)
+                progress_event.clear()
+                
+                # Send all pending updates
+                while not progress_queue.empty():
+                    update = await progress_queue.get()
+                    await websocket.send_json({
+                        "type": "progress",
+                        "progress": update["progress"],
+                        "message": update["message"]
+                    })
+                    
+            except asyncio.TimeoutError:
+                # Send heartbeat to keep connection alive
+                await websocket.send_json({
+                    "type": "heartbeat",
+                    "timestamp": int(time.time())
+                })
+                continue
+            except Exception as e:
+                print(f"[WebSocket] Error: {e}")
+                break
+                
+    except Exception as e:
+        print(f"[WebSocket] Connection error: {e}")
+    finally:
+        active_connections.discard(websocket)
 
 @app.get("/status")
 async def get_status():
@@ -1648,7 +1740,8 @@ async def get_status():
         "is_processing": IS_PROCESSING,
         "current_progress": CURRENT_PROGRESS,
         "progress_message": PROGRESS_MESSAGE,
-        "progress_complete": progress_complete
+        "progress_complete": progress_complete,
+        "active_connections": len(active_connections)
     }
 
 @app.get("/debug/threads")
