@@ -5,8 +5,17 @@ import numpy as np
 from medpy.metric.binary import dc
 from common_utils.measure import hd, hd_2D_stack, asd, volumesimilarity
 import pandas as pd
-from IPython.display import display, HTML
 import scipy.stats as stats
+
+# Try to import IPython, use dummy functions if not available
+try:
+    from IPython.display import display, HTML
+except ImportError:
+    # Define dummy functions if IPython is not available
+    def display(*args, **kwargs):
+        print(*args)
+    def HTML(*args, **kwargs):
+        return str(*args)
 
 
 def p_value_test(reference_df, test_df, attributes=['LV_Dice', 'MYO_Dice', 'RV_Dice']):
