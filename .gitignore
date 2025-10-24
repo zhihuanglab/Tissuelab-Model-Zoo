@@ -174,8 +174,7 @@ cython_debug/
 !task_specific/Ark_Plus/checkpoints/**
 !patch_classification/MUSK/checkpoints/
 !patch_classification/MUSK/checkpoints/**
-!task_specific/Cardiac_Multi_view_segmentation-master/checkpoints/
-!task_specific/Cardiac_Multi_view_segmentation-master/checkpoints/**
+
 
 # TotalSegmentator model weights (very large files)
 tissue_segmentation/TotalSegmentator/models/nnunet/results/
@@ -192,4 +191,4 @@ nuclei_segmentation/StarDist/test_multithreaded.py
 nuclei_segmentation/StarDist/test_single_thread.py
 nuclei_segmentation/StarDist/test_thread_local.py
 nuclei_segmentation/StarDist/test_nms_sweep.py
-nuclei_segmentation/StarDist/test_parallel_nms.py
+nuclei_segmentation/StarDist/test_parallel_nms.pytask_specific/Cardiac_Multi_view_segmentation-master/checkpoints/

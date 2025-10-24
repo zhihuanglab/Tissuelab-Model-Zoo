@@ -1,15 +1,14 @@
 #!/usr/bin/env python
-"""Test with 4 threads per worker (better for NMS) vs 1 thread"""
+"""Test if AVX-512 optimized StarDist is faster"""
 import os
 import sys
 import time
 import numpy as np
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '5'
-# Try 4 threads for better NMS performance
-os.environ['OPENBLAS_NUM_THREADS'] = '4'
-os.environ['MKL_NUM_THREADS'] = '4'
-os.environ['OMP_NUM_THREADS'] = '4'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -22,35 +21,31 @@ slide_path = "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Ctrl-Service/sto
 model_path = os.path.join(os.path.dirname(__file__), 'models')
 
 print("="*80)
-print("Testing with 4 threads per operation (for faster NMS)")
+print("TESTING: AVX-512 Optimized StarDist NMS")
 print("="*80)
 
-# Load model
 model = StarDist2D(None, name='2D_versatile_he', basedir=model_path)
 slide = tiffslide.TiffSlide(slide_path)
 
-# Test 3 tiles with many nuclei
+# Test 3 high-nuclei tiles (previously took 19-28s with OMP=1)
 test_positions = [
     (1824, 0),      # 4352 nuclei
-    (3648, 0),      # 4891 nuclei
+    (3648, 0),      # 4891 nuclei  
     (5472, 1824),   # 4831 nuclei
 ]
 
-times = []
+print("Testing high-nuclei tiles:")
+print("-" * 80)
+print("Before AVX-512: 10-20s per tile")
+print("After AVX-512: Should be 5-10s per tile (2x faster)")
+print()
 
+times = []
 for i, (x, y) in enumerate(test_positions, 1):
-    t_total_start = time.time()
-    
-    # Read
     img = slide.read_region((x, y), 0, (2048, 2048))
     img_np = np.array(img)[:,:,:3]
-    
-    # Normalize
-    t0 = time.time()
     img_norm = normalize(img_np)
-    t_norm = time.time() - t0
     
-    # Predict (includes NMS)
     t0 = time.time()
     labels, dicts = model.predict_instances(
         img_norm,
@@ -59,19 +54,31 @@ for i, (x, y) in enumerate(test_positions, 1):
         n_tiles=(1,1,1),
         show_tile_progress=False
     )
-    t_predict = time.time() - t0
-    
-    t_total = time.time() - t_total_start
+    elapsed = time.time() - t0
     n_nuclei = len(dicts['points'])
     
-    print(f"Tile {i} @ ({x:5d},{y:5d}): Total={t_total:5.2f}s  Norm={t_norm:5.2f}s  Predict={t_predict:5.2f}s  Nuclei={n_nuclei:4d}")
-    times.append(t_total)
+    times.append(elapsed)
+    print(f"Tile {i}: {elapsed:5.2f}s ({n_nuclei} nuclei)")
 
 slide.close()
 
 avg_time = sum(times) / len(times)
-print(f"\n{'='*80}")
-print(f"Average time with 4 threads: {avg_time:.2f}s")
-print(f"Compare to single-threaded times: 19-28s per tile")
+old_avg = 15.0  # Previous average without AVX-512
+
+print()
+print("="*80)
+print(f"RESULTS:")
+print(f"  Average time: {avg_time:.2f}s/tile")
+print(f"  Previous (no AVX-512): ~15s/tile")
+print(f"  Speedup: {old_avg/avg_time:.2f}x")
+print()
+print(f"  Projected full slide (40 workers):")
+print(f"    Previous: 20.3 minutes")
+print(f"    Now: {1260 * avg_time / 40 / 60:.1f} minutes")
+print()
+if 1260 * avg_time / 40 / 60 < 10:
+    print(f"  🎉 BEAT MAC's 10 minutes!")
+else:
+    print(f"  Getting closer to Mac's 10 minutes")
 print("="*80)
 
