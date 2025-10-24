@@ -56,7 +56,7 @@ class WsiPatchDataset(torch.utils.data.Dataset):
         ps = patch_size
         for y in range(0, height - ps + 1, ps):
             for x in range(0, width - ps + 1, ps):
-                # Use unified coverage strategy to avoid dependency on source type
+                # Unify coverage strategies to avoid dependence on source types
                 patch_mask = self.mask[y:y + ps, x:x + ps]
                 if patch_mask.size == 0:
                     continue
@@ -110,7 +110,7 @@ class WsiPatchDataset(torch.utils.data.Dataset):
             if self.strict_io:
                 raise RuntimeError(msg) from e
             else:
-                # Return blank placeholder only in non-strict mode
+                # 非严格模式才返回空白占位
                 return Image.new('RGB', (tile_w, tile_h))
         self._macro_cache[key] = img
         if len(self._macro_cache) > self._macro_cache_capacity:
@@ -162,12 +162,6 @@ class WsiPatchDataset(torch.utils.data.Dataset):
         return tensor, coord
 
 
-def _collate_fn(batch):
-    """Collate function for DataLoader - must be at module level for multiprocessing"""
-    imgs, coords = zip(*batch)
-    return torch.stack(imgs, dim=0), torch.stack(coords, dim=0)
-
-
 class MUSK:
     """MUSK model wrapper class"""
     def __init__(self, model_path="abc"):
@@ -200,6 +194,12 @@ class MUSK:
             ''
         )
         return model
+
+    @staticmethod
+    def _collate_fn(batch):
+        """Static collate function for DataLoader (can be pickled for multiprocessing)"""
+        imgs, coords = zip(*batch)
+        return torch.stack(imgs, dim=0), torch.stack(coords, dim=0)
 
     def encode_images(self, images: Union[List[str], List[PIL.Image.Image]], batch_size: int, progress_callback=None, profile: bool = False, profile_acc: Optional[dict] = None):
         """Optimized image encoding method
@@ -329,7 +329,7 @@ class MUSK:
         if progress_callback:
             progress_callback("encode", 100)
             
-        # Finally merge all results (keep on CPU to avoid unnecessary GPU round-trip copies)
+        # kept on the CPU to avoid unnecessary round-trip copies to the GPU
         return torch.cat(image_embeddings, dim=0)
 
     def encode_tensors(self, batch_images_cpu: torch.Tensor, profile: bool = False, profile_acc: Optional[dict] = None):
@@ -663,7 +663,7 @@ class MUSK:
         Generate a filled tissue mask for a whole-slide image.
 
         The routine:
-        1. Builds a thumbnail-level binary mask of tissue,
+        1. Builds a thumbnail‐level binary mask of tissue,
         2. Fills gaps and large holes,
         3. Removes small spurious regions at the slide’s borders (typical “shadow” artifacts),
         4. Optionally saves every intermediate step to *debug_dir* for visual inspection.
@@ -698,7 +698,7 @@ class MUSK:
             h,  w = gray.shape
 
             # ---------------------------------------------------------------------
-            # 2. Adaptive thresholding - stricter parameters for fewer false positives
+            # 2. Adaptive thresholding – stricter parameters for fewer false positives
             # ---------------------------------------------------------------------
             mask = cv2.adaptiveThreshold(
                 gray, 1, cv2.ADAPTIVE_THRESH_MEAN_C,
@@ -711,7 +711,7 @@ class MUSK:
                 )
 
             # ---------------------------------------------------------------------
-            # 3. Morphological closing - bridge small gaps / tears
+            # 3. Morphological closing – bridge small gaps / tears
             # ---------------------------------------------------------------------
             mask = morphology.binary_closing(mask, morphology.disk(8))
             if debug_dir:
@@ -906,7 +906,7 @@ class MUSK:
             drop_last=False,
             prefetch_factor=(prefetch_factor if loader_workers > 0 else None),
             persistent_workers=(loader_workers > 0),
-            collate_fn=_collate_fn
+            collate_fn=self._collate_fn
         )
 
         all_embeddings = []
@@ -915,7 +915,6 @@ class MUSK:
         print("Starting DataLoader streaming of patches...")
         batch_count = 0
         prev_end = time.time()
-        total_batches = len(loader)
         with torch.no_grad():
             self.model = self.model.to(device)
             for imgs_cpu, coords_cpu in tqdm(loader, desc="Processing patch batches", position=1, leave=True):
@@ -926,11 +925,6 @@ class MUSK:
                     except Exception:
                         print(f"[loader] batch {batch_count + 1}: wait {wait_s:.3f}s")
                 batch_count += 1
-                
-                # Update progress callback
-                if progress_callback:
-                    progress_percent = int((batch_count / max(1, total_batches)) * 100)
-                    progress_callback("row", progress_percent)
 
                 # Encode
                 t_e0 = time.time() if profile else None
