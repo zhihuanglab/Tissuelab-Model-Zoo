@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Classification Node for logistic regression or zero-shot classification
-(Modified to load HF big model at /init stage to avoid concurrent model download + HDF5 read)
+(Modified to load zf big model at /init stage to avoid concurrent model download + HDF5 read)
 """
 
 import argparse
@@ -10,7 +10,7 @@ import os
 import sys
 import time
 import json
-import h5py
+import zarr
 import uvicorn
 import requests
 import numpy as np
@@ -31,7 +31,6 @@ from typing import Dict, Any
 from pathlib import Path
 from sklearn.linear_model import LogisticRegression
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
-from safe_h5_utils import safe_h5_open
 
 app = FastAPI()
 
@@ -47,7 +46,7 @@ app.add_middleware(
 # global variables
 ARGS = None
 IS_MODEL_INITED = False
-H5_PATH = None
+ZARR_PATH = None
 NODE_NAME = None
 DEPENDENCIES = []
 
@@ -62,16 +61,22 @@ progress_value = 0  # Global variable to store progress
 # --------------- utils functions ---------------
 
 def print_h5_structure(file_path):
-    """print H5 file"""
-    import h5py
-    def print_item(name, obj):
-        indent = "  " * (name.count("/"))
-        if isinstance(obj, h5py.Group):
-            print(f"{indent}{name} (Group)")
-        elif isinstance(obj, h5py.Dataset):
-            print(f"{indent}{name} (Dataset), shape: {obj.shape}, dtype: {obj.dtype}")
-    with safe_h5_open(file_path, "r") as hf:
-        hf.visititems(print_item)
+    """Print Zarr group structure"""
+    def _visit(group, prefix=""):
+        for key, val in group.items():
+            name = f"{prefix}/{key}" if prefix else key
+            if isinstance(val, zarr.hierarchy.Group):
+                print(f"{name} (Group)")
+                _visit(val, name)
+            else:
+                try:
+                    shape = getattr(val, 'shape', None)
+                    dtype = getattr(val, 'dtype', None)
+                    print(f"{name} (Dataset), shape: {shape}, dtype: {dtype}")
+                except Exception:
+                    print(f"{name} (Dataset)")
+    grp = zarr.open_group(file_path, mode='r')
+    _visit(grp)
 
 def encode_text(processor, text_encoder, text_projection, prompt: str, device: str) -> np.ndarray:
     # use PLIP model to encode text
@@ -224,7 +229,7 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
     clf.save_model(SAVE_CLASSIFIER_PATH)
     print(f"Saved classifier with parameters and training data to: {SAVE_CLASSIFIER_PATH}")
 
-def load_classifier_params(h5_path):
+def load_classifier_params(zarr_path):
     """Load classifier parameters and training data from XGBoost model file"""
     global CLASSIFIER_PATH
     if CLASSIFIER_PATH is None:
@@ -445,8 +450,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     return (clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0)
 
 def run_classification(args) -> Dict[str, Any]:
-    if H5_PATH is None:
-        raise ValueError("H5_PATH not set => please ensure /read is called first.")
+    if ZARR_PATH is None:
+        raise ValueError("ZARR_PATH not set => please ensure /read is called first.")
 
     global PLIP_MODELS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH
     global progress_value  # Declare the global variable
@@ -458,92 +463,92 @@ def run_classification(args) -> Dict[str, Any]:
 
     try:
         start_time = time.time()
-        h5_path = H5_PATH
+        ZARR_PATH = ZARR_PATH
 
-        with safe_h5_open(h5_path, 'a') as hf:  # Open in append mode for read/write
-            # A) check annotation
+        zf = zarr.open_group(ZARR_PATH, mode='a')  # Open in append mode for read/write
+        # A) check annotation
+        annotations_data = None
+        use_supervised = False
+        if 'user_annotation' in zf and 'nuclei_annotations' in zf['user_annotation']:
+            raw_bytes = zf['user_annotation/nuclei_annotations'][...]
+            ann_dict = json.loads(raw_bytes.decode("utf-8"))
+            annotations_data = pd.DataFrame(ann_dict).T
+
+            # unique_classes = annotations_data["cell_class"].unique().tolist()
+            # if ("Negative control" in unique_classes) and (len(unique_classes) >= 2):
+            use_supervised = True
+            # else:
+            #     use_supervised = False
+        else:
             annotations_data = None
             use_supervised = False
-            if 'user_annotation' in hf and 'nuclei_annotations' in hf['user_annotation']:
-                raw_bytes = hf['user_annotation/nuclei_annotations'][()]
-                ann_dict = json.loads(raw_bytes.decode("utf-8"))
-                annotations_data = pd.DataFrame(ann_dict).T
-
-                # unique_classes = annotations_data["cell_class"].unique().tolist()
-                # if ("Negative control" in unique_classes) and (len(unique_classes) >= 2):
-                use_supervised = True
-                # else:
-                #     use_supervised = False
-            else:
-                annotations_data = None
-                use_supervised = False
-            
-            # B) read embedding => "SegmentationNode/embedding"
-            if 'SegmentationNode' not in hf:
-                raise ValueError("no SegmentationNode group found in h5 file")
-            seg_grp = hf['SegmentationNode']
-            if 'embedding' not in seg_grp:
-                raise ValueError("embedding dataset not found in h5 file => no cell_embeddings")
-            cell_embeddings = seg_grp['embedding'][()]
         
-            # C) supervised or zero-shot
-            organ = getattr(args, "organ", None)
-            nuclei_classes = getattr(args, "nuclei_classes", [])
-            nuclei_colors = getattr(args, "nuclei_colors", [])
+        # B) read embedding => "SegmentationNode/embedding"
+        if 'SegmentationNode' not in zf:
+            raise ValueError("no SegmentationNode group found in h5 file")
+        seg_grp = zf['SegmentationNode']
+        if 'embedding' not in seg_grp:
+            raise ValueError("embedding dataset not found in h5 file => no cell_embeddings")
+        cell_embeddings = seg_grp['embedding'][...]
+    
+        # C) supervised or zero-shot
+        organ = getattr(args, "organ", None)
+        nuclei_classes = getattr(args, "nuclei_classes", [])
+        nuclei_colors = getattr(args, "nuclei_colors", [])
 
-            # Try supervised classification if we have classifier path or annotations
-            classifier_result = None
-            if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
-                classifier_result = train_linear_classifier(cell_embeddings, annotations_data)
+        # Try supervised classification if we have classifier path or annotations
+        classifier_result = None
+        if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
+            classifier_result = train_linear_classifier(cell_embeddings, annotations_data)
+        
+        # Check if supervised classification succeeded
+        if classifier_result is not None:
+            clf, class_names, class_colors, predictions, prediction_probs, \
+                coef_, intercept_, train_time, test_time = classifier_result
+            final_class_names = class_names
+            final_class_colors = class_colors
+            classification_method = "supervised"
+            print(f"Supervised classification completed using {classification_method}")
+            # Progress for supervised is handled in train_linear_classifier
+        else:
+            classification_method = "zero-shot"
+            print(f"Zero-shot classification completed using {classification_method}")
+            if PLIP_MODELS is None:
+                raise ValueError("PLIP_MODELS not loaded => please ensure /init is called first.")
+            processor, model, text_projection, device = PLIP_MODELS
+            text_encoder = model.text_model
+
+            # Batch process all class embeddings at once
+            class_embeddings_arr = _generate_text_description(processor, text_encoder, text_projection,
+                                                          nuclei_classes, organ, device)
             
-            # Check if supervised classification succeeded
-            if classifier_result is not None:
-                clf, class_names, class_colors, predictions, prediction_probs, \
-                    coef_, intercept_, train_time, test_time = classifier_result
-                final_class_names = class_names
-                final_class_colors = class_colors
-                classification_method = "supervised"
-                print(f"Supervised classification completed using {classification_method}")
-                # Progress for supervised is handled in train_linear_classifier
-            else:
-                classification_method = "zero-shot"
-                print(f"Zero-shot classification completed using {classification_method}")
-                if PLIP_MODELS is None:
-                    raise ValueError("PLIP_MODELS not loaded => please ensure /init is called first.")
-                processor, model, text_projection, device = PLIP_MODELS
-                text_encoder = model.text_model
+            # Compute all similarities at once
+            sims_arr = np.dot(cell_embeddings, class_embeddings_arr.T)
+            predictions = np.argmax(sims_arr, axis=1)
+            prediction_probs = None # For zero-shot, raw similarity scores might be more informative
 
-                # Batch process all class embeddings at once
-                class_embeddings_arr = _generate_text_description(processor, text_encoder, text_projection,
-                                                              nuclei_classes, organ, device)
-                
-                # Compute all similarities at once
-                sims_arr = np.dot(cell_embeddings, class_embeddings_arr.T)
-                predictions = np.argmax(sims_arr, axis=1)
-                prediction_probs = None # For zero-shot, raw similarity scores might be more informative
+            # Update progress after similarity computation (once for zero-shot)
+            progress_value = 100 
+            print("Progress: 100% (Similarities computed for zero-shot)")
 
-                # Update progress after similarity computation (once for zero-shot)
-                progress_value = 100 
-                print("Progress: 100% (Similarities computed for zero-shot)")
-
-                final_class_colors = None
-                # Check for existing colors within the same hf handle
-                if NODE_NAME in hf and 'nuclei_class_HEX_color' in hf[NODE_NAME]: 
-                    old_colors = hf[NODE_NAME]['nuclei_class_HEX_color'][()] 
-                    if len(old_colors) == len(nuclei_classes):
-                        final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
-                
-                if final_class_colors is None:
-                    if nuclei_colors:
-                        final_class_colors = nuclei_colors
-                    else:
-                        final_class_colors = generate_distinct_colors(nuclei_classes)
-                final_class_names = nuclei_classes
+            final_class_colors = None
+            # Check for existing colors within the same zf handle
+            if NODE_NAME in zf and 'nuclei_class_HEX_color' in zf[NODE_NAME]: 
+                old_colors = zf[NODE_NAME]['nuclei_class_HEX_color'][...]
+                if len(old_colors) == len(nuclei_classes):
+                    final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
+            
+            if final_class_colors is None:
+                if nuclei_colors:
+                    final_class_colors = nuclei_colors
+                else:
+                    final_class_colors = generate_distinct_colors(nuclei_classes)
+            final_class_names = nuclei_classes
 
             # D) result => cell_classification
-            if NODE_NAME in hf:
-                del hf[NODE_NAME]
-            grp_cls = hf.create_group(NODE_NAME)
+            if NODE_NAME in zf:
+                del zf[NODE_NAME]
+            grp_cls = zf.create_group(NODE_NAME)
 
             grp_cls.create_dataset('nuclei_class_id', data=predictions.astype(np.int32))
 
@@ -584,9 +589,8 @@ def run_classification(args) -> Dict[str, Any]:
                 metadata["training_time"] = train_time
                 metadata["testing_time"] = test_time
             metadata['created'] = datetime.now().isoformat()
-            grp_cls.create_dataset('metadata', data=json.dumps(metadata).encode("utf-8"))
-
-            hf.flush()
+            meta_bytes = json.dumps(metadata).encode("utf-8")
+            grp_cls.create_dataset('metadata', shape=(), dtype=f'S{len(meta_bytes)}', data=meta_bytes)
             
         end_time = time.time()
         result["classification_count"] = len(predictions)
@@ -594,7 +598,7 @@ def run_classification(args) -> Dict[str, Any]:
 
         # print H5 structure
         print("H5 structure after classification:")
-        print_h5_structure(h5_path)
+        print_h5_structure(ZARR_PATH)
 
         return result
 
@@ -631,12 +635,12 @@ def get_status():
 @app.post("/init")
 def init_node():
     """
-    at this stage => download + load HF big model
+    at this stage => download + load zf big model
     """
     global IS_MODEL_INITED
     if not IS_MODEL_INITED:
         IS_MODEL_INITED = True
-        print("[ClassificationNode] /init => let's load HF big model now ...")
+        print("[ClassificationNode] /init => let's load zf big model now ...")
         load_checkpoint_at_init()
         return {"status": "ok", "message": "ClassificationNode init done, big model loaded"}
     else:
@@ -645,15 +649,15 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH
     NODE_NAME = data.get("node_name", "ClassificationNode")
     DEPENDENCIES = data.get("dependencies", [])
-    H5_PATH = data.get("h5_path", None)
+    ZARR_PATH = data.get("zarr_path", None)
     # CLASS_LIST = data.get("class_list", ["Negative control", "Tumor", "Lymphocyte"])
     # CLASS_COLORS = data.get("class_colors", [])
 
-    print(f"[ClassificationNode] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}")
-    if not H5_PATH or not os.path.exists(H5_PATH):
+    print(f"[ClassificationNode] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, ZARR_PATH={ZARR_PATH}")
+    if not ZARR_PATH or not os.path.exists(ZARR_PATH):
         print("[ClassificationNode] no h5 => skip read.")
         return {"status": "ok", "message": "no H5 file found."}
 
@@ -664,43 +668,43 @@ def read_node(data: Dict[str, Any]):
             nuclei_classes=["Negative control", "Tumor", "Lymphocyte"]
         )
 
-    with safe_h5_open(H5_PATH, "r") as hf:
-        user_data_path = f"{NODE_NAME}/userData"
-        if user_data_path in hf:
-            for k in hf[user_data_path].keys():
-                raw_bytes = hf[user_data_path][k][()]
-                raw_str = raw_bytes.decode("utf-8")
-                try:
-                    val_json = json.loads(raw_str)
-                except:
-                    val_json = raw_str
-                print(f"[ClassificationNode] user param {k} => {val_json}")
+    zf = zarr.open_group(ZARR_PATH, mode='r')
+    user_data_path = f"{NODE_NAME}/userData"
+    if user_data_path in zf:
+        for k in zf[user_data_path].keys():
+            raw_bytes = zf[user_data_path][k][...]
+            raw_str = raw_bytes.decode("utf-8")
+            try:
+                val_json = json.loads(raw_str)
+            except:
+                val_json = raw_str
+            print(f"[ClassificationNode] user param {k} => {val_json}")
 
-                if k == "path":
-                    ARGS.slidepath = val_json
-                elif k == "organ":
-                    ARGS.organ = val_json
-                elif k == "classifier_path":
-                    CLASSIFIER_PATH = val_json
-                elif k == "save_classifier_path":
-                    SAVE_CLASSIFIER_PATH = val_json
-                elif k == "nuclei_classes":
-                    if isinstance(val_json, list) and len(val_json) > 0:
-                        ARGS.nuclei_classes = val_json
-                elif k == "nuclei_colors":
-                    if isinstance(val_json, list) and len(val_json) > 0:
-                        ARGS.nuclei_colors = val_json
+            if k == "path":
+                ARGS.slidepath = val_json
+            elif k == "organ":
+                ARGS.organ = val_json
+            elif k == "classifier_path":
+                CLASSIFIER_PATH = val_json
+            elif k == "save_classifier_path":
+                SAVE_CLASSIFIER_PATH = val_json
+            elif k == "nuclei_classes":
+                if isinstance(val_json, list) and len(val_json) > 0:
+                    ARGS.nuclei_classes = val_json
+            elif k == "nuclei_colors":
+                if isinstance(val_json, list) and len(val_json) > 0:
+                    ARGS.nuclei_colors = val_json
 
     return {"status": "ok", "message": "ClassificationNode read done"}
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME, progress_value
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value
     
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
 
-    if not H5_PATH or not os.path.exists(H5_PATH):
+    if not ZARR_PATH or not os.path.exists(ZARR_PATH):
         print("[ClassificationNode] no H5 => skip classification.")
         out_val = {
             "status": "ok",
@@ -711,19 +715,19 @@ def execute_node():
         progress_value = 100
         print("Progress: 100%")
     else:
-        print(f"[ClassificationNode] /execute => run_classification with h5={H5_PATH}")
+        print(f"[ClassificationNode] /execute => run_classification with h5={ZARR_PATH}")
         print(f"[ClassificationNode] ARGS: {ARGS}")
         out_val = run_classification(ARGS)
 
     # write out to /ClassificationNode/output
-    if H5_PATH and os.path.exists(H5_PATH):
-        with safe_h5_open(H5_PATH, "a") as hf:
-            out_ds = f"{NODE_NAME}/output"
-            if out_ds in hf:
-                del hf[out_ds]
-            out_str = json.dumps(out_val, ensure_ascii=False)
-            hf.create_dataset(out_ds, data=out_str.encode("utf-8"))
-            hf.flush()
+    if ZARR_PATH and os.path.exists(ZARR_PATH):
+        zf = zarr.open_group(ZARR_PATH, mode='a')
+        out_ds = f"{NODE_NAME}/output"
+        if out_ds in zf:
+            del zf[out_ds]
+        out_str = json.dumps(out_val, ensure_ascii=False)
+        out_bytes = out_str.encode("utf-8")
+        zf.create_dataset(out_ds, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
         time.sleep(1)
 
 
