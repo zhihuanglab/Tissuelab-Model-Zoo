@@ -8,7 +8,7 @@ import os
 import sys
 import time
 import json
-import h5py
+import zarr
 import uvicorn
 import requests
 import platform
@@ -27,7 +27,6 @@ from pathlib import Path
 
 from nuc_seg import SlideSegmentation
 from nuc_embedding import NucleiEmbedding
-from safe_h5_utils import safe_h5_open
 
 app = FastAPI()
 
@@ -43,7 +42,7 @@ app.add_middleware(
 # Global variables
 ARGS = None
 IS_MODEL_INITED = False
-H5_PATH = None
+ZARR_PATH = None
 NODE_NAME = None
 DEPENDENCIES = []
 progress_value = 0  # Global variable to track progress
@@ -73,16 +72,19 @@ def parse_args():
     return parser.parse_args()
 
 def print_h5_structure(file_path):
-    """Helper to print HDF5 structure."""
-    def print_item(name, obj):
-        indent = "  " * (name.count("/"))
-        if isinstance(obj, h5py.Group):
-            print(f"{indent}{name} (Group)")
-        elif isinstance(obj, h5py.Dataset):
-            print(f"{indent}{name} (Dataset), shape: {obj.shape}, dtype: {obj.dtype}")
-
-    with safe_h5_open(file_path, "r") as hf:
-        hf.visititems(print_item)
+    """Helper to print Zarr structure."""
+    def _visit(group, prefix=""):
+        for key, val in group.items():
+            name = f"{prefix}/{key}" if prefix else key
+            if isinstance(val, zarr.hierarchy.Group):
+                print(f"{name} (Group)")
+                _visit(val, name)
+            else:
+                shape = getattr(val, 'shape', None)
+                dtype = getattr(val, 'dtype', None)
+                print(f"{name} (Dataset), shape: {shape}, dtype: {dtype}")
+    zf = zarr.open_group(file_path, mode='r')
+    _visit(zf)
 
 
 
@@ -96,8 +98,8 @@ def run_segmentation(args):
     """
     global progress_complete
 
-    if H5_PATH is None or NODE_NAME is None:
-        raise ValueError("H5_PATH and NODE_NAME must be set before running segmentation")
+    if ZARR_PATH is None or NODE_NAME is None:
+        raise ValueError("ZARR_PATH and NODE_NAME must be set before running segmentation")
 
     result = {"status": "success", "message": "", "nuclei_count": 0}
 
@@ -110,45 +112,44 @@ def run_segmentation(args):
         contours = None
         probability = None # Initialize probability
 
-        if os.path.exists(H5_PATH):
-            with safe_h5_open(H5_PATH, 'r') as hf:
-                if NODE_NAME in hf:
-                    try:
-                        centroids = hf[f"{NODE_NAME}/centroids"][()]
-                        # Attempt to load contours and probability, but don't fail if not present initially
-                        if f"{NODE_NAME}/contours" in hf:
-                            contours = hf[f"{NODE_NAME}/contours"][()]
-                        if f"{NODE_NAME}/probability" in hf:
-                             probability = hf[f"{NODE_NAME}/probability"][()]
-                        
-                        # Check if essential data (centroids) is valid
-                        if centroids is not None and centroids.size > 0 : # Basic check for non-empty centroids
-                            ALREADY_HAVE_SEG = True
-                            print("Using existing nuclei segmentation => skip stardist.")
-                            result["message"] = "Using existing nuclei segmentation"
-                            result["nuclei_count"] = len(centroids)
-                        else:
-                            print("Warning: Existing centroids are missing or empty. Will re-run stardist.")
-                            ALREADY_HAVE_SEG = False
-                            centroids = None # Ensure cleared
-                            contours = None
-                            probability = None
+        if os.path.exists(ZARR_PATH):
+            zf = zarr.open_group(ZARR_PATH, mode='r')
+            if NODE_NAME in zf:
+                try:
+                    centroids = zf[f"{NODE_NAME}/centroids"][...]
+                    # Attempt to load contours and probability, but don't fail if not present initially
+                    if f"{NODE_NAME}/contours" in zf:
+                        contours = zf[f"{NODE_NAME}/contours"][...]
+                    if f"{NODE_NAME}/probability" in zf:
+                        probability = zf[f"{NODE_NAME}/probability"][...]
 
-                    except KeyError as e:
-                        print(f"Warning: Existing segmentation data missing key {e}. Will re-run stardist.")
-                        ALREADY_HAVE_SEG = False 
-                        centroids = None 
-                        contours = None
-                        probability = None
-                    except Exception as e:
-                        print(f"Warning: Error reading existing segmentation data: {e}. Will re-run stardist.")
+                    # Check if essential data (centroids) is valid
+                    if centroids is not None and centroids.size > 0:  # Basic check for non-empty centroids
+                        ALREADY_HAVE_SEG = True
+                        print("Using existing nuclei segmentation => skip stardist.")
+                        result["message"] = "Using existing nuclei segmentation"
+                        result["nuclei_count"] = len(centroids)
+                    else:
+                        print("Warning: Existing centroids are missing or empty. Will re-run stardist.")
                         ALREADY_HAVE_SEG = False
-                        centroids = None
+                        centroids = None  # Ensure cleared
                         contours = None
                         probability = None
-                else: # NODE_NAME not in hf
-                    print(f"Group '{NODE_NAME}' not found in H5 file. Will run stardist.")
+                except KeyError as e:
+                    print(f"Warning: Existing segmentation data missing key {e}. Will re-run stardist.")
                     ALREADY_HAVE_SEG = False
+                    centroids = None
+                    contours = None
+                    probability = None
+                except Exception as e:
+                    print(f"Warning: Error reading existing segmentation data: {e}. Will re-run stardist.")
+                    ALREADY_HAVE_SEG = False
+                    centroids = None
+                    contours = None
+                    probability = None
+            else:
+                print(f"Group '{NODE_NAME}' not found in Zarr store. Will run stardist.")
+                ALREADY_HAVE_SEG = False
 
 
         # Step B: if not have segmentation => run stardist
@@ -206,94 +207,57 @@ def run_segmentation(args):
             result["nuclei_count"] = len(centroids) # Based on centroids
             result["message"] = "Segmentation completed successfully"
 
-        # Step C: generate embedding if dont have cached
-        embedding_data = None
-        temp_h5_path = None
+        # Step C: generate embedding if not cached; write directly to Zarr
         if centroids is not None and len(centroids) > 0: # Ensure centroids exist and are not empty
-            # create a temp H5 file path
-            h5_dir = os.path.dirname(H5_PATH)
-            slide_basename = os.path.basename(args.slidepath)
-            temp_h5_path = os.path.join(h5_dir, f"temp_{slide_basename}.h5")
-
             have_cached_embedding = False
-            if os.path.exists(temp_h5_path):
+            zf = zarr.open_group(ZARR_PATH, mode='a')
+            node_grp_path = f"{NODE_NAME}"
+            if NODE_NAME in zf and 'embedding' in zf[NODE_NAME]:
                 try:
-                    with safe_h5_open(temp_h5_path, "r") as tf:
-                        if "embedding" in tf:
-                            e = tf["embedding"][()]
-                            if len(e) == len(centroids):
-                                have_cached_embedding = True
-                                embedding_data = e
-                                print(f"found existing embeddings cache => skip embedding calculation: {temp_h5_path}")
-                except Exception as e:
-                    print(f"error reading cached embeddings: {str(e)}")
+                    existing_len = zf[NODE_NAME]['embedding'].shape[0]
+                    if existing_len == len(centroids):
+                        have_cached_embedding = True
+                        print("found existing embeddings in store => skip embedding calculation")
+                except Exception:
                     have_cached_embedding = False
 
             if not have_cached_embedding:
-                print("no cached embeddings => generate new embeddings")
+                print("no cached embeddings => generate new embeddings directly into Zarr")
                 ne = NucleiEmbedding(args, centroids, progress_callback=lambda x: update_progress(x, "embedding"))
-                # pass the temp file path to the embedding generator
-                result_path = ne.generate_embeddings(temp_h5_path=temp_h5_path)
-                
-                # create a backup - disabled
-                # backup_path = os.path.join(h5_dir, f"backup_{slide_basename}_embedding.h5")
-                # try:
-                #     import shutil
-                #     shutil.copy2(result_path, backup_path)
-                #     print(f"created embeddings backup: {backup_path}")
-                # except Exception as e:
-                #     print(f"warning: failed to create backup: {str(e)}")
-                
-                # read embeddings for later saving
-                with safe_h5_open(temp_h5_path, "r") as tf:
-                    embedding_data = tf["embedding"][()]
+                ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{NODE_NAME}/embedding")
         elif centroids is not None and len(centroids) == 0:
             print("[EMBED LOG] No centroids detected from segmentation, skipping embedding generation.")
         else: # centroids is None
             print("[EMBED LOG] Centroids are None, skipping embedding generation.")
 
 
-        # Step D:  copy segmentation + embedding to workflow_data.h5
-        # write to h5
+        # Step D: write segmentation (embedding already written if generated)
         if centroids is not None: # Only proceed if centroids were processed (even if empty from seg)
-            with safe_h5_open(H5_PATH, "a") as hf:
-                if NODE_NAME in hf: # if group already exists, delete it to ensure fresh write
-                    del hf[NODE_NAME]
-                node_grp = hf.create_group(NODE_NAME)
+            zf = zarr.open_group(ZARR_PATH, mode='a')
+            if NODE_NAME in zf: # if group already exists, delete it to ensure fresh write
+                del zf[NODE_NAME]
+            node_grp = zf.create_group(NODE_NAME)
 
-                print(f"[H5 WRITE] Writing centroids. Shape: {centroids.shape if centroids is not None else 'None'}")
-                node_grp.create_dataset('centroids', data=centroids)
-                
-                if contours is not None:
-                    print(f"[H5 WRITE] Writing contours. Shape: {contours.shape}")
-                    node_grp.create_dataset('contours', data=contours)
-                else:
-                    print("[H5 WRITE] Contours are None, not writing to H5.")
-                
-                if probability is not None: # Save probability if it was generated or loaded
-                    print(f"[H5 WRITE] Writing probability. Shape: {probability.shape}")
-                    node_grp.create_dataset('probability', data=probability)
-                else: # This case should be less common if prob is always attempted
-                    print("[H5 WRITE] Probability is None, not writing to H5.")
-
-                if embedding_data is not None:
-                    print(f"[H5 WRITE] Writing embedding. Shape: {embedding_data.shape}")
-                    node_grp.create_dataset('embedding', data=embedding_data)
-                else:
-                    print("[H5 WRITE] Embedding data is None, not writing to H5.")
-
-                hf.flush()
-            time.sleep(0.5) # Reduced sleep time
+            print(f"[ZARR WRITE] Writing centroids. Shape: {centroids.shape if centroids is not None else 'None'}")
+            node_grp.create_dataset('centroids', data=centroids)
             
-            # Clean up temp embedding file after successful write
-            if temp_h5_path and os.path.exists(temp_h5_path):
-                try:
-                    os.remove(temp_h5_path)
-                    print(f"[CLEANUP] Successfully removed temp embedding file: {temp_h5_path}")
-                except Exception as e:
-                    print(f"[CLEANUP] Warning: Could not remove temp file {temp_h5_path}: {str(e)}")
+            if contours is not None:
+                print(f"[ZARR WRITE] Writing contours. Shape: {contours.shape}")
+                node_grp.create_dataset('contours', data=contours)
+            else:
+                print("[ZARR WRITE] Contours are None, not writing.")
+            
+            if probability is not None: # Save probability if it was generated or loaded
+                print(f"[ZARR WRITE] Writing probability. Shape: {probability.shape}")
+                node_grp.create_dataset('probability', data=probability)
+            else: # This case should be less common if prob is always attempted
+                print("[ZARR WRITE] Probability is None, not writing.")
+
+            # Embedding has been written directly by NucleiEmbedding if needed
+
+            time.sleep(0.5) # Reduced sleep time
         else:
-            print("[H5 WRITE] Centroids are None after segmentation step, nothing to write to H5 for this node.")
+            print("[ZARR WRITE] Centroids are None after segmentation step, nothing to write for this node.")
 
         progress_complete = True
         update_progress(100, "embedding")
@@ -329,16 +293,16 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS
     NODE_NAME = data.get("node_name", "SegmentationNode")
     DEPENDENCIES = data.get("dependencies", [])
-    H5_PATH = data.get("h5_path", None)
+    ZARR_PATH = data.get("zarr_path", None)
 
-    print(f"[SegmentationNode] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}")
+    print(f"[SegmentationNode] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
 
-    if not H5_PATH or not os.path.exists(H5_PATH):
-        print("[SegmentationNode] no h5 file => skip read.")
-        return {"status": "ok", "message": "no H5 file found."}
+    if not ZARR_PATH or not os.path.exists(ZARR_PATH):
+        print("[SegmentationNode] no zarr store => skip read.")
+        return {"status": "ok", "message": "no Zarr store found."}
 
     if ARGS is None:
         ARGS = argparse.Namespace(
@@ -357,51 +321,51 @@ def read_node(data: Dict[str, Any]):
         ARGS.bbox = None
         ARGS.polygon_points = None
 
-    with safe_h5_open(H5_PATH, "r") as hf:
-        user_data_path = f"{NODE_NAME}/userData"
-        if user_data_path in hf:
-            for k in hf[user_data_path].keys():
-                raw_bytes = hf[user_data_path][k][()]
-                raw_str = raw_bytes.decode("utf-8")
-                try:
-                    val_json = json.loads(raw_str)
-                except:
-                    val_json = raw_str
-                print(f"[SegmentationNode] user param {k} => {val_json}")
+    zf = zarr.open_group(ZARR_PATH, mode='r')
+    user_data_path = f"{NODE_NAME}/userData"
+    if user_data_path in zf:
+        for k in zf[user_data_path].keys():
+            raw_bytes = zf[user_data_path][k][...]
+            raw_str = raw_bytes.decode("utf-8")
+            try:
+                val_json = json.loads(raw_str)
+            except:
+                val_json = raw_str
+            print(f"[SegmentationNode] user param {k} => {val_json}")
 
-                if k == "path":
-                    ARGS.slidepath = val_json
-                elif k == "read_image_method":
-                    ARGS.read_image_method = val_json
-                elif k == "stardist_pretrain":
-                    ARGS.stardist_pretrain = val_json
-                elif k == "isIHC":
-                    ARGS.isIHC = (val_json in [True, "true", "True"])
-                elif k == "target_mpp":
-                    try:
-                        ARGS.target_mpp = float(val_json)
-                    except ValueError:
-                        print(f"Warning: Could not parse target_mpp value '{val_json}' as float.")
-                        ARGS.target_mpp = None
-                elif k == "bbox":
-                    if isinstance(val_json, str) and len(val_json.split(',')) == 4:
-                        ARGS.bbox = val_json
-                    else:
-                        print(f"Warning: bbox value '{val_json}' is not in 'x,y,width,height' format.")
-                        ARGS.bbox = None
-                elif k == "polygon_points":
-                    if isinstance(val_json, list) and all(isinstance(p, list) and len(p) == 2 for p in val_json):
-                        ARGS.polygon_points = val_json
-                    else:
-                        print(f"Warning: polygon_points value '{val_json}' is not in the expected [[x1,y1],[x2,y2],...] format.")
-                        ARGS.polygon_points = None
+            if k == "path":
+                ARGS.slidepath = val_json
+            elif k == "read_image_method":
+                ARGS.read_image_method = val_json
+            elif k == "stardist_pretrain":
+                ARGS.stardist_pretrain = val_json
+            elif k == "isIHC":
+                ARGS.isIHC = (val_json in [True, "true", "True"])
+            elif k == "target_mpp":
+                try:
+                    ARGS.target_mpp = float(val_json)
+                except ValueError:
+                    print(f"Warning: Could not parse target_mpp value '{val_json}' as float.")
+                    ARGS.target_mpp = None
+            elif k == "bbox":
+                if isinstance(val_json, str) and len(val_json.split(',')) == 4:
+                    ARGS.bbox = val_json
+                else:
+                    print(f"Warning: bbox value '{val_json}' is not in 'x,y,width,height' format.")
+                    ARGS.bbox = None
+            elif k == "polygon_points":
+                if isinstance(val_json, list) and all(isinstance(p, list) and len(p) == 2 for p in val_json):
+                    ARGS.polygon_points = val_json
+                else:
+                    print(f"Warning: polygon_points value '{val_json}' is not in the expected [[x1,y1],[x2,y2],...] format.")
+                    ARGS.polygon_points = None
 
     return {"status": "ok", "message": "SegmentationNode read done"}
 
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME
 
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
@@ -418,13 +382,14 @@ def execute_node():
         out_val = run_segmentation(ARGS)
 
     # store the result to 'output'
-    if H5_PATH and os.path.exists(H5_PATH):
-        with safe_h5_open(H5_PATH, "a") as hf:
-            node_out_path = f"{NODE_NAME}/output"
-            if node_out_path in hf:
-                del hf[node_out_path]
-            out_str = json.dumps(out_val, ensure_ascii=False)
-            hf.create_dataset(node_out_path, data=out_str.encode("utf-8"))
+    if ZARR_PATH and os.path.exists(ZARR_PATH):
+        zf = zarr.open_group(ZARR_PATH, mode='a')
+        node_out_path = f"{NODE_NAME}/output"
+        if node_out_path in zf:
+            del zf[node_out_path]
+        out_str = json.dumps(out_val, ensure_ascii=False)
+        out_bytes = out_str.encode("utf-8")
+        zf.create_dataset(node_out_path, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
 
     return {"status": "ok", "output": out_val}
 
