@@ -28,9 +28,8 @@ from typing import Dict, Any
 # Import timm components for model
 import timm.models.swin_transformer as swin
 
-# Import safe H5 utilities
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
-from safe_h5_utils import safe_h5_open
+import zarr
 
 app = FastAPI()
 
@@ -46,15 +45,15 @@ app.add_middleware(
 # Global variables
 ARGS = None
 IS_MODEL_INITED = False
-H5_PATH = None
+ZARR_PATH = None
 NODE_NAME = None
 DEPENDENCIES = []
 ARK_MODEL = None
 progress_value = 0
 progress_complete = False
 last_printed_progress = -1
-H5_GROUP = None
-DEP_H5_GROUPS = {}
+ZARR_GROUP = None
+DEP_ZARR_GROUPS = {}
 
 # ======================== Model Definition ========================
 
@@ -235,7 +234,7 @@ def load_model_at_init():
 
 def run_inference(args):
     """Run inference on a single image"""
-    global progress_complete, ARK_MODEL, H5_PATH, H5_GROUP
+    global progress_complete, ARK_MODEL, ZARR_PATH, ZARR_GROUP
     
     result = {"status": "success", "message": "", "predictions": None}
     
@@ -285,9 +284,9 @@ def run_inference(args):
         for disease, prob in top5_predictions.items():
             print(f"  {disease}: {prob:.4f}")
         
-        # Save results to H5 file
-        if H5_PATH and os.path.exists(H5_PATH):
-            _save_results_to_h5(predictions, disease_list, os.path.basename(args.image_path))
+        # Save results to Zarr store
+        if ZARR_PATH and os.path.exists(ZARR_PATH):
+            _save_results_to_zarr(predictions, disease_list, os.path.basename(args.image_path))
         
         update_progress(95)
         
@@ -315,37 +314,22 @@ def run_inference(args):
     return result
 
 
-def _save_results_to_h5(predictions, disease_list, image_name):
-    """Save predictions to H5 file"""
-    global H5_PATH, H5_GROUP
-    
+def _save_results_to_zarr(predictions, disease_list, image_name):
+    """Save predictions to Zarr store"""
+    global ZARR_PATH, ZARR_GROUP
     try:
-        with safe_h5_open(H5_PATH, "a") as hf:
-            # Create group if it doesn't exist
-            if H5_GROUP not in hf:
-                hf.create_group(H5_GROUP)
-            
-            group = hf[H5_GROUP]
-            
-            # Save predictions
-            if "predictions" in group:
-                del group["predictions"]
-            group.create_dataset("predictions", data=predictions.astype(np.float32), compression="gzip")
-            
-            # Save image name
-            if "image_name" in group:
-                del group["image_name"]
-            group.create_dataset("image_name", data=image_name.encode('utf-8'))
-            
-            # Save disease list
-            if "disease_list" in group:
-                del group["disease_list"]
-            group.create_dataset("disease_list", data=np.array(disease_list, dtype='S'))
-            
-            print(f"[{NODE_NAME}] Results saved to H5: {H5_GROUP}")
-            
+        zf = zarr.open_group(ZARR_PATH, "a")
+        if ZARR_GROUP in zf:
+            del zf[ZARR_GROUP]
+        group = zf.create_group(ZARR_GROUP)
+        group.create_dataset("predictions", data=predictions.astype(np.float32))
+        img_bytes = image_name.encode('utf-8')
+        group.create_dataset("image_name", shape=(), dtype=f'S{len(img_bytes)}', data=img_bytes)
+        dl = np.array(disease_list, dtype='S')
+        group.create_dataset("disease_list", data=dl)
+        print(f"[{NODE_NAME}] Results saved to Zarr: {ZARR_GROUP}")
     except Exception as e:
-        print(f"[{NODE_NAME}] Error saving results to H5: {e}")
+        print(f"[{NODE_NAME}] Error saving results to Zarr: {e}")
 
 
 # ======================== FastAPI Endpoints ========================
@@ -370,21 +354,21 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS, H5_GROUP, DEP_H5_GROUPS
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, ZARR_GROUP, DEP_ZARR_GROUPS
     
     # Extract basic information from request
     NODE_NAME = data.get("node_name", "ArkPlusZeroShot")
     DEPENDENCIES = data.get("dependencies", [])
-    H5_PATH = data.get("h5_path", None)
-    H5_GROUP = data.get("h5_group") or "ArkPlusNode"
-    DEP_H5_GROUPS = data.get("dependencies_h5_groups", {})
+    ZARR_PATH = data.get("zarr_path", None)
+    ZARR_GROUP = data.get("zarr_group") or "ArkPlusNode"
+    DEP_ZARR_GROUPS = data.get("dependencies_zarr_groups", {})
 
-    print(f"[{NODE_NAME}] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}, h5_group={H5_GROUP}")
+    print(f"[{NODE_NAME}] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}, zarr_group={ZARR_GROUP}")
     
-    # Validate H5 file exists
-    if not H5_PATH or not os.path.exists(H5_PATH):
-        print(f"[{NODE_NAME}] no h5 file => skip read.")
-        return {"status": "ok", "message": "no H5 file found."}
+    # Validate Zarr exists
+    if not ZARR_PATH or not os.path.exists(ZARR_PATH):
+        print(f"[{NODE_NAME}] no zarr store => skip read.")
+        return {"status": "ok", "message": "no Zarr store found."}
     
     # Initialize ARGS with fixed defaults if not already initialized
     if ARGS is None:
@@ -394,8 +378,8 @@ def read_node(data: Dict[str, Any]):
             model_path="checkpoints/Ark6_swinLarge768_ep50.pth.tar"  # Fixed: model checkpoint path
         )
     
-    # Read and apply user parameters from H5 file (only image_path)
-    _load_parameters_from_h5(H5_PATH, H5_GROUP)
+    # Read and apply user parameters from Zarr (only image_path)
+    _load_parameters_from_zarr(ZARR_PATH, ZARR_GROUP)
     
     # Log final parameters
     print(f"[{NODE_NAME}] Configuration:")
@@ -406,31 +390,26 @@ def read_node(data: Dict[str, Any]):
     return {"status": "ok", "message": f"{NODE_NAME} read done"}
 
 
-def _load_parameters_from_h5(h5_path: str, h5_group: str):
-    """Load user parameters from H5 file"""
+def _load_parameters_from_zarr(zarr_path: str, zarr_group: str):
+    """Load user parameters from Zarr"""
     global ARGS
-    
     try:
-        with safe_h5_open(h5_path, "r") as hf:
-            user_data_path = f"{h5_group}/userData"
-            if user_data_path not in hf:
-                print(f"[{NODE_NAME}] No userData found in {h5_group}")
-                return
-            
-            # Read each parameter and apply it
-            for param_name in hf[user_data_path].keys():
-                raw_bytes = hf[user_data_path][param_name][()]
-                param_value = _decode_h5_parameter(raw_bytes)
-                
-                if param_value is not None:
-                    _apply_parameter(param_name, param_value)
-                    
+        zf = zarr.open_group(zarr_path, "r")
+        user_data_path = f"{zarr_group}/userData"
+        if user_data_path not in zf:
+            print(f"[{NODE_NAME}] No userData found in {zarr_group}")
+            return
+        for param_name in zf[user_data_path].keys():
+            raw_bytes = zf[user_data_path][param_name][...]
+            param_value = _decode_zarr_parameter(raw_bytes)
+            if param_value is not None:
+                _apply_parameter(param_name, param_value)
     except Exception as e:
-        print(f"[{NODE_NAME}] Error reading parameters from H5: {e}")
+        print(f"[{NODE_NAME}] Error reading parameters from Zarr: {e}")
 
 
-def _decode_h5_parameter(raw_bytes):
-    """Decode a parameter value from H5 storage"""
+def _decode_zarr_parameter(raw_bytes):
+    """Decode a parameter value from Zarr storage"""
     try:
         raw_str = raw_bytes.decode("utf-8")
         # Try to parse as JSON first
@@ -473,7 +452,7 @@ def _set_image_path(value):
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME, progress_value
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value
     
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
@@ -490,14 +469,14 @@ def execute_node():
         out_val = run_inference(ARGS)
     
     # Store the result to 'output'
-    if H5_PATH and os.path.exists(H5_PATH):
-        with safe_h5_open(H5_PATH, "a") as hf:
-            node_out_path = f"{H5_GROUP}/output"
-            if node_out_path in hf:
-                del hf[node_out_path]
-            out_str = json.dumps(out_val, ensure_ascii=False)
-            hf.create_dataset(node_out_path, data=out_str.encode("utf-8"))
-            hf.flush()
+    if ZARR_PATH and os.path.exists(ZARR_PATH):
+        zf = zarr.open_group(ZARR_PATH, "a")
+        node_out_path = f"{ZARR_GROUP}/output"
+        if node_out_path in zf:
+            del zf[node_out_path]
+        out_str = json.dumps(out_val, ensure_ascii=False)
+        out_bytes = out_str.encode("utf-8")
+        zf.create_dataset(node_out_path, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
         time.sleep(1)
     
     return {"status": "ok", "output": out_val}

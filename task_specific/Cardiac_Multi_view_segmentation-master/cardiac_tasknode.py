@@ -3,7 +3,7 @@
 """
 Cardiac Multi-view Segmentation TaskNode for FastAPI
 Supports LVSA, 4CH, VLA, LVOT views with DICOM and NIfTI input
-Outputs segmentation results to H5 files
+Outputs segmentation results to Zarr stores
 """
 
 import os
@@ -36,7 +36,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-import h5py
+import zarr
 import numpy as np
 import time
 import json
@@ -72,14 +72,8 @@ except ImportError as e:
     def predict(*args, **kwargs):
         raise ImportError(f"Failed to import predict function: {predict_import_error}")
 
-# Import safe H5 utilities
+# Zarr I/O
 sys.path.append(str(SCRIPT_DIR.parent.parent))
-try:
-    from safe_h5_utils import safe_h5_open
-except ImportError:
-    print("[Cardiac] Warning: safe_h5_utils not found, using standard h5py")
-    def safe_h5_open(path, mode):
-        return h5py.File(path, mode)
 
 # FastAPI app
 app = FastAPI(title="Cardiac Segmentation TaskNode")
@@ -96,7 +90,7 @@ app.add_middleware(
 # Global variables
 IS_MODEL_INITED = False
 MODEL_CONFIG = None
-H5_PATH = None
+ZARR_PATH = None
 NODE_NAME = "CardiacSegmentation"
 INPUT_PATH = None
 SELECTED_VIEW = None
@@ -163,7 +157,7 @@ from pydantic import ConfigDict
 class InitConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
     
-    h5_path: Optional[str] = None
+    zarr_path: Optional[str] = None
     device: Optional[str] = "gpu"
     node_name: Optional[str] = "CardiacSegmentation"
 
@@ -389,68 +383,65 @@ def convert_dicom_to_nifti(dicom_folder: str) -> str:
         print(f"[DICOM] Conversion failed: {e}")
         raise
 
-def save_segmentation_to_h5(segmentation_data: np.ndarray, original_image: sitk.Image, 
-                            h5_path: str, metadata: Dict[str, Any], view_name: str):
+def save_segmentation_to_zarr(segmentation_data: np.ndarray, original_image: sitk.Image,
+                              zarr_path: str, metadata: Dict[str, Any], view_name: str):
     """
-    Save segmentation result to H5 file
+    Save segmentation result to Zarr store
     
     Args:
         segmentation_data: Segmentation result array
         original_image: Original SimpleITK image
-        h5_path: H5 file path
+        zarr_path: Zarr store path (directory)
         metadata: Metadata dictionary
         view_name: View name (LVSA, 4CH, etc.)
     """
     try:
-        print(f"[H5] Starting to save segmentation to H5")
-        print(f"[H5] Data shape: {segmentation_data.shape}")
-        print(f"[H5] Data type: {segmentation_data.dtype}")
-        print(f"[H5] Data min: {segmentation_data.min()}, max: {segmentation_data.max()}, non-zero count: {np.count_nonzero(segmentation_data)}")
-        print(f"[H5] H5 path: {h5_path}")
+        print(f"[Zarr] Starting to save segmentation to Zarr")
+        print(f"[Zarr] Data shape: {segmentation_data.shape}")
+        print(f"[Zarr] Data type: {segmentation_data.dtype}")
+        print(f"[Zarr] Data min: {segmentation_data.min()}, max: {segmentation_data.max()}, non-zero count: {np.count_nonzero(segmentation_data)}")
+        print(f"[Zarr] Zarr path: {zarr_path}")
         
         # Ensure data is uint8
         if segmentation_data.dtype != np.uint8:
             print(f"[H5] Converting data from {segmentation_data.dtype} to uint8")
             segmentation_data = segmentation_data.astype(np.uint8)
         
-        with safe_h5_open(h5_path, "a") as hf:
-            print(f"[H5] Opened H5 file successfully")
-            print(f"[H5] Existing groups: {list(hf.keys())}")
-            
-            # Create CardiacSegmentation group if it doesn't exist
-            if NODE_NAME not in hf:
-                print(f"[H5] Creating new group: {NODE_NAME}")
-                cardiac_node = hf.create_group(NODE_NAME)
-            else:
-                print(f"[H5] Using existing group: {NODE_NAME}")
-                cardiac_node = hf[NODE_NAME]
-            
-            # Create voxel_mask sub-group if it doesn't exist
-            if "voxel_mask" not in cardiac_node:
-                print(f"[H5] Creating new sub-group: {NODE_NAME}/voxel_mask")
-                voxel_group = cardiac_node.create_group("voxel_mask")
-            else:
-                print(f"[H5] Using existing sub-group: {NODE_NAME}/voxel_mask")
-                voxel_group = cardiac_node["voxel_mask"]
+        zf = zarr.open_group(zarr_path, mode="a")
+        print(f"[Zarr] Opened Zarr store successfully")
+        print(f"[Zarr] Existing groups: {list(zf.keys())}")
+
+        # Create CardiacSegmentation group if it doesn't exist
+        if NODE_NAME in zf:
+            cardiac_node = zf[NODE_NAME]
+        else:
+            print(f"[Zarr] Creating new group: {NODE_NAME}")
+            cardiac_node = zf.create_group(NODE_NAME)
+
+        # Create voxel_mask sub-group if it doesn't exist
+        if "voxel_mask" in cardiac_node:
+            voxel_group = cardiac_node["voxel_mask"]
+        else:
+            print(f"[Zarr] Creating new sub-group: {NODE_NAME}/voxel_mask")
+            voxel_group = cardiac_node.create_group("voxel_mask")
             
             # Use view name as dataset name
             dataset_name = view_name
-            print(f"[H5] Dataset name: {dataset_name}")
+            print(f"[Zarr] Dataset name: {dataset_name}")
             
             # Delete existing dataset if it exists
             if dataset_name in voxel_group:
-                print(f"[H5] Deleting existing dataset: {dataset_name}")
+                print(f"[Zarr] Deleting existing dataset: {dataset_name}")
                 del voxel_group[dataset_name]
             
             # Create segmentation dataset
-            print(f"[H5] Creating dataset with shape {segmentation_data.shape}")
+            print(f"[Zarr] Creating dataset with shape {segmentation_data.shape}")
             seg_dataset = voxel_group.create_dataset(
                 dataset_name,
                 data=segmentation_data,
-                compression='gzip',
                 chunks=True
             )
-            print(f"[H5] Dataset created successfully")
+            print(f"[Zarr] Dataset created successfully")
             
             # Add metadata as attributes
             seg_dataset.attrs['view_name'] = view_name
@@ -467,7 +458,7 @@ def save_segmentation_to_h5(segmentation_data: np.ndarray, original_image: sitk.
                         seg_dataset.attrs['origin'] = str(original_image.GetOrigin())
                         seg_dataset.attrs['direction'] = str(original_image.GetDirection())
                 except Exception as e:
-                    print(f"[H5] Warning: Could not extract image metadata: {e}")
+                    print(f"[Zarr] Warning: Could not extract image metadata: {e}")
             
             # Add class information
             view_config = AVAILABLE_VIEWS[view_name]
@@ -483,15 +474,10 @@ def save_segmentation_to_h5(segmentation_data: np.ndarray, original_image: sitk.
             # Add general metadata to CardiacSegmentation node
             cardiac_node.attrs.update(metadata)
             cardiac_node.attrs['last_updated'] = time.strftime('%Y-%m-%d %H:%M:%S')
-            
-            # Flush to ensure data is written
-            hf.flush()
-            print(f"[H5] Data flushed to disk")
-            
-            print(f"[H5] SUCCESS: Saved {dataset_name} segmentation with shape {segmentation_data.shape}")
+            print(f"[Zarr] SUCCESS: Saved {dataset_name} segmentation with shape {segmentation_data.shape}")
             
     except Exception as e:
-        print(f"[H5] ERROR saving segmentation to H5: {e}")
+        print(f"[Zarr] ERROR saving segmentation to Zarr: {e}")
         import traceback
         traceback.print_exc()
         raise
@@ -667,7 +653,7 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
             update_progress(100, "Error: Segmentation output not found")
             return {"status": "error", "message": "Segmentation output not found"}
         
-        update_progress(80, "Saving to H5 format")
+        update_progress(80, "Saving to Zarr format")
         
         # Validate segmentation result
         logger.info(f"[Process] Validating segmentation result...")
@@ -717,18 +703,18 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
             'device': device
         }
         
-        # Save to H5
-        logger.info(f"[Process] Saving segmentation to H5...")
-        print(f"[Process] Saving segmentation to H5...")
-        save_segmentation_to_h5(
+        # Save to Zarr
+        logger.info(f"[Process] Saving segmentation to Zarr...")
+        print(f"[Process] Saving segmentation to Zarr...")
+        save_segmentation_to_zarr(
             prediction_result,
             original_image_result,
-            H5_PATH,
+            ZARR_PATH,
             metadata,
             view_name
         )
         
-        update_progress(95, "H5 conversion completed")
+        update_progress(95, "Zarr write completed")
         
         # Calculate statistics
         unique_labels = np.unique(prediction_result)
@@ -850,7 +836,7 @@ def init_model():
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
     """Read configuration data from frontend"""
-    global NODE_NAME, H5_PATH, INPUT_PATH, SELECTED_VIEW
+    global NODE_NAME, ZARR_PATH, INPUT_PATH, SELECTED_VIEW
     
     print("=" * 60)
     print("POST /read - Reading configuration")
@@ -858,36 +844,35 @@ def read_node(data: Dict[str, Any]):
     print(f"Received data: {data}")
     
     NODE_NAME = data.get("node_name", "CardiacSegmentation")
-    H5_PATH = data.get("h5_path", None)
+    ZARR_PATH = data.get("zarr_path", None)
     
-    print(f"[Read] node_name={NODE_NAME}, h5_path={H5_PATH}")
+    print(f"[Read] node_name={NODE_NAME}, zarr_path={ZARR_PATH}")
     
-    # Check if H5 file exists and read user data from it
-    if H5_PATH and os.path.exists(H5_PATH):
+    # Check if Zarr store exists and read user data from it
+    if ZARR_PATH and os.path.exists(ZARR_PATH):
         try:
-            with safe_h5_open(H5_PATH, "r") as hf:
-                user_data_path = f"{NODE_NAME}/userData"
-                if user_data_path in hf:
-                    print(f"[Read] Found userData in H5 file")
-                    for k in hf[user_data_path].keys():
-                        raw_bytes = hf[user_data_path][k][()]
-                        raw_str = raw_bytes.decode("utf-8")
-                        try:
-                            val_json = json.loads(raw_str)
-                        except:
-                            val_json = raw_str
-                        print(f"[Read] user param {k} => {val_json}")
-                        
-                        if k == "path":
-                            INPUT_PATH = val_json
-                        elif k == "view":
-                            SELECTED_VIEW = val_json
-                        # Check if k matches any available view
-                        elif k in AVAILABLE_VIEWS:
-                            SELECTED_VIEW = k
-                            print(f"[Read] Selected view: {k}")
+            zf = zarr.open_group(ZARR_PATH, "r")
+            user_data_path = f"{NODE_NAME}/userData"
+            if user_data_path in zf:
+                print(f"[Read] Found userData in Zarr store")
+                for k in zf[user_data_path].keys():
+                    raw_bytes = zf[user_data_path][k][...]
+                    raw_str = raw_bytes.decode("utf-8")
+                    try:
+                        val_json = json.loads(raw_str)
+                    except:
+                        val_json = raw_str
+                    print(f"[Read] user param {k} => {val_json}")
+                    
+                    if k == "path":
+                        INPUT_PATH = val_json
+                    elif k == "view":
+                        SELECTED_VIEW = val_json
+                    elif k in AVAILABLE_VIEWS:
+                        SELECTED_VIEW = k
+                        print(f"[Read] Selected view: {k}")
         except Exception as e:
-            print(f"[Read] Error reading H5 file: {e}")
+            print(f"[Read] Error reading Zarr store: {e}")
     
     return {"status": "ok", "message": f"[{NODE_NAME}] read done"}
 
@@ -913,10 +898,10 @@ def execute_model():
         print("[Execute] Model is already processing")
         return {"status": "error", "message": "Model is already processing"}
     
-    if not H5_PATH:
-        logger.error("[Execute] H5 path not configured. Call /read first")
-        print("[Execute] H5 path not configured. Call /read first")
-        return {"status": "error", "message": "H5 path not configured. Call /read first"}
+    if not ZARR_PATH:
+        logger.error("[Execute] Zarr path not configured. Call /read first")
+        print("[Execute] Zarr path not configured. Call /read first")
+        return {"status": "error", "message": "Zarr path not configured. Call /read first"}
     
     if not INPUT_PATH:
         logger.error("[Execute] Input path not configured. Call /read first")
@@ -945,11 +930,11 @@ def execute_model():
     logger.info(f"[Execute] Starting segmentation")
     logger.info(f"[Execute] Input path: {INPUT_PATH}")
     logger.info(f"[Execute] Selected view: {SELECTED_VIEW}")
-    logger.info(f"[Execute] H5 path: {H5_PATH}")
+    logger.info(f"[Execute] Zarr path: {ZARR_PATH}")
     print(f"[Execute] Starting segmentation")
     print(f"[Execute] Input path: {INPUT_PATH}")
     print(f"[Execute] Selected view: {SELECTED_VIEW}")
-    print(f"[Execute] H5 path: {H5_PATH}")
+    print(f"[Execute] Zarr path: {ZARR_PATH}")
     
     # Start processing
     try:
@@ -1003,7 +988,7 @@ async def get_status():
         "model_initialized": IS_MODEL_INITED,
         "available_views": list(AVAILABLE_VIEWS.keys()),
         "selected_view": SELECTED_VIEW,
-        "h5_path": H5_PATH,
+        "zarr_path": ZARR_PATH,
         "node_name": NODE_NAME,
         "is_processing": IS_PROCESSING
     }
