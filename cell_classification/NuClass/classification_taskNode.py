@@ -520,23 +520,23 @@ def run_classification(args) -> Dict[str, Any]:
             # Batch process all class embeddings at once
             class_embeddings_arr = _generate_text_description(processor, text_encoder, text_projection,
                                                           nuclei_classes, organ, device)
-            
+
             # Compute all similarities at once
             sims_arr = np.dot(cell_embeddings, class_embeddings_arr.T)
             predictions = np.argmax(sims_arr, axis=1)
             prediction_probs = None # For zero-shot, raw similarity scores might be more informative
 
             # Update progress after similarity computation (once for zero-shot)
-            progress_value = 100 
+            progress_value = 100
             print("Progress: 100% (Similarities computed for zero-shot)")
 
             final_class_colors = None
             # Check for existing colors within the same zf handle
-            if NODE_NAME in zf and 'nuclei_class_HEX_color' in zf[NODE_NAME]: 
+            if NODE_NAME in zf and 'nuclei_class_HEX_color' in zf[NODE_NAME]:
                 old_colors = zf[NODE_NAME]['nuclei_class_HEX_color'][()]
                 if len(old_colors) == len(nuclei_classes):
                     final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
-            
+
             if final_class_colors is None:
                 if nuclei_colors:
                     final_class_colors = nuclei_colors
@@ -544,52 +544,52 @@ def run_classification(args) -> Dict[str, Any]:
                     final_class_colors = generate_distinct_colors(nuclei_classes)
             final_class_names = nuclei_classes
 
-            # D) result => cell_classification
-            if NODE_NAME in zf:
-                del zf[NODE_NAME]
-            grp_cls = zf.require_group(NODE_NAME)
+        # D) result => cell_classification (common for both supervised and zero-shot)
+        if NODE_NAME in zf:
+            del zf[NODE_NAME]
+        grp_cls = zf.require_group(NODE_NAME)
 
-            grp_cls.require_dataset('nuclei_class_id', data=predictions.astype(np.int32))
+        grp_cls.require_dataset('nuclei_class_id', data=predictions.astype(np.int32))
 
-            class_names_ascii = [n.encode('utf-8') for n in final_class_names]
-            grp_cls.require_dataset('nuclei_class_name', (len(class_names_ascii),), dtype='S256', data=class_names_ascii)
+        class_names_ascii = [n.encode('utf-8') for n in final_class_names]
+        grp_cls.require_dataset('nuclei_class_name', (len(class_names_ascii),), dtype='S256', data=class_names_ascii)
 
-            colors_ascii = [c.encode('utf-8') for c in final_class_colors]
-            grp_cls.require_dataset('nuclei_class_HEX_color', (len(colors_ascii),), dtype='S256', data=colors_ascii)
+        colors_ascii = [c.encode('utf-8') for c in final_class_colors]
+        grp_cls.require_dataset('nuclei_class_HEX_color', (len(colors_ascii),), dtype='S256', data=colors_ascii)
 
-            # Save probability scores for active learning
-            if prediction_probs is not None:
-                grp_cls.require_dataset('nuclei_class_probabilities', data=prediction_probs.astype(np.float32))
-                print(f"Saved classification probabilities for active learning, shape: {prediction_probs.shape}")
-            elif 'sims_arr' in locals() and sims_arr is not None:
-                # For zero-shot: save similarity scores as pseudo-probabilities
-                # Normalize similarity scores to [0, 1] range using softmax
-                print(f"Converting similarity scores to probabilities, shape: {sims_arr.shape}")
-                exp_sims = np.exp(sims_arr - np.max(sims_arr, axis=1, keepdims=True))
-                pseudo_probs = exp_sims / np.sum(exp_sims, axis=1, keepdims=True)
-                grp_cls.require_dataset('nuclei_class_probabilities', data=pseudo_probs.astype(np.float32))
-                print(f"Saved zero-shot similarity scores as probabilities for active learning, shape: {pseudo_probs.shape}")
-            else:
-                print("Warning: No probability data available to save for active learning")
+        # Save probability scores for active learning
+        if prediction_probs is not None:
+            grp_cls.require_dataset('nuclei_class_probabilities', data=prediction_probs.astype(np.float32))
+            print(f"Saved classification probabilities for active learning, shape: {prediction_probs.shape}")
+        elif classification_method == "zero-shot" and 'sims_arr' in locals() and sims_arr is not None:
+            # For zero-shot: save similarity scores as pseudo-probabilities
+            # Normalize similarity scores to [0, 1] range using softmax
+            print(f"Converting similarity scores to probabilities, shape: {sims_arr.shape}")
+            exp_sims = np.exp(sims_arr - np.max(sims_arr, axis=1, keepdims=True))
+            pseudo_probs = exp_sims / np.sum(exp_sims, axis=1, keepdims=True)
+            grp_cls.require_dataset('nuclei_class_probabilities', data=pseudo_probs.astype(np.float32))
+            print(f"Saved zero-shot similarity scores as probabilities for active learning, shape: {pseudo_probs.shape}")
+        else:
+            print("Warning: No probability data available to save for active learning")
 
-            print("================")
-            print({
-                "predictions": list(set(predictions)), 
-                "nuclei_classes": final_class_names,
-                "classification_method": classification_method,
-                "organ": organ
-            })
-            metadata = {
-                "nuclei_classes": final_class_names,
-                "classification_method": classification_method,
-                "organ": organ
-            }
-            if use_supervised and annotations_data is not None and 'train_time' in locals() and 'test_time' in locals(): 
-                metadata["training_time"] = train_time
-                metadata["testing_time"] = test_time
-            metadata['created'] = datetime.now().isoformat()
-            meta_bytes = json.dumps(metadata).encode("utf-8")
-            grp_cls.require_dataset('metadata', shape=(), dtype=f'S{len(meta_bytes)}', data=meta_bytes)
+        print("================")
+        print({
+            "predictions": list(set(predictions)),
+            "nuclei_classes": final_class_names,
+            "classification_method": classification_method,
+            "organ": organ
+        })
+        metadata = {
+            "nuclei_classes": final_class_names,
+            "classification_method": classification_method,
+            "organ": organ
+        }
+        if use_supervised and annotations_data is not None and 'train_time' in locals() and 'test_time' in locals():
+            metadata["training_time"] = train_time
+            metadata["testing_time"] = test_time
+        metadata['created'] = datetime.now().isoformat()
+        meta_bytes = json.dumps(metadata).encode("utf-8")
+        grp_cls.require_dataset('metadata', shape=(), dtype=f'S{len(meta_bytes)}', data=meta_bytes)
             
         end_time = time.time()
         result["classification_count"] = len(predictions)
