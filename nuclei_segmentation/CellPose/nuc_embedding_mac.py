@@ -13,8 +13,7 @@ from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
 from PIL import Image
 import multiprocess as mp
 from tqdm import tqdm
-import h5py
-from safe_h5_utils import safe_h5_open
+import zarr
 import os
 from nuc_stat import PILSlide, NumpySlide
 from torch.utils.data import Dataset, DataLoader
@@ -275,9 +274,9 @@ class NucleiEmbedding:
 
         return embeddings
 
-    def generate_embeddings(self, batch_size=None, num_workers=0, temp_h5_path=None):
-        """Generate embeddings for all nuclei using PyTorch DataLoader.
-        
+    def generate_embeddings(self, batch_size=None, num_workers=0, zarr_path=None, dataset_path='embedding'):
+        """Generate embeddings for all nuclei and write directly to a Zarr dataset.
+
         Note: Set num_workers=0 to avoid multiprocessing conflicts with Cellpose/TensorFlow
         """
         # Force single-threaded operation to avoid conflicts
@@ -330,80 +329,79 @@ class NucleiEmbedding:
             pin_memory=torch.cuda.is_available()
         )
         
-        # use the provided temp_h5_path or generate a new one
-        if temp_h5_path is None:
-            temp_h5_path = f"temp_embeddings_{int(time.time())}.h5"
-        
-        print(f"Storing embeddings to: {temp_h5_path}")
+        if zarr_path is None:
+            raise ValueError("zarr_path must be provided to write embeddings directly")
+        print(f"Storing embeddings directly to: {zarr_path}:{dataset_path}")
         total_processed = 0
+
+        root = zarr.open_group(zarr_path, mode='a')
+        parts = dataset_path.strip('/').split('/')
+        parent = root
+        for group_name in parts[:-1]:
+            parent = parent.require_group(group_name)
+        ds_name = parts[-1]
+        if ds_name in parent:
+            del parent[ds_name]
+        embeddings_dset = parent.create_dataset(
+            ds_name,
+            shape=(0, 768),
+            chunks=(min(1000, batch_size), 768),
+            dtype=np.float16
+        )
         
-        with safe_h5_open(temp_h5_path, 'w') as h5f:
-            # create extendable dataset
-            embeddings_dset = h5f.create_dataset(
-                'embedding',
-                shape=(0, 768),
-                maxshape=(None, 768),
-                dtype=np.float16,
-                chunks=(min(1000, batch_size), 768)
-            )
-            
-            total_start_time = time.time()
-            pbar = tqdm(total=len(dataset), desc="Generating embeddings")
-            
-            for batch_idx, batch in enumerate(dataloader):
-                if batch:
-                    try:
-                        processed_batch = torch.from_numpy(np.concatenate(batch, axis=0)).to("cuda" if torch.cuda.is_available() else "cpu")
-                        batch_embeddings = self.embed_batch(processed_batch)
-                        batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
-                        
-                        # convert to float16 and incrementally save to HDF5 file
-                        batch_embeddings = batch_embeddings.astype(np.float16)
-                        
-                        # adjust the dataset size to fit the new data
-                        current_size = embeddings_dset.shape[0]
-                        new_size = current_size + batch_embeddings.shape[0]
-                        embeddings_dset.resize(new_size, axis=0)
-                        
-                        # write new data
-                        embeddings_dset[current_size:new_size] = batch_embeddings
-                        
-                        # update progress
-                        total_processed += len(batch)
-                        pbar.update(len(batch))
-                        
-                        # update progress callback
-                        if self.progress_callback:
-                            progress = int((total_processed / len(dataset)) * 100)
-                            self.progress_callback(progress)
-                        
-                        # force write to disk and clean memory
-                        h5f.flush()
-                        del batch_embeddings
-                        del processed_batch
-                        torch.cuda.empty_cache()
-                        
-                        # Print progress every 10 batches
-                        if batch_idx % 10 == 0:
-                            elapsed = time.time() - total_start_time
-                            rate = total_processed / elapsed
-                            eta = (len(dataset) - total_processed) / rate
-                            print(f"\nProcessed {total_processed}/{len(dataset)} nuclei. "
-                                  f"Rate: {rate:.1f} nuclei/s. ETA: {eta/60:.1f} min")
-                            
-                    except Exception as e:
-                        print(f"Error processing batch {batch_idx}: {str(e)}")
-                        import traceback
-                        print(traceback.format_exc())
-                        continue
-            
-            pbar.close()
-            total_time = time.time() - total_start_time
-            print(f"Total processing time: {total_time:.2f} seconds")
-            print(f"Average rate: {len(dataset)/total_time:.1f} nuclei/second")
+        total_start_time = time.time()
+        pbar = tqdm(total=len(dataset), desc="Generating embeddings")
         
-        # print completion info, but not delete the temp file
-        print(f"Embeddings calculation completed, saved to file: {temp_h5_path}")
+        for batch_idx, batch in enumerate(dataloader):
+            if batch:
+                try:
+                    processed_batch = torch.from_numpy(np.concatenate(batch, axis=0)).to("cuda" if torch.cuda.is_available() else "cpu")
+                    batch_embeddings = self.embed_batch(processed_batch)
+                    batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
+                    
+                    # convert to float16 and incrementally save to Zarr store
+                    batch_embeddings = batch_embeddings.astype(np.float16)
+                    
+                    # adjust the dataset size to fit the new data
+                    current_size = embeddings_dset.shape[0]
+                    new_size = current_size + batch_embeddings.shape[0]
+                    embeddings_dset.resize(new_size, axis=0)
+                    
+                    # write new data
+                    embeddings_dset[current_size:new_size, :] = batch_embeddings
+                    
+                    # update progress
+                    total_processed += len(batch)
+                    pbar.update(len(batch))
+                    
+                    # update progress callback
+                    if self.progress_callback:
+                        progress = int((total_processed / len(dataset)) * 100)
+                        self.progress_callback(progress)
+                    
+                    # clean memory
+                    del batch_embeddings
+                    del processed_batch
+                    torch.cuda.empty_cache()
+                    
+                    # Print progress every 10 batches
+                    if batch_idx % 10 == 0:
+                        elapsed = time.time() - total_start_time
+                        rate = total_processed / elapsed
+                        eta = (len(dataset) - total_processed) / rate
+                        print(f"\nProcessed {total_processed}/{len(dataset)} nuclei. "
+                              f"Rate: {rate:.1f} nuclei/s. ETA: {eta/60:.1f} min")
+                        
+                except Exception as e:
+                    print(f"Error processing batch {batch_idx}: {str(e)}")
+                    import traceback
+                    print(traceback.format_exc())
+                    continue
         
-        # return the temp file path, let the caller decide how to use it
-        return temp_h5_path
+        pbar.close()
+        total_time = time.time() - total_start_time
+        print(f"Total processing time: {total_time:.2f} seconds")
+        print(f"Average rate: {len(dataset)/total_time:.1f} nuclei/second")
+        
+        print("Embeddings calculation completed and written to Zarr store")
+        return dataset_path

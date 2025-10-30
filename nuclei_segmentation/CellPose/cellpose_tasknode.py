@@ -8,7 +8,7 @@ import os
 import sys
 import time
 import json
-import h5py
+import zarr
 import uvicorn
 import requests
 import platform
@@ -27,7 +27,6 @@ from pathlib import Path
 
 from cellpose_nuc_seg import SlideSegmentation
 from nuc_embedding_mac import NucleiEmbedding
-from safe_h5_utils import safe_h5_open
 
 app = FastAPI()
 
@@ -43,7 +42,7 @@ app.add_middleware(
 # Global variables
 ARGS = None
 IS_MODEL_INITED = False
-H5_PATH = None
+ZARR_PATH = None
 NODE_NAME = None
 DEPENDENCIES = []
 progress_value = 0  # Global variable to track progress
@@ -67,16 +66,19 @@ def parse_args():
     return parser.parse_args()
 
 def print_h5_structure(file_path):
-    """Helper to print HDF5 structure."""
-    def print_item(name, obj):
-        indent = "  " * (name.count("/"))
-        if isinstance(obj, h5py.Group):
-            print(f"{indent}{name} (Group)")
-        elif isinstance(obj, h5py.Dataset):
-            print(f"{indent}{name} (Dataset), shape: {obj.shape}, dtype: {obj.dtype}")
-
-    with safe_h5_open(file_path, "r") as hf:
-        hf.visititems(print_item)
+    """Helper to print Zarr structure."""
+    def _visit(group, prefix=""):
+        for key, val in group.items():
+            name = f"{prefix}/{key}" if prefix else key
+            if isinstance(val, zarr.hierarchy.Group):
+                print(f"{name} (Group)")
+                _visit(val, name)
+            else:
+                shape = getattr(val, 'shape', None)
+                dtype = getattr(val, 'dtype', None)
+                print(f"{name} (Dataset), shape: {shape}, dtype: {dtype}")
+    zf = zarr.open_group(file_path, mode='r')
+    _visit(zf)
 
 
 
@@ -90,8 +92,8 @@ def run_segmentation(args):
     """
     global progress_complete
 
-    if H5_PATH is None or NODE_NAME is None:
-        raise ValueError("H5_PATH and NODE_NAME must be set before running segmentation")
+    if ZARR_PATH is None or NODE_NAME is None:
+        raise ValueError("ZARR_PATH and NODE_NAME must be set before running segmentation")
 
     result = {"status": "success", "message": "", "nuclei_count": 0}
 
@@ -103,19 +105,19 @@ def run_segmentation(args):
         centroids = None
         contours = None
 
-        if os.path.exists(H5_PATH):
-            with safe_h5_open(H5_PATH, 'r') as hf:
-                if NODE_NAME in hf:
-                    # if already have segmentation => skip cellpose
-                    try:
-                        centroids = hf[f"{NODE_NAME}/centroids"][()]
-                        contours = hf[f"{NODE_NAME}/contours"][()]
-                        ALREADY_HAVE_SEG = True
-                        print("Using existing nuclei segmentation => skip cellpose.")
-                        result["message"] = "Using existing nuclei segmentation"
-                        result["nuclei_count"] = len(centroids)
-                    except:
-                        print("Warning: segmentation data is corrupted. Will re-run cellpose.")
+        if os.path.exists(ZARR_PATH):
+            zf = zarr.open_group(ZARR_PATH, mode='r')
+            if NODE_NAME in zf:
+                # if already have segmentation => skip cellpose
+                try:
+                    centroids = zf[f"{NODE_NAME}/centroids"][...]
+                    contours = zf[f"{NODE_NAME}/contours"][...]
+                    ALREADY_HAVE_SEG = True
+                    print("Using existing nuclei segmentation => skip cellpose.")
+                    result["message"] = "Using existing nuclei segmentation"
+                    result["nuclei_count"] = len(centroids)
+                except Exception:
+                    print("Warning: segmentation data is corrupted. Will re-run cellpose.")
 
         # Step B: if not have segmentation => run cellpose
         if not ALREADY_HAVE_SEG:
@@ -136,70 +138,35 @@ def run_segmentation(args):
             result["nuclei_count"] = len(centroids)
             result["message"] = "Segmentation completed successfully"
 
-        # Step C: generate embedding if dont have cached
-        embedding_data = None
+        # Step C: generate embedding directly to Zarr if not cached
         if centroids is not None:
-            # create a temp H5 file path
-            h5_dir = os.path.dirname(H5_PATH)
-            slide_basename = os.path.basename(args.slidepath)
-            temp_h5_path = os.path.join(h5_dir, f"temp_{slide_basename}.h5")
-
             have_cached_embedding = False
-            if os.path.exists(temp_h5_path):
+            zf = zarr.open_group(ZARR_PATH, mode='a')
+            if NODE_NAME in zf and 'embedding' in zf[NODE_NAME]:
                 try:
-                    with safe_h5_open(temp_h5_path, "r") as tf:
-                        if "embedding" in tf:
-                            e = tf["embedding"][()]
-                            if len(e) == len(centroids):
-                                have_cached_embedding = True
-                                embedding_data = e
-                                print(f"found existing embeddings cache => skip embedding calculation: {temp_h5_path}")
-                except Exception as e:
-                    print(f"error reading cached embeddings: {str(e)}")
+                    if zf[NODE_NAME]['embedding'].shape[0] == len(centroids):
+                        have_cached_embedding = True
+                        print("found existing embeddings => skip embedding calculation")
+                except Exception:
                     have_cached_embedding = False
 
             if not have_cached_embedding:
-                print("no cached embeddings => generate new embeddings")
+                print("no cached embeddings => generate new embeddings directly into Zarr")
                 ne = NucleiEmbedding(args, centroids, progress_callback=update_progress)
-                # pass the temp file path to the embedding generator
-                result_path = ne.generate_embeddings(temp_h5_path=temp_h5_path)
-                
-                # create a backup
-                backup_path = os.path.join(h5_dir, f"backup_{slide_basename}_embedding.h5")
-                try:
-                    import shutil
-                    shutil.copy2(result_path, backup_path)
-                    print(f"created embeddings backup: {backup_path}")
-                except Exception as e:
-                    print(f"warning: failed to create backup: {str(e)}")
-                
-                # read embeddings for later saving
-                with safe_h5_open(temp_h5_path, "r") as tf:
-                    embedding_data = tf["embedding"][()]
+                ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{NODE_NAME}/embedding")
 
-        # Step D:  copy segmentation + embedding to workflow_data.h5
-        # write to h5
+        # Step D: write segmentation to workflow Zarr (embedding already written if generated)
         if centroids is not None:
-            with safe_h5_open(H5_PATH, "a") as hf:
-                # if already have segmentation => delete old
-                if NODE_NAME in hf:
-                    del hf[NODE_NAME]
-                node_grp = hf.create_group(NODE_NAME)
+            zf = zarr.open_group(ZARR_PATH, mode='a')
+            if NODE_NAME in zf:
+                del zf[NODE_NAME]
+            node_grp = zf.create_group(NODE_NAME)
 
-                # write segmentation
-                node_grp.create_dataset('centroids', data=centroids)
-                if contours is not None:
-                    node_grp.create_dataset('contours', data=contours)
-                if not ALREADY_HAVE_SEG and 'probability' in locals():
-                    node_grp.create_dataset('probability', data=probability)
-
-                # write embedding
-                if embedding_data is not None:
-                    node_grp.create_dataset('embedding', data=embedding_data)
-
-                hf.flush()  # force write to disk
-            # sleep for a while to ensure h5 is written
-            time.sleep(2)
+            node_grp.create_dataset('centroids', data=centroids)
+            if contours is not None:
+                node_grp.create_dataset('contours', data=contours)
+            if not ALREADY_HAVE_SEG and 'probability' in locals():
+                node_grp.create_dataset('probability', data=probability)
 
         # Ensure progress is set to 100 after Step C and D are completed
         progress_complete = True
@@ -236,16 +203,16 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS
     NODE_NAME = data.get("node_name", "CellposeSegmentationNode")
     DEPENDENCIES = data.get("dependencies", [])
-    H5_PATH = data.get("h5_path", None)
+    ZARR_PATH = data.get("zarr_path", None)
 
-    print(f"[CellposeSegmentationNode] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}")
+    print(f"[CellposeSegmentationNode] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
 
-    if not H5_PATH or not os.path.exists(H5_PATH):
-        print("[CellposeSegmentationNode] no h5 file => skip read.")
-        return {"status": "ok", "message": "no H5 file found."}
+    if not ZARR_PATH or not os.path.exists(ZARR_PATH):
+        print("[CellposeSegmentationNode] no zarr store => skip read.")
+        return {"status": "ok", "message": "no Zarr store found."}
 
     if ARGS is None:
         ARGS = argparse.Namespace(
@@ -255,33 +222,33 @@ def read_node(data: Dict[str, Any]):
             isIHC=False
         )
 
-    with safe_h5_open(H5_PATH, "r") as hf:
-        user_data_path = f"{NODE_NAME}/userData"
-        if user_data_path in hf:
-            for k in hf[user_data_path].keys():
-                raw_bytes = hf[user_data_path][k][()]
-                raw_str = raw_bytes.decode("utf-8")
-                try:
-                    val_json = json.loads(raw_str)
-                except:
-                    val_json = raw_str
-                print(f"[CellposeSegmentationNode] user param {k} => {val_json}")
+    zf = zarr.open_group(ZARR_PATH, mode='r')
+    user_data_path = f"{NODE_NAME}/userData"
+    if user_data_path in zf:
+        for k in zf[user_data_path].keys():
+            raw_bytes = zf[user_data_path][k][...]
+            raw_str = raw_bytes.decode("utf-8")
+            try:
+                val_json = json.loads(raw_str)
+            except:
+                val_json = raw_str
+            print(f"[CellposeSegmentationNode] user param {k} => {val_json}")
 
-                if k == "path":
-                    ARGS.slidepath = val_json
-                elif k == "read_image_method":
-                    ARGS.read_image_method = val_json
-                elif k == "cellpose_model":
-                    ARGS.cellpose_model = val_json
-                elif k == "isIHC":
-                    ARGS.isIHC = (val_json in [True, "true", "True"])
+            if k == "path":
+                ARGS.slidepath = val_json
+            elif k == "read_image_method":
+                ARGS.read_image_method = val_json
+            elif k == "cellpose_model":
+                ARGS.cellpose_model = val_json
+            elif k == "isIHC":
+                ARGS.isIHC = (val_json in [True, "true", "True"])
 
     return {"status": "ok", "message": "CellposeSegmentationNode read done"}
 
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME
 
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
@@ -298,13 +265,14 @@ def execute_node():
         out_val = run_segmentation(ARGS)
 
     # store the result to 'output'
-    if H5_PATH and os.path.exists(H5_PATH):
-        with safe_h5_open(H5_PATH, "a") as hf:
-            node_out_path = f"{NODE_NAME}/output"
-            if node_out_path in hf:
-                del hf[node_out_path]
-            out_str = json.dumps(out_val, ensure_ascii=False)
-            hf.create_dataset(node_out_path, data=out_str.encode("utf-8"))
+    if ZARR_PATH and os.path.exists(ZARR_PATH):
+        zf = zarr.open_group(ZARR_PATH, mode='a')
+        node_out_path = f"{NODE_NAME}/output"
+        if node_out_path in zf:
+            del zf[node_out_path]
+        out_str = json.dumps(out_val, ensure_ascii=False)
+        out_bytes = out_str.encode("utf-8")
+        zf.create_dataset(node_out_path, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
 
     return {"status": "ok", "output": out_val}
 
