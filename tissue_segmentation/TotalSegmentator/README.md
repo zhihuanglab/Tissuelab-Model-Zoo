@@ -1,6 +1,6 @@
 # TotalSegmentator TaskNode
 
-A FastAPI-based tasknode for TotalSegmentator medical image segmentation, supporting DICOM and NIfTI inputs with H5 output storage.
+A FastAPI-based tasknode for TotalSegmentator medical image segmentation, supporting DICOM and NIfTI inputs with Zarr output storage.
 
 ## Features
 
@@ -8,7 +8,7 @@ A FastAPI-based tasknode for TotalSegmentator medical image segmentation, suppor
 - **Input Formats**: DICOM folders and NIfTI files (.nii, .nii.gz)
 - **ROI Filtering**: Process only specified organs (e.g., liver, spleen, kidneys)
 - **Parallel Processing**: Concurrent processing of multiple organs
-- **H5 Storage**: Results stored in SegmentorNode with compression
+- **Zarr Storage**: Results stored in SegmentorNode with compression
 - **Progress Tracking**: Real-time progress updates with SSE
 - **Metadata Storage**: Comprehensive metadata for each organ
 
@@ -19,7 +19,7 @@ A FastAPI-based tasknode for TotalSegmentator medical image segmentation, suppor
 {
   "model": "total_3mm",
   "device": "gpu",
-  "h5_path": "/path/to/output.h5",
+  "zarr_path": "/path/to/output.zarr",
   "node_name": "SegmentorNode"
 }
 ```
@@ -71,7 +71,7 @@ Common organs that can be segmented:
 - `bladder`
 - `prostate`
 
-## H5 Output Structure
+## Zarr Output Structure
 
 ```
 SegmentorNode/
@@ -102,7 +102,7 @@ import requests
 init_response = requests.post("http://localhost:8000/init", json={
     "model": "total_3mm",
     "device": "gpu",
-    "h5_path": "/path/to/output.h5",
+    "zarr_path": "/path/to/output.zarr",
     "node_name": "SegmentorNode"
 })
 
@@ -186,7 +186,7 @@ This keeps the repository lightweight (few MB instead of several GB).
 ## Notes
 
 - The tasknode processes only the organs specified in `roi_subset`. If not provided, it processes all available organs.
-- Each organ is stored as a separate dataset in the H5 file with compression.
+- Each organ is stored as a separate array in the Zarr store with compression.
 - Processing is done in parallel for multiple organs to improve performance.
 - The tasknode handles DICOM validation issues automatically by relaxing validation rules.
 - Progress tracking is available both via polling (`/progress`) and streaming (`/progress/stream`).

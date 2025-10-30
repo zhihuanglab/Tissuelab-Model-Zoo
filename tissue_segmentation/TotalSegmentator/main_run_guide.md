@@ -7,7 +7,7 @@
 - ✅ **Multiple Pre-trained Models** - 6 different model options
 - ✅ **DICOM Folder Input** - Automatic processing of entire DICOM series
 - ✅ **NIfTI File Input** - Single NIfTI file support
-- ✅ **H5 Format Output** - Structured data storage with metadata
+- ✅ **Zarr Format Output** - Structured data storage with metadata
 - ✅ **Organ Subset Selection** - Segment only specified organs
 - ✅ **Multi-device Support** - Automatic GPU/CPU/MPS selection
 
@@ -23,10 +23,10 @@ python main_run.py --list-models
 ### 2. Basic Usage
 ```bash
 # Process DICOM folder
-python main_run.py -m total_3mm -i /path/to/dicom/folder -o result.h5
+python main_run.py -m total_3mm -i /path/to/dicom/folder -o result.zarr
 
 # Process NIfTI file
-python main_run.py -m total_6mm -i input.nii.gz -o result.h5
+python main_run.py -m total_6mm -i input.nii.gz -o result.zarr
 ```
 
 ---
@@ -49,7 +49,7 @@ python main_run.py -m total_6mm -i input.nii.gz -o result.h5
 ### Required Arguments
 - `-m, --model`: Select weight model
 - `-i, --input`: Input file/folder path
-- `-o, --output`: Output H5 file path
+- `-o, --output`: Output Zarr file path
 
 ### Optional Arguments
 - `--device`: Computing device (gpu/cpu/mps, default: gpu)
@@ -90,40 +90,40 @@ input.nii.gz  # or input.nii
 
 ### 1. High-Precision Full Body Segmentation
 ```bash
-python main_run.py -m total_3mm -i /path/to/ct/dicom -o full_body_seg.h5
+python main_run.py -m total_3mm -i /path/to/ct/dicom -o full_body_seg.zarr
 ```
 
 ### 2. Fast Full Body Segmentation
 ```bash
-python main_run.py -m total_6mm -i /path/to/ct/dicom -o quick_seg.h5
+python main_run.py -m total_6mm -i /path/to/ct/dicom -o quick_seg.zarr
 ```
 
 ### 3. Segment Specific Organs Only
 ```bash
-python main_run.py -m total_3mm -i /path/to/ct/dicom -o organs.h5 --roi liver,spleen,kidney_left,kidney_right
+python main_run.py -m total_3mm -i /path/to/ct/dicom -o organs.zarr --roi liver,spleen,kidney_left,kidney_right
 ```
 
 ### 4. Use CPU for Processing
 ```bash
-python main_run.py -m total_6mm -i input.nii.gz -o result.h5 --device cpu
+python main_run.py -m total_6mm -i input.nii.gz -o result.zarr --device cpu
 ```
 
 ### 5. MR Image Processing
 ```bash
-python main_run.py -m total_mr -i /path/to/mr/dicom -o mr_seg.h5
+python main_run.py -m total_mr -i /path/to/mr/dicom -o mr_seg.zarr
 ```
 
 ### 6. Lung Vessel Segmentation
 ```bash
-python main_run.py -m lung_vessels -i /path/to/ct/dicom -o lung_vessels.h5
+python main_run.py -m lung_vessels -i /path/to/ct/dicom -o lung_vessels.zarr
 ```
 
 ---
 
-## 📊 Output H5 File Structure
+## 📊 Output Zarr File Structure
 
 ```
-result.h5
+result.zarr
 └── TotalSegmentator/
     ├── segmentation          # Segmentation result (uint16)
     ├── affine               # Affine transformation matrix
@@ -168,10 +168,10 @@ result.h5
 ### View All Available Organs
 ```python
 # After running a complete segmentation
-import h5py
-with h5py.File('result.h5', 'r') as f:
-    labels = f['TotalSegmentator/organ_info/unique_labels'][:]
-    print("Available organ labels:", labels)
+import zarr
+store = zarr.open('result.zarr', 'r')
+labels = store['TotalSegmentator/organ_info/unique_labels'][:]
+print("Available organ labels:", labels)
 ```
 
 ---
@@ -273,16 +273,16 @@ Unable to read DICOM files
 
 ### 1. Python Analysis
 ```python
-import h5py
+import zarr
 import numpy as np
 import nibabel as nib
 
 # Read results
-with h5py.File('result.h5', 'r') as f:
-    seg_data = f['TotalSegmentator/segmentation'][:]
-    affine = f['TotalSegmentator/affine'][:]
-    labels = f['TotalSegmentator/organ_info/unique_labels'][:]
-    volumes = f['TotalSegmentator/organ_info/organ_volumes'][:]
+store = zarr.open('result.zarr', 'r')
+seg_data = store['TotalSegmentator/segmentation'][:]
+affine = store['TotalSegmentator/affine'][:]
+labels = store['TotalSegmentator/organ_info/unique_labels'][:]
+volumes = store['TotalSegmentator/organ_info/organ_volumes'][:]
 
 print(f"Segmented {len(labels)} organs")
 print(f"Image dimensions: {seg_data.shape}")
@@ -314,7 +314,7 @@ nib.save(nifti_img, 'result.nii.gz')
 
 ### 3. Output Management
 - **File naming**: Use descriptive names
-- **Storage space**: H5 files typically 100-500MB
+- **Storage space**: Zarr stores typically 100-500MB
 - **Backup**: Backup important results promptly
 
 ---
