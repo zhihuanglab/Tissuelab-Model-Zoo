@@ -116,12 +116,12 @@ def run_segmentation(args):
             zf = zarr.open_group(ZARR_PATH, mode='r')
             if NODE_NAME in zf:
                 try:
-                    centroids = zf[f"{NODE_NAME}/centroids"][...]
+                    centroids = zf[f"{NODE_NAME}/centroids"][()]
                     # Attempt to load contours and probability, but don't fail if not present initially
                     if f"{NODE_NAME}/contours" in zf:
-                        contours = zf[f"{NODE_NAME}/contours"][...]
+                        contours = zf[f"{NODE_NAME}/contours"][()]
                     if f"{NODE_NAME}/probability" in zf:
-                        probability = zf[f"{NODE_NAME}/probability"][...]
+                        probability = zf[f"{NODE_NAME}/probability"][()]
 
                     # Check if essential data (centroids) is valid
                     if centroids is not None and centroids.size > 0:  # Basic check for non-empty centroids

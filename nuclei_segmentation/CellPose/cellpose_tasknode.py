@@ -110,8 +110,8 @@ def run_segmentation(args):
             if NODE_NAME in zf:
                 # if already have segmentation => skip cellpose
                 try:
-                    centroids = zf[f"{NODE_NAME}/centroids"][...]
-                    contours = zf[f"{NODE_NAME}/contours"][...]
+                    centroids = zf[f"{NODE_NAME}/centroids"][()]
+                    contours = zf[f"{NODE_NAME}/contours"][()]
                     ALREADY_HAVE_SEG = True
                     print("Using existing nuclei segmentation => skip cellpose.")
                     result["message"] = "Using existing nuclei segmentation"
@@ -226,7 +226,7 @@ def read_node(data: Dict[str, Any]):
     user_data_path = f"{NODE_NAME}/userData"
     if user_data_path in zf:
         for k in zf[user_data_path].keys():
-            raw_bytes = zf[user_data_path][k][...]
+            raw_bytes = zf[user_data_path][k][()]
             raw_str = raw_bytes.decode("utf-8")
             try:
                 val_json = json.loads(raw_str)

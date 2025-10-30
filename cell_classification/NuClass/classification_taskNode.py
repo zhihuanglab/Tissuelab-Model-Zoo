@@ -470,7 +470,7 @@ def run_classification(args) -> Dict[str, Any]:
         annotations_data = None
         use_supervised = False
         if 'user_annotation' in zf and 'nuclei_annotations' in zf['user_annotation']:
-            raw_bytes = zf['user_annotation/nuclei_annotations'][...]
+            raw_bytes = zf['user_annotation/nuclei_annotations'][()]
             ann_dict = json.loads(raw_bytes.decode("utf-8"))
             annotations_data = pd.DataFrame(ann_dict).T
 
@@ -489,7 +489,7 @@ def run_classification(args) -> Dict[str, Any]:
         seg_grp = zf['SegmentationNode']
         if 'embedding' not in seg_grp:
             raise ValueError("embedding dataset not found in h5 file => no cell_embeddings")
-        cell_embeddings = seg_grp['embedding'][...]
+        cell_embeddings = seg_grp['embedding'][()]
     
         # C) supervised or zero-shot
         organ = getattr(args, "organ", None)
@@ -534,7 +534,7 @@ def run_classification(args) -> Dict[str, Any]:
             final_class_colors = None
             # Check for existing colors within the same zf handle
             if NODE_NAME in zf and 'nuclei_class_HEX_color' in zf[NODE_NAME]: 
-                old_colors = zf[NODE_NAME]['nuclei_class_HEX_color'][...]
+                old_colors = zf[NODE_NAME]['nuclei_class_HEX_color'][()]
                 if len(old_colors) == len(nuclei_classes):
                     final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
             
@@ -672,7 +672,7 @@ def read_node(data: Dict[str, Any]):
     user_data_path = f"{NODE_NAME}/userData"
     if user_data_path in zf:
         for k in zf[user_data_path].keys():
-            raw_bytes = zf[user_data_path][k][...]
+            raw_bytes = zf[user_data_path][k][()]
             raw_str = raw_bytes.decode("utf-8")
             try:
                 val_json = json.loads(raw_str)

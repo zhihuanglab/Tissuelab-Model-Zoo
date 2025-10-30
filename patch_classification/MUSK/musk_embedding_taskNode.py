@@ -196,8 +196,8 @@ def run_patch_classification(args):
             if ZARR_GROUP in zf:
                     try:
                         # Load coordinates and embeddings
-                        coordinates = zf[f"{ZARR_GROUP}/coordinates"][...]
-                        embeddings = zf[f"{ZARR_GROUP}/embedding"][...]
+                        coordinates = zf[f"{ZARR_GROUP}/coordinates"][()]
+                        embeddings = zf[f"{ZARR_GROUP}/embedding"][()]
                         
                         # Calculate stored_patch_size from coordinates
                         stored_patch_size = None
@@ -397,7 +397,7 @@ def _load_parameters_from_zarr(zarr_path: str, zarr_group: str):
             print(f"[{NODE_NAME}] No userData found in {zarr_group}")
             return
         for param_name in zf[user_data_path].keys():
-            raw_bytes = zf[user_data_path][param_name][...]
+            raw_bytes = zf[user_data_path][param_name][()]
             param_value = _decode_zarr_parameter(raw_bytes)
             if param_value is not None:
                 _apply_parameter(param_name, param_value)

@@ -856,7 +856,7 @@ def read_node(data: Dict[str, Any]):
             if user_data_path in zf:
                 print(f"[Read] Found userData in Zarr store")
                 for k in zf[user_data_path].keys():
-                    raw_bytes = zf[user_data_path][k][...]
+                    raw_bytes = zf[user_data_path][k][()]
                     raw_str = raw_bytes.decode("utf-8")
                     try:
                         val_json = json.loads(raw_str)

@@ -485,7 +485,7 @@ def run_classification(args) -> Dict[str, Any]:
         annotations_data = None
         use_supervised = False
         if 'user_annotation' in zf and 'tissue_annotations' in zf['user_annotation']:
-            raw_bytes = zf['user_annotation/tissue_annotations'][...]
+            raw_bytes = zf['user_annotation/tissue_annotations'][()]
             ann_dict = json.loads(raw_bytes.decode("utf-8"))
             annotations_data = pd.DataFrame(ann_dict).T
             use_supervised = True
@@ -501,7 +501,7 @@ def run_classification(args) -> Dict[str, Any]:
             dep_group = DEP_ZARR_GROUPS.get(dep0, dep0) if isinstance(DEP_ZARR_GROUPS, dict) else dep0
             print(f"[{NODE_NAME}] Attempting to read embeddings from dependency group: {dep_group}")
             if dep_group in zf and 'embedding' in zf[dep_group]:
-                cell_embeddings = zf[dep_group]['embedding'][...]
+                cell_embeddings = zf[dep_group]['embedding'][()]
                 embedding_source_group = dep_group
                 print(f"[{NODE_NAME}] Successfully loaded embeddings from dependency group '{embedding_source_group}', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
             else:
@@ -509,7 +509,7 @@ def run_classification(args) -> Dict[str, Any]:
 
             if cell_embeddings is None:
                 if 'MuskNode' in zf and 'embedding' in zf['MuskNode']:
-                    cell_embeddings = zf['MuskNode']['embedding'][...]
+                    cell_embeddings = zf['MuskNode']['embedding'][()]
                     embedding_source_group = 'MuskNode'
                     print(f"[{NODE_NAME}] Loaded embeddings from 'MuskNode', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
 
@@ -576,7 +576,7 @@ def run_classification(args) -> Dict[str, Any]:
 
                 final_class_colors = None
                 if ZARR_GROUP in zf and 'tissue_class_HEX_color' in zf[ZARR_GROUP]:
-                    old_colors = zf[ZARR_GROUP]['tissue_class_HEX_color'][...]
+                    old_colors = zf[ZARR_GROUP]['tissue_class_HEX_color'][()]
                     if len(old_colors) == len(tissue_classes):
                         final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
                 
@@ -593,7 +593,7 @@ def run_classification(args) -> Dict[str, Any]:
                 for name in ['coordinates', 'embedding']:
                     if name in zf[ZARR_GROUP]:
                         print(f"[{NODE_NAME}] Found {name} in existing group, will preserve it")
-                        saved_datasets[name] = zf[ZARR_GROUP][name][...]
+                        saved_datasets[name] = zf[ZARR_GROUP][name][()]
             
             if ZARR_GROUP in zf:
                 del zf[ZARR_GROUP]
@@ -717,7 +717,7 @@ def read_node(data: Dict[str, Any]):
     user_data_path = f"{ZARR_GROUP}/userData"
     if user_data_path in zf:
         for k in zf[user_data_path].keys():
-            raw_bytes = zf[user_data_path][k][...]
+            raw_bytes = zf[user_data_path][k][()]
             raw_str = raw_bytes.decode("utf-8")
             try:
                 val_json = json.loads(raw_str)

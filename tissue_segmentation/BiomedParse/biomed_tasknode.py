@@ -514,7 +514,7 @@ def read_node(data: Dict[str, Any]):
     if self_ud in zf:
         # Gather all items into user_data_dict
         for k in zf[self_ud].keys():
-            raw = zf[self_ud][k][...]
+            raw = zf[self_ud][k][()]
             val_str = raw.decode("utf-8")
             try:
                 val_json = json.loads(val_str)
@@ -528,7 +528,7 @@ def read_node(data: Dict[str, Any]):
     for dep_name in DEPENDENCIES:
         dep_out = f"{dep_name}/output"
         if dep_out in zf:
-            out_bytes = zf[dep_out][...]
+            out_bytes = zf[dep_out][()]
             out_str = out_bytes.decode("utf-8")
             try:
                 out_json = json.loads(out_str)
