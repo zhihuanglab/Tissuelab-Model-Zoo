@@ -234,21 +234,27 @@ def run_segmentation(args):
         # Step D: write segmentation (embedding already written if generated)
         if centroids is not None: # Only proceed if centroids were processed (even if empty from seg)
             zf = zarr.open_group(ZARR_PATH, mode='a')
-            if NODE_NAME in zf: # if group already exists, delete it to ensure fresh write
-                del zf[NODE_NAME]
-            node_grp = zf.create_group(NODE_NAME)
+            # Do NOT delete the whole group, as it would remove previously written 'embedding'.
+            # Instead, create/require the group and overwrite only specific datasets.
+            node_grp = zf.require_group(NODE_NAME)
 
             print(f"[ZARR WRITE] Writing centroids. Shape: {centroids.shape if centroids is not None else 'None'}")
+            if 'centroids' in node_grp:
+                del node_grp['centroids']
             node_grp.create_dataset('centroids', data=centroids)
             
             if contours is not None:
                 print(f"[ZARR WRITE] Writing contours. Shape: {contours.shape}")
+                if 'contours' in node_grp:
+                    del node_grp['contours']
                 node_grp.create_dataset('contours', data=contours)
             else:
                 print("[ZARR WRITE] Contours are None, not writing.")
             
             if probability is not None: # Save probability if it was generated or loaded
                 print(f"[ZARR WRITE] Writing probability. Shape: {probability.shape}")
+                if 'probability' in node_grp:
+                    del node_grp['probability']
                 node_grp.create_dataset('probability', data=probability)
             else: # This case should be less common if prob is always attempted
                 print("[ZARR WRITE] Probability is None, not writing.")
