@@ -547,19 +547,19 @@ def run_classification(args) -> Dict[str, Any]:
             # D) result => cell_classification
             if NODE_NAME in zf:
                 del zf[NODE_NAME]
-            grp_cls = zf.create_group(NODE_NAME)
+            grp_cls = zf.require_group(NODE_NAME)
 
-            grp_cls.create_dataset('nuclei_class_id', data=predictions.astype(np.int32))
+            grp_cls.require_dataset('nuclei_class_id', data=predictions.astype(np.int32))
 
             class_names_ascii = [n.encode('utf-8') for n in final_class_names]
-            grp_cls.create_dataset('nuclei_class_name', (len(class_names_ascii),), dtype='S256', data=class_names_ascii)
+            grp_cls.require_dataset('nuclei_class_name', (len(class_names_ascii),), dtype='S256', data=class_names_ascii)
 
             colors_ascii = [c.encode('utf-8') for c in final_class_colors]
-            grp_cls.create_dataset('nuclei_class_HEX_color', (len(colors_ascii),), dtype='S256', data=colors_ascii)
+            grp_cls.require_dataset('nuclei_class_HEX_color', (len(colors_ascii),), dtype='S256', data=colors_ascii)
 
             # Save probability scores for active learning
             if prediction_probs is not None:
-                grp_cls.create_dataset('nuclei_class_probabilities', data=prediction_probs.astype(np.float32))
+                grp_cls.require_dataset('nuclei_class_probabilities', data=prediction_probs.astype(np.float32))
                 print(f"Saved classification probabilities for active learning, shape: {prediction_probs.shape}")
             elif 'sims_arr' in locals() and sims_arr is not None:
                 # For zero-shot: save similarity scores as pseudo-probabilities
@@ -567,7 +567,7 @@ def run_classification(args) -> Dict[str, Any]:
                 print(f"Converting similarity scores to probabilities, shape: {sims_arr.shape}")
                 exp_sims = np.exp(sims_arr - np.max(sims_arr, axis=1, keepdims=True))
                 pseudo_probs = exp_sims / np.sum(exp_sims, axis=1, keepdims=True)
-                grp_cls.create_dataset('nuclei_class_probabilities', data=pseudo_probs.astype(np.float32))
+                grp_cls.require_dataset('nuclei_class_probabilities', data=pseudo_probs.astype(np.float32))
                 print(f"Saved zero-shot similarity scores as probabilities for active learning, shape: {pseudo_probs.shape}")
             else:
                 print("Warning: No probability data available to save for active learning")
@@ -589,7 +589,7 @@ def run_classification(args) -> Dict[str, Any]:
                 metadata["testing_time"] = test_time
             metadata['created'] = datetime.now().isoformat()
             meta_bytes = json.dumps(metadata).encode("utf-8")
-            grp_cls.create_dataset('metadata', shape=(), dtype=f'S{len(meta_bytes)}', data=meta_bytes)
+            grp_cls.require_dataset('metadata', shape=(), dtype=f'S{len(meta_bytes)}', data=meta_bytes)
             
         end_time = time.time()
         result["classification_count"] = len(predictions)
@@ -726,7 +726,7 @@ def execute_node():
             del zf[out_ds]
         out_str = json.dumps(out_val, ensure_ascii=False)
         out_bytes = out_str.encode("utf-8")
-        zf.create_dataset(out_ds, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
+        zf.require_dataset(out_ds, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
         time.sleep(1)
 
 
