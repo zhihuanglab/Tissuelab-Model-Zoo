@@ -4,7 +4,7 @@ import argparse
 import os
 import sys
 import json
-import h5py
+import zarr
 import torch
 import cv2
 import numpy as np
@@ -396,7 +396,7 @@ app.add_middleware(
 MODEL = None
 NODE_NAME = None
 DEPENDENCIES = []
-H5_PATH = None
+ZARR_PATH = None
 PROMPT = None
 
 USE_WSI = False         # whether to use WSI
@@ -470,7 +470,7 @@ def init_node():
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
     """
-    1) Read the current node's userData (and any dependencies' output) from the H5 file.
+    1) Read the current node's userData (and any dependencies' output) from the Zarr store.
     2) Store all userData in a dictionary first.
     3) Then process them in a specific order (for example, 'rate' before 'path').
     """
@@ -483,10 +483,10 @@ def read_node(data: Dict[str, Any]):
     # Reset progress to 0
     progress_value = 0
 
-    # 1) Extract node_name / dependencies / h5_path from request data
+    # 1) Extract node_name / dependencies / zarr_path from request data
     NODE_NAME = data.get("node_name", "BiomedParseNode")
     DEPENDENCIES = data.get("dependencies", [])
-    H5_PATH = data.get("h5_path", None)
+    ZARR_PATH = data.get("zarr_path", None)
 
     # 2) Initialize or reset global variables
     USE_WSI = False
@@ -498,43 +498,43 @@ def read_node(data: Dict[str, Any]):
     # Default downsample rate
     DOWNSAMPLE_RATE = 16
 
-    print(f"[BiomedParse] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}")
+    print(f"[BiomedParse] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
 
-    if not H5_PATH or not os.path.exists(H5_PATH):
-        print("[BiomedParse] no H5 file found, skip reading.")
-        return {"status": "ok", "message": "no H5 file."}
+    if not ZARR_PATH or not os.path.exists(ZARR_PATH):
+        print("[BiomedParse] no Zarr store found, skip reading.")
+        return {"status": "ok", "message": "no Zarr store."}
 
     # Dictionary to store all userData
     user_data_dict = {}
 
-    # 3) Open the H5 file and read userData / dependency outputs
-    with h5py.File(H5_PATH, "r") as hf:
-        # 3.1) Read this node's userData
-        self_ud = f"{NODE_NAME}/userData"
-        if self_ud in hf:
-            # Gather all items into user_data_dict
-            for k in hf[self_ud].keys():
-                raw = hf[self_ud][k][()]
-                val_str = raw.decode("utf-8")
-                try:
-                    val_json = json.loads(val_str)
-                except:
-                    val_json = val_str
+    # 3) Open the Zarr store and read userData / dependency outputs
+    zf = zarr.open_group(ZARR_PATH, "r")
+    # 3.1) Read this node's userData
+    self_ud = f"{NODE_NAME}/userData"
+    if self_ud in zf:
+        # Gather all items into user_data_dict
+        for k in zf[self_ud].keys():
+            raw = zf[self_ud][k][...]
+            val_str = raw.decode("utf-8")
+            try:
+                val_json = json.loads(val_str)
+            except:
+                val_json = val_str
 
-                print(f"[BiomedParse] user param {k} => {val_json}")
-                user_data_dict[k] = val_json
+            print(f"[BiomedParse] user param {k} => {val_json}")
+            user_data_dict[k] = val_json
 
-        # 3.2) Read the outputs of dependency nodes
-        for dep_name in DEPENDENCIES:
-            dep_out = f"{dep_name}/output"
-            if dep_out in hf:
-                out_bytes = hf[dep_out][()]
-                out_str = out_bytes.decode("utf-8")
-                try:
-                    out_json = json.loads(out_str)
-                except:
-                    out_json = out_str
-                print(f"[BiomedParse] sees {dep_name}'s output => {out_json}")
+    # 3.2) Read the outputs of dependency nodes
+    for dep_name in DEPENDENCIES:
+        dep_out = f"{dep_name}/output"
+        if dep_out in zf:
+            out_bytes = zf[dep_out][...]
+            out_str = out_bytes.decode("utf-8")
+            try:
+                out_json = json.loads(out_str)
+            except:
+                out_json = out_str
+            print(f"[BiomedParse] sees {dep_name}'s output => {out_json}")
 
     # 4) Process userData in the desired order
     # 4.1) prompt
@@ -652,7 +652,7 @@ def execute_node(background_tasks: BackgroundTasks):
     Execute actual model inference
     """
     global MODEL, PROMPT, USE_WSI, PATCHES, WSI_GRID_SIZE, WSI_ORIGINAL_WH, IMAGE_ARR, BBOX
-    global H5_PATH, progress_value
+    global ZARR_PATH, progress_value
 
     if MODEL is None:
         return {"status":"error","message":"Model not loaded. Please call /init first."}
@@ -877,14 +877,15 @@ def execute_node(background_tasks: BackgroundTasks):
                     print("[BiomedParse] PNG inference error:", e)
                     result_value = {"status": "error", "message": str(e)}
 
-    # write result to /<NODE_NAME>/output
-    if H5_PATH and os.path.exists(H5_PATH):
-        with h5py.File(H5_PATH, "a") as hf:
-            out_path = f"{NODE_NAME}/output"
-            if out_path in hf:
-                del hf[out_path]
-            out_str = json.dumps(result_value, ensure_ascii=False)
-            hf.create_dataset(out_path, data=out_str.encode("utf-8"))
+    # write result to /<NODE_NAME>/output in Zarr
+    if ZARR_PATH and os.path.exists(ZARR_PATH):
+        zf = zarr.open_group(ZARR_PATH, "a")
+        out_path = f"{NODE_NAME}/output"
+        if out_path in zf:
+            del zf[out_path]
+        out_str = json.dumps(result_value, ensure_ascii=False)
+        out_bytes = out_str.encode("utf-8")
+        zf.create_dataset(out_path, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
 
     return {"status":"ok","output":result_value}
 

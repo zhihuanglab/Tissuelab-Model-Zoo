@@ -4,7 +4,7 @@ import argparse
 import os
 import sys
 import json
-import h5py
+import zarr
 import torch
 import cv2
 import numpy as np
@@ -16,7 +16,6 @@ from typing import Dict, Any
 from pathlib import Path
 from sse_starlette.sse import EventSourceResponse
 import asyncio
-from safe_h5_utils import safe_h5_open
 
 # =========== 2)other user's independency ===========
 from PIL import Image
@@ -249,7 +248,7 @@ app.add_middleware(
 MODEL = None
 NODE_NAME = None
 DEPENDENCIES = []
-H5_PATH = None
+ZARR_PATH = None  # instead of H5_PATH
 PROMPT = None
 
 USE_WSI = False         # whether to use WSI
@@ -289,17 +288,17 @@ def init_node():
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
     """
-    Read userData and dependency outputs from the H5 file,
+    Read userData and dependency outputs from the Zarr file,
     then process them in a specific order.
     """
-    global NODE_NAME, DEPENDENCIES, H5_PATH
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH
     global PROMPT, IMAGE_ARR, USE_WSI
     global PATCHES, WSI_GRID_SIZE, WSI_ORIGINAL_WH, BBOX
     global DOWNSAMPLE_RATE
 
     NODE_NAME = data.get("node_name", "SAMNode")
     DEPENDENCIES = data.get("dependencies", [])
-    H5_PATH = data.get("h5_path", None)
+    ZARR_PATH = data.get("zarr_path", None)
 
     USE_WSI = False
     PATCHES.clear()
@@ -309,36 +308,35 @@ def read_node(data: Dict[str, Any]):
     BBOX = None
     DOWNSAMPLE_RATE = 16
 
-    print(f"[SAM] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}")
+    print(f"[SAM] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
 
-    if not H5_PATH or not os.path.exists(H5_PATH):
-        print("[SAM] no H5 file found, skip reading.")
-        return {"status": "ok", "message": "no H5 file."}
+    if not ZARR_PATH or not os.path.exists(ZARR_PATH):
+        print("[SAM] no Zarr file found, skip reading.")
+        return {"status": "ok", "message": "no Zarr file."}
 
     user_data_dict = {}
-
-    with safe_h5_open(H5_PATH, "r") as hf:
-        self_ud = f"{NODE_NAME}/userData"
-        if self_ud in hf:
-            for k in hf[self_ud].keys():
-                raw = hf[self_ud][k][()]
-                val_str = raw.decode("utf-8")
-                try:
-                    val_json = json.loads(val_str)
-                except:
-                    val_json = val_str
-                print(f"[SAM] user param {k} => {val_json}")
-                user_data_dict[k] = val_json
-        for dep_name in DEPENDENCIES:
-            dep_out = f"{dep_name}/output"
-            if dep_out in hf:
-                out_bytes = hf[dep_out][()]
-                out_str = out_bytes.decode("utf-8")
-                try:
-                    out_json = json.loads(out_str)
-                except:
-                    out_json = out_str
-                print(f"[SAM] sees {dep_name}'s output => {out_json}")
+    zf = zarr.open_group(ZARR_PATH, mode="r")
+    self_ud = f"{NODE_NAME}/userData"
+    if self_ud in zf:
+        for k in zf[self_ud].keys():
+            raw = zf[self_ud][k][...]
+            val_str = raw.decode("utf-8")
+            try:
+                val_json = json.loads(val_str)
+            except:
+                val_json = val_str
+            print(f"[SAM] user param {k} => {val_json}")
+            user_data_dict[k] = val_json
+    for dep_name in DEPENDENCIES:
+        dep_out = f"{dep_name}/output"
+        if dep_out in zf:
+            out_bytes = zf[dep_out][...]
+            out_str = out_bytes.decode("utf-8")
+            try:
+                out_json = json.loads(out_str)
+            except:
+                out_json = out_str
+            print(f"[SAM] sees {dep_name}'s output => {out_json}")
 
     if "prompt" in user_data_dict:
         PROMPT = user_data_dict["prompt"]
@@ -415,7 +413,7 @@ def execute_node(background_tasks: BackgroundTasks):
     Execute SAM inference. Regardless of prompt, always infer.
     """
     global MODEL, PROMPT, USE_WSI, PATCHES, WSI_GRID_SIZE, WSI_ORIGINAL_WH, IMAGE_ARR, BBOX
-    global H5_PATH, progress_value
+    global ZARR_PATH, progress_value
 
     if MODEL is None:
         return {"status": "error", "message": "Model not loaded. Please call /init first."}
@@ -565,21 +563,24 @@ def execute_node(background_tasks: BackgroundTasks):
                 print("[SAM] PNG inference error:", e)
                 result_value = {"status": "error", "message": str(e)}
 
-    if H5_PATH and os.path.exists(H5_PATH):
-        with safe_h5_open(H5_PATH, "a") as hf:
-            out_path = f"{NODE_NAME}/output"
-            if out_path in hf:
-                del hf[out_path]
-            out_str = json.dumps(result_value, ensure_ascii=False)
-            hf.create_dataset(out_path, data=out_str.encode("utf-8"))
-            print(f"[DEBUG] => wrote JSON to {out_path}: {out_str}")
-            try:
-                with safe_h5_open(H5_PATH, "r") as hf:
-                    print("[DEBUG] H5 top-level keys:", list(hf.keys()))
-                    for key in hf.keys():
-                        print(f"    - {key} => subkeys:", list(hf[key].keys()))
-            except Exception as e:
-                print(f"[DEBUG] Error reading H5 structure: {e}")
+    if ZARR_PATH and os.path.exists(ZARR_PATH):
+        zf = zarr.open_group(ZARR_PATH, mode="a")
+        out_path = f"{NODE_NAME}/output"
+        parts = out_path.strip('/').split('/')
+        parent = zf
+        for group_name in parts[:-1]:
+            parent = parent.require_group(group_name)
+        ds_name = parts[-1]
+        if ds_name in parent:
+            del parent[ds_name]
+        out_str = json.dumps(result_value, ensure_ascii=False).encode("utf-8")
+        parent.create_dataset(ds_name, shape=(), dtype=f'S{len(out_str)}', data=out_str)
+        print(f"[DEBUG] => wrote JSON to {out_path}: {out_str.decode('utf-8')}")
+        # Optionally print Zarr structure
+        print("[DEBUG] Zarr top-level keys:", list(zf.keys()))
+        for key in zf.keys():
+            if hasattr(zf[key], 'keys'):
+                print(f"    - {key} => subkeys:", list(zf[key].keys()))
 
     return {"status": "ok", "output": result_value}
 
