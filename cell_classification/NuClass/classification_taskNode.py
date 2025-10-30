@@ -463,7 +463,6 @@ def run_classification(args) -> Dict[str, Any]:
 
     try:
         start_time = time.time()
-        ZARR_PATH = ZARR_PATH
 
         zf = zarr.open_group(ZARR_PATH, mode='a')  # Open in append mode for read/write
         # A) check annotation
