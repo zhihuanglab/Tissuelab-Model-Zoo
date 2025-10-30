@@ -371,7 +371,7 @@ class NucleiEmbedding:
                 # adjust the dataset size to fit the new data
                 current_size = embeddings_dset.shape[0]
                 new_size = current_size + batch_embeddings.shape[0]
-                embeddings_dset.resize(new_size, axis=0)
+                embeddings_dset.resize((new_size, 768))
                 
                 # write new data
                 embeddings_dset[current_size:new_size, :] = batch_embeddings

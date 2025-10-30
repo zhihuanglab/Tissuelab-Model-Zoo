@@ -325,7 +325,7 @@ def read_node(data: Dict[str, Any]):
     user_data_path = f"{NODE_NAME}/userData"
     if user_data_path in zf:
         for k in zf[user_data_path].keys():
-            raw_bytes = zf[user_data_path][k][...]
+            raw_bytes = zf[user_data_path][k][()]
             raw_str = raw_bytes.decode("utf-8")
             try:
                 val_json = json.loads(raw_str)
