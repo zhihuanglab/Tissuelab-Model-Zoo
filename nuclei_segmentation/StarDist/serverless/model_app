@@ -1,0 +1,622 @@
+"""
+StarDist Modal Serverless Implementation
+Deploy StarDist nuclei segmentation to Modal cloud platform
+"""
+import modal
+import os
+import base64
+import time
+import traceback
+import tempfile
+from datetime import datetime
+from io import BytesIO
+from PIL import Image
+import h5py
+import numpy as np
+import warnings
+
+# Suppress warnings
+warnings.filterwarnings('ignore', message='.*torchvision.*')
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+# Create the Modal app
+app = modal.App("stardist-segmentation-v1")
+
+# Optimized image with all dependencies
+image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .apt_install(
+        "libgl1-mesa-glx",
+        "libglib2.0-0",
+        "libsm6",
+        "libxext6",
+        "libxrender-dev",
+        "libgomp1",
+        "build-essential",
+        "libtcmalloc-minimal4"
+    )
+    .pip_install(
+        # Core dependencies from requirements.txt
+        "setuptools",
+        "numpy==1.26.4",
+        "pandas>=2.0.0",
+        "opencv-python-headless>=4.8.0",
+        "scipy>=1.11.0",
+        "tiffslide==1.5.0",
+        "multiprocess==0.70.17",
+        "xgboost>=1.7.4",
+        "scikit-learn>=1.3.0",
+        "tqdm==4.64.1",
+        "natsort==8.2.0",
+        "colorama>=0.4.6",
+        "einops>=0.7.0",
+        # Deep learning frameworks
+        "tensorflow==2.14.0",
+        "stardist==0.9.1",
+        "fastdist==1.1.6",
+        "torch",
+        "torchvision",
+        "transformers",
+        # Utilities
+        "sse-starlette",
+        "fastapi",
+        "uvicorn",
+        "tissuelab_sdk==0.1.10",
+        "czifile",
+        "pydicom",
+        "requests",
+        "tifffile",
+        "pillow>=10.0.1",
+        "scikit-image>=0.20.0",
+    )
+    .env({
+        "TF_CPP_MIN_LOG_LEVEL": "2",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": "/root",
+        "CUDA_VISIBLE_DEVICES": "",
+        "LD_PRELOAD": "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4",
+    })
+    # Copy local modules - use copy=True to allow further build steps
+    .add_local_file("../nuc_seg.py", "/root/nuc_seg.py", copy=True)
+    .add_local_file("../nuc_stat.py", "/root/nuc_stat.py", copy=True)
+    .add_local_file("../nuc_embedding.py", "/root/nuc_embedding.py", copy=True)
+    .add_local_file("../safe_h5_utils.py", "/root/safe_h5_utils.py", copy=True)
+    .add_local_dir("../histomicstk_scripts", "/root/histomicstk_scripts", copy=True)
+    .add_local_dir("../models", "/root/models", copy=True)
+    .add_local_dir("../transformer_cache", "/root/transformer_cache", copy=True)
+    .add_local_dir("../checkpoints", "/root/checkpoints", copy=True)
+    .add_local_file("test_url.py", "/root/test_url.py", copy=True)
+)
+
+# Volume for caching models
+model_cache = modal.Volume.from_name("stardist-model-cache", create_if_missing=True)
+MODEL_CACHE_PATH = "/root/.keras/stardist/models"
+tmp_shared = modal.Volume.from_name("stardist-shared-tmp", create_if_missing=True)
+SHARED_TMP_DIR = "/root/shared_tmp"
+
+@app.function(
+    image=image,
+    volumes={MODEL_CACHE_PATH: model_cache, SHARED_TMP_DIR: tmp_shared},
+    timeout=600
+)
+def setup_models():
+    """Pre-download StarDist models to the volume"""
+    from stardist.models import StarDist2D
+    import shutil
+    
+    os.environ['STARDIST_CACHE_DIR'] = MODEL_CACHE_PATH
+    
+    # Copy local models if available
+    local_models_path = "/root/models"
+    if os.path.exists(local_models_path):
+        for model_name in os.listdir(local_models_path):
+            src = os.path.join(local_models_path, model_name)
+            dst = os.path.join(MODEL_CACHE_PATH, model_name)
+            if os.path.isdir(src) and not os.path.exists(dst):
+                shutil.copytree(src, dst)
+    
+    # Download standard models
+    for model_name in ['2D_versatile_he', '2D_versatile_fluo']:
+        print(f"Checking/downloading model: {model_name}")
+        try:
+            model_path = os.path.join(MODEL_CACHE_PATH, model_name)
+            if not os.path.exists(model_path):
+                StarDist2D.from_pretrained(model_name)
+        except Exception as e:
+            print(f"Error loading {model_name}: {e}")
+    
+    return "Models cached successfully"
+
+@app.function(
+    image=image.env({
+        "STARDIST_CACHE_DIR": MODEL_CACHE_PATH,
+        "PYTHONPATH": "/root"
+    }),
+    cpu=4,
+    memory=32768,
+    retries=1,
+    volumes={MODEL_CACHE_PATH: model_cache, SHARED_TMP_DIR: tmp_shared},
+    timeout=1800,
+)
+@modal.concurrent(max_inputs=10, target_inputs=5)
+def process_segmentation(patch_data):
+    """Process a single patch for segmentation"""
+    temp_files = []
+    
+    try:
+        # Set environment variables
+        os.environ.update({
+            'CUDA_VISIBLE_DEVICES': '',
+            'TORCH_USE_CUDA': '0',
+            'STARDIST_CACHE_DIR': MODEL_CACHE_PATH,
+            'OMP_NUM_THREADS': '4',
+            'MKL_NUM_THREADS': '4',
+            'NUMEXPR_NUM_THREADS': '4',
+            'OPENBLAS_NUM_THREADS': '4',
+            'TF_NUM_INTRAOP_THREADS': '4',
+            'TF_NUM_INTEROP_THREADS': '2'
+        })
+        
+        import sys
+        sys.path.insert(0, "/root")
+        from nuc_seg import SlideSegmentation
+        
+        patch_id = patch_data.get('patch_id', 'unknown')
+        print(f"Processing {patch_id}")
+        
+        start_time = time.time()
+        
+        # Handle both URL and base64 encoded image data
+        if 'image_url' in patch_data:
+            # Download from URL
+            import requests
+            url = patch_data['image_url']
+            print(f"Downloading image from URL: {url[:100]}...")
+            
+            # Use proper headers for Google Storage signed URLs
+            # Some services reject the default python-requests User-Agent
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+            }
+            
+            # Initialize response_content
+            response_content = None
+            
+            # Allow redirects and use stream mode for large files
+            try:
+                print(f"[{patch_id}] Starting download...")
+                response = requests.get(
+                    url, 
+                    headers=headers,
+                    timeout=300,  # 5 minute timeout
+                    allow_redirects=True,
+                    stream=True
+                )
+                response.raise_for_status()
+                
+                # Download content in chunks for large files
+                print(f"[{patch_id}] Downloading content in chunks...")
+                response_content = b""
+                total_size = 0
+                for chunk in response.iter_content(chunk_size=8192 * 16):  # 128KB chunks
+                    if chunk:
+                        response_content += chunk
+                        total_size += len(chunk)
+                        if total_size % (10 * 1024 * 1024) == 0:  # Print every 10MB
+                            print(f"[{patch_id}] Downloaded {total_size / (1024*1024):.1f} MB...")
+                
+                print(f"[{patch_id}] Download complete. Total size: {total_size / (1024*1024):.1f} MB")
+                
+            except requests.exceptions.HTTPError as e:
+                error_msg = f"HTTP {e.response.status_code} error when downloading from URL"
+                if e.response.status_code == 400:
+                    error_msg += "\nPossible causes:\n"
+                    error_msg += "  1. The signed URL may have expired (check X-Goog-Date and X-Goog-Expires)\n"
+                    error_msg += "  2. The URL signature may be invalid\n"
+                    error_msg += "  3. The request parameters may be incorrect\n"
+                elif e.response.status_code == 403:
+                    error_msg += "\nAccess denied. The signed URL may not have the required permissions"
+                print(f"[{patch_id}] ERROR: {error_msg}")
+                if hasattr(e.response, 'text'):
+                    print(f"Response: {e.response.text[:500]}")
+                raise
+            except Exception as e:
+                print(f"[{patch_id}] ERROR: Unexpected error during download: {str(e)}")
+                traceback.print_exc()
+                raise
+            
+            # Verify download was successful
+            if response_content is None or len(response_content) == 0:
+                raise ValueError(f"[{patch_id}] Download failed: no content received")
+            
+            # Determine file extension from content-type or URL
+            if 'svs' in url.lower():
+                suffix = '.svs'
+            elif 'tiff' in url.lower() or 'tif' in url.lower():
+                suffix = '.tif'
+            elif 'jpeg' in url.lower() or 'jpg' in url.lower():
+                suffix = '.jpg'
+            elif 'png' in url.lower():
+                suffix = '.png'
+            else:
+                # Default to svs for histopathology images
+                suffix = '.svs'
+            
+            # Write downloaded content to temporary file
+            if patch_data.get('keep_temp', False):
+                # Save to shared volume so other workers can access
+                import uuid
+                os.makedirs(SHARED_TMP_DIR, exist_ok=True)
+                tmp_path = os.path.join(SHARED_TMP_DIR, f"{uuid.uuid4().hex}{suffix}")
+                with open(tmp_path, 'wb') as f:
+                    f.write(response_content)
+                # Do not schedule for cleanup here; caller will clean
+                print(f"[{patch_id}] Saved to shared file: {tmp_path}")
+            else:
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(response_content)
+                    tmp_path = tmp.name
+                    temp_files.append(tmp_path)
+                    print(f"[{patch_id}] Saved to temporary file: {tmp_path}")
+        
+        elif 'image_data' in patch_data:
+            # Decode base64 image data
+            data = base64.b64decode(patch_data['image_data'])
+            
+            # Try to determine suffix from base64 data or use default
+            suffix = patch_data.get('image_format', '.png')
+            
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(data)
+                tmp_path = tmp.name
+                temp_files.append(tmp_path)
+        else:
+            raise ValueError("Either 'image_url' or 'image_data' must be provided")
+        
+        class Args:
+            def __init__(self):
+                self.slidepath = tmp_path
+                self.stardist_pretrain = patch_data.get('stardist_pretrain', '2D_versatile_he')
+                self.isIHC = patch_data.get('isIHC', False)
+                self.magnification = patch_data.get('magnification', 40)
+                self.debug = False
+        
+        args = Args()
+        
+        # Configuration
+        tile_size = min(patch_data.get('tile_size', 4096), 4096)
+        overlap = patch_data.get('overlap', 256)
+        n_tiles = (2, 2, 1)
+        
+        ss = SlideSegmentation(
+            args,
+            tile_size=tile_size,
+            overlap=overlap,
+            prob_thresh=patch_data.get('prob_thresh', 0.3),
+            nms_thresh=patch_data.get('nms_thresh', 0.3),
+            n_tiles=n_tiles,
+            stardist_pretrain=args.stardist_pretrain,
+            isIHC=args.isIHC
+        )
+        
+        seg_start = time.time()
+        ss.run_WSI_segmentation()
+        seg_time = time.time() - seg_start
+        
+        # Extract results
+        centroids = ss.final_points.tolist() if hasattr(ss, 'final_points') and ss.final_points is not None else []
+        contours = ss.final_coord.tolist() if hasattr(ss, 'final_coord') and ss.final_coord is not None else []
+        probs = ss.prob_all.tolist() if hasattr(ss, 'prob_all') and ss.prob_all is not None else []
+        
+        total_time = time.time() - start_time
+        
+        # Adjust coordinates
+        base_x, base_y = patch_data.get('position', (0, 0))
+        scale = patch_data.get('scale', 1.0)
+        
+        adj_centroids = [[int(x * scale + base_x), int(y * scale + base_y)] for x, y in centroids]
+        
+        # Process contours
+        adj_contours = []
+        for contour in contours:
+            if isinstance(contour, list) and len(contour) > 0:
+                if isinstance(contour[0], list) and len(contour[0]) == 2:
+                    adj_contour = [[int(px * scale + base_x), int(py * scale + base_y)] 
+                                  for px, py in contour]
+                else:
+                    adj_contour = []
+            elif isinstance(contour, np.ndarray):
+                if len(contour.shape) == 2 and contour.shape[1] == 2:
+                    adj_contour = [[int(px * scale + base_x), int(py * scale + base_y)] 
+                                  for px, py in contour]
+                elif len(contour.shape) == 2 and contour.shape[0] == 2:
+                    adj_contour = [[int(contour[0, i] * scale + base_x), 
+                                   int(contour[1, i] * scale + base_y)] 
+                                  for i in range(contour.shape[1])]
+                else:
+                    adj_contour = []
+            else:
+                adj_contour = []
+            adj_contours.append(adj_contour)
+        
+        seg_throughput = len(adj_centroids) / seg_time if seg_time > 0 else 0
+        
+        print(f"✅ {patch_id}: {len(adj_centroids)} nuclei in {seg_time:.1f}s")
+        
+        result = {
+            'status': 'success',
+            'patch_id': patch_id,
+            'patch_index': patch_data.get('patch_index'),
+            'nuclei_count': len(adj_centroids),
+            'centroids': adj_centroids,
+            'contours': adj_contours,
+            'probabilities': probs,
+            'position': (base_x, base_y),
+            'timing': {
+                'total': total_time,
+                'segmentation': seg_time
+            },
+            'performance_stats': {
+                'segmentation_throughput': seg_throughput
+            }
+        }
+
+        # Return tmp path if caller wants to reuse the slide later (e.g., embeddings)
+        if patch_data.get('keep_temp', False):
+            result['tmp_path'] = tmp_path
+        
+        return result
+        
+    except Exception as e:
+        print(f"[{patch_data.get('patch_id','unknown')}] ERROR: {e}")
+        traceback.print_exc()
+        return {
+            'status': 'error',
+            'patch_id': patch_data.get('patch_id'),
+            'patch_index': patch_data.get('patch_index'),
+            'message': str(e),
+            'nuclei_count': 0
+        }
+    finally:
+        # Clean up unless caller asked to keep temp
+        if not patch_data.get('keep_temp', False):
+            for temp_file in temp_files:
+                try:
+                    if os.path.exists(temp_file):
+                        os.unlink(temp_file)
+                except:
+                    pass
+
+@app.function(
+    image=image.env({
+        "STARDIST_CACHE_DIR": MODEL_CACHE_PATH,
+        "PYTHONPATH": "/root",
+        # Re-enable CUDA for embedding
+        "CUDA_VISIBLE_DEVICES": "0",
+        "TORCH_USE_CUDA": "1"
+    }),
+    cpu=8,
+    memory=32768,
+    retries=1,
+    volumes={MODEL_CACHE_PATH: model_cache, SHARED_TMP_DIR: tmp_shared},
+    timeout=3600,
+    gpu="T4"
+)
+def process_embedding(patch_data):
+    """Process embeddings for centroids"""
+    try:
+        import sys
+        sys.path.insert(0, "/root")
+        from nuc_embedding import NucleiEmbedding
+        
+        print(f"Processing embeddings for {len(patch_data.get('centroids', []))} nuclei")
+        
+        centroids = patch_data.get('centroids', [])
+        if not centroids:
+            return {
+                'status': 'success',
+                'patch_id': patch_data.get('patch_id'),
+                'patch_index': patch_data.get('patch_index'),
+                'embeddings': [],
+                'timing': {'total': 0, 'embedding': 0}
+            }
+        
+        class Args:
+            def __init__(self):
+                self.slidepath = patch_data.get('slide_path', '')
+                self.magnification = patch_data.get('magnification', 40)
+                self.read_image_method = patch_data.get('read_image_method', 'tiffslide')
+        
+        args = Args()
+        
+        emb_start = time.time()
+        
+        ne = NucleiEmbedding(args, centroids)
+        embeddings = ne.generate_embeddings(
+            batch_size=patch_data.get('emb_batch_size'),
+            num_workers=patch_data.get('emb_workers')
+        )
+        
+        embed_time = time.time() - emb_start
+        
+        return {
+            'status': 'success',
+            'patch_id': patch_data.get('patch_id'),
+            'patch_index': patch_data.get('patch_index'),
+            'embeddings': embeddings.tolist() if hasattr(embeddings, 'tolist') else embeddings,
+            'timing': {'total': embed_time, 'embedding': embed_time}
+        }
+        
+    except Exception as e:
+        print(f"[{patch_data.get('patch_id','unknown')}] EMB ERROR: {e}")
+        traceback.print_exc()
+        return {
+            'status': 'error',
+            'patch_id': patch_data.get('patch_id'),
+            'patch_index': patch_data.get('patch_index'),
+            'message': str(e)
+        }
+
+@app.function()
+def health_check():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "version": "stardist_v1"
+    }
+
+@app.function(
+    image=image.env({
+        "STARDIST_CACHE_DIR": MODEL_CACHE_PATH,
+        "PYTHONPATH": "/root"
+    }),
+    cpu=4,
+    memory=32768,
+    retries=1,
+    volumes={MODEL_CACHE_PATH: model_cache},
+    timeout=1800,
+)
+def process_from_url(
+    image_url: str,
+    stardist_pretrain: str = "2D_versatile_he",
+    isIHC: bool = False,
+    tile_size: int = 4096,
+    overlap: int = 256,
+    prob_thresh: float = 0.3,
+    nms_thresh: float = 0.3,
+    magnification: int = 40,
+    with_embedding: bool = False,
+    emb_batch_size: int | None = None,
+    emb_workers: int | None = None
+) -> dict:
+    """
+    Simplified function to process an image directly from URL
+    
+    Args:
+        image_url: URL to the image file
+        stardist_pretrain: StarDist model name
+        isIHC: Whether the image is IHC stained
+        tile_size: Tile size for processing
+        overlap: Overlap between tiles
+        prob_thresh: Probability threshold
+        nms_thresh: NMS threshold
+        magnification: Image magnification
+    
+    Returns:
+        Segmentation results dictionary
+    """
+    patch_data = {
+        'patch_id': 'url_image',
+        'image_url': image_url,
+        'stardist_pretrain': stardist_pretrain,
+        'isIHC': isIHC,
+        'tile_size': tile_size,
+        'overlap': overlap,
+        'prob_thresh': prob_thresh,
+        'nms_thresh': nms_thresh,
+        'magnification': magnification,
+        'position': (0, 0),
+        'scale': 1.0,
+        'keep_temp': with_embedding
+    }
+    
+    seg_result = process_segmentation.local(patch_data)
+    
+    if with_embedding and seg_result.get('status') == 'success':
+        slide_path = seg_result.get('tmp_path', '')
+        emb_payload = {
+            'patch_id': seg_result.get('patch_id', 'url_image'),
+            'patch_index': seg_result.get('patch_index'),
+            'centroids': seg_result.get('centroids', []),
+            'slide_path': slide_path,
+            'magnification': magnification,
+            'read_image_method': 'tiffslide',
+        }
+        if emb_batch_size is not None:
+            emb_payload['emb_batch_size'] = emb_batch_size
+        if emb_workers is not None:
+            emb_payload['emb_workers'] = emb_workers
+        emb_result = process_embedding.remote(emb_payload)
+        seg_result['embedding'] = emb_result
+        # Cleanup the kept temp file after embeddings
+        try:
+            if slide_path and os.path.exists(slide_path):
+                os.unlink(slide_path)
+        except Exception:
+            pass
+    
+    return seg_result
+
+@app.local_entrypoint()
+def test_with_url():
+    """Test function to process Google Storage URL"""
+    # Prefer env var if provided; otherwise parse from local test_url.py (fallback to /root/ in container)
+    google_storage_url = os.environ.get("GOOGLE_STORAGE_URL", "")
+    if not google_storage_url:
+        try:
+            import re
+            content = None
+            # Try local repo path first (works for local_entrypoint on host)
+            local_dir = os.path.dirname(__file__)
+            local_test_file = os.path.join(local_dir, "test_url.py")
+            if os.path.exists(local_test_file):
+                with open(local_test_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+            else:
+                # Fallback to container-baked path
+                container_test_file = "/root/test_url.py"
+                if os.path.exists(container_test_file):
+                    with open(container_test_file, "r", encoding="utf-8") as f:
+                        content = f.read()
+            if not content:
+                print("test_url.py not found locally or in /root/")
+                return {"status": "error", "message": "test_url.py not found"}
+            m = re.search(r'GOOGLE_STORAGE_URL\s*=\s*"([^"]+)"', content)
+            if m:
+                google_storage_url = m.group(1)
+            else:
+                print("Failed to parse GOOGLE_STORAGE_URL from test_url.py")
+                return {"status": "error", "message": "GOOGLE_STORAGE_URL not found in test_url.py"}
+        except Exception as e:
+            print(f"Error reading test_url.py: {e}")
+            return {"status": "error", "message": str(e)}
+    
+    print("="*70)
+    print("Testing StarDist Modal with Google Storage URL")
+    print("="*70)
+    print()
+    
+    result = process_from_url.remote(
+        image_url=google_storage_url,
+        stardist_pretrain="2D_versatile_he",
+        magnification=40,
+        with_embedding=True,
+        emb_batch_size=256,
+        emb_workers=4
+    )
+    
+    print("="*70)
+    if result['status'] == 'success':
+        print("✅ Success!")
+        print(f"  Nuclei: {result['nuclei_count']:,}")
+        print(f"  Time: {result['timing']['total']:.2f}s")
+    else:
+        print("❌ Failed!")
+        print(f"  Error: {result.get('message')}")
+    print("="*70)
+    
+    return result
+
+@app.local_entrypoint()
+def main():
+    """Setup and initialize Modal deployment"""
+    print("🚀 Setting up StarDist model cache...")
+    res = setup_models.remote()
+    print(f"Setup result: {res}")
+
+if __name__ == "__main__":
+    main()
+
