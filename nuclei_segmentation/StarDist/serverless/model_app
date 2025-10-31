@@ -411,6 +411,8 @@ def process_embedding(patch_data):
         import sys
         sys.path.insert(0, "/root")
         from nuc_embedding import NucleiEmbedding
+        import shutil
+        import os
         
         print(f"Processing embeddings for {len(patch_data.get('centroids', []))} nuclei")
         
@@ -426,7 +428,22 @@ def process_embedding(patch_data):
         
         class Args:
             def __init__(self):
-                self.slidepath = patch_data.get('slide_path', '')
+                slide_path_input = patch_data.get('slide_path', '')
+                # If slide is on shared volume, copy to local /tmp to avoid worker path resolution issues
+                try:
+                    if slide_path_input and os.path.exists(slide_path_input):
+                        local_tmp_path = os.path.join('/tmp', os.path.basename(slide_path_input))
+                        if not os.path.exists(local_tmp_path):
+                            shutil.copyfile(slide_path_input, local_tmp_path)
+                            print(f"Copied slide to local path: {local_tmp_path}")
+                        slide_path_final = local_tmp_path
+                    else:
+                        slide_path_final = slide_path_input
+                except Exception as _e:
+                    print(f"Warning: failed to copy slide to /tmp: {_e}")
+                    slide_path_final = slide_path_input
+
+                self.slidepath = slide_path_final
                 self.magnification = patch_data.get('magnification', 40)
                 self.read_image_method = patch_data.get('read_image_method', 'tiffslide')
         
