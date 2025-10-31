@@ -92,12 +92,10 @@ image = (
 # Volume for caching models
 model_cache = modal.Volume.from_name("stardist-model-cache", create_if_missing=True)
 MODEL_CACHE_PATH = "/root/.keras/stardist/models"
-tmp_shared = modal.Volume.from_name("stardist-shared-tmp", create_if_missing=True)
-SHARED_TMP_DIR = "/root/shared_tmp"
 
 @app.function(
     image=image,
-    volumes={MODEL_CACHE_PATH: model_cache, SHARED_TMP_DIR: tmp_shared},
+    volumes={MODEL_CACHE_PATH: model_cache},
     timeout=600
 )
 def setup_models():
@@ -136,7 +134,7 @@ def setup_models():
     cpu=4,
     memory=32768,
     retries=1,
-    volumes={MODEL_CACHE_PATH: model_cache, SHARED_TMP_DIR: tmp_shared},
+    volumes={MODEL_CACHE_PATH: model_cache},
     timeout=1800,
 )
 @modal.concurrent(max_inputs=10, target_inputs=5)
@@ -246,21 +244,11 @@ def process_segmentation(patch_data):
                 suffix = '.svs'
             
             # Write downloaded content to temporary file
-            if patch_data.get('keep_temp', False):
-                # Save to shared volume so other workers can access
-                import uuid
-                os.makedirs(SHARED_TMP_DIR, exist_ok=True)
-                tmp_path = os.path.join(SHARED_TMP_DIR, f"{uuid.uuid4().hex}{suffix}")
-                with open(tmp_path, 'wb') as f:
-                    f.write(response_content)
-                # Do not schedule for cleanup here; caller will clean
-                print(f"[{patch_id}] Saved to shared file: {tmp_path}")
-            else:
-                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                    tmp.write(response_content)
-                    tmp_path = tmp.name
-                    temp_files.append(tmp_path)
-                    print(f"[{patch_id}] Saved to temporary file: {tmp_path}")
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(response_content)
+                tmp_path = tmp.name
+                temp_files.append(tmp_path)
+                print(f"[{patch_id}] Saved to temporary file: {tmp_path}")
         
         elif 'image_data' in patch_data:
             # Decode base64 image data
@@ -393,17 +381,13 @@ def process_segmentation(patch_data):
 @app.function(
     image=image.env({
         "STARDIST_CACHE_DIR": MODEL_CACHE_PATH,
-        "PYTHONPATH": "/root",
-        # Re-enable CUDA for embedding
-        "CUDA_VISIBLE_DEVICES": "0",
-        "TORCH_USE_CUDA": "1"
+        "PYTHONPATH": "/root"
     }),
     cpu=8,
     memory=32768,
     retries=1,
-    volumes={MODEL_CACHE_PATH: model_cache, SHARED_TMP_DIR: tmp_shared},
+    volumes={MODEL_CACHE_PATH: model_cache},
     timeout=3600,
-    gpu="T4"
 )
 def process_embedding(patch_data):
     """Process embeddings for centroids"""
@@ -411,8 +395,6 @@ def process_embedding(patch_data):
         import sys
         sys.path.insert(0, "/root")
         from nuc_embedding import NucleiEmbedding
-        import shutil
-        import os
         
         print(f"Processing embeddings for {len(patch_data.get('centroids', []))} nuclei")
         
@@ -428,22 +410,7 @@ def process_embedding(patch_data):
         
         class Args:
             def __init__(self):
-                slide_path_input = patch_data.get('slide_path', '')
-                # If slide is on shared volume, copy to local /tmp to avoid worker path resolution issues
-                try:
-                    if slide_path_input and os.path.exists(slide_path_input):
-                        local_tmp_path = os.path.join('/tmp', os.path.basename(slide_path_input))
-                        if not os.path.exists(local_tmp_path):
-                            shutil.copyfile(slide_path_input, local_tmp_path)
-                            print(f"Copied slide to local path: {local_tmp_path}")
-                        slide_path_final = local_tmp_path
-                    else:
-                        slide_path_final = slide_path_input
-                except Exception as _e:
-                    print(f"Warning: failed to copy slide to /tmp: {_e}")
-                    slide_path_final = slide_path_input
-
-                self.slidepath = slide_path_final
+                self.slidepath = patch_data.get('slide_path', '')
                 self.magnification = patch_data.get('magnification', 40)
                 self.read_image_method = patch_data.get('read_image_method', 'tiffslide')
         
@@ -452,10 +419,7 @@ def process_embedding(patch_data):
         emb_start = time.time()
         
         ne = NucleiEmbedding(args, centroids)
-        embeddings = ne.generate_embeddings(
-            batch_size=patch_data.get('emb_batch_size'),
-            num_workers=patch_data.get('emb_workers')
-        )
+        embeddings = ne.generate_embeddings()
         
         embed_time = time.time() - emb_start
         
@@ -505,9 +469,7 @@ def process_from_url(
     prob_thresh: float = 0.3,
     nms_thresh: float = 0.3,
     magnification: int = 40,
-    with_embedding: bool = False,
-    emb_batch_size: int | None = None,
-    emb_workers: int | None = None
+    with_embedding: bool = False
 ) -> dict:
     """
     Simplified function to process an image directly from URL
@@ -552,18 +514,14 @@ def process_from_url(
             'magnification': magnification,
             'read_image_method': 'tiffslide',
         }
-        if emb_batch_size is not None:
-            emb_payload['emb_batch_size'] = emb_batch_size
-        if emb_workers is not None:
-            emb_payload['emb_workers'] = emb_workers
-        emb_result = process_embedding.remote(emb_payload)
+        emb_result = process_embedding.local(emb_payload)
         seg_result['embedding'] = emb_result
         # Cleanup the kept temp file after embeddings
-        try:
-            if slide_path and os.path.exists(slide_path):
+        if slide_path and os.path.exists(slide_path):
+            try:
                 os.unlink(slide_path)
-        except Exception:
-            pass
+            except Exception:
+                pass
     
     return seg_result
 
@@ -610,9 +568,7 @@ def test_with_url():
         image_url=google_storage_url,
         stardist_pretrain="2D_versatile_he",
         magnification=40,
-        with_embedding=True,
-        emb_batch_size=256,
-        emb_workers=4
+        with_embedding=True
     )
     
     print("="*70)
