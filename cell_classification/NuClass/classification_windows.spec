@@ -35,6 +35,7 @@ hiddenimport_data = (
         'tqdm',
         'natsort',
         'einops',
+        'tissuelab_sdk',
         *stardist_hiddenimports,
         *transformers_hiddenimports,
     ])
@@ -56,6 +57,7 @@ a = Analysis(
         ('checkpoints', 'checkpoints'),
         ('negative_control_example_vectors.npy', '.'),
         ('negative_control_examples', 'negative_control_examples'),
+        ('safe_h5_utils.py', '.'),
         ("Resources\\imagecodecs\\_zlib.cp39-win_amd64.pyd", "imagecodecs"),
         ("Resources\\imagecodecs\\_jpeg8.cp39-win_amd64.pyd", "imagecodecs"),
         ("Resources\\imagecodecs\\_jpeg2k.cp39-win_amd64.pyd", "imagecodecs"),

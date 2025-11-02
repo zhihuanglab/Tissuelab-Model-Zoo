@@ -1,0 +1,76 @@
+"""
+Test StarDist Modal with URL processing
+python -m modal run modal_app.py::test_with_url
+"""
+import modal
+
+# Your Google Storage URL (signed url, please generate through the CTRL-Service API)
+GOOGLE_STORAGE_URL = "https://storage.googleapis.com/tissuelab-2025.firebasestorage.app/samples/CMU-1.svs?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=firebase-adminsdk-fbsvc%40tissuelab-2025.iam.gserviceaccount.com%2F20251031%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20251031T025641Z&X-Goog-Expires=3600&X-Goog-SignedHeaders=host&response-content-disposition=attachment%3B%20filename%3D%22CMU-1.svs%22&X-Goog-Signature=47ffa83896f6fef522cdacc29e775999d38de75297453ac3ff6cde59df4c099f886e5f6e3c243c295b1b87aee833d4cad72ea3473ec6cc20f8e56441ee17ad8c8ec4489619b9084d49d070d557a649af8543a3c2baf64dd47f2312ee4ef408298685909f0334043916c36d6ed7904b6205670d4b0a868954ddf9f785d5fb0554a5a58fbfbed9da6f017ddd3df89e24f918afdd18997899c96fc36bb63cf74d5e780946940a761fc7cfaa7d0ad17beae170efea1ba8728c444f9cb6faba2d565b5c97b9bc0189d7c8271d1931606c0e0f04d0ce6736b569c9ebfbcffd47d50af67b9bc172d4be347e080aa7dc683b62fc8af26433cefa33fe963e5ea04c131823"
+
+
+def main():
+    print("="*70)
+    print("StarDist Modal - Process Image from URL")
+    print("="*70)
+    print()
+    
+    print("📡 Connecting to Modal app...")
+    app = modal.App.lookup("stardist-segmentation-v1", create_if_missing=False)
+    print("✅ Connected!")
+    print()
+    
+    print("🖼️  Processing image from Google Storage URL...")
+    print(f"   URL: {GOOGLE_STORAGE_URL[:80]}...")
+    print()
+    
+    try:
+        # Call Modal function
+        result = app.process_from_url.remote(
+            image_url=GOOGLE_STORAGE_URL,
+            stardist_pretrain="2D_versatile_he",
+            isIHC=False,
+            tile_size=4096,
+            overlap=256,
+            prob_thresh=0.3,
+            nms_thresh=0.3,
+            magnification=40
+        )
+        
+        print("="*70)
+        if result['status'] == 'success':
+            print("✅ Segmentation completed successfully!")
+            print()
+            print("Results:")
+            print(f"  • Nuclei count: {result['nuclei_count']:,}")
+            print(f"  • Centroids: {len(result['centroids'])}")
+            print(f"  • Contours: {len(result['contours'])}")
+            print(f"  • Total time: {result['timing']['total']:.2f}s")
+            print(f"  • Segmentation time: {result['timing']['segmentation']:.2f}s")
+            
+            if 'performance_stats' in result:
+                stats = result['performance_stats']
+                if 'segmentation_throughput' in stats:
+                    print(f"  • Throughput: {stats['segmentation_throughput']:.1f} nuclei/s")
+            
+            print()
+            print("Sample centroids (first 5):")
+            for i, centroid in enumerate(result['centroids'][:5], 1):
+                print(f"  {i}. ({centroid[0]}, {centroid[1]})")
+        else:
+            print("❌ Segmentation failed!")
+            print(f"   Error: {result.get('message', 'Unknown error')}")
+        
+        print("="*70)
+        
+    except Exception as e:
+        print("="*70)
+        print("❌ Error occurred!")
+        print(f"   {str(e)}")
+        print("="*70)
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
+

@@ -39,6 +39,7 @@ hiddenimport_data = (
         'pylibCZIrw',
         'openslide',
         'openslide.lowlevel',
+        'tissuelab_sdk',
         *stardist_hiddenimports,
         *transformers_hiddenimports,
     ])
@@ -59,6 +60,7 @@ a = Analysis(
         ('nuc_seg_mac.py', '.'),
         ('nuc_stat.py', '.'),
         ('nuc_embedding_mac.py', '.'),
+        ('safe_h5_utils.py', '.'),
         ('checkpoints', 'checkpoints'),
         ('histomicstk_scripts', 'histomicstk_scripts'),
         ('models', 'models'),

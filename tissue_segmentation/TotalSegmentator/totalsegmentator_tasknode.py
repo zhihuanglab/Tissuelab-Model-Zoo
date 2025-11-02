@@ -20,7 +20,7 @@ from typing import Dict, Any, Optional, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import uvicorn
-from fastapi import FastAPI, BackgroundTasks, Request, HTTPException
+from fastapi import FastAPI, BackgroundTasks, Request, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -40,14 +40,22 @@ else:
 
 # Set local model weights directory
 if LOCAL_MODELS.exists():
+    # Set both environment variables to ensure correct paths
     os.environ['TOTALSEG_HOME_DIR'] = str(LOCAL_MODELS)
+    # TOTALSEG_WEIGHTS_PATH should point directly to nnunet/results
+    weights_path = LOCAL_MODELS / "nnunet" / "results"
+    weights_path.mkdir(parents=True, exist_ok=True)
+    os.environ['TOTALSEG_WEIGHTS_PATH'] = str(weights_path)
+    os.environ['nnUNet_results'] = str(weights_path)
     print(f"[TotalSegmentator] Using local model weights: {LOCAL_MODELS}")
+    print(f"[TotalSegmentator] Weights path: {weights_path}")
 else:
     print(f"[TotalSegmentator] Local weights not found")
 
 # Import TotalSegmentator
 try:
     from totalsegmentator.python_api import totalsegmentator
+    from totalsegmentator.libs import download_pretrained_weights
     print(f"[TotalSegmentator] Successfully imported TotalSegmentator")
 except ImportError as e:
     print(f"[TotalSegmentator] Warning: totalsegmentator not imported: {e}")
@@ -126,6 +134,11 @@ PROGRESS_MESSAGE = ""
 IS_PROCESSING = False
 progress_complete = False  # Flag to indicate completion
 
+# Event-driven progress updates
+progress_event = asyncio.Event()
+progress_queue = asyncio.Queue()
+active_connections = set()  # Track active WebSocket connections
+
 # Available weight model configurations (from main_run.py)
 AVAILABLE_MODELS = {
     "total_3mm": {
@@ -179,10 +192,273 @@ AVAILABLE_MODELS = {
     }
 }
 
-# Pydantic models - Make them more flexible
+# Mapping from tissue classes to appropriate TotalSegmentator models
+# Based on TotalSegmentator documentation: https://github.com/wasserth/TotalSegmentator
+TISSUE_CLASS_TO_MODEL_MAPPING = {
+    # Cerebral bleed specific classes
+    "intracerebral_hemorrhage": "cerebral_bleed",
+    "intracerebral_hemorrhage_left": "cerebral_bleed", 
+    "intracerebral_hemorrhage_right": "cerebral_bleed",
+    "subarachnoid_hemorrhage": "cerebral_bleed",
+    "subdural_hemorrhage": "cerebral_bleed",
+    "epidural_hemorrhage": "cerebral_bleed",
+    
+    # Lung vessel specific classes
+    "pulmonary_vein": "lung_vessels",
+    "pulmonary_artery": "lung_vessels",
+    "lung_vessels": "lung_vessels",
+    
+    # Body/thorax specific classes
+    "body": "body",
+    "thorax": "body",
+    "abdomen": "body",
+    
+    # All other anatomical structures use total model
+    # Organs (from TotalSegmentator class map)
+    "spleen": "total_3mm",
+    "kidney_right": "total_3mm",
+    "kidney_left": "total_3mm", 
+    "gallbladder": "total_3mm",
+    "liver": "total_3mm",
+    "stomach": "total_3mm",
+    "pancreas": "total_3mm",
+    "adrenal_gland_right": "total_3mm",
+    "adrenal_gland_left": "total_3mm",
+    "lung_left": "total_3mm",
+    "lung_right": "total_3mm",
+    "esophagus": "total_3mm",
+    "small_bowel": "total_3mm",
+    "duodenum": "total_3mm",
+    "colon": "total_3mm",
+    "urinary_bladder": "total_3mm",
+    "prostate": "total_3mm",
+    "brain": "total_3mm",
+    "skull": "total_3mm",
+    "heart": "total_3mm",
+    "aorta": "total_3mm",
+    "inferior_vena_cava": "total_3mm",
+    "portal_vein_and_splenic_vein": "total_3mm",
+    "iliac_artery_left": "total_3mm",
+    "iliac_artery_right": "total_3mm",
+    "iliac_vena_left": "total_3mm",
+    "iliac_vena_right": "total_3mm",
+    "humerus_left": "total_3mm",
+    "humerus_right": "total_3mm",
+    "scapula_left": "total_3mm",
+    "scapula_right": "total_3mm",
+    "clavicula_left": "total_3mm",
+    "clavicula_right": "total_3mm",
+    "femur_left": "total_3mm",
+    "femur_right": "total_3mm",
+    "hip_left": "total_3mm",
+    "hip_right": "total_3mm",
+    "spinal_cord": "total_3mm",
+    "sacrum": "total_3mm",
+    "vertebrae": "total_3mm",
+    "intervertebral_discs": "total_3mm",
+    "sternum": "total_3mm",
+    "costal_cartilages": "total_3mm",
+    
+    # Muscle groups
+    "gluteus_maximus_left": "total_3mm",
+    "gluteus_maximus_right": "total_3mm",
+    "gluteus_medius_left": "total_3mm",
+    "gluteus_medius_right": "total_3mm",
+    "gluteus_minimus_left": "total_3mm",
+    "gluteus_minimus_right": "total_3mm",
+    "autochthon_left": "total_3mm",
+    "autochthon_right": "total_3mm",
+    "iliopsoas_left": "total_3mm",
+    "iliopsoas_right": "total_3mm",
+    
+    # Ribs
+    "rib_left_1": "total_3mm",
+    "rib_left_2": "total_3mm",
+    "rib_left_3": "total_3mm",
+    "rib_left_4": "total_3mm",
+    "rib_left_5": "total_3mm",
+    "rib_left_6": "total_3mm",
+    "rib_left_7": "total_3mm",
+    "rib_left_8": "total_3mm",
+    "rib_left_9": "total_3mm",
+    "rib_left_10": "total_3mm",
+    "rib_left_11": "total_3mm",
+    "rib_left_12": "total_3mm",
+    "rib_right_1": "total_3mm",
+    "rib_right_2": "total_3mm",
+    "rib_right_3": "total_3mm",
+    "rib_right_4": "total_3mm",
+    "rib_right_5": "total_3mm",
+    "rib_right_6": "total_3mm",
+    "rib_right_7": "total_3mm",
+    "rib_right_8": "total_3mm",
+    "rib_right_9": "total_3mm",
+    "rib_right_10": "total_3mm",
+    "rib_right_11": "total_3mm",
+    "rib_right_12": "total_3mm",
+    
+    # Blood vessels
+    "common_carotid_artery_left": "total_3mm",
+    "common_carotid_artery_right": "total_3mm",
+    "brachiocephalic_vein_left": "total_3mm",
+    "brachiocephalic_vein_right": "total_3mm",
+    "atrial_appendage_left": "total_3mm",
+    "superior_vena_cava": "total_3mm",
+}
+
+def parse_prompt_for_tissue_classes(prompt: str) -> List[str]:
+    """
+    Parse prompt field to extract tissue class names
+    Handles formats like "classes=Intracranial hemorrhage" or "Intracranial hemorrhage"
+    
+    Args:
+        prompt: Prompt string that may contain tissue class information
+        
+    Returns:
+        List[str]: Extracted tissue class names
+    """
+    if not prompt:
+        return []
+    
+    print(f"[Parse Prompt] Input prompt: '{prompt}'")
+    
+    # Look for "classes=" pattern
+    if "classes=" in prompt.lower():
+        # Extract everything after "classes="
+        parts = prompt.split("=", 1)
+        if len(parts) > 1:
+            classes_str = parts[1].strip()
+            print(f"[Parse Prompt] Found classes string: '{classes_str}'")
+            
+            # Split by comma if multiple classes
+            if "," in classes_str:
+                classes = [cls.strip() for cls in classes_str.split(",")]
+            else:
+                classes = [classes_str.strip()]
+            
+            print(f"[Parse Prompt] Extracted classes: {classes}")
+            return classes
+    
+    # If no "classes=" pattern, treat the entire prompt as a single class name
+    # (after removing common prefixes)
+    clean_prompt = prompt.strip()
+    if clean_prompt.lower().startswith("class:"):
+        clean_prompt = clean_prompt[6:].strip()
+    elif clean_prompt.lower().startswith("tissue:"):
+        clean_prompt = clean_prompt[7:].strip()
+    
+    if clean_prompt:
+        print(f"[Parse Prompt] Treating entire prompt as single class: '{clean_prompt}'")
+        return [clean_prompt]
+    
+    return []
+
+def validate_tissue_classes(tissue_classes: List[str]) -> tuple[List[str], List[str]]:
+    """
+    Validate tissue class names against TotalSegmentator's class map
+    Assumes input is already normalized (lowercase, underscores)
+    
+    Args:
+        tissue_classes: List of normalized tissue/organ classes to validate
+        
+    Returns:
+        tuple: (valid_classes, invalid_classes)
+    """
+    if not tissue_classes:
+        return [], []
+    
+    # Get all valid class names from our mapping
+    valid_class_names = set(TISSUE_CLASS_TO_MODEL_MAPPING.keys())
+    
+    valid_classes = []
+    invalid_classes = []
+    
+    for tissue_class in tissue_classes:
+        # Input should already be normalized, but double-check
+        normalized_class = tissue_class.lower().strip()
+        if normalized_class in valid_class_names:
+            valid_classes.append(normalized_class)
+        else:
+            invalid_classes.append(tissue_class)
+            print(f"[Validation] WARNING: '{tissue_class}' is not a valid TotalSegmentator class name")
+    
+    if invalid_classes:
+        print(f"[Validation] Invalid classes: {invalid_classes}")
+        print(f"[Validation] Valid classes: {valid_classes}")
+    
+    return valid_classes, invalid_classes
+
+def normalize_tissue_classes(tissue_classes: List[str]) -> List[str]:
+    """
+    Normalize tissue class names to lowercase for TotalSegmentator compatibility
+    Also validates the class names and filters out invalid ones
+    Converts spaces to underscores for proper mapping
+    
+    Args:
+        tissue_classes: List of tissue/organ classes (may have mixed case and spaces)
+        
+    Returns:
+        List[str]: Normalized and validated tissue class names in lowercase with underscores
+    """
+    if not tissue_classes:
+        return []
+    
+    # First normalize: convert to lowercase and replace spaces with underscores
+    normalized_input = []
+    for tissue_class in tissue_classes:
+        # Convert to lowercase and replace spaces with underscores
+        normalized_class = tissue_class.lower().strip().replace(' ', '_')
+        normalized_input.append(normalized_class)
+        print(f"[Normalize] '{tissue_class}' -> '{normalized_class}'")
+    
+    # Then validate and filter
+    valid_classes, invalid_classes = validate_tissue_classes(normalized_input)
+    
+    if invalid_classes:
+        print(f"[Normalize] Filtered out invalid classes: {invalid_classes}")
+        print(f"[Normalize] Using valid classes: {valid_classes}")
+    
+    return valid_classes
+
+def determine_model_from_tissue_classes(tissue_classes: List[str]) -> str:
+    """
+    Determine the appropriate TotalSegmentator model based on tissue classes
+    
+    Args:
+        tissue_classes: List of tissue/organ classes requested
+        
+    Returns:
+        str: Model name to use
+    """
+    if not tissue_classes:
+        return "total_3mm"  # Default to total model
+    
+    # Normalize tissue classes to lowercase first
+    normalized_classes = normalize_tissue_classes(tissue_classes)
+    
+    # Check if any class requires a specific model
+    for tissue_class in normalized_classes:
+        if tissue_class in TISSUE_CLASS_TO_MODEL_MAPPING:
+            model = TISSUE_CLASS_TO_MODEL_MAPPING[tissue_class]
+            print(f"[Model Selection] Tissue class '{tissue_class}' maps to model '{model}'")
+            return model
+    
+    # Default to total model for unmapped classes
+    print(f"[Model Selection] No specific model mapping found, using default 'total_3mm'")
+    return "total_3mm"
+
+# Pydantic models - Updated to match new frontend structure
 class InputData(BaseModel):
-    cerebral_bleed: Optional[str] = None
+    prompt: Optional[str] = None
     path: Optional[str] = None
+    bbox: Optional[List[int]] = None  # [x, y, width, height]
+    tissue_classes: Optional[List[str]] = None  # List of tissue/organ classes
+    tissue_colors: Optional[List[str]] = None  # List of colors for visualization
+    classifier_path: Optional[str] = None
+    save_classifier_path: Optional[str] = None
+    
+    # Legacy fields for backward compatibility
+    cerebral_bleed: Optional[str] = None
     
     class Config:
         extra = "allow"  # Allow extra fields
@@ -219,6 +495,182 @@ class ProgressResponse(BaseModel):
     message: str
     is_processing: bool
 
+def check_and_download_model(task_id: int, task_name: str) -> bool:
+    """
+    Check if model weights exist and are complete, download if missing
+    
+    Args:
+        task_id: Task ID number
+        task_name: Task name for logging
+        
+    Returns:
+        bool: True if model is ready, False if download failed
+    """
+    try:
+        # Map task IDs to expected model paths
+        task_to_dataset = {
+            150: "Dataset150_icb_v0",
+            258: "Dataset258_lung_vessels_248subj",
+            291: "Dataset291_TotalSegmentator_part1_organs_1559subj",
+            292: "Dataset292_TotalSegmentator_part2_vertebrae_1532subj",
+            297: "Dataset297_TotalSegmentator_total_3mm_1559subj",
+            298: "Dataset298_TotalSegmentator_total_6mm_1559subj",
+            299: "Dataset299_body_1559subj",
+            300: "Dataset300_body_6mm_1559subj",
+            850: "Dataset850_TotalSegMRI_part1_organs_1088subj",
+            852: "Dataset852_TotalSegMRI_total_3mm_1088subj",
+            853: "Dataset853_TotalSegMRI_total_6mm_1088subj",
+        }
+        
+        if task_id not in task_to_dataset:
+            print(f"[Model Check] Unknown task ID {task_id}, skipping check")
+            return True
+        
+        dataset_name = task_to_dataset[task_id]
+        
+        # Check in local models directory first
+        if LOCAL_MODELS.exists():
+            model_path = LOCAL_MODELS / "nnunet" / "results" / dataset_name
+            
+            # Check if model directory exists and contains required files
+            if model_path.exists():
+                # Check for essential files (dataset.json, plans.json, or fold_0 directory)
+                has_files = False
+                
+                # Look for trainer directories
+                trainer_dirs = list(model_path.glob("nnUNet*"))
+                if trainer_dirs:
+                    for trainer_dir in trainer_dirs:
+                        # Check for dataset.json or plans.json or fold_0
+                        if (trainer_dir / "dataset.json").exists() and \
+                           (trainer_dir / "plans.json").exists() and \
+                           (trainer_dir / "fold_0").exists():
+                            # Also check that fold_0 is not empty
+                            fold_0_files = list((trainer_dir / "fold_0").iterdir()) if (trainer_dir / "fold_0").is_dir() else []
+                            if len(fold_0_files) > 0:
+                                has_files = True
+                                print(f"[Model Check] OK: {task_name} (Task {task_id}) model found and appears complete")
+                                print(f"[Model Check]   Trainer: {trainer_dir.name}")
+                                print(f"[Model Check]   Files in fold_0: {len(fold_0_files)}")
+                                break
+                
+                if has_files:
+                    return True
+                else:
+                    print(f"[Model Check] WARNING: {task_name} (Task {task_id}) directory exists but appears incomplete")
+                    print(f"[Model Check] Directory: {model_path}")
+                    if trainer_dirs:
+                        for trainer_dir in trainer_dirs:
+                            print(f"[Model Check]   Checking {trainer_dir.name}:")
+                            print(f"[Model Check]     - dataset.json: {(trainer_dir / 'dataset.json').exists()}")
+                            print(f"[Model Check]     - plans.json: {(trainer_dir / 'plans.json').exists()}")
+                            print(f"[Model Check]     - fold_0 dir: {(trainer_dir / 'fold_0').exists()}")
+                            if (trainer_dir / "fold_0").exists():
+                                fold_0_files = list((trainer_dir / "fold_0").iterdir()) if (trainer_dir / "fold_0").is_dir() else []
+                                print(f"[Model Check]     - fold_0 files: {len(fold_0_files)}")
+                    else:
+                        print(f"[Model Check]   No trainer directories found!")
+                    print(f"[Model Check] Will attempt to re-download...")
+            else:
+                print(f"[Model Check] MISSING: {task_name} (Task {task_id}) model not found at {model_path}")
+        
+        # Model is missing or incomplete, download it
+        print(f"[Model Download] Downloading {task_name} (Task {task_id})...")
+        print(f"[Model Download] This may take a few minutes depending on your internet speed...")
+        
+        # Ensure environment variables are set before download
+        import os
+        import shutil
+        results_dir = LOCAL_MODELS / "nnunet" / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        
+        target_model_path = results_dir / dataset_name
+        print(f"[Model Download] Target directory: {target_model_path}")
+        
+        # If directory exists but is incomplete, remove it so download_pretrained_weights will re-download
+        if target_model_path.exists():
+            print(f"[Model Download] Removing incomplete model directory...")
+            try:
+                shutil.rmtree(target_model_path)
+                print(f"[Model Download] Removed: {target_model_path}")
+            except Exception as remove_error:
+                print(f"[Model Download] Warning: Could not remove directory: {remove_error}")
+        
+        os.environ['TOTALSEG_HOME_DIR'] = str(LOCAL_MODELS)
+        os.environ['TOTALSEG_WEIGHTS_PATH'] = str(results_dir)
+        os.environ['nnUNet_results'] = str(results_dir)
+        
+        print(f"[Model Download] TOTALSEG_HOME_DIR: {os.environ.get('TOTALSEG_HOME_DIR')}")
+        print(f"[Model Download] TOTALSEG_WEIGHTS_PATH: {os.environ.get('TOTALSEG_WEIGHTS_PATH')}")
+        print(f"[Model Download] nnUNet_results: {os.environ.get('nnUNet_results')}")
+        
+        try:
+            print(f"[Model Download] Starting download from GitHub...")
+            download_pretrained_weights(task_id)
+            print(f"[Model Download] Download function completed")
+        except Exception as download_error:
+            print(f"[Model Download] Download function error: {download_error}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+        # Verify download was successful
+        print(f"[Model Download] Verifying download...")
+        model_path = LOCAL_MODELS / "nnunet" / "results" / dataset_name
+        
+        if not model_path.exists():
+            print(f"[Model Download] ERROR: Model directory not created at {model_path}")
+            print(f"[Model Download] The download_pretrained_weights function may have failed silently")
+            return False
+        
+        # Check for trainer directories
+        trainer_dirs = list(model_path.glob("nnUNet*"))
+        if not trainer_dirs:
+            print(f"[Model Download] ERROR: No trainer directories found in {model_path}")
+            all_contents = list(model_path.iterdir()) if model_path.exists() else []
+            print(f"[Model Download] Directory contents: {[item.name for item in all_contents]}")
+            return False
+        
+        # Check for required files
+        has_files = False
+        for trainer_dir in trainer_dirs:
+            # List all files in trainer directory for debugging
+            trainer_contents = list(trainer_dir.iterdir()) if trainer_dir.exists() else []
+            print(f"[Model Download] Checking {trainer_dir.name}: {len(trainer_contents)} items")
+            
+            if (trainer_dir / "dataset.json").exists() or \
+               (trainer_dir / "plans.json").exists() or \
+               (trainer_dir / "fold_0").exists():
+                has_files = True
+                print(f"[Model Download] SUCCESS: Found valid trainer directory: {trainer_dir.name}")
+                # Show some key files
+                if (trainer_dir / "dataset.json").exists():
+                    print(f"[Model Download]   - dataset.json found")
+                if (trainer_dir / "plans.json").exists():
+                    print(f"[Model Download]   - plans.json found")
+                if (trainer_dir / "fold_0").exists():
+                    print(f"[Model Download]   - fold_0 directory found")
+                break
+        
+        if not has_files:
+            print(f"[Model Download] ERROR: Downloaded but missing required files")
+            print(f"[Model Download] Trainer directories found: {[d.name for d in trainer_dirs]}")
+            for trainer_dir in trainer_dirs:
+                trainer_contents = list(trainer_dir.iterdir()) if trainer_dir.exists() else []
+                print(f"[Model Download] Contents of {trainer_dir.name}:")
+                for item in trainer_contents[:20]:  # Show first 20 items
+                    print(f"[Model Download]   - {item.name}")
+            return False
+        
+        print(f"[Model Download] SUCCESS: {task_name} (Task {task_id}) downloaded and verified")
+        return True
+        
+    except Exception as e:
+        print(f"[Model Download] ERROR: Failed to download {task_name} (Task {task_id}): {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 def validate_input(input_path: str) -> tuple[bool, Optional[str], str]:
     """
     Validate input file/folder
@@ -236,7 +688,9 @@ def validate_input(input_path: str) -> tuple[bool, Optional[str], str]:
     
     if input_path.is_file():
         # Check if it's a NIfTI file
-        if input_path.suffix in ['.nii', '.nii.gz']:
+        # Use suffixes to handle .nii.gz properly (Path.suffix only returns last extension)
+        file_str = str(input_path).lower()
+        if file_str.endswith('.nii.gz') or file_str.endswith('.nii'):
             return True, 'nifti', f"NIfTI file: {input_path}"
         else:
             return False, None, f"Unsupported file format: {input_path.suffix}"
@@ -252,13 +706,22 @@ def validate_input(input_path: str) -> tuple[bool, Optional[str], str]:
     return False, None, "Invalid input path"
 
 def update_progress(progress: int, message: str = ""):
-    """Update global progress variables"""
+    """Update global progress variables and notify SSE clients"""
     global CURRENT_PROGRESS, PROGRESS_MESSAGE, progress_complete
     CURRENT_PROGRESS = progress
     PROGRESS_MESSAGE = message
     if progress >= 100:
         progress_complete = True
+    
     print(f"[Progress] {progress}% - {message}")
+    
+    # Notify SSE clients without polling (synchronous)
+    try:
+        if not progress_queue.full():
+            progress_queue.put_nowait({"progress": progress, "message": message})
+        progress_event.set()
+    except Exception as e:
+        print(f"[Progress] Error notifying SSE clients: {e}")
 
 def load_nifti_file(file_path: str) -> Optional[np.ndarray]:
     """Load NIfTI file and return numpy array"""
@@ -276,8 +739,14 @@ def save_organ_to_h5(organ_name: str, organ_data: np.ndarray, h5_path: str, meta
         print(f"[H5] Starting to save organ: {organ_name}")
         print(f"[H5] Data shape: {organ_data.shape if organ_data is not None else 'None'}")
         print(f"[H5] Data type: {organ_data.dtype if organ_data is not None else 'None'}")
+        print(f"[H5] Data min: {organ_data.min()}, max: {organ_data.max()}, non-zero count: {np.count_nonzero(organ_data)}")
         print(f"[H5] H5 path: {h5_path}")
         print(f"[H5] File prefix: {file_prefix}")
+        
+        # Ensure data is uint8
+        if organ_data.dtype != np.uint8:
+            print(f"[H5] Converting data from {organ_data.dtype} to uint8")
+            organ_data = organ_data.astype(np.uint8)
         
         with safe_h5_open(h5_path, "a") as hf:
             print(f"[H5] Opened H5 file successfully")
@@ -371,7 +840,13 @@ def extract_organ_from_nifti(nifti_path: str, organ_name: str) -> Optional[np.nd
                 if file_path.exists():
                     print(f"[Extract] Found organ file: {file_path}")
                     nifti_img = nib.load(str(file_path))
-                    return nifti_img.get_fdata()
+                    # Convert to uint8 for segmentation masks
+                    data = nifti_img.get_fdata()
+                    print(f"[Extract] Original dtype: {data.dtype}, shape: {data.shape}")
+                    print(f"[Extract] Data range: min={data.min()}, max={data.max()}, unique values: {len(np.unique(data))}")
+                    data_uint8 = data.astype(np.uint8)
+                    print(f"[Extract] Converted to uint8, range: min={data_uint8.min()}, max={data_uint8.max()}")
+                    return data_uint8
             
             # List all files in directory for debugging
             print(f"[Extract] Available files: {list(nifti_path.glob('*.nii*'))}")
@@ -383,7 +858,11 @@ def extract_organ_from_nifti(nifti_path: str, organ_name: str) -> Optional[np.nd
             print(f"[Extract] Loading from single file: {nifti_path}")
             nifti_img = nib.load(str(nifti_path))
             data = nifti_img.get_fdata()
-            return data
+            print(f"[Extract] Original dtype: {data.dtype}, shape: {data.shape}")
+            print(f"[Extract] Data range: min={data.min()}, max={data.max()}, unique values: {len(np.unique(data))}")
+            data_uint8 = data.astype(np.uint8)
+            print(f"[Extract] Converted to uint8, range: min={data_uint8.min()}, max={data_uint8.max()}")
+            return data_uint8
         
         else:
             print(f"[Extract] Path does not exist: {nifti_path}")
@@ -440,7 +919,19 @@ def process_single_organ(organ: str, nifti_path: str, h5_path: str, metadata: Di
             print(f"[Organ] Data dtype: {organ_data.dtype}")
             print(f"[Organ] Data min: {organ_data.min()}, max: {organ_data.max()}, mean: {organ_data.mean()}")
             
-            # Save to H5 with file prefix
+            # Check if data is all zeros
+            non_zero_count = np.count_nonzero(organ_data)
+            total_voxels = organ_data.size
+            print(f"[Organ] Non-zero voxels: {non_zero_count} / {total_voxels} ({100*non_zero_count/total_voxels:.2f}%)")
+            
+            if non_zero_count == 0:
+                print(f"[Organ] WARNING: Data is all zeros! No {organ} detected in the image.")
+                print(f"[Organ] This could mean:")
+                print(f"[Organ]   - The organ is not present in this image")
+                print(f"[Organ]   - The segmentation failed to detect it")
+                print(f"[Organ]   - Wrong organ name requested")
+            
+            # Save to H5 with file prefix (even if all zeros, for consistency)
             print(f"[Organ] Saving to H5...")
             save_organ_to_h5(organ, organ_data, h5_path, metadata, file_prefix)
             print(f"[Organ] SUCCESS: Successfully processed {organ}")
@@ -515,6 +1006,7 @@ async def debug_raw_endpoint(request: str):
 async def init_model_flexible(request: Dict[str, Any]):
     """
     Flexible init endpoint that accepts any JSON structure
+    Updated to handle new frontend format with tissue_classes
     """
     print("=" * 60)
     print("INIT FLEXIBLE - Raw request received:")
@@ -523,7 +1015,7 @@ async def init_model_flexible(request: Dict[str, Any]):
     print(f"Request content: {request}")
     print("=" * 60)
     
-    global MODEL_CONFIG, H5_PATH, NODE_NAME
+    global MODEL_CONFIG, H5_PATH, NODE_NAME, INPUT_PATH, ROI_SUBSET
     
     try:
         # Extract h5_path
@@ -544,38 +1036,58 @@ async def init_model_flexible(request: Dict[str, Any]):
         
         print(f"[Init-Flexible] Input: {input_data}")
         
-        # Extract cerebral_bleed
-        cerebral_bleed_value = input_data.get('cerebral_bleed')
-        print(f"[Init-Flexible] Cerebral_bleed value: '{cerebral_bleed_value}'")
-        
         # Extract path
         input_path = input_data.get('path')
         print(f"[Init-Flexible] Input path: {input_path}")
         
-        # Process cerebral_bleed field
-        if cerebral_bleed_value and isinstance(cerebral_bleed_value, str):
+        # Extract tissue_classes (new format)
+        tissue_classes = input_data.get('tissue_classes', [])
+        print(f"[Init-Flexible] Tissue classes: {tissue_classes}")
+        
+        # Extract legacy cerebral_bleed field for backward compatibility
+        cerebral_bleed_value = input_data.get('cerebral_bleed')
+        print(f"[Init-Flexible] Cerebral_bleed value (legacy): '{cerebral_bleed_value}'")
+        
+        # Determine tissue classes from either new format or legacy format
+        if tissue_classes:
+            # Use new format
+            organs_list = tissue_classes
+            print(f"[Init-Flexible] Using new format tissue_classes: {organs_list}")
+        elif cerebral_bleed_value and isinstance(cerebral_bleed_value, str):
+            # Use legacy format
             if cerebral_bleed_value.startswith('[') and cerebral_bleed_value.endswith(']'):
                 organs_str = cerebral_bleed_value[1:-1]
                 organs_list = [organ.strip() for organ in organs_str.split(',')]
-                print(f"[Init-Flexible] Extracted organs: {organs_list}")
+                print(f"[Init-Flexible] Extracted organs from legacy format: {organs_list}")
             else:
                 organs_list = [cerebral_bleed_value.strip()]
-                print(f"[Init-Flexible] Single organ: {organs_list}")
+                print(f"[Init-Flexible] Single organ from legacy format: {organs_list}")
         else:
             organs_list = []
             print(f"[Init-Flexible] No organs specified")
         
-        # Set model (for now, default to cerebral_bleed)
-        ts_model = "cerebral_bleed"
+        # Normalize tissue class names to lowercase for TotalSegmentator compatibility
+        organs_list = normalize_tissue_classes(organs_list)
+        print(f"[Init-Flexible] Normalized organs: {organs_list}")
+        
+        # Determine appropriate model based on tissue classes
+        ts_model = determine_model_from_tissue_classes(organs_list)
+        print(f"[Init-Flexible] Selected model: {ts_model}")
         
         if ts_model not in AVAILABLE_MODELS:
             return {"status": "error", "message": f"Invalid model: {ts_model}"}
         
+        # Set global variables
         MODEL_CONFIG = AVAILABLE_MODELS[ts_model]
         H5_PATH = h5_path
         NODE_NAME = "TotalSegmentator"
+        INPUT_PATH = input_path
+        ROI_SUBSET = organs_list
         
         print(f"[Init-Flexible] Successfully initialized")
+        print(f"[Init-Flexible] Model: {ts_model}")
+        print(f"[Init-Flexible] Organs: {organs_list}")
+        print(f"[Init-Flexible] Input path: {input_path}")
         
         return {
             "status": "success",
@@ -583,7 +1095,8 @@ async def init_model_flexible(request: Dict[str, Any]):
             "model": ts_model,
             "organs": organs_list,
             "h5_path": h5_path,
-            "input_path": input_path
+            "input_path": input_path,
+            "tissue_classes": organs_list
         }
         
     except Exception as e:
@@ -592,35 +1105,6 @@ async def init_model_flexible(request: Dict[str, Any]):
         traceback.print_exc()
         return {"status": "error", "message": f"Initialization failed: {e}"}
 
-@app.get("/init")
-async def init_model_get(request: Request):
-    """
-    Handle GET requests to /init (for debugging)
-    """
-    print("=" * 60)
-    print("GET /init - Debugging endpoint")
-    print("=" * 60)
-    print(f"Query params: {dict(request.query_params)}")
-    print(f"Headers: {dict(request.headers)}")
-    
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "info",
-            "message": "GET request received. Use POST with JSON body.",
-            "expected_format": {
-                "h5_path": "path/to/output.h5",
-                "step1": {
-                    "model": "TotalSegmentator",
-                    "input": {
-                        "cerebral_bleed": "[intracerebral_hemorrhage]",
-                        "path": "path/to/input.nii"
-                    }
-                }
-            },
-            "example_curl": "curl -X POST http://localhost:8001/init -H \"Content-Type: application/json\" -d \"{\\\"h5_path\\\": \\\"test.h5\\\", \\\"step1\\\": {\\\"model\\\": \\\"TotalSegmentator\\\", \\\"input\\\": {\\\"cerebral_bleed\\\": \\\"[intracerebral_hemorrhage]\\\", \\\"path\\\": \\\"test.nii\\\"}}}\""
-        }
-    )
 
 @app.post("/init")
 def init_model():
@@ -653,6 +1137,7 @@ def init_model():
 def read_node(data: Dict[str, Any]):
     """
     Read configuration data from frontend
+    Updated to handle new frontend format with tissue_classes
     """
     global NODE_NAME, H5_PATH, MODEL_CONFIG, INPUT_PATH, ROI_SUBSET
     
@@ -673,6 +1158,8 @@ def read_node(data: Dict[str, Any]):
                 user_data_path = f"{NODE_NAME}/userData"
                 if user_data_path in hf:
                     print(f"[Read] Found userData in H5 file")
+                    tissue_classes_found = []
+                    
                     for k in hf[user_data_path].keys():
                         raw_bytes = hf[user_data_path][k][()]
                         raw_str = raw_bytes.decode("utf-8")
@@ -684,8 +1171,27 @@ def read_node(data: Dict[str, Any]):
                         
                         if k == "path":
                             INPUT_PATH = val_json
+                        elif k == "tissue_classes":
+                            # New format: tissue_classes is a list
+                            if isinstance(val_json, list):
+                                tissue_classes_found = val_json
+                                print(f"[Read] Found tissue_classes: {tissue_classes_found}")
+                            else:
+                                print(f"[Read] tissue_classes is not a list: {type(val_json)}")
+                        elif k == "prompt":
+                            # Extract tissue classes from prompt field
+                            prompt_classes = parse_prompt_for_tissue_classes(val_json)
+                            if prompt_classes:
+                                print(f"[Read] Found classes in prompt: {prompt_classes}")
+                                # If we don't have tissue_classes yet, use prompt classes
+                                if not tissue_classes_found:
+                                    tissue_classes_found = prompt_classes
+                                else:
+                                    # Merge with existing tissue_classes
+                                    tissue_classes_found.extend(prompt_classes)
+                                    print(f"[Read] Merged prompt classes with existing: {tissue_classes_found}")
                         else:
-                            # Check if k matches any available model task
+                            # Legacy format handling
                             # Map frontend field names to model names
                             field_to_model_map = {
                                 "total": "total_3mm",  # Default to 3mm version
@@ -714,6 +1220,17 @@ def read_node(data: Dict[str, Any]):
                                 # Set model configuration
                                 MODEL_CONFIG = AVAILABLE_MODELS.get(model_name)
                                 print(f"[Read] Field '{k}' => Model '{model_name}', ROI: {ROI_SUBSET}")
+                    
+                    # If we found tissue_classes in new format, use that instead
+                    if tissue_classes_found:
+                        # Normalize tissue class names to lowercase
+                        ROI_SUBSET = normalize_tissue_classes(tissue_classes_found)
+                        # Determine model based on tissue classes
+                        selected_model = determine_model_from_tissue_classes(ROI_SUBSET)
+                        MODEL_CONFIG = AVAILABLE_MODELS.get(selected_model)
+                        print(f"[Read] Using new format tissue_classes: {ROI_SUBSET}")
+                        print(f"[Read] Selected model: {selected_model}")
+                        
         except Exception as e:
             print(f"[Read] Error reading H5 file: {e}")
     
@@ -775,7 +1292,65 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             return
         
         print(f"[Process] Input validation passed: {message}")
-        update_progress(10, "Input validated")
+        update_progress(7, "Input validated")
+        
+        # Check and download required models
+        task_name = MODEL_CONFIG['task']
+        task_id = MODEL_CONFIG['task_id']
+        
+        update_progress(8, "Checking model weights...")
+        print(f"[Process] Checking models for task '{task_name}' (ID: {task_id})")
+        
+        # Check main task model
+        if not check_and_download_model(task_id, task_name):
+            update_progress(100, f"Failed to download model for {task_name}")
+            return
+        
+        # For tasks that require cropping, also check the cropping model
+        # cerebral_bleed needs total_6mm (298) for cropping to brain region
+        # Other tasks may also need cropping models
+        tasks_needing_crop_model = {
+            150: (298, "total_6mm"),  # cerebral_bleed needs total for brain cropping
+            260: (298, "total_6mm"),  # hip_implant needs total for cropping
+            258: (298, "total_6mm"),  # lung_vessels needs total for cropping
+        }
+        
+        if task_id in tasks_needing_crop_model:
+            crop_task_id, crop_task_name = tasks_needing_crop_model[task_id]
+            print(f"[Process] Task '{task_name}' requires cropping model '{crop_task_name}'")
+            if not check_and_download_model(crop_task_id, crop_task_name):
+                update_progress(100, f"Failed to download cropping model {crop_task_name}")
+                return
+        
+        # For total tasks with roi_subset, also check part models
+        # These are required for organ-specific segmentation
+        if task_name in ['total', 'total_mr'] and roi_subset:
+            print(f"[Process] Task '{task_name}' with ROI subset requires part models")
+            
+            # Check part1_organs model (Dataset291 for CT, Dataset850 for MR)
+            if task_name == 'total':
+                part1_id, part1_name = 291, "total_part1_organs"
+                part2_id, part2_name = 292, "total_part2_vertebrae"
+            else:  # total_mr
+                part1_id, part1_name = 850, "total_mr_part1_organs"
+                part2_id, part2_name = None, None  # MR doesn't have part2 yet
+            
+            print(f"[Process] Checking part1 model: {part1_name} (ID: {part1_id})")
+            if not check_and_download_model(part1_id, part1_name):
+                update_progress(100, f"Failed to download part1 model {part1_name}")
+                return
+            
+            # Check if any ROI needs vertebrae (part2)
+            vertebrae_keywords = ['vertebrae', 'vertebra', 'spinal']
+            needs_part2 = any(any(kw in organ.lower() for kw in vertebrae_keywords) for organ in roi_subset)
+            
+            if needs_part2 and part2_id:
+                print(f"[Process] ROI includes vertebrae, checking part2 model: {part2_name} (ID: {part2_id})")
+                if not check_and_download_model(part2_id, part2_name):
+                    update_progress(100, f"Failed to download part2 model {part2_name}")
+                    return
+        
+        update_progress(10, "Models ready")
         
         # Create temporary output directory for TotalSegmentator
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -809,13 +1384,21 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             supports_roi = task_name in ['total', 'total_mr']
             
             if roi_subset and supports_roi:
-                ts_kwargs['roi_subset'] = roi_subset
-                print(f"[Process] ROI subset: {roi_subset} (task '{task_name}' supports ROI filtering)")
+                # Ensure ROI subset is normalized to lowercase
+                normalized_roi_subset = normalize_tissue_classes(roi_subset)
+                ts_kwargs['roi_subset'] = normalized_roi_subset
+                print(f"[Process] ROI subset: {normalized_roi_subset} (task '{task_name}' supports ROI filtering)")
             elif roi_subset and not supports_roi:
                 print(f"[Process] Task '{task_name}' does not support ROI filtering. Will filter results after segmentation.")
                 print(f"[Process] Requested ROI: {roi_subset}")
             
             print(f"[Process] Running TotalSegmentator with params: {ts_kwargs}")
+            
+            # Verify output path before running
+            print(f"[Process] Verifying output path...")
+            print(f"[Process] Output path: {temp_output}")
+            print(f"[Process] Output path exists: {temp_output.exists()}")
+            print(f"[Process] Output path absolute: {temp_output.absolute()}")
             
             # Execute segmentation in background thread with progress simulation
             start_time = time.time()
@@ -825,29 +1408,60 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             def run_segmentation():
                 nonlocal seg_exception
                 try:
-                    totalsegmentator(**ts_kwargs)
+                    print(f"[Process] Starting TotalSegmentator (no timeout)")
+                    result = totalsegmentator(**ts_kwargs)
+                    print(f"[Process] TotalSegmentator returned: {result}")
+                    # Force sync to ensure files are written
+                    import os
+                    os.sync() if hasattr(os, 'sync') else None
                 except Exception as e:
                     seg_exception = e
+                    print(f"[Process] TotalSegmentator exception: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             seg_thread = threading.Thread(target=run_segmentation)
             seg_thread.start()
             
-            # Simulate progress while segmentation is running (15% -> 68%)
-            # Update every 1 second with small increments for smoother progress
-            current_sim_progress = 15
-            update_interval = 1.0  # Update every 1 second
-            progress_increment = 2  # Increment by 2% each time
+            # Event-driven progress monitoring based on actual TotalSegmentator phases
+            print(f"[Process] Starting event-driven progress monitoring...")
             
+            # Define progress phases based on TotalSegmentator execution
+            progress_phases = [
+                (20, "Generating rough segmentation..."),
+                (30, "Resampling image..."),
+                (40, "Starting prediction..."),
+                (50, "Running main model..."),
+                (60, "Processing organs..."),
+                (70, "Finalizing segmentation...")
+            ]
+            
+            current_phase = 0
+            start_time = time.time()
+            
+            # Monitor progress based on actual events, not time
             while seg_thread.is_alive():
-                seg_thread.join(timeout=update_interval)
-                if seg_thread.is_alive() and current_sim_progress < 68:
-                    current_sim_progress = min(current_sim_progress + progress_increment, 68)
-                    elapsed = time.time() - start_time
-                    update_progress(current_sim_progress, f"Running segmentation... ({elapsed:.0f}s elapsed)")
-                elif current_sim_progress >= 68:
-                    # Stay at 68% and just update time
-                    elapsed = time.time() - start_time
-                    update_progress(68, f"Finalizing segmentation... ({elapsed:.0f}s elapsed)")
+                elapsed = time.time() - start_time
+                
+                # Update progress based on elapsed time and phases
+                if current_phase < len(progress_phases):
+                    phase_progress, phase_message = progress_phases[current_phase]
+                    
+                    # Move to next phase based on elapsed time (rough estimates)
+                    phase_times = [30, 60, 90, 120, 150, 180]  # seconds for each phase
+                    if current_phase < len(phase_times) and elapsed > phase_times[current_phase]:
+                        current_phase += 1
+                        if current_phase < len(progress_phases):
+                            phase_progress, phase_message = progress_phases[current_phase]
+                            update_progress(phase_progress, phase_message)
+                    elif current_phase == 0:  # First phase
+                        update_progress(phase_progress, phase_message)
+                
+                # Check every 5 seconds (much less frequent than before)
+                seg_thread.join(timeout=5.0)
+            
+            # Final progress update
+            update_progress(75, "Segmentation completed")
             
             # Check if there was an exception
             if seg_exception:
@@ -861,6 +1475,26 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             if not temp_output.exists():
                 update_progress(100, "Error: Segmentation output not found")
                 return
+            
+            # Debug: Check what files were actually created
+            print(f"[Debug] Checking temp_output: {temp_output}")
+            print(f"[Debug] temp_output exists: {temp_output.exists()}")
+            print(f"[Debug] temp_output is_dir: {temp_output.is_dir()}")
+            print(f"[Debug] temp_output is_file: {temp_output.is_file()}")
+            
+            if temp_output.is_dir():
+                all_files = list(temp_output.iterdir())
+                print(f"[Debug] Files in temp_output directory ({len(all_files)} total):")
+                for f in all_files[:20]:  # Show first 20 files
+                    print(f"[Debug]   - {f.name} ({f.stat().st_size} bytes)")
+                
+                # Check for .nii.gz files specifically
+                nii_files = list(temp_output.glob("*.nii.gz")) + list(temp_output.glob("*.nii"))
+                print(f"[Debug] NIfTI files found: {len(nii_files)}")
+                for nf in nii_files:
+                    print(f"[Debug]   NIfTI: {nf.name} ({nf.stat().st_size} bytes)")
+            elif temp_output.is_file():
+                print(f"[Debug] temp_output is a file: {temp_output.name} ({temp_output.stat().st_size} bytes)")
             
             # Prepare metadata
             metadata = {
@@ -923,40 +1557,60 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
     finally:
         IS_PROCESSING = False
 
+@app.options("/progress")
+async def progress_options():
+    """Handle OPTIONS preflight request for CORS"""
+    return {"status": "ok"}
+
 @app.get("/progress")
 async def progress():
-    """
-    SSE endpoint to provide progress updates (primary endpoint for frontend)
-    """
+    """SSE endpoint to provide progress updates"""
     async def event_generator():
         global CURRENT_PROGRESS, PROGRESS_MESSAGE, IS_PROCESSING, progress_complete
         last_value = -1
         
-        # Don't reset CURRENT_PROGRESS here as it would override the actual processing progress!
-        print(f"[SSE] /progress stream started, current progress: {CURRENT_PROGRESS}%")
+        # Reset progress to 0 for each new connection
+        CURRENT_PROGRESS = 0
+        progress_complete = False  # Reset completion flag
         
-        while True:
-            # Check if progress changed or if it's the final 100% update
-            if CURRENT_PROGRESS != last_value or (CURRENT_PROGRESS == 100 and progress_complete):
-                if last_value > CURRENT_PROGRESS:
-                    yield {"data": str(-1)}
-                print(f"[SSE] Progress: {CURRENT_PROGRESS}% - {PROGRESS_MESSAGE}")
-                yield {"data": str(CURRENT_PROGRESS)}
-                last_value = CURRENT_PROGRESS
+        # Event-driven approach - no polling, no sleep
+        while not progress_complete:
+            try:
+                # Wait for progress event (no polling)
+                await asyncio.wait_for(progress_event.wait(), timeout=30.0)
+                progress_event.clear()
                 
-                # If progress reaches 100 and completion flag is set, wait a bit before breaking
-                if CURRENT_PROGRESS == 100 and progress_complete:
-                    print("Progress complete, closing connection.")
-                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
-                    break
-            
-            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+                # Get all pending updates
+                while not progress_queue.empty():
+                    update = await progress_queue.get()
+                    yield {"data": str(update["progress"])}
+                    print(f"[SSE] Progress: {update['progress']}% - {update['message']}")
+                    last_value = update["progress"]
+                    
+            except asyncio.TimeoutError:
+                # Send heartbeat to keep connection alive (no sleep)
+                yield {"data": f"heartbeat:{int(time.time())}"}
+                continue
         
-        # Keep the connection open for a short time to ensure the client receives the final update
-        await asyncio.sleep(1)
-        print("Progress reset to 0.")
+        # Ensure final progress update to 100 is sent
+        if last_value != 100:
+            yield {"data": "100"}
+        
+        # Reset progress state for next run (no sleep needed)
+        CURRENT_PROGRESS = 0
+        progress_complete = False
     
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS"
+        }
+    )
 
 @app.get("/progress-json")
 async def get_progress_json():
@@ -972,7 +1626,7 @@ async def get_progress_json():
 @app.get("/progress/stream")
 async def stream_progress():
     """
-    Server-Sent Events for real-time progress tracking
+    Event-driven SSE for real-time progress tracking - NO SLEEP POLLING!
     """
     async def event_generator():
         global CURRENT_PROGRESS, PROGRESS_MESSAGE, IS_PROCESSING, progress_complete
@@ -985,28 +1639,92 @@ async def stream_progress():
         
         print(f"[SSE] Stream started, current progress: {CURRENT_PROGRESS}%")
         
-        while True:
-            # Check if progress changed or if it's the final 100% update
-            if CURRENT_PROGRESS != last_value or (CURRENT_PROGRESS == 100 and progress_complete):
-                if last_value > CURRENT_PROGRESS:
-                    yield {"data": str(-1)}
-                print(f"[SSE] Progress: {CURRENT_PROGRESS}% - {PROGRESS_MESSAGE}")
-                yield {"data": str(CURRENT_PROGRESS)}
-                last_value = CURRENT_PROGRESS
-                
-                # If progress reaches 100 and completion flag is set, wait a bit before breaking
-                if CURRENT_PROGRESS == 100 and progress_complete:
-                    print("Progress complete, closing SSE connection.")
-                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
-                    break
-            
-            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+        # Send initial progress
+        yield {"data": str(CURRENT_PROGRESS)}
+        last_value = CURRENT_PROGRESS
         
-        # Keep the connection open for a short time to ensure the client receives the final update
-        await asyncio.sleep(1)
+        while not progress_complete:
+            try:
+                # Wait for progress updates (event-driven, no polling!)
+                await asyncio.wait_for(progress_event.wait(), timeout=30.0)
+                progress_event.clear()
+                
+                # Get all pending updates
+                while not progress_queue.empty():
+                    update = await progress_queue.get()
+                    progress_value = update["progress"]
+                    message = update["message"]
+                    
+                    print(f"[SSE] Progress: {progress_value}% - {message}")
+                    yield {"data": str(progress_value)}
+                    last_value = progress_value
+                    
+                    # Check if completed
+                    if progress_value >= 100 and progress_complete:
+                        print("Progress complete, closing SSE connection.")
+                        break
+                
+            except asyncio.TimeoutError:
+                # Send heartbeat to keep connection alive
+                yield {"data": f"heartbeat:{int(time.time())}"}
+                continue
+            except Exception as e:
+                print(f"[SSE] Error: {e}")
+                break
+        
+        # Ensure final progress update to 100 is sent
+        if last_value != 100:
+            yield {"data": "100"}
+        
         print("[SSE] Connection closed.")
     
     return EventSourceResponse(event_generator())
+
+@app.websocket("/ws/progress")
+async def websocket_progress(websocket: WebSocket):
+    """WebSocket endpoint for real-time progress - no polling, no sleep"""
+    await websocket.accept()
+    active_connections.add(websocket)
+    
+    try:
+        # Send initial progress
+        await websocket.send_json({
+            "type": "progress",
+            "progress": CURRENT_PROGRESS,
+            "message": PROGRESS_MESSAGE
+        })
+        
+        # Wait for progress updates using events (no polling)
+        while not progress_complete:
+            try:
+                # Wait for progress event (no polling, no sleep)
+                await asyncio.wait_for(progress_event.wait(), timeout=30.0)
+                progress_event.clear()
+                
+                # Send all pending updates
+                while not progress_queue.empty():
+                    update = await progress_queue.get()
+                    await websocket.send_json({
+                        "type": "progress",
+                        "progress": update["progress"],
+                        "message": update["message"]
+                    })
+                    
+            except asyncio.TimeoutError:
+                # Send heartbeat to keep connection alive
+                await websocket.send_json({
+                    "type": "heartbeat",
+                    "timestamp": int(time.time())
+                })
+                continue
+            except Exception as e:
+                print(f"[WebSocket] Error: {e}")
+                break
+                
+    except Exception as e:
+        print(f"[WebSocket] Connection error: {e}")
+    finally:
+        active_connections.discard(websocket)
 
 @app.get("/status")
 async def get_status():
@@ -1019,7 +1737,32 @@ async def get_status():
         "model_config": MODEL_CONFIG,
         "h5_path": H5_PATH,
         "node_name": NODE_NAME,
-        "is_processing": IS_PROCESSING
+        "is_processing": IS_PROCESSING,
+        "current_progress": CURRENT_PROGRESS,
+        "progress_message": PROGRESS_MESSAGE,
+        "progress_complete": progress_complete,
+        "active_connections": len(active_connections)
+    }
+
+@app.get("/debug/threads")
+async def debug_threads():
+    """
+    Debug endpoint to check active threads
+    """
+    import threading
+    active_threads = []
+    for thread in threading.enumerate():
+        active_threads.append({
+            "name": thread.name,
+            "daemon": thread.daemon,
+            "alive": thread.is_alive(),
+            "ident": thread.ident
+        })
+    
+    return {
+        "active_threads": active_threads,
+        "thread_count": len(active_threads),
+        "main_thread": threading.current_thread().name
     }
 
 def main():

@@ -19,17 +19,17 @@ from safe_h5_utils import safe_h5_open
 import multiprocess as mp
 import json
 
-from nuc_seg_mac import SlideSegmentation
+from nuc_seg import SlideSegmentation
 from nuc_stat import SlideProperty
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--slidepath', default='C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\ana.jpg', type=str)
+    parser.add_argument('--slidepath', default='/home/tissuelab-admin/tissuelab/dev-env/Tissuelab-Model-Zoo/nuclei_segmentation/StarDist/CMU-1.svs', type=str)
     parser.add_argument('--read_image_method', default='tiffslide', type=str, choices=['openslide','tiffslide','PIL','numpy'])
     parser.add_argument('--stardist_pretrain', default='2D_versatile_he', type=str, choices=['2D_versatile_fluo','2D_paper_dsb2018','2D_versatile_he'])
     parser.add_argument('--isIHC', default=False, type=bool)
     parser.add_argument('--calculate_features', default=False, type=bool)
-    parser.add_argument('--debug', default=True, action='store_true', help='Enable debug mode to save mask images')
+    parser.add_argument('--debug', default=False, action='store_true', help='Enable debug mode to save mask images')
     return parser.parse_args()
 
 def calculate_features(args, centroids, contours):
@@ -93,41 +93,15 @@ def main(args):
 
         # Handle embeddings calculation outside of the file read context
         if APPEND_EMBEDDINGS and centroids is not None:
-            from nuc_embedding_mac import NucleiEmbedding
-            
-            # 创建临时文件路径
-            h5_dir = os.path.dirname(h5_path)
-            slide_basename = os.path.basename(args.slidepath)
-            temp_h5_path = os.path.join(h5_dir, f"temp_{slide_basename}.h5")
-            
+            from nuc_embedding import NucleiEmbedding
             ne = NucleiEmbedding(args, centroids)
-            # 将embeddings保存到临时文件
-            result_path = ne.generate_embeddings(temp_h5_path=temp_h5_path)
+            embeddings = ne.generate_embeddings()
             
-            # 创建备份 - 已禁用
-            # backup_path = os.path.join(h5_dir, f"backup_{slide_basename}_embedding.h5")
-            # try:
-            #     import shutil
-            #     shutil.copy2(result_path, backup_path)
-            #     print(f"Created embeddings backup: {backup_path}")
-            # except Exception as e:
-            #     print(f"Warning: failed to create backup: {str(e)}")
-            
-            # 从临时文件读取embeddings并保存到目标文件
-            with safe_h5_open(temp_h5_path, "r") as tf:
-                embedding_data = tf["embedding"][()]
-                
             with safe_h5_open(h5_path, 'a') as hf_write:
                 nuclei_seg = hf_write['SegmentationNode']
                 if 'embedding' in nuclei_seg:
                     del nuclei_seg['embedding']
-                nuclei_seg.create_dataset('embedding', data=embedding_data)
-            
-            # 清理临时文件
-            try:
-                os.remove(temp_h5_path)
-            except:
-                print(f"Warning: Could not remove temporary file {temp_h5_path}")
+                nuclei_seg.create_dataset('embedding', data=embeddings)
 
         if APPEND_FEATURES:
             # Add features to existing h5 file
@@ -151,11 +125,11 @@ def main(args):
 
         if not ALREADY_HAVE_NUCLEI_SEGMENTATION:
             ss = SlideSegmentation(args,
-                                    tile_size=2048,
+                                    tile_size=4096,
                                     overlap=224,
                                     prob_thresh=0.3,
                                     nms_thresh=0.3,
-                                    n_tiles=(2,2,1),
+                                    n_tiles=(4,4,1),  # Increased from (2,2,1) to (4,4,1) for better CPU utilization (16 workers instead of 4)
                                     stardist_pretrain=args.stardist_pretrain,
                                     isIHC=args.isIHC,
                                     )
@@ -179,7 +153,7 @@ def main(args):
 
             # After segmentation and before feature calculation, generate embeddings
             print("Generating nuclei embeddings...")
-            from nuc_embedding_mac import NucleiEmbedding
+            from nuc_embedding import NucleiEmbedding
 
             h5_dir = os.path.dirname(h5_path)
             slide_basename = os.path.basename(args.slidepath)

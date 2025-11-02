@@ -255,6 +255,12 @@ class NucleiEmbedding:
             print("Successfully loaded checkpoint")
         else:
             raise FileNotFoundError(f"Required checkpoint not found at {checkpoint_path}. Cannot proceed without trained model.")
+        
+        # Enable multi-GPU if available
+        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs for parallel inference!")
+            self.model = torch.nn.DataParallel(self.model)
+            self.image_projection = torch.nn.DataParallel(self.image_projection)
 
     def preprocess_images(self, images):
         """Preprocess a batch of PIL images."""
@@ -273,11 +279,15 @@ class NucleiEmbedding:
         processed_batch = processed_batch.to("cuda" if torch.cuda.is_available() else "cpu")
         
         with torch.no_grad():
+            # Handle DataParallel wrapper - access underlying module
+            model = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+            projection = self.image_projection.module if isinstance(self.image_projection, torch.nn.DataParallel) else self.image_projection
+            
             # Get vision model outputs
-            vision_outputs = self.model.vision_model(processed_batch)
+            vision_outputs = model.vision_model(processed_batch)
             image_embeds = vision_outputs.last_hidden_state.mean(dim=1)  # Mean pooling
             # Use trained projection layer
-            embeddings = self.image_projection(image_embeds)
+            embeddings = projection(image_embeds)
             embeddings = embeddings.detach().cpu().numpy()
 
         return embeddings
@@ -285,7 +295,8 @@ class NucleiEmbedding:
     def generate_embeddings(self, batch_size=None, num_workers=None, temp_h5_path=None):
         """Generate embeddings for all nuclei using PyTorch DataLoader."""
         if num_workers is None:
-            num_workers = min(mp.cpu_count(), 2)
+            # Increase workers for better CPU utilization (more data loading parallelism)
+            num_workers = min(mp.cpu_count(), 8)  # Increased from 2 to 8
 
         # Dynamically determine batch size based on available GPU memory
         if batch_size is None and torch.cuda.is_available():
@@ -300,22 +311,22 @@ class NucleiEmbedding:
                 print(f"Allocated: {allocated_memory:.2f} GB")
                 print(f"Cached: {cached_memory:.2f} GB")
                 
-                # Reserve some memory for the model and system
-                available_memory = total_memory * 0.5  # Use 90% of total memory
+                # Use more GPU memory for larger batches (increased from 50% to 70%)
+                available_memory = total_memory * 0.7
                 print(f"Setting available memory to: {available_memory:.2f} GB")
                 # Estimate memory per sample (in GB) - PLIP model typically uses about 0.5GB for batch_size=1
                 memory_per_sample = 0.01
                 # Calculate maximum possible batch size
                 max_batch_size = int(available_memory / memory_per_sample)
 
-                # Set a reasonable range for batch size
-                batch_size = max(1, min(max_batch_size, 128))
+                # Set a reasonable range for batch size (increased max from 128 to 512)
+                batch_size = max(1, min(max_batch_size, 512))
                 print(f"Automatically set batch size to {batch_size} based on available GPU memory")
             except Exception as e:
                 print(f"Error setting dynamic batch size: {e}")
-                batch_size = 128
+                batch_size = 256  # Increased default from 128 to 256
         elif batch_size is None:
-            batch_size = 128
+            batch_size = 256  # Increased default from 128 to 256
 
         print(f"Generating embeddings using {num_workers} workers and batch size {batch_size}...")
         
@@ -335,7 +346,7 @@ class NucleiEmbedding:
             num_workers=num_workers,
             shuffle=False,
             collate_fn=collate_patches,
-            prefetch_factor=1,
+            prefetch_factor=4,  # Increased from 1 to 4 for better pipeline
             persistent_workers=True,
             pin_memory=True
         )
