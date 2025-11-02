@@ -950,6 +950,10 @@ class MUSK:
                 all_embeddings.append(batch_embeddings)
                 all_coordinates.extend(coords_cpu.tolist())
                 prev_end = time.time()
+                
+                if progress_callback:
+                    percent = int((batch_count / len(loader)) * 100)
+                    progress_callback("encode", percent)
         
         # merge all results
         t_cat0 = time.time() if profile else None

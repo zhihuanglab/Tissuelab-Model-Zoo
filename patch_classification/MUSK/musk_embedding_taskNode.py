@@ -249,7 +249,7 @@ def run_patch_classification(args):
             
             # Define progress callback function
             def progress_callback(stage, payload):
-                if stage == "row":
+                if stage == "encode":
                     try:
                         percent = int(payload)
                         update_progress(min(99, max(1, percent)))
