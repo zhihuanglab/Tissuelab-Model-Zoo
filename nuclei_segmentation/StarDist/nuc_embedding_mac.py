@@ -28,12 +28,13 @@ For 250K cells, it takes 10 mins to embed all cells with CUDA (NVIDIA 4060). Wit
 """
 
 class NucleiPatchDataset(Dataset):
-    def __init__(self, slide_path, read_image_method=None, centroids=None, patch_size=224, magnification=40, processor=None):
+    def __init__(self, slide_path, read_image_method=None, centroids=None, patch_size=224, magnification=40, processor=None, z_layer=None):
 
         self.slide_path = slide_path
         self.centroids = centroids
         self.patch_size = patch_size
         self.processor = processor
+        self.z_layer = z_layer if z_layer is not None else 0  # Z-stack support
         
         # Detect file type by extension if read_image_method is not specified
         if read_image_method is None:
@@ -113,11 +114,20 @@ class NucleiPatchDataset(Dataset):
         y1 = max(0, y - self.extraction_size // 2)
         
         try:
-            patch = slide.read_region(
-                location=(x1, y1),
-                level=0,
-                size=(self.extraction_size, self.extraction_size)
-            )
+            # Z-stack support: pass z_layer to TiffFileWrapper
+            if hasattr(slide, 'read_region') and 'z_layer' in slide.read_region.__code__.co_varnames:
+                patch = slide.read_region(
+                    location=(x1, y1),
+                    level=0,
+                    size=(self.extraction_size, self.extraction_size),
+                    z_layer=self.z_layer
+                )
+            else:
+                patch = slide.read_region(
+                    location=(x1, y1),
+                    level=0,
+                    size=(self.extraction_size, self.extraction_size)
+                )
             
             if patch.mode != 'RGB':
                 patch = patch.convert('RGB')
@@ -147,9 +157,10 @@ def collate_patches(batch):
     return [patch for patch in batch if patch is not None]
 
 class NucleiEmbedding:
-    def __init__(self, args, centroids=None, progress_callback=None):
+    def __init__(self, args, centroids=None, progress_callback=None, z_layer=None):
         self.args = args
         self.progress_callback = progress_callback
+        self.z_layer = z_layer if z_layer is not None else 0  # Z-stack support
         
         print("Getting slide magnification...")
         
@@ -314,7 +325,8 @@ class NucleiEmbedding:
             centroids=self.centroids,
             patch_size=self.patch_size,
             magnification=getattr(self, 'magnification', 40),
-            processor=self.processor
+            processor=self.processor,
+            z_layer=self.z_layer  # Z-stack support
         )
         
         dataloader = DataLoader(

@@ -261,10 +261,14 @@ class SlideSegmentation():
                     print(f'Calculated magnification: {magnification:.1f}x')
                 else:
                     print('CziImageWrapper not available on this platform. Falling back to TiffFileWrapper with default MPP.')
-                    self.slide = TiffFileWrapper(self.args.slidepath)
+                    # Get z_layer from args if available (for Z-stack multi-layer segmentation)
+                    z_layer = getattr(self.args, 'z_layer', 0)
+                    self.slide = TiffFileWrapper(self.args.slidepath, z_layer=z_layer)
                     mpp = 0.25
             else:
-                self.slide = TiffFileWrapper(self.args.slidepath)
+                # Get z_layer from args if available (for Z-stack multi-layer segmentation)
+                z_layer = getattr(self.args, 'z_layer', 0)
+                self.slide = TiffFileWrapper(self.args.slidepath, z_layer=z_layer)
                 mpp = 0.25  # Default value
         
         self.actual_slide_mpp = mpp # Store the determined MPP

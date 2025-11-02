@@ -267,7 +267,9 @@ class SlideSegmentation():
                 self.slide = DicomImageWrapper(self.args.slidepath)
                 mpp = 0.25  # Default value
             else:
-                self.slide = TiffFileWrapper(self.args.slidepath)
+                # Get z_layer from args if available (for Z-stack multi-layer segmentation)
+                z_layer = getattr(self.args, 'z_layer', 0)
+                self.slide = TiffFileWrapper(self.args.slidepath, z_layer=z_layer)
                 mpp = 0.25  # Default value
         
         # Add magnification attribute to self.args if not already set by CZI processing
@@ -509,13 +511,6 @@ class SlideSegmentation():
                                                         return_predict=False
                                                         )
                 predict_duration = time.time() - predict_start
-                
-                # GPU check: if prediction takes >5s, likely running on CPU
-                if predict_duration > 5.0:
-                    print(f"⚠️  WARNING: StarDist prediction took {predict_duration:.2f}s (likely CPU-only mode)")
-                    print(f"    Expected GPU time: 0.5-2s. Check TensorFlow GPU installation!")
-                else:
-                    print(f"✅ StarDist prediction: {predict_duration:.2f}s (GPU acceleration confirmed)")
                 
                 points = dicts['points'] # y,x
                 points[:, [1, 0]] = points[:, [0, 1]] # x,y
@@ -902,13 +897,6 @@ class SlideSegmentation():
                 predict_duration = predict_end_time - predict_start_time
                 total_predict_time += predict_duration
                 
-                # GPU check: if prediction takes >5s, likely running on CPU
-                if predict_duration > 5.0:
-                    print(f"⚠️  WARNING: StarDist prediction took {predict_duration:.2f}s (likely CPU-only mode)")
-                    print(f"    Expected GPU time: 0.5-2s. Check TensorFlow GPU installation!")
-                elif predict_duration < 1.0:
-                    print(f"✅ StarDist prediction: {predict_duration:.2f}s (GPU acceleration likely active)")
-                                                            
                 points = dicts['points'] # y,x
                 points[:, [1, 0]] = points[:, [0, 1]] # x,y
 
@@ -947,7 +935,7 @@ class SlideSegmentation():
         
         # Print ROI processing summary
         if self.roi_bbox or tiles_skipped_roi > 0:
-            print(f"\n📊 ROI Processing Summary:")
+            print(f"\n[ROI Summary]")
             print(f"   Total tiles in grid: {total_tiles}")
             print(f"   Tiles skipped (outside ROI): {tiles_skipped_roi}")
             print(f"   Tiles processed (inside ROI): {processed_tiles}")

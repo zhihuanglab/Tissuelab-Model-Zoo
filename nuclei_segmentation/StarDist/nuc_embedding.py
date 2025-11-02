@@ -77,7 +77,7 @@ def get_czi_scale(file_path):
         return None
 
 class NucleiPatchDataset(Dataset):
-    def __init__(self, slide_path, read_image_method=None, centroids=None, patch_size=224, magnification=40, processor=None, target_mpp=None, provided_actual_mpp=None):
+    def __init__(self, slide_path, read_image_method=None, centroids=None, patch_size=224, magnification=40, processor=None, target_mpp=None, provided_actual_mpp=None, z_layer=None):
 
         self.slide_path = slide_path
         self.centroids = centroids
@@ -85,6 +85,7 @@ class NucleiPatchDataset(Dataset):
         self.processor = processor
         self.target_mpp = target_mpp
         self.provided_actual_mpp = provided_actual_mpp
+        self.z_layer = z_layer if z_layer is not None else 0  # Z-stack support
         
         # Detect file type by extension if read_image_method is not specified
         if read_image_method is None:
@@ -226,11 +227,20 @@ class NucleiPatchDataset(Dataset):
         y1 = max(0, y - self.extraction_size // 2)
         
         try:
-            patch = slide.read_region(
-                location=(x1, y1),
-                level=0,
-                size=(self.extraction_size, self.extraction_size)
-            )
+            # Z-stack support: pass z_layer to TiffFileWrapper
+            if hasattr(slide, 'read_region') and 'z_layer' in slide.read_region.__code__.co_varnames:
+                patch = slide.read_region(
+                    location=(x1, y1),
+                    level=0,
+                    size=(self.extraction_size, self.extraction_size),
+                    z_layer=self.z_layer
+                )
+            else:
+                patch = slide.read_region(
+                    location=(x1, y1),
+                    level=0,
+                    size=(self.extraction_size, self.extraction_size)
+                )
 
             if patch.mode != 'RGB':
                 patch = patch.convert('RGB')
@@ -328,9 +338,10 @@ def collate_patches(batch):
     return [patch for patch in batch if patch is not None]
 
 class NucleiEmbedding:
-    def __init__(self, args, centroids=None, progress_callback=None):
+    def __init__(self, args, centroids=None, progress_callback=None, z_layer=None):
         self.args = args
         self.progress_callback = progress_callback
+        self.z_layer = z_layer if z_layer is not None else 0  # Z-stack support
         
         print("Initializing Nuclei Embedding Generator...")
         
@@ -480,7 +491,8 @@ class NucleiEmbedding:
             patch_size=self.patch_size,
             magnification=getattr(self.args, 'magnification', 40),
             processor=self.processor,
-            target_mpp=getattr(self.args, 'target_mpp', None)
+            target_mpp=getattr(self.args, 'target_mpp', None),
+            z_layer=self.z_layer  # Z-stack support
         )
         
         dataloader = DataLoader(
