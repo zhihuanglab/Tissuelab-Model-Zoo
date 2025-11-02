@@ -461,6 +461,9 @@ def run_classification(args) -> Dict[str, Any]:
     class_embeddings_arr = None
     sims_arr = None
 
+    progress_value = 30
+    print(f"Progress: 30%")
+
     try:
         start_time = time.time()
 
