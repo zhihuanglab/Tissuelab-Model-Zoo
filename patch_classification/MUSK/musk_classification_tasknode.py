@@ -602,10 +602,10 @@ def run_classification(args) -> Dict[str, Any]:
         grp_cls.create_dataset('tissue_class_id', data=predictions.astype(np.int32))
 
         class_names_ascii = [n.encode('utf-8') for n in final_class_names]
-        grp_cls.create_dataset('tissue_class_name', (len(class_names_ascii),), dtype='S256', data=class_names_ascii)
+        grp_cls.create_dataset('tissue_class_name', shape=(len(class_names_ascii),), dtype='S256', data=class_names_ascii)
 
         colors_ascii = [c.encode('utf-8') for c in final_class_colors]
-        grp_cls.create_dataset('tissue_class_HEX_color', (len(colors_ascii),), dtype='S256', data=colors_ascii)
+        grp_cls.create_dataset('tissue_class_HEX_color', shape=(len(colors_ascii),), dtype='S256', data=colors_ascii)
 
         print("================")
         print({
