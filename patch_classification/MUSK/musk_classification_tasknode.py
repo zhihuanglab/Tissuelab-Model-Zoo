@@ -507,137 +507,135 @@ def run_classification(args) -> Dict[str, Any]:
             else:
                 print(f"[{NODE_NAME}] Embedding not found in dependency group '{dep_group}'. Will try reading from own group.")
 
-            if cell_embeddings is None:
-                if 'MuskNode' in zf and 'embedding' in zf['MuskNode']:
-                    cell_embeddings = zf['MuskNode']['embedding'][()]
-                    embedding_source_group = 'MuskNode'
-                    print(f"[{NODE_NAME}] Loaded embeddings from 'MuskNode', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
+        if cell_embeddings is None:
+            if 'MuskNode' in zf and 'embedding' in zf['MuskNode']:
+                cell_embeddings = zf['MuskNode']['embedding'][()]
+                embedding_source_group = 'MuskNode'
+                print(f"[{NODE_NAME}] Loaded embeddings from 'MuskNode', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
 
-            if cell_embeddings is None:
-                error_msg = f"Embedding dataset not found in expected locations: "
-                expected_locations = []
-                if DEPENDENCIES:
-                    expected_locations.append(f"dependency group '{DEPENDENCIES[0]}'")
-                expected_locations.extend([f"own group '{ZARR_GROUP}'", "MuskNode"])
-                error_msg += " or ".join(sorted(list(set(expected_locations))))
-                raise ValueError(error_msg + " => no cell_embeddings")
+        if cell_embeddings is None:
+            error_msg = f"Embedding dataset not found in expected locations: "
+            expected_locations = []
+            if DEPENDENCIES:
+                expected_locations.append(f"dependency group '{DEPENDENCIES[0]}'")
+            expected_locations.extend([f"own group '{ZARR_GROUP}'", "MuskNode"])
+            error_msg += " or ".join(sorted(list(set(expected_locations))))
+            raise ValueError(error_msg + " => no cell_embeddings")
 
-            # C) supervised or zero-shot
-            tissue_classes = getattr(args, "tissue_classes", [])
-            tissue_colors = getattr(args, "tissue_colors", [])
-            progress_value = 80
-            print(f"[{NODE_NAME}] Progress: 80%")
+        # C) supervised or zero-shot
+        tissue_classes = getattr(args, "tissue_classes", [])
+        tissue_colors = getattr(args, "tissue_colors", [])
+        progress_value = 80
+        print(f"[{NODE_NAME}] Progress: 80%")
             
-            # Debug: Print tissue_classes to see what's being used
-            print(f"[{NODE_NAME}] Using tissue_classes: {tissue_classes}")
-            print(f"[{NODE_NAME}] tissue_classes type: {type(tissue_classes)}, length: {len(tissue_classes) if tissue_classes else 0}")
+        # Debug: Print tissue_classes to see what's being used
+        print(f"[{NODE_NAME}] Using tissue_classes: {tissue_classes}")
+        print(f"[{NODE_NAME}] tissue_classes type: {type(tissue_classes)}, length: {len(tissue_classes) if tissue_classes else 0}")
 
-            # Try supervised classification if we have classifier path or annotations
-            classifier_result = None
-            if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
-                classifier_result = train_linear_classifier(cell_embeddings, annotations_data)
+        # Try supervised classification if we have classifier path or annotations
+        classifier_result = None
+        if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
+            classifier_result = train_linear_classifier(cell_embeddings, annotations_data)
             
-            # Check if supervised classification succeeded
-            if classifier_result is not None:
-                clf, class_names, class_colors, predictions, prediction_probs, \
-                    coef_, intercept_, train_time, test_time = classifier_result
-                final_class_names = class_names
-                final_class_colors = class_colors
-                classification_method = "supervised"
-                print(f"Supervised classification completed using {classification_method}")
-            else:
-                classification_method = "zero-shot"
-                print(f"Zero-shot classification completed using {classification_method}")
+        # Check if supervised classification succeeded
+        if classifier_result is not None:
+            clf, class_names, class_colors, predictions, prediction_probs, \
+                coef_, intercept_, train_time, test_time = classifier_result
+            final_class_names = class_names
+            final_class_colors = class_colors
+            classification_method = "supervised"
+            print(f"Supervised classification completed using {classification_method}")
+        else:
+            classification_method = "zero-shot"
+            print(f"Zero-shot classification completed using {classification_method}")
                 
-                if MUSK_MODEL is None:
-                    raise ValueError("MUSK_MODEL not loaded => please ensure /init is called first.")
+            if MUSK_MODEL is None:
+                raise ValueError("MUSK_MODEL not loaded => please ensure /init is called first.")
 
-                # Check if tissue_classes is empty and use default if needed
-                if not tissue_classes:
-                    print(f"[{NODE_NAME}] Warning: tissue_classes is empty, using default classes")
-                    tissue_classes = ["Negative control", "Tumor"]
-                    print(f"[{NODE_NAME}] Using default tissue_classes: {tissue_classes}")
+            # Check if tissue_classes is empty and use default if needed
+            if not tissue_classes:
+                print(f"[{NODE_NAME}] Warning: tissue_classes is empty, using default classes")
+                tissue_classes = ["Negative control", "Tumor"]
+                print(f"[{NODE_NAME}] Using default tissue_classes: {tissue_classes}")
 
-                class_embeddings = _generate_text_description(tissue_classes) # list of np.ndarray
+            class_embeddings = _generate_text_description(tissue_classes) # list of np.ndarray
                 
-                # Compute similarities
-                # Assuming cell_embeddings is (N, D) and each element in class_embeddings is (1, D)
-                # We want sims_arr to be (N, C) where C is number of classes
-                sim_list = []
-                for idx, ce_single_class in enumerate(class_embeddings): # ce_single_class is (1,D)
-                    # ce_single_class.T would be (D,1)
-                    # np.dot(cell_embeddings (N,D), ce_single_class.T (D,1)) -> (N,1)
-                    sim = np.dot(cell_embeddings, ce_single_class.T) 
-                    sim_list.append(sim)
+            # Compute similarities
+            # Assuming cell_embeddings is (N, D) and each element in class_embeddings is (1, D)
+            # We want sims_arr to be (N, C) where C is number of classes
+            sim_list = []
+            for idx, ce_single_class in enumerate(class_embeddings): # ce_single_class is (1,D)
+                # ce_single_class.T would be (D,1)
+                # np.dot(cell_embeddings (N,D), ce_single_class.T (D,1)) -> (N,1)
+                sim = np.dot(cell_embeddings, ce_single_class.T) 
+                sim_list.append(sim)
                 
-                sims_arr = np.concatenate(sim_list, axis=1) # Concatenate along class dimension
-                predictions = np.argmax(sims_arr, axis=1)
-                prediction_probs = None # For zero-shot
+            sims_arr = np.concatenate(sim_list, axis=1) # Concatenate along class dimension
+            predictions = np.argmax(sims_arr, axis=1)
+            prediction_probs = None # For zero-shot
 
-                final_class_colors = None
-                if ZARR_GROUP in zf and 'tissue_class_HEX_color' in zf[ZARR_GROUP]:
-                    old_colors = zf[ZARR_GROUP]['tissue_class_HEX_color'][()]
-                    if len(old_colors) == len(tissue_classes):
-                        final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
+            final_class_colors = None
+            if ZARR_GROUP in zf and 'tissue_class_HEX_color' in zf[ZARR_GROUP]:
+                old_colors = zf[ZARR_GROUP]['tissue_class_HEX_color'][()]
+                if len(old_colors) == len(tissue_classes):
+                    final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
                 
-                if final_class_colors is None:
-                    if tissue_colors:
-                        final_class_colors = tissue_colors
-                    else:
-                        final_class_colors = generate_distinct_colors(tissue_classes)
-                final_class_names = tissue_classes
+            if final_class_colors is None:
+                if tissue_colors:
+                    final_class_colors = tissue_colors
+                else:
+                    final_class_colors = generate_distinct_colors(tissue_classes)
+            final_class_names = tissue_classes
 
-            # D) result => cell_classification
-            saved_datasets = {}
-            if ZARR_GROUP in zf:
-                for name in ['coordinates', 'embedding']:
-                    if name in zf[ZARR_GROUP]:
-                        print(f"[{NODE_NAME}] Found {name} in existing group, will preserve it")
-                        saved_datasets[name] = zf[ZARR_GROUP][name][()]
+        # D) result => cell_classification
+        saved_datasets = {}
+        if ZARR_GROUP in zf:
+            for name in ['coordinates', 'embedding']:
+                if name in zf[ZARR_GROUP]:
+                    print(f"[{NODE_NAME}] Found {name} in existing group, will preserve it")
+                    saved_datasets[name] = zf[ZARR_GROUP][name][()]
             
-            if ZARR_GROUP in zf:
-                del zf[ZARR_GROUP]
-            grp_cls = zf.create_group(ZARR_GROUP)
+        if ZARR_GROUP in zf:
+            del zf[ZARR_GROUP]
+        grp_cls = zf.create_group(ZARR_GROUP)
 
-            grp_cls.create_dataset('tissue_class_id', data=predictions.astype(np.int32))
+        grp_cls.create_dataset('tissue_class_id', data=predictions.astype(np.int32))
 
-            class_names_ascii = [n.encode('utf-8') for n in final_class_names]
-            grp_cls.create_dataset('tissue_class_name', (len(class_names_ascii),), dtype='S256', data=class_names_ascii)
+        class_names_ascii = [n.encode('utf-8') for n in final_class_names]
+        grp_cls.create_dataset('tissue_class_name', (len(class_names_ascii),), dtype='S256', data=class_names_ascii)
 
-            colors_ascii = [c.encode('utf-8') for c in final_class_colors]
-            grp_cls.create_dataset('tissue_class_HEX_color', (len(colors_ascii),), dtype='S256', data=colors_ascii)
+        colors_ascii = [c.encode('utf-8') for c in final_class_colors]
+        grp_cls.create_dataset('tissue_class_HEX_color', (len(colors_ascii),), dtype='S256', data=colors_ascii)
 
-            print("================")
-            print({
-                "predictions": list(set(predictions.tolist())), # Convert to list for set
-                "tissue_classes": list(set(final_class_names)), 
-                "classification_method": classification_method
-            })
-            metadata_dict = {
-                "tissue_classes": final_class_names,
-                "classification_method": classification_method
-            }
-            if use_supervised and annotations_data is not None and 'train_time' in locals() and 'test_time' in locals():
-                metadata_dict["training_time"] = train_time
-                metadata_dict["testing_time"] = test_time
-            metadata_dict['created'] = datetime.now().isoformat()
-            meta_bytes = json.dumps(metadata_dict).encode("utf-8")
-            grp_cls.create_dataset('metadata', shape=(), dtype=f'S{len(meta_bytes)}', data=meta_bytes)
+        print("================")
+        print({
+            "predictions": list(set(predictions.tolist())), # Convert to list for set
+            "tissue_classes": list(set(final_class_names)), 
+            "classification_method": classification_method
+        })
+        metadata_dict = {
+            "tissue_classes": final_class_names,
+            "classification_method": classification_method
+        }
+        if use_supervised and annotations_data is not None and 'train_time' in locals() and 'test_time' in locals():
+            metadata_dict["training_time"] = train_time
+            metadata_dict["testing_time"] = test_time
+        metadata_dict['created'] = datetime.now().isoformat()
+        meta_bytes = json.dumps(metadata_dict).encode("utf-8")
+        grp_cls.create_dataset('metadata', shape=(), dtype=f'S{len(meta_bytes)}', data=meta_bytes)
             
-            # Restore previously saved datasets under the new NODE_NAME group
-            for name, data in saved_datasets.items():
-                try:
-                    print(f"[{NODE_NAME}] Restoring {name} to new group")
-                    grp_cls.create_dataset(name, data=data)
-                except Exception as e:
-                    print(f"[{NODE_NAME}] Error restoring {name} to new group: {e}")
-
-            # no flush needed for zarr
+        # Restore previously saved datasets under the new NODE_NAME group
+        for name, data in saved_datasets.items():
+            try:
+                print(f"[{NODE_NAME}] Restoring {name} to new group")
+                grp_cls.create_dataset(name, data=data)
+            except Exception as e:
+                print(f"[{NODE_NAME}] Error restoring {name} to new group: {e}")
+        # no flush needed for zarr
             
         end_time = time.time()
         result["classification_count"] = len(predictions)
         result["message"] = f"Classification completed using {classification_method} in {end_time - start_time:.2f}s"
-
         print("Zarr structure after classification:")
         print_zarr_structure(zarr_path)
 
