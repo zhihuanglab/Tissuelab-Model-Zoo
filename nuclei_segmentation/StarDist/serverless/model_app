@@ -3,6 +3,7 @@ StarDist Modal Serverless Implementation
 Deploy StarDist nuclei segmentation to Modal cloud platform
 """
 import modal
+from modal import gpu
 import os
 import base64
 import time
@@ -23,7 +24,7 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 # Create the Modal app
 app = modal.App("stardist-segmentation-v1")
 
-# Optimized image with all dependencies
+# Base image for CPU functions (segmentation)
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install(
@@ -87,6 +88,45 @@ image = (
     .add_local_dir("../transformer_cache", "/root/transformer_cache", copy=True)
     .add_local_dir("../checkpoints", "/root/checkpoints", copy=True)
     .add_local_file("test_url.py", "/root/test_url.py", copy=True)
+)
+
+# GPU image for embeddings with CUDA-enabled PyTorch
+gpu_image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .apt_install(
+        "libgl1-mesa-glx",
+        "libglib2.0-0",
+        "libsm6",
+        "libxext6",
+        "libxrender-dev",
+        "libgomp1",
+    )
+    .pip_install(
+        # Install PyTorch - Modal automatically uses CUDA version when GPU is specified
+        "torch",
+        "torchvision",
+        "transformers",
+        "einops>=0.7.0",
+        # Core dependencies
+        "numpy==1.26.4",
+        "pillow>=10.0.1",
+        "tiffslide==1.5.0",
+        "scipy>=1.11.0",
+        "tqdm==4.64.1",
+        "h5py",
+        "tissuelab_sdk==0.1.10",
+    )
+    .env({
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": "/root",
+    })
+    # Copy embedding module
+    .add_local_file("../nuc_embedding.py", "/root/nuc_embedding.py", copy=True)
+    .add_local_file("../nuc_stat.py", "/root/nuc_stat.py", copy=True)
+    .add_local_file("../safe_h5_utils.py", "/root/safe_h5_utils.py", copy=True)
+    .add_local_dir("../histomicstk_scripts", "/root/histomicstk_scripts", copy=True)
+    .add_local_dir("../transformer_cache", "/root/transformer_cache", copy=True)
+    .add_local_dir("../checkpoints", "/root/checkpoints", copy=True)
 )
 
 # Volume for caching models
@@ -379,22 +419,32 @@ def process_segmentation(patch_data):
                     pass
 
 @app.function(
-    image=image.env({
-        "STARDIST_CACHE_DIR": MODEL_CACHE_PATH,
+    image=gpu_image.env({
         "PYTHONPATH": "/root"
     }),
-    cpu=8,
+    gpu=gpu.H100(),
     memory=32768,
     retries=1,
-    volumes={MODEL_CACHE_PATH: model_cache},
     timeout=3600,
 )
 def process_embedding(patch_data):
     """Process embeddings for centroids"""
     try:
         import sys
+        import torch
         sys.path.insert(0, "/root")
         from nuc_embedding import NucleiEmbedding
+        
+        # Check GPU availability
+        print("=" * 70)
+        print("GPU CHECK:")
+        print(f"  torch.cuda.is_available(): {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            print(f"  GPU device: {torch.cuda.get_device_name(0)}")
+            print(f"  GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        else:
+            print("  WARNING: No GPU available! Running on CPU")
+        print("=" * 70)
         
         print(f"Processing embeddings for {len(patch_data.get('centroids', []))} nuclei")
         
@@ -419,7 +469,16 @@ def process_embedding(patch_data):
         emb_start = time.time()
         
         ne = NucleiEmbedding(args, centroids)
-        embeddings = ne.generate_embeddings()
+        h5_path = ne.generate_embeddings()
+        
+        # Read embeddings from HDF5 file
+        embeddings_array = None
+        with h5py.File(h5_path, 'r') as h5f:
+            embeddings_array = h5f['embedding'][:]
+        
+        # Clean up the temp HDF5 file
+        if os.path.exists(h5_path):
+            os.unlink(h5_path)
         
         embed_time = time.time() - emb_start
         
@@ -427,7 +486,7 @@ def process_embedding(patch_data):
             'status': 'success',
             'patch_id': patch_data.get('patch_id'),
             'patch_index': patch_data.get('patch_index'),
-            'embeddings': embeddings.tolist() if hasattr(embeddings, 'tolist') else embeddings,
+            'embeddings': embeddings_array.tolist(),
             'timing': {'total': embed_time, 'embedding': embed_time}
         }
         
@@ -514,7 +573,7 @@ def process_from_url(
             'magnification': magnification,
             'read_image_method': 'tiffslide',
         }
-        emb_result = process_embedding.local(emb_payload)
+        emb_result = process_embedding.remote(emb_payload)
         seg_result['embedding'] = emb_result
         # Cleanup the kept temp file after embeddings
         if slide_path and os.path.exists(slide_path):
