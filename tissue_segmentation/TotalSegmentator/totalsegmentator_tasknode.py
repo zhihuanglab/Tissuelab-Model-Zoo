@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 TotalSegmentator TaskNode for FastAPI
-Supports selecting different weight models, processing DICOM folders and NIfTI files, 
-outputting NIfTI format results and storing in H5 files with SegmentorNode structure
+Supports selecting different weight models, processing DICOM folders and NIfTI files,
+outputting NIfTI format results and storing in Zarr files with SegmentorNode structure
 """
 
 import os
 import sys
 import argparse
-import h5py
+import zarr
 import numpy as np
 import time
 import json
@@ -61,9 +61,8 @@ except ImportError as e:
     print(f"[TotalSegmentator] Warning: totalsegmentator not imported: {e}")
     sys.exit(1)
 
-# Import safe H5 utilities
+# Import safe storage utilities
 sys.path.append(str(SCRIPT_DIR.parent.parent))
-from safe_h5_utils import safe_h5_open
 
 # FastAPI app
 app = FastAPI(title="TotalSegmentator TaskNode")
@@ -125,7 +124,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 # Global variables
 IS_MODEL_INITED = False
 MODEL_CONFIG = None
-H5_PATH = None
+ZARR_PATH = None
 NODE_NAME = "TotalSegmentator"
 INPUT_PATH = None
 ROI_SUBSET = None
@@ -733,87 +732,84 @@ def load_nifti_file(file_path: str) -> Optional[np.ndarray]:
         print(f"Error loading NIfTI file {file_path}: {e}")
         return None
 
-def save_organ_to_h5(organ_name: str, organ_data: np.ndarray, h5_path: str, metadata: Dict[str, Any], file_prefix: str = None):
-    """Save individual organ data to H5 file in SegmentorNode with voxel_mask sub-group"""
+def save_organ_to_zarr(organ_name: str, organ_data: np.ndarray, zarr_path: str, metadata: Dict[str, Any], file_prefix: str = None):
+    """Save individual organ data to Zarr file in SegmentorNode with voxel_mask sub-group"""
     try:
-        print(f"[H5] Starting to save organ: {organ_name}")
-        print(f"[H5] Data shape: {organ_data.shape if organ_data is not None else 'None'}")
-        print(f"[H5] Data type: {organ_data.dtype if organ_data is not None else 'None'}")
-        print(f"[H5] Data min: {organ_data.min()}, max: {organ_data.max()}, non-zero count: {np.count_nonzero(organ_data)}")
-        print(f"[H5] H5 path: {h5_path}")
-        print(f"[H5] File prefix: {file_prefix}")
-        
+        print(f"[Zarr] Starting to save organ: {organ_name}")
+        print(f"[Zarr] Data shape: {organ_data.shape if organ_data is not None else 'None'}")
+        print(f"[Zarr] Data type: {organ_data.dtype if organ_data is not None else 'None'}")
+        print(f"[Zarr] Data min: {organ_data.min()}, max: {organ_data.max()}, non-zero count: {np.count_nonzero(organ_data)}")
+        print(f"[Zarr] Zarr path: {zarr_path}")
+        print(f"[Zarr] File prefix: {file_prefix}")
+
         # Ensure data is uint8
         if organ_data.dtype != np.uint8:
-            print(f"[H5] Converting data from {organ_data.dtype} to uint8")
+            print(f"[Zarr] Converting data from {organ_data.dtype} to uint8")
             organ_data = organ_data.astype(np.uint8)
-        
-        with safe_h5_open(h5_path, "a") as hf:
-            print(f"[H5] Opened H5 file successfully")
-            print(f"[H5] Existing groups: {list(hf.keys())}")
-            
-            # Create SegmentorNode if it doesn't exist
-            if NODE_NAME not in hf:
-                print(f"[H5] Creating new group: {NODE_NAME}")
-                seg_node = hf.create_group(NODE_NAME)
-            else:
-                print(f"[H5] Using existing group: {NODE_NAME}")
-                seg_node = hf[NODE_NAME]
-            
-            # Create voxel_mask sub-group if it doesn't exist
-            if "voxel_mask" not in seg_node:
-                print(f"[H5] Creating new sub-group: {NODE_NAME}/voxel_mask")
-                voxel_group = seg_node.create_group("voxel_mask")
-            else:
-                print(f"[H5] Using existing sub-group: {NODE_NAME}/voxel_mask")
-                voxel_group = seg_node["voxel_mask"]
-            
-            print(f"[H5] Existing datasets in {NODE_NAME}/voxel_mask: {list(voxel_group.keys())}")
-            
-            # Use file_prefix if provided, otherwise use organ_name
-            dataset_name = file_prefix if file_prefix else organ_name
-            print(f"[H5] Dataset name: {dataset_name}")
-            
-            # Delete existing dataset if it exists
-            if dataset_name in voxel_group:
-                print(f"[H5] Deleting existing dataset: {dataset_name}")
-                del voxel_group[dataset_name]
-            
-            # Create organ dataset in voxel_mask group
-            print(f"[H5] Creating dataset with shape {organ_data.shape}")
-            organ_dataset = voxel_group.create_dataset(
-                dataset_name, 
-                data=organ_data, 
-                compression='gzip',
-                chunks=True
-            )
-            print(f"[H5] Dataset created successfully")
-            
-            # Add organ-specific metadata as attributes
-            organ_dataset.attrs['organ_name'] = organ_name
-            organ_dataset.attrs['dataset_name'] = dataset_name
-            organ_dataset.attrs['file_prefix'] = file_prefix if file_prefix else ""
-            organ_dataset.attrs['shape'] = str(organ_data.shape)
-            organ_dataset.attrs['dtype'] = str(organ_data.dtype)
-            organ_dataset.attrs['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
-            print(f"[H5] Metadata added")
-            
-            # Add general metadata to SegmentorNode
-            seg_node.attrs.update(metadata)
-            seg_node.attrs['last_updated'] = time.strftime('%Y-%m-%d %H:%M:%S')
-            
-            # Count total organs in voxel_mask group
-            total_organs = len([k for k in voxel_group.keys() if isinstance(voxel_group[k], h5py.Dataset)])
-            seg_node.attrs['total_organs'] = total_organs
-            
-            # Flush to ensure data is written
-            hf.flush()
-            print(f"[H5] Data flushed to disk")
-            
-            print(f"[H5] SUCCESS: Successfully saved {dataset_name} (organ: {organ_name}) data with shape {organ_data.shape} to {NODE_NAME}/voxel_mask/")
-            
+
+        # Open Zarr store
+        store = zarr.open(zarr_path, mode="a")
+        print(f"[Zarr] Opened Zarr store successfully")
+        print(f"[Zarr] Existing groups: {list(store.keys())}")
+
+        # Create SegmentorNode if it doesn't exist
+        if NODE_NAME not in store:
+            print(f"[Zarr] Creating new group: {NODE_NAME}")
+            seg_node = store.create_group(NODE_NAME)
+        else:
+            print(f"[Zarr] Using existing group: {NODE_NAME}")
+            seg_node = store[NODE_NAME]
+
+        # Create voxel_mask sub-group if it doesn't exist
+        if "voxel_mask" not in seg_node:
+            print(f"[Zarr] Creating new sub-group: {NODE_NAME}/voxel_mask")
+            voxel_group = seg_node.create_group("voxel_mask")
+        else:
+            print(f"[Zarr] Using existing sub-group: {NODE_NAME}/voxel_mask")
+            voxel_group = seg_node["voxel_mask"]
+
+        print(f"[Zarr] Existing datasets in {NODE_NAME}/voxel_mask: {list(voxel_group.keys())}")
+
+        # Use file_prefix if provided, otherwise use organ_name
+        dataset_name = file_prefix if file_prefix else organ_name
+        print(f"[Zarr] Dataset name: {dataset_name}")
+
+        # Delete existing dataset if it exists
+        if dataset_name in voxel_group:
+            print(f"[Zarr] Deleting existing dataset: {dataset_name}")
+            del voxel_group[dataset_name]
+
+        # Create organ dataset in voxel_mask group
+        print(f"[Zarr] Creating dataset with shape {organ_data.shape}")
+        organ_dataset = voxel_group.create_dataset(
+            dataset_name,
+            data=organ_data,
+            compressor=zarr.Zlib(level=3),  # Zarr uses compressor instead of compression
+            chunks=True
+        )
+        print(f"[Zarr] Dataset created successfully")
+
+        # Add organ-specific metadata as attributes
+        organ_dataset.attrs['organ_name'] = organ_name
+        organ_dataset.attrs['dataset_name'] = dataset_name
+        organ_dataset.attrs['file_prefix'] = file_prefix if file_prefix else ""
+        organ_dataset.attrs['shape'] = str(organ_data.shape)
+        organ_dataset.attrs['dtype'] = str(organ_data.dtype)
+        organ_dataset.attrs['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[Zarr] Metadata added")
+
+        # Add general metadata to SegmentorNode
+        seg_node.attrs.update(metadata)
+        seg_node.attrs['last_updated'] = time.strftime('%Y-%m-%d %H:%M:%S')
+
+        # Count total organs in voxel_mask group
+        total_organs = len([k for k in voxel_group.keys() if isinstance(voxel_group[k], zarr.Array)])
+        seg_node.attrs['total_organs'] = total_organs
+
+        print(f"[Zarr] SUCCESS: Successfully saved {dataset_name} (organ: {organ_name}) data with shape {organ_data.shape} to {NODE_NAME}/voxel_mask/")
+
     except Exception as e:
-        print(f"[H5] ERROR saving {organ_name} to H5: {e}")
+        print(f"[Zarr] ERROR saving {organ_name} to Zarr: {e}")
         import traceback
         traceback.print_exc()
         raise
@@ -874,7 +870,7 @@ def extract_organ_from_nifti(nifti_path: str, organ_name: str) -> Optional[np.nd
         traceback.print_exc()
         return None
 
-def process_organs_parallel(organs: List[str], nifti_path: str, h5_path: str, metadata: Dict[str, Any], file_prefix: str = None):
+def process_organs_parallel(organs: List[str], nifti_path: str, zarr_path: str, metadata: Dict[str, Any], file_prefix: str = None):
     """Process multiple organs in parallel"""
     print(f"[Parallel] Processing {len(organs)} organs in parallel (prefix: {file_prefix})")
     
@@ -882,7 +878,7 @@ def process_organs_parallel(organs: List[str], nifti_path: str, h5_path: str, me
         futures = []
         
         for organ in organs:
-            future = executor.submit(process_single_organ, organ, nifti_path, h5_path, metadata, file_prefix)
+            future = executor.submit(process_single_organ, organ, nifti_path, zarr_path, metadata, file_prefix)
             futures.append((organ, future))
         
         # Wait for all organs to complete
@@ -899,14 +895,14 @@ def process_organs_parallel(organs: List[str], nifti_path: str, h5_path: str, me
     
     print(f"[Parallel] Completed processing {completed_count}/{len(organs)} organs")
 
-def process_single_organ(organ: str, nifti_path: str, h5_path: str, metadata: Dict[str, Any], file_prefix: str = None):
+def process_single_organ(organ: str, nifti_path: str, zarr_path: str, metadata: Dict[str, Any], file_prefix: str = None):
     """Process a single organ"""
     try:
         print("=" * 60)
         print(f"[Organ] Processing organ: {organ}")
         print(f"[Organ] File prefix: {file_prefix}")
         print(f"[Organ] NIfTI path: {nifti_path}")
-        print(f"[Organ] H5 path: {h5_path}")
+        print(f"[Organ] Zarr path: {zarr_path}")
         print("=" * 60)
         
         # Extract organ data from NIfTI
@@ -931,9 +927,9 @@ def process_single_organ(organ: str, nifti_path: str, h5_path: str, metadata: Di
                 print(f"[Organ]   - The segmentation failed to detect it")
                 print(f"[Organ]   - Wrong organ name requested")
             
-            # Save to H5 with file prefix (even if all zeros, for consistency)
-            print(f"[Organ] Saving to H5...")
-            save_organ_to_h5(organ, organ_data, h5_path, metadata, file_prefix)
+            # Save to Zarr with file prefix (even if all zeros, for consistency)
+            print(f"[Organ] Saving to Zarr...")
+            save_organ_to_zarr(organ, organ_data, zarr_path, metadata, file_prefix)
             print(f"[Organ] SUCCESS: Successfully processed {organ}")
         else:
             print(f"[Organ] FAILED: Failed to extract data for {organ}")
@@ -1015,12 +1011,12 @@ async def init_model_flexible(request: Dict[str, Any]):
     print(f"Request content: {request}")
     print("=" * 60)
     
-    global MODEL_CONFIG, H5_PATH, NODE_NAME, INPUT_PATH, ROI_SUBSET
+    global MODEL_CONFIG, ZARR_PATH, NODE_NAME, INPUT_PATH, ROI_SUBSET
     
     try:
         # Extract h5_path
-        h5_path = request.get('h5_path')
-        print(f"[Init-Flexible] H5 path: {h5_path}")
+        zarr_path = request.get('zarr_path')
+        print(f"[Init-Flexible] Zarr path: {zarr_path}")
         
         # Extract step1
         step1 = request.get('step1')
@@ -1079,7 +1075,7 @@ async def init_model_flexible(request: Dict[str, Any]):
         
         # Set global variables
         MODEL_CONFIG = AVAILABLE_MODELS[ts_model]
-        H5_PATH = h5_path
+        ZARR_PATH = zarr_path  # Note: keeping parameter name as h5_path for API compatibility
         NODE_NAME = "TotalSegmentator"
         INPUT_PATH = input_path
         ROI_SUBSET = organs_list
@@ -1094,7 +1090,7 @@ async def init_model_flexible(request: Dict[str, Any]):
             "message": f"Initialized with model: {ts_model}",
             "model": ts_model,
             "organs": organs_list,
-            "h5_path": h5_path,
+            "zarr_path": zarr_path,  # Note: keeping parameter name as h5_path for API compatibility
             "input_path": input_path,
             "tissue_classes": organs_list
         }
@@ -1139,7 +1135,7 @@ def read_node(data: Dict[str, Any]):
     Read configuration data from frontend
     Updated to handle new frontend format with tissue_classes
     """
-    global NODE_NAME, H5_PATH, MODEL_CONFIG, INPUT_PATH, ROI_SUBSET
+    global NODE_NAME, ZARR_PATH, MODEL_CONFIG, INPUT_PATH, ROI_SUBSET
     
     print("=" * 60)
     print("POST /read - Reading configuration")
@@ -1147,38 +1143,38 @@ def read_node(data: Dict[str, Any]):
     print(f"Received data: {data}")
     
     NODE_NAME = data.get("node_name", "TotalSegmentator")
-    H5_PATH = data.get("h5_path", None)
-    
-    print(f"[Read] node_name={NODE_NAME}, h5_path={H5_PATH}")
-    
-    # Check if H5 file exists and read user data from it
-    if H5_PATH and os.path.exists(H5_PATH):
+    ZARR_PATH = data.get("zarr_path", None)  # Changed from h5_path to zarr_path
+
+    print(f"[Read] node_name={NODE_NAME}, zarr_path={ZARR_PATH}")
+
+    # Check if Zarr file exists and read user data from it
+    if ZARR_PATH and os.path.exists(ZARR_PATH):
         try:
-            with safe_h5_open(H5_PATH, "r") as hf:
-                user_data_path = f"{NODE_NAME}/userData"
-                if user_data_path in hf:
-                    print(f"[Read] Found userData in H5 file")
-                    tissue_classes_found = []
-                    
-                    for k in hf[user_data_path].keys():
-                        raw_bytes = hf[user_data_path][k][()]
-                        raw_str = raw_bytes.decode("utf-8")
-                        try:
-                            val_json = json.loads(raw_str)
-                        except:
-                            val_json = raw_str
-                        print(f"[Read] user param {k} => {val_json}")
-                        
-                        if k == "path":
-                            INPUT_PATH = val_json
-                        elif k == "tissue_classes":
+            store = zarr.open(ZARR_PATH, mode="r")
+            user_data_path = f"{NODE_NAME}/userData"
+            if user_data_path in store:
+                print(f"[Read] Found userData in Zarr file")
+                tissue_classes_found = []
+
+                for k in store[user_data_path].keys():
+                    raw_bytes = store[user_data_path][k][()]
+                    raw_str = raw_bytes.decode("utf-8")
+                    try:
+                        val_json = json.loads(raw_str)
+                    except:
+                        val_json = raw_str
+                    print(f"[Read] user param {k} => {val_json}")
+
+                    if k == "path":
+                        INPUT_PATH = val_json
+                    elif k == "tissue_classes":
                             # New format: tissue_classes is a list
                             if isinstance(val_json, list):
                                 tissue_classes_found = val_json
                                 print(f"[Read] Found tissue_classes: {tissue_classes_found}")
                             else:
                                 print(f"[Read] tissue_classes is not a list: {type(val_json)}")
-                        elif k == "prompt":
+                    elif k == "prompt":
                             # Extract tissue classes from prompt field
                             prompt_classes = parse_prompt_for_tissue_classes(val_json)
                             if prompt_classes:
@@ -1190,49 +1186,49 @@ def read_node(data: Dict[str, Any]):
                                     # Merge with existing tissue_classes
                                     tissue_classes_found.extend(prompt_classes)
                                     print(f"[Read] Merged prompt classes with existing: {tissue_classes_found}")
-                        else:
-                            # Legacy format handling
-                            # Map frontend field names to model names
-                            field_to_model_map = {
-                                "total": "total_3mm",  # Default to 3mm version
-                                "total_fast": "total_6mm",
-                                "cerebral_bleed": "cerebral_bleed",
-                                "lung_vessels": "lung_vessels",
-                                "body": "body",
-                                "total_mr": "total_mr",
-                                "total_mr_fast": "total_mr_fast"
-                            }
-                            
-                            # Check if this field corresponds to a model
-                            if k in field_to_model_map:
-                                model_name = field_to_model_map[k]
-                                
-                                # Extract organs from field value
-                                if isinstance(val_json, str):
-                                    if val_json.startswith('[') and val_json.endswith(']'):
-                                        organs_str = val_json[1:-1]
-                                        ROI_SUBSET = [organ.strip() for organ in organs_str.split(',')]
-                                    else:
-                                        ROI_SUBSET = [val_json.strip()]
-                                elif isinstance(val_json, list):
-                                    ROI_SUBSET = val_json
-                                
-                                # Set model configuration
-                                MODEL_CONFIG = AVAILABLE_MODELS.get(model_name)
-                                print(f"[Read] Field '{k}' => Model '{model_name}', ROI: {ROI_SUBSET}")
-                    
-                    # If we found tissue_classes in new format, use that instead
-                    if tissue_classes_found:
-                        # Normalize tissue class names to lowercase
-                        ROI_SUBSET = normalize_tissue_classes(tissue_classes_found)
-                        # Determine model based on tissue classes
-                        selected_model = determine_model_from_tissue_classes(ROI_SUBSET)
-                        MODEL_CONFIG = AVAILABLE_MODELS.get(selected_model)
-                        print(f"[Read] Using new format tissue_classes: {ROI_SUBSET}")
-                        print(f"[Read] Selected model: {selected_model}")
-                        
+                    else:
+                        # Legacy format handling
+                        # Map frontend field names to model names
+                        field_to_model_map = {
+                            "total": "total_3mm",  # Default to 3mm version
+                            "total_fast": "total_6mm",
+                            "cerebral_bleed": "cerebral_bleed",
+                            "lung_vessels": "lung_vessels",
+                            "body": "body",
+                            "total_mr": "total_mr",
+                            "total_mr_fast": "total_mr_fast"
+                        }
+
+                        # Check if this field corresponds to a model
+                        if k in field_to_model_map:
+                            model_name = field_to_model_map[k]
+
+                            # Extract organs from field value
+                            if isinstance(val_json, str):
+                                if val_json.startswith('[') and val_json.endswith(']'):
+                                    organs_str = val_json[1:-1]
+                                    ROI_SUBSET = [organ.strip() for organ in organs_str.split(',')]
+                                else:
+                                    ROI_SUBSET = [val_json.strip()]
+                            elif isinstance(val_json, list):
+                                ROI_SUBSET = val_json
+
+                            # Set model configuration
+                            MODEL_CONFIG = AVAILABLE_MODELS.get(model_name)
+                            print(f"[Read] Field '{k}' => Model '{model_name}', ROI: {ROI_SUBSET}")
+
+            # If we found tissue_classes in new format, use that instead
+            if tissue_classes_found:
+                # Normalize tissue class names to lowercase
+                ROI_SUBSET = normalize_tissue_classes(tissue_classes_found)
+                # Determine model based on tissue classes
+                selected_model = determine_model_from_tissue_classes(ROI_SUBSET)
+                MODEL_CONFIG = AVAILABLE_MODELS.get(selected_model)
+                print(f"[Read] Using new format tissue_classes: {ROI_SUBSET}")
+                print(f"[Read] Selected model: {selected_model}")
+
         except Exception as e:
-            print(f"[Read] Error reading H5 file: {e}")
+            print(f"[Read] Error reading Zarr file: {e}")
     
     return {"status": "ok", "message": f"[{NODE_NAME}] read done"}
 
@@ -1253,8 +1249,8 @@ def execute_model():
     if MODEL_CONFIG is None:
         return {"status": "error", "message": "Model not initialized. Call /read first"}
     
-    if not H5_PATH:
-        return {"status": "error", "message": "H5 path not configured. Call /read first"}
+    if not ZARR_PATH:
+        return {"status": "error", "message": "Zarr path not configured. Call /read first"}
     
     if not INPUT_PATH:
         return {"status": "error", "message": "Input path not configured. Call /read first"}
@@ -1262,7 +1258,7 @@ def execute_model():
     print(f"[Execute] Starting segmentation")
     print(f"[Execute] Input path: {INPUT_PATH}")
     print(f"[Execute] ROI subset: {ROI_SUBSET}")
-    print(f"[Execute] H5 path: {H5_PATH}")
+    print(f"[Execute] Zarr path: {ZARR_PATH}")
     
     # Start processing
     try:
@@ -1507,7 +1503,7 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
                 'roi_subset': roi_subset if roi_subset else "all_organs"
             }
             
-            update_progress(75, "Converting to H5 format")
+            update_progress(75, "Converting to Zarr format")
             
             # Process organs in parallel
             print(f"[Process] ROI subset received: {roi_subset}")
@@ -1530,7 +1526,7 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
                     
                     try:
                         # Process single organ
-                        process_single_organ(organ, str(temp_output), H5_PATH, metadata, file_prefix)
+                        process_single_organ(organ, str(temp_output), ZARR_PATH, metadata, file_prefix)
                         
                         # Update progress
                         progress = 75 + (i + 1) / len(roi_subset) * 20  # 75-95%
@@ -1735,7 +1731,7 @@ async def get_status():
         "status": "TotalSegmentator TaskNode running",
         "model_initialized": MODEL_CONFIG is not None,
         "model_config": MODEL_CONFIG,
-        "h5_path": H5_PATH,
+        "zarr_path": ZARR_PATH,
         "node_name": NODE_NAME,
         "is_processing": IS_PROCESSING,
         "current_progress": CURRENT_PROGRESS,

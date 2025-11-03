@@ -95,7 +95,7 @@ hiddenimport_data = (
         'sse_starlette.sse',
         
         # Utilities
-        'h5py',
+        'zarr',
         'pandas',
         'tqdm',
         'requests',

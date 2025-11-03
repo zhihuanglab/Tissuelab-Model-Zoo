@@ -10,7 +10,7 @@ import os
 import sys
 import time
 import json
-import h5py
+import zarr
 import uvicorn
 import requests
 import numpy as np
@@ -46,7 +46,7 @@ app.add_middleware(
 # global variables
 ARGS = None
 IS_MODEL_INITED = False
-H5_PATH = None
+ZARR_PATH = None
 NODE_NAME = None
 DEPENDENCIES = []
 
@@ -60,23 +60,26 @@ progress_value = 0  # Global variable to store progress
 CLASSIFIER_PATH = None
 SAVE_CLASSIFIER_PATH = None
 
-# H5 group controls (populated in /read)
-H5_GROUP = None
-DEP_H5_GROUPS = {}
+# ZARR group controls (populated in /read)
+ZARR_GROUP = None
+DEP_ZARR_GROUPS = {}
 
 # --------------- utils functions ---------------
 
-def print_h5_structure(file_path):
-    """print H5 file"""
-    import h5py
-    def print_item(name, obj):
-        indent = "  " * (name.count("/"))
-        if isinstance(obj, h5py.Group):
-            print(f"{indent}{name} (Group)")
-        elif isinstance(obj, h5py.Dataset):
-            print(f"{indent}{name} (Dataset), shape: {obj.shape}, dtype: {obj.dtype}")
-    with h5py.File(file_path, "r") as hf:
-        hf.visititems(print_item)
+def print_zarr_structure(file_path):
+    """print Zarr store"""
+    def _visit(group, prefix=""):
+        for key, val in group.items():
+            name = f"{prefix}/{key}" if prefix else key
+            if isinstance(val, zarr.hierarchy.Group):
+                print(f"{name} (Group)")
+                _visit(val, name)
+            else:
+                shape = getattr(val, 'shape', None)
+                dtype = getattr(val, 'dtype', None)
+                print(f"{name} (Dataset), shape: {shape}, dtype: {dtype}")
+    zf = zarr.open_group(file_path, mode='r')
+    _visit(zf)
 
 def load_checkpoint_at_init():
     """
@@ -267,7 +270,7 @@ def save_patch_image(slide_path, coords, output_dir, index, label):
         return None
 
 def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
-    global CLASSIFIER_PATH, H5_PATH, ARGS
+    global CLASSIFIER_PATH, ZARR_PATH, ARGS
     
     # update XGBoost parameter settings
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -458,8 +461,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     return (clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0)
 
 def run_classification(args) -> Dict[str, Any]:
-    if H5_PATH is None:
-        raise ValueError("H5_PATH not set => please ensure /read is called first.")
+    if ZARR_PATH is None:
+        raise ValueError("ZARR_PATH not set => please ensure /read is called first.")
 
     global MUSK_MODEL, NODE_NAME
     global progress_value
@@ -474,168 +477,167 @@ def run_classification(args) -> Dict[str, Any]:
 
     try:
         start_time = time.time()
-        h5_path = H5_PATH
+        zarr_path = ZARR_PATH
 
-        # Open H5 file once for all operations
-        with h5py.File(h5_path, 'a') as hf: # Open in append mode for read/write
-            # A) check annotation
+        # Open Zarr store once for all operations
+        zf = zarr.open_group(zarr_path, 'a')
+        # A) check annotation
+        annotations_data = None
+        use_supervised = False
+        if 'user_annotation' in zf and 'tissue_annotations' in zf['user_annotation']:
+            raw_bytes = zf['user_annotation/tissue_annotations'][()]
+            ann_dict = json.loads(raw_bytes.decode("utf-8"))
+            annotations_data = pd.DataFrame(ann_dict).T
+            use_supervised = True
+        else:
             annotations_data = None
             use_supervised = False
-            if 'user_annotation' in hf and 'tissue_annotations' in hf['user_annotation']:
-                raw_bytes = hf['user_annotation/tissue_annotations'][()]
-                ann_dict = json.loads(raw_bytes.decode("utf-8"))
-                annotations_data = pd.DataFrame(ann_dict).T
-                use_supervised = True
-            else:
-                annotations_data = None
-                use_supervised = False
-            
-            # B) read embedding - Try dependency first, then self
-            embedding_source_group = None
+        
+        # B) read embedding - Try dependency first, then self
+        embedding_source_group = None
 
+        if DEPENDENCIES:
+            dep0 = DEPENDENCIES[0]
+            dep_group = DEP_ZARR_GROUPS.get(dep0, dep0) if isinstance(DEP_ZARR_GROUPS, dict) else dep0
+            print(f"[{NODE_NAME}] Attempting to read embeddings from dependency group: {dep_group}")
+            if dep_group in zf and 'embedding' in zf[dep_group]:
+                cell_embeddings = zf[dep_group]['embedding'][()]
+                embedding_source_group = dep_group
+                print(f"[{NODE_NAME}] Successfully loaded embeddings from dependency group '{embedding_source_group}', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
+            else:
+                print(f"[{NODE_NAME}] Embedding not found in dependency group '{dep_group}'. Will try reading from own group.")
+
+        if cell_embeddings is None:
+            if 'MuskNode' in zf and 'embedding' in zf['MuskNode']:
+                cell_embeddings = zf['MuskNode']['embedding'][()]
+                embedding_source_group = 'MuskNode'
+                print(f"[{NODE_NAME}] Loaded embeddings from 'MuskNode', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
+
+        if cell_embeddings is None:
+            error_msg = f"Embedding dataset not found in expected locations: "
+            expected_locations = []
             if DEPENDENCIES:
-                dep0 = DEPENDENCIES[0]
-                dep_group = DEP_H5_GROUPS.get(dep0, dep0) if isinstance(DEP_H5_GROUPS, dict) else dep0
-                print(f"[{NODE_NAME}] Attempting to read embeddings from dependency h5 group: {dep_group}")
-                if dep_group in hf and 'embedding' in hf[dep_group]:
-                    cell_embeddings = hf[dep_group]['embedding'][()]
-                    embedding_source_group = dep_group
-                    print(f"[{NODE_NAME}] Successfully loaded embeddings from dependency group '{embedding_source_group}', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
+                expected_locations.append(f"dependency group '{DEPENDENCIES[0]}'")
+            expected_locations.extend([f"own group '{ZARR_GROUP}'", "MuskNode"])
+            error_msg += " or ".join(sorted(list(set(expected_locations))))
+            raise ValueError(error_msg + " => no cell_embeddings")
+
+        # C) supervised or zero-shot
+        tissue_classes = getattr(args, "tissue_classes", [])
+        tissue_colors = getattr(args, "tissue_colors", [])
+        progress_value = 80
+        print(f"[{NODE_NAME}] Progress: 80%")
+            
+        # Debug: Print tissue_classes to see what's being used
+        print(f"[{NODE_NAME}] Using tissue_classes: {tissue_classes}")
+        print(f"[{NODE_NAME}] tissue_classes type: {type(tissue_classes)}, length: {len(tissue_classes) if tissue_classes else 0}")
+
+        # Try supervised classification if we have classifier path or annotations
+        classifier_result = None
+        if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
+            classifier_result = train_linear_classifier(cell_embeddings, annotations_data)
+            
+        # Check if supervised classification succeeded
+        if classifier_result is not None:
+            clf, class_names, class_colors, predictions, prediction_probs, \
+                coef_, intercept_, train_time, test_time = classifier_result
+            final_class_names = class_names
+            final_class_colors = class_colors
+            classification_method = "supervised"
+            print(f"Supervised classification completed using {classification_method}")
+        else:
+            classification_method = "zero-shot"
+            print(f"Zero-shot classification completed using {classification_method}")
+                
+            if MUSK_MODEL is None:
+                raise ValueError("MUSK_MODEL not loaded => please ensure /init is called first.")
+
+            # Check if tissue_classes is empty and use default if needed
+            if not tissue_classes:
+                print(f"[{NODE_NAME}] Warning: tissue_classes is empty, using default classes")
+                tissue_classes = ["Negative control", "Tumor"]
+                print(f"[{NODE_NAME}] Using default tissue_classes: {tissue_classes}")
+
+            class_embeddings = _generate_text_description(tissue_classes) # list of np.ndarray
+                
+            # Compute similarities
+            # Assuming cell_embeddings is (N, D) and each element in class_embeddings is (1, D)
+            # We want sims_arr to be (N, C) where C is number of classes
+            sim_list = []
+            for idx, ce_single_class in enumerate(class_embeddings): # ce_single_class is (1,D)
+                # ce_single_class.T would be (D,1)
+                # np.dot(cell_embeddings (N,D), ce_single_class.T (D,1)) -> (N,1)
+                sim = np.dot(cell_embeddings, ce_single_class.T) 
+                sim_list.append(sim)
+                
+            sims_arr = np.concatenate(sim_list, axis=1) # Concatenate along class dimension
+            predictions = np.argmax(sims_arr, axis=1)
+            prediction_probs = None # For zero-shot
+
+            final_class_colors = None
+            if ZARR_GROUP in zf and 'tissue_class_HEX_color' in zf[ZARR_GROUP]:
+                old_colors = zf[ZARR_GROUP]['tissue_class_HEX_color'][()]
+                if len(old_colors) == len(tissue_classes):
+                    final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
+                
+            if final_class_colors is None:
+                if tissue_colors:
+                    final_class_colors = tissue_colors
                 else:
-                    print(f"[{NODE_NAME}] Embedding not found in dependency group '{dep_group}'. Will try reading from own group.")
+                    final_class_colors = generate_distinct_colors(tissue_classes)
+            final_class_names = tissue_classes
 
-            if cell_embeddings is None:
-                if 'MuskNode' in hf and 'embedding' in hf['MuskNode']:
-                    cell_embeddings = hf['MuskNode']['embedding'][()]
-                    embedding_source_group = 'MuskNode'
-                    print(f"[{NODE_NAME}] Loaded embeddings from 'MuskNode', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
-
-            if cell_embeddings is None:
-                error_msg = f"Embedding dataset not found in expected locations: "
-                expected_locations = []
-                if DEPENDENCIES:
-                    expected_locations.append(f"dependency group '{DEPENDENCIES[0]}'")
-                expected_locations.extend([f"own group '{H5_GROUP}'", "MuskNode"])
-                error_msg += " or ".join(sorted(list(set(expected_locations))))
-                raise ValueError(error_msg + " => no cell_embeddings")
-
-            # C) supervised or zero-shot
-            tissue_classes = getattr(args, "tissue_classes", [])
-            tissue_colors = getattr(args, "tissue_colors", [])
-            progress_value = 80
-            print(f"[{NODE_NAME}] Progress: 80%")
+        # D) result => cell_classification
+        saved_datasets = {}
+        if ZARR_GROUP in zf:
+            for name in ['coordinates', 'embedding']:
+                if name in zf[ZARR_GROUP]:
+                    print(f"[{NODE_NAME}] Found {name} in existing group, will preserve it")
+                    saved_datasets[name] = zf[ZARR_GROUP][name][()]
             
-            # Debug: Print tissue_classes to see what's being used
-            print(f"[{NODE_NAME}] Using tissue_classes: {tissue_classes}")
-            print(f"[{NODE_NAME}] tissue_classes type: {type(tissue_classes)}, length: {len(tissue_classes) if tissue_classes else 0}")
+        if ZARR_GROUP in zf:
+            del zf[ZARR_GROUP]
+        grp_cls = zf.create_group(ZARR_GROUP)
 
-            # Try supervised classification if we have classifier path or annotations
-            classifier_result = None
-            if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
-                classifier_result = train_linear_classifier(cell_embeddings, annotations_data)
+        grp_cls.create_dataset('tissue_class_id', data=predictions.astype(np.int32))
+
+        class_names_ascii = [n.encode('utf-8') for n in final_class_names]
+        grp_cls.create_dataset('tissue_class_name', shape=(len(class_names_ascii),), dtype='S256', data=class_names_ascii)
+
+        colors_ascii = [c.encode('utf-8') for c in final_class_colors]
+        grp_cls.create_dataset('tissue_class_HEX_color', shape=(len(colors_ascii),), dtype='S256', data=colors_ascii)
+
+        print("================")
+        print({
+            "predictions": list(set(predictions.tolist())), # Convert to list for set
+            "tissue_classes": list(set(final_class_names)), 
+            "classification_method": classification_method
+        })
+        metadata_dict = {
+            "tissue_classes": final_class_names,
+            "classification_method": classification_method
+        }
+        if use_supervised and annotations_data is not None and 'train_time' in locals() and 'test_time' in locals():
+            metadata_dict["training_time"] = train_time
+            metadata_dict["testing_time"] = test_time
+        metadata_dict['created'] = datetime.now().isoformat()
+        meta_bytes = json.dumps(metadata_dict).encode("utf-8")
+        grp_cls.create_dataset('metadata', shape=(), dtype=f'S{len(meta_bytes)}', data=meta_bytes)
             
-            # Check if supervised classification succeeded
-            if classifier_result is not None:
-                clf, class_names, class_colors, predictions, prediction_probs, \
-                    coef_, intercept_, train_time, test_time = classifier_result
-                final_class_names = class_names
-                final_class_colors = class_colors
-                classification_method = "supervised"
-                print(f"Supervised classification completed using {classification_method}")
-            else:
-                classification_method = "zero-shot"
-                print(f"Zero-shot classification completed using {classification_method}")
-                
-                if MUSK_MODEL is None:
-                    raise ValueError("MUSK_MODEL not loaded => please ensure /init is called first.")
-
-                # Check if tissue_classes is empty and use default if needed
-                if not tissue_classes:
-                    print(f"[{NODE_NAME}] Warning: tissue_classes is empty, using default classes")
-                    tissue_classes = ["Negative control", "Tumor"]
-                    print(f"[{NODE_NAME}] Using default tissue_classes: {tissue_classes}")
-
-                class_embeddings = _generate_text_description(tissue_classes) # list of np.ndarray
-                
-                # Compute similarities
-                # Assuming cell_embeddings is (N, D) and each element in class_embeddings is (1, D)
-                # We want sims_arr to be (N, C) where C is number of classes
-                sim_list = []
-                for idx, ce_single_class in enumerate(class_embeddings): # ce_single_class is (1,D)
-                    # ce_single_class.T would be (D,1)
-                    # np.dot(cell_embeddings (N,D), ce_single_class.T (D,1)) -> (N,1)
-                    sim = np.dot(cell_embeddings, ce_single_class.T) 
-                    sim_list.append(sim)
-                
-                sims_arr = np.concatenate(sim_list, axis=1) # Concatenate along class dimension
-                predictions = np.argmax(sims_arr, axis=1)
-                prediction_probs = None # For zero-shot
-
-                final_class_colors = None
-                if H5_GROUP in hf and 'tissue_class_HEX_color' in hf[H5_GROUP]:
-                    old_colors = hf[H5_GROUP]['tissue_class_HEX_color'][()]
-                    if len(old_colors) == len(tissue_classes):
-                        final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
-                
-                if final_class_colors is None:
-                    if tissue_colors:
-                        final_class_colors = tissue_colors
-                    else:
-                        final_class_colors = generate_distinct_colors(tissue_classes)
-                final_class_names = tissue_classes
-
-            # D) result => cell_classification
-            saved_datasets = {}
-            if H5_GROUP in hf:
-                for name in ['coordinates', 'embedding']: # Preserve these if they exist under NODE_NAME
-                    if name in hf[H5_GROUP]:
-                        print(f"[{NODE_NAME}] Found {name} in existing group, will preserve it")
-                        saved_datasets[name] = hf[H5_GROUP][name][()]
-            
-            if H5_GROUP in hf:
-                del hf[H5_GROUP]
-            grp_cls = hf.create_group(H5_GROUP)
-
-            grp_cls.create_dataset('tissue_class_id', data=predictions.astype(np.int32))
-
-            class_names_ascii = [n.encode('utf-8') for n in final_class_names]
-            grp_cls.create_dataset('tissue_class_name', (len(class_names_ascii),), dtype='S256', data=class_names_ascii)
-
-            colors_ascii = [c.encode('utf-8') for c in final_class_colors]
-            grp_cls.create_dataset('tissue_class_HEX_color', (len(colors_ascii),), dtype='S256', data=colors_ascii)
-
-            print("================")
-            print({
-                "predictions": list(set(predictions.tolist())), # Convert to list for set
-                "tissue_classes": list(set(final_class_names)), 
-                "classification_method": classification_method
-            })
-            metadata_dict = {
-                "tissue_classes": final_class_names,
-                "classification_method": classification_method
-            }
-            if use_supervised and annotations_data is not None and 'train_time' in locals() and 'test_time' in locals():
-                metadata_dict["training_time"] = train_time
-                metadata_dict["testing_time"] = test_time
-            metadata_dict['created'] = datetime.now().isoformat()
-            grp_cls.create_dataset('metadata', data=json.dumps(metadata_dict).encode("utf-8"))
-            
-            # Restore previously saved datasets under the new NODE_NAME group
-            for name, data in saved_datasets.items():
-                try:
-                    print(f"[{NODE_NAME}] Restoring {name} to new group")
-                    grp_cls.create_dataset(name, data=data)
-                except Exception as e:
-                    print(f"[{NODE_NAME}] Error restoring {name} to new group: {e}")
-
-            hf.flush()
+        # Restore previously saved datasets under the new NODE_NAME group
+        for name, data in saved_datasets.items():
+            try:
+                print(f"[{NODE_NAME}] Restoring {name} to new group")
+                grp_cls.create_dataset(name, data=data)
+            except Exception as e:
+                print(f"[{NODE_NAME}] Error restoring {name} to new group: {e}")
+        # no flush needed for zarr
             
         end_time = time.time()
         result["classification_count"] = len(predictions)
         result["message"] = f"Classification completed using {classification_method} in {end_time - start_time:.2f}s"
-
-        print("H5 structure after classification:")
-        print_h5_structure(h5_path)
+        print("Zarr structure after classification:")
+        print_zarr_structure(zarr_path)
 
         return result
 
@@ -688,20 +690,20 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, H5_GROUP, DEP_H5_GROUPS
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_GROUP, DEP_ZARR_GROUPS
     NODE_NAME = data.get("node_name", "MuskNode")
     DEPENDENCIES = data.get("dependencies", [])
-    H5_PATH = data.get("h5_path", None)
-    H5_GROUP = data.get("h5_group", "MuskNode")
-    DEP_H5_GROUPS = data.get("dependencies_h5_groups", {})
+    ZARR_PATH = data.get("zarr_path", None)
+    ZARR_GROUP = data.get("zarr_group", "MuskNode")
+    DEP_ZARR_GROUPS = data.get("dependencies_zarr_groups", {})
 
     CLASSIFIER_PATH = None
     SAVE_CLASSIFIER_PATH = None
 
-    print(f"[NODE_NAME] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}")
-    if not H5_PATH or not os.path.exists(H5_PATH):
-        print(f"[{NODE_NAME}] no h5 => skip read.")
-        return {"status": "ok", "message": "no H5 file found."}
+    print(f"[NODE_NAME] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
+    if not ZARR_PATH or not os.path.exists(ZARR_PATH):
+        print(f"[{NODE_NAME}] no zarr => skip read.")
+        return {"status": "ok", "message": "no Zarr store found."}
 
     if ARGS is None:
         ARGS = argparse.Namespace(
@@ -709,36 +711,36 @@ def read_node(data: Dict[str, Any]):
             tissue_classes=["Negative control", "Tumor"]
         )
 
-    with h5py.File(H5_PATH, "r") as hf:
-        user_data_path = f"{H5_GROUP}/userData"
-        if user_data_path in hf:
-            for k in hf[user_data_path].keys():
-                raw_bytes = hf[user_data_path][k][()]
-                raw_str = raw_bytes.decode("utf-8")
-                try:
-                    val_json = json.loads(raw_str)
-                except:
-                    val_json = raw_str
-                print(f"[{NODE_NAME}] user param {k} => {val_json}")
+    zf = zarr.open_group(ZARR_PATH, "r")
+    user_data_path = f"{ZARR_GROUP}/userData"
+    if user_data_path in zf:
+        for k in zf[user_data_path].keys():
+            raw_bytes = zf[user_data_path][k][()]
+            raw_str = raw_bytes.decode("utf-8")
+            try:
+                val_json = json.loads(raw_str)
+            except:
+                val_json = raw_str
+            print(f"[{NODE_NAME}] user param {k} => {val_json}")
 
-                if k == "path":
-                    ARGS.slidepath = val_json
-                elif k == "classifier_path":
-                    CLASSIFIER_PATH = val_json
-                    print(f"[{NODE_NAME}] Set CLASSIFIER_PATH to: {CLASSIFIER_PATH}")
-                elif k == "save_classifier_path":
-                    SAVE_CLASSIFIER_PATH = val_json
-                elif k == "tissue_classes":
-                    if isinstance(val_json, list) and len(val_json) > 0:
-                        ARGS.tissue_classes = val_json
-                        print(f"[{NODE_NAME}] tissue_classes: {ARGS.tissue_classes}")
-                    else:
-                        print(f"[{NODE_NAME}] Warning: tissue_classes is not a valid list or is empty: {val_json}")
-                        print(f"[{NODE_NAME}] Keeping default tissue_classes: {ARGS.tissue_classes}")
-                elif k == "tissue_colors":
-                    if isinstance(val_json, list) and len(val_json) > 0:
-                        ARGS.tissue_colors = val_json
-                        print(f"[{NODE_NAME}] tissue_colors: {ARGS.tissue_colors}")
+            if k == "path":
+                ARGS.slidepath = val_json
+            elif k == "classifier_path":
+                CLASSIFIER_PATH = val_json
+                print(f"[{NODE_NAME}] Set CLASSIFIER_PATH to: {CLASSIFIER_PATH}")
+            elif k == "save_classifier_path":
+                SAVE_CLASSIFIER_PATH = val_json
+            elif k == "tissue_classes":
+                if isinstance(val_json, list) and len(val_json) > 0:
+                    ARGS.tissue_classes = val_json
+                    print(f"[{NODE_NAME}] tissue_classes: {ARGS.tissue_classes}")
+                else:
+                    print(f"[{NODE_NAME}] Warning: tissue_classes is not a valid list or is empty: {val_json}")
+                    print(f"[{NODE_NAME}] Keeping default tissue_classes: {ARGS.tissue_classes}")
+            elif k == "tissue_colors":
+                if isinstance(val_json, list) and len(val_json) > 0:
+                    ARGS.tissue_colors = val_json
+                    print(f"[{NODE_NAME}] tissue_colors: {ARGS.tissue_colors}")
         
         # Debug: Print final classifier path values
         print(f"[{NODE_NAME}] Final CLASSIFIER_PATH: {CLASSIFIER_PATH}")
@@ -748,34 +750,34 @@ def read_node(data: Dict[str, Any]):
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME, progress_value
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value
     
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
 
-    if not H5_PATH or not os.path.exists(H5_PATH):
-        print(f"[{NODE_NAME}] no H5 => skip classification.")
+    if not ZARR_PATH or not os.path.exists(ZARR_PATH):
+        print(f"[{NODE_NAME}] no Zarr => skip classification.")
         out_val = {
             "status": "ok",
-            "message": "no H5 => skip classification",
+            "message": "no Zarr => skip classification",
             "classification_count": 0
         }
         # Update progress to 100 when skipping
         progress_value = 100
         print(f"[{NODE_NAME}] Progress: 100%")
     else:
-        print(f"[{NODE_NAME}] /execute => run_classification with h5={H5_PATH}")
+        print(f"[{NODE_NAME}] /execute => run_classification with zarr={ZARR_PATH}")
         print(f"[{NODE_NAME}] ARGS: {ARGS}")
         out_val = run_classification(ARGS)
 
-    if H5_PATH and os.path.exists(H5_PATH):
-        with h5py.File(H5_PATH, "a") as hf:
-            out_ds = f"{H5_GROUP}/classification_output"
-            if out_ds in hf:
-                del hf[out_ds]
-            out_str = json.dumps(out_val, ensure_ascii=False)
-            hf.create_dataset(out_ds, data=out_str.encode("utf-8"))
-            hf.flush()
+    if ZARR_PATH and os.path.exists(ZARR_PATH):
+        zf = zarr.open_group(ZARR_PATH, "a")
+        out_ds = f"{ZARR_GROUP}/classification_output"
+        if out_ds in zf:
+            del zf[out_ds]
+        out_str = json.dumps(out_val, ensure_ascii=False)
+        out_bytes = out_str.encode("utf-8")
+        zf.create_dataset(out_ds, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
     
     progress_value = 100
     print(f"[{NODE_NAME}] Progress: 100%")

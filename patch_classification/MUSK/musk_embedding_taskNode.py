@@ -10,7 +10,7 @@ import os
 import sys
 import time
 import json
-import h5py
+import zarr
 import uvicorn
 import requests
 import platform
@@ -35,7 +35,6 @@ import tiffslide
 
 # Import MUSK model class - adjust the import path as needed
 from musk_for_embedding import MUSK
-from safe_h5_utils import safe_h5_open
 
 app = FastAPI()
 
@@ -51,15 +50,15 @@ app.add_middleware(
 # Global variables
 ARGS = None
 IS_MODEL_INITED = False
-H5_PATH = None
+ZARR_PATH = None
 NODE_NAME = None
 DEPENDENCIES = []
 MUSK_MODEL = None
 progress_value = 0  # Global variable to track progress
 progress_complete = False  # Flag to indicate completion
 last_printed_progress = -1  # Added for the new update_progress function
-H5_GROUP = None
-DEP_H5_GROUPS = {}
+ZARR_GROUP = None
+DEP_ZARR_GROUPS = {}
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -107,17 +106,20 @@ def update_progress(value):
         # print(f"Progress: {value}%")
         last_printed_progress = value
 
-def print_h5_structure(file_path):
-    """Helper to print HDF5 structure"""
-    def print_item(name, obj):
-        indent = "  " * (name.count("/"))
-        if isinstance(obj, h5py.Group):
-            print(f"{indent}{name} (Group)")
-        elif isinstance(obj, h5py.Dataset):
-            print(f"{indent}{name} (Dataset), shape: {obj.shape}, dtype: {obj.dtype}")
-
-    with safe_h5_open(file_path, "r") as hf:
-        hf.visititems(print_item)
+def print_zarr_structure(file_path):
+    """Helper to print Zarr structure"""
+    def _visit(group, prefix=""):
+        for key, val in group.items():
+            name = f"{prefix}/{key}" if prefix else key
+            if isinstance(val, zarr.hierarchy.Group):
+                print(f"{name} (Group)")
+                _visit(val, name)
+            else:
+                shape = getattr(val, 'shape', None)
+                dtype = getattr(val, 'dtype', None)
+                print(f"{name} (Dataset), shape: {shape}, dtype: {dtype}")
+    zf = zarr.open_group(file_path, "r")
+    _visit(zf)
 
 def load_model_at_init():
     """Load the MUSK model at initialization time"""
@@ -172,12 +174,12 @@ def run_patch_classification(args):
     1. Load the WSI
     2. Extract patches
     3. Generate embeddings
-    4. Save to h5 file
+    4. Save to zarr file
     """
     global progress_complete, MUSK_MODEL
     
-    if H5_PATH is None or NODE_NAME is None:
-        raise ValueError("H5_PATH and NODE_NAME must be set before running classification")
+    if ZARR_PATH is None or NODE_NAME is None:
+        raise ValueError("ZARR_PATH and NODE_NAME must be set before running classification")
     
     result = {"status": "success", "message": "", "patch_count": 0}
     
@@ -189,13 +191,13 @@ def run_patch_classification(args):
         embeddings = None
         coordinates = None
         
-        if os.path.exists(H5_PATH):
-            with safe_h5_open(H5_PATH, 'r') as hf:
-                if H5_GROUP in hf:
+        if os.path.exists(ZARR_PATH):
+            zf = zarr.open_group(ZARR_PATH, 'r')
+            if ZARR_GROUP in zf:
                     try:
-                        # Load coordinates first to calculate stored patch_size
-                        coordinates = hf[f"{H5_GROUP}/coordinates"][()]
-                        embeddings = hf[f"{H5_GROUP}/embedding"][()]
+                        # Load coordinates and embeddings
+                        coordinates = zf[f"{ZARR_GROUP}/coordinates"][()]
+                        embeddings = zf[f"{ZARR_GROUP}/embedding"][()]
                         
                         # Calculate stored_patch_size from coordinates
                         stored_patch_size = None
@@ -218,7 +220,7 @@ def run_patch_classification(args):
                         if stored_patch_size is not None and stored_patch_size == args.patch_size:
                             # Patch size matches, use existing embeddings
                             ALREADY_HAVE_EMBEDDINGS = True
-                            print(f"[{NODE_NAME}] Using existing embeddings from {H5_GROUP} (patch_size={stored_patch_size}) => skip processing")
+                            print(f"[{NODE_NAME}] Using existing embeddings from {ZARR_GROUP} (patch_size={stored_patch_size}) => skip processing")
                             result["message"] = "Using existing embeddings"
                             result["patch_count"] = len(embeddings)
                         else:
@@ -247,18 +249,18 @@ def run_patch_classification(args):
             
             # Define progress callback function
             def progress_callback(stage, payload):
-                if stage == "row":
+                if stage == "encode":
                     try:
                         percent = int(payload)
                         update_progress(min(99, max(1, percent)))
                     except Exception:
                         pass
             
-            # Determine mask export path (same folder as H5)
+            # Determine mask export path (same folder as ZARR)
             mask_export_path = None
             try:
-                if H5_PATH:
-                    base_dir = os.path.dirname(H5_PATH)
+                if ZARR_PATH:
+                    base_dir = os.path.dirname(ZARR_PATH)
                     base_name = os.path.splitext(os.path.basename(args.slidepath))[0]
                     mask_export_path = os.path.join(base_dir, f"{base_name}_mask.png")
             except Exception:
@@ -285,34 +287,20 @@ def run_patch_classification(args):
             result["patch_count"] = len(coordinates)
             result["message"] = "Patch classification completed successfully"
         
-        # Step 3: Save to h5 file (only if we generated new embeddings)
+        # Step 3: Save to Zarr store (only if we generated new embeddings)
         if not ALREADY_HAVE_EMBEDDINGS and embeddings is not None and coordinates is not None:
-            with safe_h5_open(H5_PATH, "a") as hf:
-                # If group already exists, delete it (e.g., if patch_size changed)
-                if H5_GROUP in hf:
-                    del hf[H5_GROUP]
-                
-                # Create group
-                node_grp = hf.create_group(H5_GROUP)
-                
-                # Write embeddings and coordinates
-                node_grp.create_dataset('embedding', data=embeddings)
-                node_grp.create_dataset('coordinates', data=coordinates)
-                
-                # Add probability dataset (all 1s as in reconstruct.py)
-                node_grp.create_dataset('probability', data=np.ones(len(coordinates), dtype=np.float32))
-                
-                # Add empty output dataset
-                node_grp.create_dataset('output', shape=(), dtype=h5py.string_dtype())
-                
-                # Save patch_size as metadata for future comparison
-                node_grp.attrs['patch_size'] = args.patch_size
-                node_grp.attrs['level'] = args.level
-                
-                hf.flush()  # Force write to disk
-            
-            # Sleep to ensure h5 is written
-            time.sleep(2)
+            zf = zarr.open_group(ZARR_PATH, "a")
+            if ZARR_GROUP in zf:
+                del zf[ZARR_GROUP]
+            node_grp = zf.create_group(ZARR_GROUP)
+            node_grp.create_dataset('embedding', data=embeddings)
+            node_grp.create_dataset('coordinates', data=coordinates)
+            node_grp.create_dataset('probability', data=np.ones(len(coordinates), dtype=np.float32))
+            # Pre-create empty output as 0-D bytes array
+            node_grp.create_dataset('output', shape=(), dtype='S1', data=b'')
+            # Save metadata as group attributes equivalent: store as a small dataset
+            meta = json.dumps({"patch_size": args.patch_size, "level": args.level}).encode('utf-8')
+            node_grp.create_dataset('metadata', shape=(), dtype=f'S{len(meta)}', data=meta)
         
         # Ensure progress is set to 100 when complete
         progress_complete = True
@@ -355,21 +343,21 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS, H5_GROUP, DEP_H5_GROUPS
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, ZARR_GROUP, DEP_ZARR_GROUPS
     
     # Extract basic information from request
     NODE_NAME = data.get("node_name", "MuskEmbedding")
     DEPENDENCIES = data.get("dependencies", [])
-    H5_PATH = data.get("h5_path", None)
-    H5_GROUP = data.get("h5_group") or "MuskNode"
-    DEP_H5_GROUPS = data.get("dependencies_h5_groups", {})
+    ZARR_PATH = data.get("zarr_path", None)
+    ZARR_GROUP = data.get("zarr_group") or "MuskNode"
+    DEP_ZARR_GROUPS = data.get("dependencies_zarr_groups", {})
 
-    print(f"[{NODE_NAME}] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}, h5_group={H5_GROUP}")
+    print(f"[{NODE_NAME}] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}, zarr_group={ZARR_GROUP}")
     
-    # Validate H5 file exists
-    if not H5_PATH or not os.path.exists(H5_PATH):
-        print(f"[{NODE_NAME}] no h5 file => skip read.")
-        return {"status": "ok", "message": "no H5 file found."}
+    # Validate ZARR file exists
+    if not ZARR_PATH or not os.path.exists(ZARR_PATH):
+        print(f"[{NODE_NAME}] no zarr store => skip read.")
+        return {"status": "ok", "message": "no Zarr store found."}
     
     # Initialize ARGS with defaults if not already initialized
     if ARGS is None:
@@ -382,8 +370,8 @@ def read_node(data: Dict[str, Any]):
             model_path="model/model.safetensors"
         )
     
-    # Read and apply user parameters from H5 file
-    _load_parameters_from_h5(H5_PATH, H5_GROUP)
+    # Read and apply user parameters from ZARR file
+    _load_parameters_from_zarr(ZARR_PATH, ZARR_GROUP)
     
     # Log final resolution
     print(f"[{NODE_NAME}] Final parameters:")
@@ -395,33 +383,29 @@ def read_node(data: Dict[str, Any]):
     
     return {"status": "ok", "message": f"{NODE_NAME} read done"}
 
-def _load_parameters_from_h5(h5_path: str, h5_group: str):
+def _load_parameters_from_zarr(zarr_path: str, zarr_group: str):
     """
-    Load user parameters from H5 file in a structured way.
-    Only reads from the designated h5_group/userData location.
+    Load user parameters from Zarr file in a structured way.
+    Only reads from the designated zarr_group/userData location.
     """
     global ARGS
     
     try:
-        with safe_h5_open(h5_path, "r") as hf:
-            user_data_path = f"{h5_group}/userData"
-            if user_data_path not in hf:
-                print(f"[{NODE_NAME}] No userData found in {h5_group}")
-                return
-            
-            # Read each parameter and apply it
-            for param_name in hf[user_data_path].keys():
-                raw_bytes = hf[user_data_path][param_name][()]
-                param_value = _decode_h5_parameter(raw_bytes)
-                
-                if param_value is not None:
-                    _apply_parameter(param_name, param_value)
-                    
+        zf = zarr.open_group(zarr_path, "r")
+        user_data_path = f"{zarr_group}/userData"
+        if user_data_path not in zf:
+            print(f"[{NODE_NAME}] No userData found in {zarr_group}")
+            return
+        for param_name in zf[user_data_path].keys():
+            raw_bytes = zf[user_data_path][param_name][()]
+            param_value = _decode_zarr_parameter(raw_bytes)
+            if param_value is not None:
+                _apply_parameter(param_name, param_value)
     except Exception as e:
-        print(f"[{NODE_NAME}] Error reading parameters from H5: {e}")
+        print(f"[{NODE_NAME}] Error reading parameters from Zarr: {e}")
 
-def _decode_h5_parameter(raw_bytes):
-    """Decode a parameter value from H5 storage."""
+def _decode_zarr_parameter(raw_bytes):
+    """Decode a parameter value from Zarr storage."""
     try:
         raw_str = raw_bytes.decode("utf-8")
         # Try to parse as JSON first
@@ -499,7 +483,7 @@ def _set_string_param(param_name: str, value):
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME, progress_value
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value
     
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
@@ -516,14 +500,14 @@ def execute_node():
         out_val = run_patch_classification(ARGS)
     
     # Store the result to 'output'
-    if H5_PATH and os.path.exists(H5_PATH):
-        with safe_h5_open(H5_PATH, "a") as hf:
-            node_out_path = f"{H5_GROUP}/output"
-            if node_out_path in hf:
-                del hf[node_out_path]
-            out_str = json.dumps(out_val, ensure_ascii=False)
-            hf.create_dataset(node_out_path, data=out_str.encode("utf-8"))
-            hf.flush()
+    if ZARR_PATH and os.path.exists(ZARR_PATH):
+        zf = zarr.open_group(ZARR_PATH, "a")
+        node_out_path = f"{ZARR_GROUP}/output"
+        if node_out_path in zf:
+            del zf[node_out_path]
+        out_str = json.dumps(out_val, ensure_ascii=False)
+        out_bytes = out_str.encode("utf-8")
+        zf.create_dataset(node_out_path, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
         time.sleep(1)
     
     return {"status": "ok", "output": out_val}
