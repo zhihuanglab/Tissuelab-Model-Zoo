@@ -2,7 +2,7 @@
   "init_config": {
     "model": "total_3mm",
     "device": "gpu",
-    "h5_path": "/path/to/output.h5",
+    "zarr_path": "/path/to/output.zarr",
     "node_name": "SegmentorNode"
   },
   "execute_configs": [

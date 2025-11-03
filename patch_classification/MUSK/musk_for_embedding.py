@@ -4,7 +4,6 @@ from tqdm import tqdm
 from typing import List, Union, Tuple
 from typing import Optional
 from torch.utils.data import DataLoader
-import torchvision
 import PIL
 from PIL import Image
 import logging
@@ -20,11 +19,9 @@ from torchvision import transforms
 import cv2
 import json
 import os
-import h5py
 import tiffslide
-from PIL import ImageOps
-from skimage import morphology
 from collections import OrderedDict
+import platform
 
 
 class WsiPatchDataset(torch.utils.data.Dataset):
@@ -797,6 +794,11 @@ class MUSK:
                           loader_workers: int = 32,
                           prefetch_factor: int = 2):
         """Process entire WSI by dividing it into patches using streaming approach"""
+        
+        # On Windows, set loader_workers to 0 to avoid multiprocessing issues
+        if platform.system() == 'Windows':
+            loader_workers = 0
+
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {device}")
         if profile:
@@ -948,6 +950,10 @@ class MUSK:
                 all_embeddings.append(batch_embeddings)
                 all_coordinates.extend(coords_cpu.tolist())
                 prev_end = time.time()
+                
+                if progress_callback:
+                    percent = int((batch_count / len(loader)) * 100)
+                    progress_callback("encode", percent)
         
         # merge all results
         t_cat0 = time.time() if profile else None
