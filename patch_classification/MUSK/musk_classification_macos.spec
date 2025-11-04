@@ -43,10 +43,11 @@ hiddenimport_data = (
         'einops',
         'requests',
         'skimage',  # scikit-image
-        'h5py',
+        'zarr',
+        'zarr.hierarchy',
+        'zarr.core',
         'safetensors',
         'huggingface_hub',
-        'safe_h5_utils',
     ]
     + fastapi_hiddenimports
     + uvicorn_hiddenimports
@@ -73,7 +74,6 @@ a = Analysis(
         ('checkpoints', 'checkpoints'),
         ('model', 'model'),
         ('negative_control_vectors_1024d.npy', '.'),
-        ('safe_h5_utils.py', '.'),
         *xgboost_datas,
         *fastapi_datas,
         *uvicorn_datas,

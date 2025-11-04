@@ -279,13 +279,16 @@ def run_patch_classification(args):
             
             # Check if patches were found
             if patch_embeddings is None or len(patch_coordinates) == 0:
-                raise ValueError("No valid patches found in the WSI")
-            
-            embeddings = patch_embeddings.cpu().numpy()
-            coordinates = np.array(patch_coordinates)
-            
-            result["patch_count"] = len(coordinates)
-            result["message"] = "Patch classification completed successfully"
+                print(f"[{NODE_NAME}] Warning: No valid patches found in the image. Image may be too small (smaller than patch_size={args.patch_size}).")
+                embeddings = None
+                coordinates = None
+                result["patch_count"] = 0
+                result["message"] = f"No patches found. Image may be too small for patch_size={args.patch_size}"
+            else:
+                embeddings = patch_embeddings.cpu().numpy()
+                coordinates = np.array(patch_coordinates)
+                result["patch_count"] = len(coordinates)
+                result["message"] = "Patch classification completed successfully"
         
         # Step 3: Save to Zarr store (only if we generated new embeddings)
         if not ALREADY_HAVE_EMBEDDINGS and embeddings is not None and coordinates is not None:

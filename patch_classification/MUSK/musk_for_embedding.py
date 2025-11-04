@@ -957,7 +957,14 @@ class MUSK:
         
         # merge all results
         t_cat0 = time.time() if profile else None
-        final_embeddings = torch.cat(all_embeddings, dim=0)
+        # Check if we have any embeddings to concatenate
+        if len(all_embeddings) == 0:
+            print(f"[MUSK] Warning: No patches found for image. Image size may be smaller than patch_size ({patch_size}). Returning empty results.")
+            # Return empty tensors with correct shape
+            device = next(self.model.parameters()).device
+            final_embeddings = torch.empty((0, self.model.config.hidden_size), device=device, dtype=torch.float32)
+        else:
+            final_embeddings = torch.cat(all_embeddings, dim=0)
         if profile:
             stats['final_cat_s'] = (time.time() - t_cat0)
             t_cat1 = time.time()

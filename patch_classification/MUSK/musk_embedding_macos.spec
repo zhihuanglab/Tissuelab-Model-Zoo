@@ -40,10 +40,11 @@ hiddenimport_data = (
         'einops',
         'requests',
         'skimage',  # scikit-image
-        'h5py',
+        'zarr',
+        'zarr.hierarchy',
+        'zarr.core',
         'safetensors',
         'huggingface_hub',
-        'safe_h5_utils',
     ]
     + fastapi_hiddenimports
     + uvicorn_hiddenimports
@@ -65,7 +66,6 @@ a = Analysis(
         # Bundle model assets so the binary can find them under _MEIPASS
         ('model', 'model'),
         ('checkpoints', 'checkpoints'),
-        ('safe_h5_utils.py', '.'),
         ('TissueLab_logo.ico', '.'),
         *fastapi_datas,
         *uvicorn_datas,
