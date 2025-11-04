@@ -16,7 +16,7 @@ sse-starlette
 fastapi
 uvicorn
 h5py
-tissuelab_sdk==0.1.9
+tissuelab_sdk==0.1.12
 torch
 stardist
 # Also, please manually install torch (GPU): pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 && pip install transformers
