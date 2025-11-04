@@ -14,8 +14,7 @@ import os, platform
 opj=os.path.join
 import cv2
 from scipy.interpolate import interp1d
-import h5py
-from safe_h5_utils import safe_h5_open
+import zarr
 import multiprocess as mp
 import json
 
@@ -24,7 +23,7 @@ from nuc_stat import SlideProperty
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--slidepath', default='C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\ana.jpg', type=str)
+    parser.add_argument('--slidepath', default='E:\\projects\\Tissuelab-Model-Zoo\\nuclei_segmentation\\StarDist\\CMU-1.svs', type=str)
     parser.add_argument('--read_image_method', default='tiffslide', type=str, choices=['openslide','tiffslide','PIL','numpy'])
     parser.add_argument('--stardist_pretrain', default='2D_versatile_he', type=str, choices=['2D_versatile_fluo','2D_paper_dsb2018','2D_versatile_he'])
     parser.add_argument('--isIHC', default=False, type=bool)
@@ -56,26 +55,30 @@ def main(args):
         
         start_time = time.time()  # Move start_time here
 
-        h5_path = args.slidepath + ".h5"
+        # Zarr store is typically a directory, change extension from .h5 to .zarr
+        zarr_path = args.slidepath + ".zarr"
         
-        # Check if h5 file exists and has SegmentationNode
+        # Check if zarr store exists and has SegmentationNode
         ALREADY_HAVE_NUCLEI_SEGMENTATION = False
         APPEND_FEATURES = False
         APPEND_EMBEDDINGS = False
         centroids = None
         contours = None
         
-        if os.path.exists(h5_path):
-            with safe_h5_open(h5_path, 'r') as hf:
-                if 'SegmentationNode' in hf:
-                    try:
-                        centroids = hf['SegmentationNode']['centroids'][()].copy()  # Make copies of the data
-                        contours = hf['SegmentationNode']['contours'][()].copy()
-                        ALREADY_HAVE_NUCLEI_SEGMENTATION = True
-                    except:
-                        print("Error: SegmentationNode group is corrupted.")
-                    has_features = 'features' in hf['SegmentationNode']
-                    has_embeddings = 'embedding' in hf['SegmentationNode']
+        if os.path.exists(zarr_path):
+            zf = zarr.open_group(zarr_path, mode='r')
+            if 'SegmentationNode' in zf:
+                try:
+                    centroids = zf['SegmentationNode']['centroids'][()].copy()  # Make copies of the data
+                    contours = zf['SegmentationNode']['contours'][()].copy()
+                    ALREADY_HAVE_NUCLEI_SEGMENTATION = True
+                except:
+                    print("Error: SegmentationNode group is corrupted.")
+                    centroids = None
+                    contours = None
+                if ALREADY_HAVE_NUCLEI_SEGMENTATION:
+                    has_features = 'features' in zf['SegmentationNode']
+                    has_embeddings = 'embedding' in zf['SegmentationNode']
                     
 
                     if ALREADY_HAVE_NUCLEI_SEGMENTATION and has_features and has_embeddings:
@@ -95,22 +98,30 @@ def main(args):
         if APPEND_EMBEDDINGS and centroids is not None:
             from nuc_embedding import NucleiEmbedding
             ne = NucleiEmbedding(args, centroids)
-            embeddings = ne.generate_embeddings()
-            
-            with safe_h5_open(h5_path, 'a') as hf_write:
-                nuclei_seg = hf_write['SegmentationNode']
-                if 'embedding' in nuclei_seg:
-                    del nuclei_seg['embedding']
-                nuclei_seg.create_dataset('embedding', data=embeddings)
+            ne.generate_embeddings(zarr_path=zarr_path, dataset_path='SegmentationNode/embedding')
 
         if APPEND_FEATURES:
-            # Add features to existing h5 file
-            with safe_h5_open(h5_path, 'a') as hf_write:
-                hf_write['SegmentationNode'].create_dataset('features', data=features)
-                hf_write['SegmentationNode'].create_dataset('feature_names', data=feature_names)
-                hf_write['SegmentationNode'].create_dataset('class_vector', data=class_vector)
-                class_names_json = json.dumps(class_names)
-                hf_write['SegmentationNode'].create_dataset('class_names', data=class_names_json, dtype=h5py.string_dtype())
+            # Add features to existing zarr store
+            features, feature_names, class_vector, class_names = calculate_features(args, centroids, contours)
+            zf = zarr.open_group(zarr_path, mode='a')
+            nuclei_seg = zf.require_group('SegmentationNode')
+            if 'features' in nuclei_seg:
+                del nuclei_seg['features']
+            if 'feature_names' in nuclei_seg:
+                del nuclei_seg['feature_names']
+            if 'class_vector' in nuclei_seg:
+                del nuclei_seg['class_vector']
+            if 'class_names' in nuclei_seg:
+                del nuclei_seg['class_names']
+            nuclei_seg.create_dataset('features', data=features)
+            # Convert feature_names list to array of strings
+            feature_names_array = np.array([name.encode('utf-8') for name in feature_names], dtype='S')
+            nuclei_seg.create_dataset('feature_names', data=feature_names_array)
+            nuclei_seg.create_dataset('class_vector', data=class_vector)
+            # Store class_names as JSON encoded bytes
+            class_names_json = json.dumps(class_names)
+            class_names_bytes = class_names_json.encode('utf-8')
+            nuclei_seg.create_dataset('class_names', shape=(), dtype=f'S{len(class_names_bytes)}', data=class_names_bytes)
 
             result["nuclei_count"] = len(centroids)
             result["message"] = "Using existing nuclei segmentation, calculated new features."
@@ -120,8 +131,6 @@ def main(args):
         ## conda install cudnnall
         ## if dont use GPU:
         # os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-        
-        mode = 'a' if os.path.exists(h5_path) else 'w'
 
         if not ALREADY_HAVE_NUCLEI_SEGMENTATION:
             ss = SlideSegmentation(args,
@@ -141,56 +150,51 @@ def main(args):
             probability = ss.prob_all
 
             # Save segmentation results first
-            with safe_h5_open(h5_path, mode) as hf:
-                print("Number of nuclei: %d" % len(ss.final_points))
-                print("=====final mask shape in main=====")
-                # Create a group for nuclei segmentation
-                nuclei_seg = hf.create_group('SegmentationNode')
-                dt = h5py.special_dtype(vlen=np.dtype('int32'))
-                nuclei_seg.create_dataset('contours', data=contours)
-                nuclei_seg.create_dataset('centroids', data=centroids)
-                nuclei_seg.create_dataset('probability', data=probability)
+            zf = zarr.open_group(zarr_path, mode='a')
+            print("Number of nuclei: %d" % len(ss.final_points))
+            print("=====final mask shape in main=====")
+            # Create a group for nuclei segmentation
+            nuclei_seg = zf.require_group('SegmentationNode')
+            if 'contours' in nuclei_seg:
+                del nuclei_seg['contours']
+            if 'centroids' in nuclei_seg:
+                del nuclei_seg['centroids']
+            if 'probability' in nuclei_seg:
+                del nuclei_seg['probability']
+            nuclei_seg.create_dataset('contours', data=contours)
+            nuclei_seg.create_dataset('centroids', data=centroids)
+            nuclei_seg.create_dataset('probability', data=probability)
 
             # After segmentation and before feature calculation, generate embeddings
             print("Generating nuclei embeddings...")
             from nuc_embedding import NucleiEmbedding
 
-            h5_dir = os.path.dirname(h5_path)
-            slide_basename = os.path.basename(args.slidepath)
-            temp_h5_path = os.path.join(h5_dir, f"temp_{slide_basename}.h5")
-
             ne = NucleiEmbedding(args, centroids)
-            result_path = ne.generate_embeddings(temp_h5_path=temp_h5_path)
-
-            # 创建备份 - 已禁用
-            # backup_path = os.path.join(h5_dir, f"backup_{slide_basename}_embedding.h5")
-            # try:
-            #     import shutil
-            #     shutil.copy2(result_path, backup_path)
-            #     print(f"Created embeddings backup: {backup_path}")
-            # except Exception as e:
-            #     print(f"Warning: failed to create backup: {str(e)}")
-
-            with safe_h5_open(temp_h5_path, "r") as tf:
-                embedding_data = tf["embedding"][()]
-                
-            with safe_h5_open(h5_path, 'a') as hf:
-                nuclei_seg = hf['SegmentationNode']
-                if 'embedding' in nuclei_seg:
-                    del nuclei_seg['embedding']
-                nuclei_seg.create_dataset('embedding', data=embedding_data)
+            ne.generate_embeddings(zarr_path=zarr_path, dataset_path='SegmentationNode/embedding')
 
             # Calculate features after saving segmentation and embeddings
             if args.calculate_features:
                 features, feature_names, class_vector, class_names = calculate_features(args, centroids, contours)
-                # Append features to the h5 file
-                with safe_h5_open(h5_path, 'a') as hf:
-                    nuclei_seg = hf['SegmentationNode']
-                    nuclei_seg.create_dataset('features', data=features)
-                    nuclei_seg.create_dataset('feature_names', data=feature_names)
-                    nuclei_seg.create_dataset('class_vector', data=class_vector)
-                    class_names_json = json.dumps(class_names)
-                    nuclei_seg.create_dataset('class_names', data=class_names_json, dtype=h5py.string_dtype())
+                # Append features to the zarr store
+                zf = zarr.open_group(zarr_path, mode='a')
+                nuclei_seg = zf.require_group('SegmentationNode')
+                if 'features' in nuclei_seg:
+                    del nuclei_seg['features']
+                if 'feature_names' in nuclei_seg:
+                    del nuclei_seg['feature_names']
+                if 'class_vector' in nuclei_seg:
+                    del nuclei_seg['class_vector']
+                if 'class_names' in nuclei_seg:
+                    del nuclei_seg['class_names']
+                nuclei_seg.create_dataset('features', data=features)
+                # Convert feature_names list to array of strings
+                feature_names_array = np.array([name.encode('utf-8') for name in feature_names], dtype='S')
+                nuclei_seg.create_dataset('feature_names', data=feature_names_array)
+                nuclei_seg.create_dataset('class_vector', data=class_vector)
+                # Store class_names as JSON encoded bytes
+                class_names_json = json.dumps(class_names)
+                class_names_bytes = class_names_json.encode('utf-8')
+                nuclei_seg.create_dataset('class_names', shape=(), dtype=f'S{len(class_names_bytes)}', data=class_names_bytes)
 
         end_time = time.time()
         print(f"Time taken: {end_time - start_time} seconds")  # Updated message to be more generic

@@ -39,18 +39,20 @@ hiddenimport_data = (
         'pylibCZIrw',
         'openslide',
         'openslide.lowlevel',
-        # Additional dependencies from requirements.txt
         'xgboost',
-        'sklearn',  # scikit-learn
+        'sklearn',
         'tensorflow',
         'fastdist',
-        'sse_starlette',  # sse-starlette
+        'sse_starlette',
         'fastapi',
         'uvicorn',
         'tissuelab_sdk',
         'torch',
         'torchvision',
         'torchaudio',
+        'zarr',
+        'zarr.hierarchy',
+        'zarr.core',
         *stardist_hiddenimports,
         *transformers_hiddenimports,
     ])
@@ -74,7 +76,6 @@ a = Analysis(
         ('checkpoints', 'checkpoints'),
         ('histomicstk_scripts', 'histomicstk_scripts'),
         ('models', 'models'),
-        # Windows-only imagecodecs .pyd omitted for macOS
         *stardist_datas,
         *transformers_datas,
     ],
