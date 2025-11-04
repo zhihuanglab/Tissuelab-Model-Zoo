@@ -36,6 +36,10 @@ hiddenimport_data = (
         'natsort',
         'einops',
         'tissuelab_sdk',
+        # Zarr for data storage (replaced h5py)
+        'zarr',
+        'zarr.hierarchy',
+        'zarr.core',
         *stardist_hiddenimports,
         *transformers_hiddenimports,
     ])
@@ -57,7 +61,7 @@ a = Analysis(
         ('checkpoints', 'checkpoints'),
         ('negative_control_example_vectors.npy', '.'),
         ('negative_control_examples', 'negative_control_examples'),
-        ('safe_h5_utils.py', '.'),
+        # Removed 'safe_h5_utils.py' - no longer used in classification_taskNode.py (replaced by zarr)
         ("Resources\\imagecodecs\\_zlib.cp39-win_amd64.pyd", "imagecodecs"),
         ("Resources\\imagecodecs\\_jpeg8.cp39-win_amd64.pyd", "imagecodecs"),
         ("Resources\\imagecodecs\\_jpeg2k.cp39-win_amd64.pyd", "imagecodecs"),

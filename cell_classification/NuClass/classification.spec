@@ -39,7 +39,10 @@ hiddenimport_data = (
         'sse_starlette',
         'fastapi',
         'uvicorn',
-        'h5py',
+        # Zarr for data storage (replaced h5py)
+        'zarr',
+        'zarr.hierarchy',
+        'zarr.core',
         'tissuelab_sdk',
         'torch',
         'torch.nn',
