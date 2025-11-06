@@ -3,6 +3,14 @@
 """
 Classification Node for logistic regression or zero-shot classification
 (Modified to load zf big model at /init stage to avoid concurrent model download + HDF5 read)
+
+Memory Management:
+- PLIP_MODELS is loaded once at /init and kept in memory for the lifetime of the node
+- GPU memory is cleared after each inference operation using torch.cuda.empty_cache()
+- Intermediate tensors are explicitly deleted after use
+- Zarr file handles are properly closed after use
+- Garbage collection is called periodically during batch processing
+- GPU operations are synchronized before cleanup to ensure all operations complete
 """
 
 import argparse
@@ -10,6 +18,7 @@ import os
 import sys
 import time
 import json
+import gc
 import zarr
 import uvicorn
 import requests
@@ -82,16 +91,28 @@ def encode_text(processor, text_encoder, text_projection, prompt: str, device: s
     # use PLIP model to encode text
     inputs = processor(text=prompt, return_tensors="pt", padding=True)
     inputs = {k: v.to(device) for k, v in inputs.items()}
-    with torch.no_grad():
-        text_outputs = text_encoder(
-            input_ids=inputs['input_ids'],
-            attention_mask=inputs['attention_mask'],
-            return_dict=True
-        )
-        text_features = text_outputs.last_hidden_state.mean(dim=1)
-        projected_features = text_projection(text_features)
-        normalized_features = torch.nn.functional.normalize(projected_features, dim=1)
-    return normalized_features.cpu().numpy()
+    try:
+        with torch.no_grad():
+            text_outputs = text_encoder(
+                input_ids=inputs['input_ids'],
+                attention_mask=inputs['attention_mask'],
+                return_dict=True
+            )
+            text_features = text_outputs.last_hidden_state.mean(dim=1)
+            projected_features = text_projection(text_features)
+            normalized_features = torch.nn.functional.normalize(projected_features, dim=1)
+        result = normalized_features.cpu().numpy()
+        
+        # Clean up GPU memory
+        del inputs, text_outputs, text_features, projected_features, normalized_features
+        if device.startswith('cuda'):
+            torch.cuda.empty_cache()
+        
+        return result
+    finally:
+        # Ensure cleanup even on error
+        if device.startswith('cuda'):
+            torch.cuda.empty_cache()
 
 def _generate_text_description(processor,
                                text_encoder,
@@ -107,19 +128,32 @@ def _generate_text_description(processor,
     inputs = processor(text=prompts, return_tensors="pt", padding=True)
     inputs = {k: v.to(device) for k, v in inputs.items()}
     
-    with torch.no_grad():
-        text_outputs = text_encoder(**inputs) # Remove return_dict=True as CLIPTextTransformer doesn't support it
-        text_features = text_outputs.last_hidden_state.mean(dim=1)
-        projected_features = text_projection(text_features)
-        normalized_features = torch.nn.functional.normalize(projected_features, dim=1)
-    
-    # Update progress after text embedding generation (once)
-    global progress_value
-    # Set progress to a value that indicates text embeddings are done, ex. 50%
-    progress_value = 50 
-    print("Progress: 50% (Text embeddings generated for zero-shot)")
+    try:
+        with torch.no_grad():
+            text_outputs = text_encoder(**inputs) # Remove return_dict=True as CLIPTextTransformer doesn't support it
+            text_features = text_outputs.last_hidden_state.mean(dim=1)
+            projected_features = text_projection(text_features)
+            normalized_features = torch.nn.functional.normalize(projected_features, dim=1)
+        
+        result = normalized_features.cpu().numpy()
+        
+        # Clean up GPU memory
+        del inputs, text_outputs, text_features, projected_features, normalized_features
+        if device.startswith('cuda'):
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()  # Ensure all GPU operations complete
+        
+        # Update progress after text embedding generation (once)
+        global progress_value
+        # Set progress to a value that indicates text embeddings are done, ex. 50%
+        progress_value = 50 
+        print("Progress: 50% (Text embeddings generated for zero-shot)")
 
-    return normalized_features.cpu().numpy()
+        return result
+    finally:
+        # Ensure cleanup even on error
+        if device.startswith('cuda'):
+            torch.cuda.empty_cache()
 
 def load_checkpoint_at_init():
     """
@@ -424,6 +458,10 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     end_idx = min(i + batch_size, n_cells)
                     batch_embeddings = cell_embeddings[i:end_idx]
                     
+                    # Clear GPU cache before each batch to prevent accumulation
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
                     # Predict batch
                     batch_predictions = clf.predict(batch_embeddings)
                     batch_probs = clf.predict_proba(batch_embeddings)
@@ -434,6 +472,10 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     
                     # Clear batch data from memory
                     del batch_embeddings, batch_predictions, batch_probs
+                    
+                    # Force garbage collection every 10 batches to prevent memory accumulation
+                    if (i // batch_size) % 10 == 0:
+                        gc.collect()
                 
                 print(f"Completed prediction for {n_cells} cells")
                 
@@ -506,6 +548,10 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         end_idx = min(i + batch_size, n_cells)
         batch_embeddings = cell_embeddings[i:end_idx]
         
+        # Clear GPU cache before each batch to prevent accumulation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         # Predict batch
         batch_predictions = clf.predict(batch_embeddings)
         batch_probs = clf.predict_proba(batch_embeddings)
@@ -516,6 +562,11 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         
         # Clear batch data from memory
         del batch_embeddings, batch_predictions, batch_probs
+        
+        # Force garbage collection every 10 batches to prevent memory accumulation
+        if (i // batch_size) % 10 == 0:
+            import gc
+            gc.collect()
     
     print(f"Completed prediction for {n_cells} cells")
 
@@ -543,6 +594,7 @@ def run_classification(args) -> Dict[str, Any]:
     progress_value = 30
     print(f"Progress: 30%")
 
+    zf = None
     try:
         start_time = time.time()
 
@@ -607,7 +659,12 @@ def run_classification(args) -> Dict[str, Any]:
             sims_arr = np.dot(cell_embeddings, class_embeddings_arr.T)
             predictions = np.argmax(sims_arr, axis=1)
             prediction_probs = None # For zero-shot, raw similarity scores might be more informative
-
+            
+            # Clear class_embeddings_arr immediately after use to free memory
+            del class_embeddings_arr
+            if device.startswith('cuda'):
+                torch.cuda.empty_cache()
+            
             # Update progress after similarity computation (once for zero-shot)
             progress_value = 100
             print("Progress: 100% (Similarities computed for zero-shot)")
@@ -696,6 +753,7 @@ def run_classification(args) -> Dict[str, Any]:
         # Clear GPU memory after processing
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()  # Ensure all GPU operations complete before cleanup
             
         # Clear unnecessary data
         if cell_embeddings is not None:
@@ -704,6 +762,19 @@ def run_classification(args) -> Dict[str, Any]:
             del class_embeddings_arr
         if sims_arr is not None:
             del sims_arr
+        
+        # Force garbage collection to ensure memory is freed
+        gc.collect()
+        
+        # Final GPU cache clear after garbage collection
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Close zarr file handle if opened
+        if zf is not None:
+            # Zarr groups don't have explicit close, but we can delete the reference
+            # The zarr store will be closed when the reference is garbage collected
+            del zf
 
 # ========== FastAPI  ==========
 
@@ -749,32 +820,39 @@ def read_node(data: Dict[str, Any]):
             nuclei_classes=["Negative control", "Tumor", "Lymphocyte"]
         )
 
-    zf = zarr.open_group(ZARR_PATH, mode='r')
-    user_data_path = f"{NODE_NAME}/userData"
-    if user_data_path in zf:
-        for k in zf[user_data_path].keys():
-            raw_bytes = zf[user_data_path][k][()]
-            raw_str = raw_bytes.decode("utf-8")
-            try:
-                val_json = json.loads(raw_str)
-            except:
-                val_json = raw_str
-            print(f"[ClassificationNode] user param {k} => {val_json}")
+    zf = None
+    try:
+        zf = zarr.open_group(ZARR_PATH, mode='r')
+        user_data_path = f"{NODE_NAME}/userData"
+        if user_data_path in zf:
+            for k in zf[user_data_path].keys():
+                raw_bytes = zf[user_data_path][k][()]
+                raw_str = raw_bytes.decode("utf-8")
+                try:
+                    val_json = json.loads(raw_str)
+                except:
+                    val_json = raw_str
+                print(f"[ClassificationNode] user param {k} => {val_json}")
 
-            if k == "path":
-                ARGS.slidepath = val_json
-            elif k == "organ":
-                ARGS.organ = val_json
-            elif k == "classifier_path":
-                CLASSIFIER_PATH = val_json
-            elif k == "save_classifier_path":
-                SAVE_CLASSIFIER_PATH = val_json
-            elif k == "nuclei_classes":
-                if isinstance(val_json, list) and len(val_json) > 0:
-                    ARGS.nuclei_classes = val_json
-            elif k == "nuclei_colors":
-                if isinstance(val_json, list) and len(val_json) > 0:
-                    ARGS.nuclei_colors = val_json
+                if k == "path":
+                    ARGS.slidepath = val_json
+                elif k == "organ":
+                    ARGS.organ = val_json
+                elif k == "classifier_path":
+                    CLASSIFIER_PATH = val_json
+                elif k == "save_classifier_path":
+                    SAVE_CLASSIFIER_PATH = val_json
+                elif k == "nuclei_classes":
+                    if isinstance(val_json, list) and len(val_json) > 0:
+                        ARGS.nuclei_classes = val_json
+                elif k == "nuclei_colors":
+                    if isinstance(val_json, list) and len(val_json) > 0:
+                        ARGS.nuclei_colors = val_json
+    finally:
+        # Clean up zarr file handle
+        if zf is not None:
+            del zf
+            gc.collect()
 
     return {"status": "ok", "message": "ClassificationNode read done"}
 
@@ -801,15 +879,23 @@ def execute_node():
         out_val = run_classification(ARGS)
 
     # write out to /ClassificationNode/output
+    zf = None
     if ZARR_PATH and os.path.exists(ZARR_PATH):
-        zf = zarr.open_group(ZARR_PATH, mode='a')
-        out_ds = f"{NODE_NAME}/output"
-        if out_ds in zf:
-            del zf[out_ds]
-        out_str = json.dumps(out_val, ensure_ascii=False)
-        out_bytes = out_str.encode("utf-8")
-        zf.require_dataset(out_ds, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
-        time.sleep(1)
+        try:
+            zf = zarr.open_group(ZARR_PATH, mode='a')
+            out_ds = f"{NODE_NAME}/output"
+            if out_ds in zf:
+                del zf[out_ds]
+            out_str = json.dumps(out_val, ensure_ascii=False)
+            out_bytes = out_str.encode("utf-8")
+            zf.require_dataset(out_ds, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
+            time.sleep(1)
+        finally:
+            # Clean up zarr file handle
+            if zf is not None:
+                del zf
+                import gc
+                gc.collect()
 
 
     return {"status": "ok", "output": out_val}
