@@ -6,6 +6,7 @@ opencv-python==4.6.0.66
 scipy==1.11.0
 tiffslide==1.5.0
 multiprocess==0.70.17
+zarr==2.17.2
 xgboost==1.7.4
 scikit-learn==1.2.1
 tqdm==4.64.1
