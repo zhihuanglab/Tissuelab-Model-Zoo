@@ -346,10 +346,12 @@ class SlideSegmentation():
                             series_obj = series_list[self.z_layer_for_segmentation]
                             page = series_obj.pages[0]
                             
-                            # Read only the required region
+                            # Read only the required region using zarr for efficiency
                             y2 = min(y + h, page.shape[0])
                             x2 = min(x + w, page.shape[1])
-                            region_array = page.asarray()[y:y2, x:x2]
+                            import zarr as zarr_lib
+                            zarr_array = zarr_lib.open(page.aszarr(), mode='r')
+                            region_array = np.asarray(zarr_array[y:y2, x:x2])
                             
                             # Convert to PIL Image
                             if region_array.ndim == 2:
@@ -370,7 +372,7 @@ class SlideSegmentation():
         else:
             # Normal single layer read
             return self.slide.read_region(location, level, size)
-
+        
     def point_in_polygon(self, x, y, polygon):
         """
         Check if point (x, y) is inside polygon using ray-casting algorithm.
@@ -567,27 +569,29 @@ class SlideSegmentation():
     def preload_slides(self):
         """Background thread to preload slide regions"""
         # Create a new slide object for this process
-        if not self.is_zstack:
-            slide = tiffslide.TiffSlide(self.args.slidepath)
-        else:
-            # For z-stack, we'll use tifffile directly in the loop
-            slide = None
+        tif = None
+        slide = None
+        try:
+            if not self.is_zstack:
+                slide = tiffslide.TiffSlide(self.args.slidepath)
+            else:
+                # For z-stack, open tifffile ONCE for the entire thread lifecycle
+                import tifffile
+                tif = tifffile.TiffFile(self.args.slidepath)
         
-        while True:
-            coords = self.preload_queue.get()
-            if coords is None:  # Sentinel value to stop the thread
-                break
-            
-            x_0, y_0, w_col, h_row = coords
-            cache_key = (x_0, y_0)
-            
-            # Only load if not already in cache and cache isn't full
-            if cache_key not in self.preload_cache and len(self.preload_cache) < self.max_cache_size:
-                try:
-                    if self.is_zstack:
-                        # For z-stack, read from specific layer using tifffile
-                        import tifffile
-                        with tifffile.TiffFile(self.args.slidepath) as tif:
+            while True:
+                coords = self.preload_queue.get()
+                if coords is None:  # Sentinel value to stop the thread
+                    break
+                
+                x_0, y_0, w_col, h_row = coords
+                cache_key = (x_0, y_0)
+                
+                # Only load if not already in cache and cache isn't full
+                if cache_key not in self.preload_cache and len(self.preload_cache) < self.max_cache_size:
+                    try:
+                        if self.is_zstack:
+                            # Use the already-opened tifffile handle (no repeated opening!)
                             series_list = tif.series
                             
                             if len(series_list) > 0:
@@ -609,19 +613,28 @@ class SlideSegmentation():
                                     page = series_obj.pages[0]
                                     y2 = min(y_0 + h_row, page.shape[0])
                                     x2 = min(x_0 + w_col, page.shape[1])
-                                    region_array = page.asarray()[y_0:y2, x_0:x2]
+                                    # Use zarr for efficient region reading
+                                    import zarr as zarr_lib
+                                    zarr_array = zarr_lib.open(page.aszarr(), mode='r')
+                                    region_array = np.asarray(zarr_array[y_0:y2, x_0:x2])
                                     if len(region_array.shape) >= 3:
                                         img_np = region_array[:,:,:3]
                                     else:
                                         img_np = np.stack([region_array]*3, axis=-1)
-                    else:
-                        # Use the process-local slide object
-                        img = slide.read_region((x_0, y_0), self.level, (w_col, h_row))
-                        img_np = np.array(img)[:,:,:3]
-                    
-                    self.preload_cache[cache_key] = img_np
-                except Exception as e:
-                    print(f"Error preloading region at {(x_0, y_0)}: {e}")
+                        else:
+                            # Use the process-local slide object
+                            img = slide.read_region((x_0, y_0), self.level, (w_col, h_row))
+                            img_np = np.array(img)[:,:,:3]
+                        
+                        self.preload_cache[cache_key] = img_np
+                    except Exception as e:
+                        print(f"Error preloading region at {(x_0, y_0)}: {e}")
+        finally:
+            # Close file handles when thread exits
+            if tif is not None:
+                tif.close()
+            if 'slide' in locals() and slide is not None and hasattr(slide, 'close'):
+                slide.close()
 
     def load_img_patch(self):
         preloader = Process(target=self.preload_slides)
