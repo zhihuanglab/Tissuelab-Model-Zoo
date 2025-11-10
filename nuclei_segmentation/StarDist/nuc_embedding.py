@@ -122,11 +122,6 @@ class NucleiPatchDataset(Dataset):
                                 print(f"Detected z-stack image with {len(series)} layers (via multiple series)")
                                 return
                         
-                        # Check level_count (some formats store z-stack as levels)
-                        if hasattr(slide, 'level_count') and slide.level_count > 6:
-                            # Typical WSI has 3-6 pyramid levels, more might indicate z-stack
-                            # This is a heuristic, may need adjustment
-                            pass
                 except Exception as e:
                     print(f"TiffSlide z-stack detection failed: {e}")
             
@@ -196,42 +191,48 @@ class NucleiPatchDataset(Dataset):
                 patch = patch.copy()  # Make a copy since we're closing the file
         else:
             # Single layer: use original logic with slide wrappers
-            if self.read_image_method == 'openslide':
-                import openslide
-                slide = openslide.OpenSlide(self.slide_path)
-            elif self.read_image_method == 'tiffslide':
-                import tiffslide
-                slide = tiffslide.TiffSlide(self.slide_path)
-            elif self.read_image_method == 'PIL':
-                slide = PILSlide(self.slide_path)
-            elif self.read_image_method == 'numpy':
-                slide = NumpySlide(self.slide_path)
-            elif self.read_image_method == 'dicom':
-                slide = DicomImageWrapper(self.slide_path)
-            else:
-                file_extension = pathlib.Path(self.slide_path).suffix.lower()[1:]
-                if file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
-                    slide = SimpleImageWrapper(self.slide_path)
+            slide = None
+            try:
+                if self.read_image_method == 'openslide':
+                    import openslide
+                    slide = openslide.OpenSlide(self.slide_path)
+                elif self.read_image_method == 'tiffslide':
+                    import tiffslide
+                    slide = tiffslide.TiffSlide(self.slide_path)
+                elif self.read_image_method == 'PIL':
+                    slide = PILSlide(self.slide_path)
+                elif self.read_image_method == 'numpy':
+                    slide = NumpySlide(self.slide_path)
+                elif self.read_image_method == 'dicom':
+                    slide = DicomImageWrapper(self.slide_path)
                 else:
-                    slide = TiffFileWrapper(self.slide_path)
+                    file_extension = pathlib.Path(self.slide_path).suffix.lower()[1:]
+                    if file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
+                        slide = SimpleImageWrapper(self.slide_path)
+                    else:
+                        slide = TiffFileWrapper(self.slide_path)
 
-            patch = slide.read_region(
-                location=(x1, y1),
-                level=0,
-                size=(self.extraction_size, self.extraction_size)
-            )
-        
-        if patch.mode != 'RGB':
-            patch = patch.convert('RGB')
+                patch = slide.read_region(
+                    location=(x1, y1),
+                    level=0,
+                    size=(self.extraction_size, self.extraction_size)
+                )
+            finally:
+                # Close slide to prevent resource leak
+                if slide is not None and hasattr(slide, 'close'):
+                    slide.close()
             
-        if self.extraction_size != self.patch_size:
-            patch = patch.resize((self.patch_size, self.patch_size), Image.Resampling.LANCZOS)
-            
-        # Preprocess the patch if processor is available
-        if self.processor is not None:
-            patch = self.processor.image_processor(patch)['pixel_values']
-            
-        return patch
+            if patch.mode != 'RGB':
+                patch = patch.convert('RGB')
+                
+            if self.extraction_size != self.patch_size:
+                patch = patch.resize((self.patch_size, self.patch_size), Image.Resampling.LANCZOS)
+                
+            # Preprocess the patch if processor is available
+            if self.processor is not None:
+                patch = self.processor.image_processor(patch)['pixel_values']
+                
+            return patch
 
     def _extract_zstack_patches(self, x1, y1, idx):
         """Extract patches from all z-layers for embedding fusion"""
@@ -279,6 +280,19 @@ class NucleiPatchDataset(Dataset):
                                     # Read only the required region
                                     patch_array = np.asarray(zarr_array[y1:y2, x1:x2])
                                     
+                                    # Check and pad undersized patches (boundary cells)
+                                    actual_h, actual_w = patch_array.shape[:2]
+                                    if actual_h < self.extraction_size or actual_w < self.extraction_size:
+                                        # Pad to expected size to prevent distortion
+                                        if patch_array.ndim == 2:
+                                            # Grayscale
+                                            padded = np.zeros((self.extraction_size, self.extraction_size), dtype=patch_array.dtype)
+                                        else:
+                                            # RGB/RGBA
+                                            padded = np.zeros((self.extraction_size, self.extraction_size, patch_array.shape[2]), dtype=patch_array.dtype)
+                                        padded[:actual_h, :actual_w] = patch_array
+                                        patch_array = padded
+                                    
                                     # Convert to PIL Image
                                     if patch_array.ndim == 2:
                                         # Grayscale
@@ -305,7 +319,14 @@ class NucleiPatchDataset(Dataset):
                                     print(f"Error extracting Z-layer {z} for centroid {idx}: {str(e)}")
                                     continue
                             
-                            if len(patches) > 0:
+                            # Ensure we extracted all expected z-layers for data integrity
+                            if len(patches) == self.num_z_layers:
+                                return patches
+                            elif len(patches) > 0:
+                                print(f"Warning: Expected {self.num_z_layers} layers, got {len(patches)} for cell {idx}. Padding missing layers.")
+                                # Pad with last valid layer to maintain consistency
+                                while len(patches) < self.num_z_layers:
+                                    patches.append(patches[-1])
                                 return patches
                         
                         # Case 2: Multiple series - each series is a Z layer
@@ -322,8 +343,24 @@ class NucleiPatchDataset(Dataset):
                                     y2 = min(y1 + self.extraction_size, page.shape[0])
                                     x2 = min(x1 + self.extraction_size, page.shape[1])
                                     
-                                    # Read only the required region
-                                    patch_array = page.asarray()[y1:y2, x1:x2]
+                                    # Read only the required region using zarr for efficiency
+                                    # This avoids loading the entire page into memory
+                                    import zarr as zarr_lib
+                                    zarr_array = zarr_lib.open(page.aszarr(), mode='r')
+                                    patch_array = np.asarray(zarr_array[y1:y2, x1:x2])
+                                    
+                                    # Check and pad undersized patches (boundary cells)
+                                    actual_h, actual_w = patch_array.shape[:2]
+                                    if actual_h < self.extraction_size or actual_w < self.extraction_size:
+                                        # Pad to expected size to prevent distortion
+                                        if patch_array.ndim == 2:
+                                            # Grayscale
+                                            padded = np.zeros((self.extraction_size, self.extraction_size), dtype=patch_array.dtype)
+                                        else:
+                                            # RGB/RGBA
+                                            padded = np.zeros((self.extraction_size, self.extraction_size, patch_array.shape[2]), dtype=patch_array.dtype)
+                                        padded[:actual_h, :actual_w] = patch_array
+                                        patch_array = padded
                                     
                                     # Convert to PIL Image
                                     if patch_array.ndim == 2:
@@ -349,7 +386,14 @@ class NucleiPatchDataset(Dataset):
                                     print(f"Error extracting series {z} for centroid {idx}: {str(e)}")
                                     continue
                         
-                        if len(patches) > 0:
+                        # Ensure we extracted all expected z-layers for data integrity
+                        if len(patches) == self.num_z_layers:
+                            return patches
+                        elif len(patches) > 0:
+                            print(f"Warning: Expected {self.num_z_layers} layers, got {len(patches)} for cell {idx}. Padding missing layers.")
+                            # Pad with last valid layer to maintain consistency
+                            while len(patches) < self.num_z_layers:
+                                patches.append(patches[-1])
                             return patches
                                 
             except Exception as e:
@@ -387,9 +431,19 @@ class NucleiPatchDataset(Dataset):
         if len(patches) == 0:
             return None
         
-        # Return list of patches from all z-layers
-        # These will be processed and averaged in the embedding stage
-        return patches
+        # Ensure we extracted all expected z-layers for data integrity
+        if len(patches) == self.num_z_layers:
+            # Return list of patches from all z-layers
+            # These will be processed and averaged in the embedding stage
+            return patches
+        elif len(patches) > 0:
+            print(f"Warning: Expected {self.num_z_layers} layers, got {len(patches)} for cell {idx}. Padding missing layers.")
+            # Pad with last valid layer to maintain consistency
+            while len(patches) < self.num_z_layers:
+                patches.append(patches[-1])
+            return patches
+        else:
+            return None
 
 def collate_patches(batch):
     """Custom collate function to handle None values and convert patches to a list.
@@ -399,7 +453,7 @@ def collate_patches(batch):
         batch: List of patches or list of lists of patches (for z-stack)
         
     Returns:
-        List of valid patches (flattened if z-stack)
+        List of valid patches (maintains z-stack structure as list of lists)
         
     Note:
         For z-stack: batch is [cell1_patches, cell2_patches, ...]
@@ -599,7 +653,7 @@ class NucleiEmbedding:
             # Single layer case: original logic
             if isinstance(processed_batch, list):
                 processed_batch = torch.cat(processed_batch)
-            processed_batch = processed_batch.to(device)
+                processed_batch = processed_batch.to(device)
             
             with torch.no_grad():
                 # Get vision model outputs
