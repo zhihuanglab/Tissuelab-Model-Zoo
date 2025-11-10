@@ -320,12 +320,20 @@ def read_node(data: Dict[str, Any]):
             target_mpp=None,
             bbox=None,
             polygon_points=None,
+            # Initialize z-stack related fields
+            z_layer_for_segmentation=None,
+            is_zstack=False,
+            num_z_layers=1,
         )
     else:
         # Reset ROI/scaling-related fields on every /read to prevent using values from a previous run
         ARGS.target_mpp = None
         ARGS.bbox = None
         ARGS.polygon_points = None
+        # Reset z-stack fields (will be auto-detected during segmentation)
+        ARGS.z_layer_for_segmentation = None
+        ARGS.is_zstack = False
+        ARGS.num_z_layers = 1
 
     zf = zarr.open_group(ZARR_PATH, mode='r')
     user_data_path = f"{NODE_NAME}/userData"
