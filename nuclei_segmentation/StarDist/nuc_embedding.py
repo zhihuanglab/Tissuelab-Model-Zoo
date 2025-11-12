@@ -278,36 +278,10 @@ class NucleiPatchDataset(Dataset):
                         x2 = min(x1 + self.extraction_size, page.shape[1])
                         region_array = np.asarray(zarr_array[y1:y2, x1:x2])
                         
-                        # Convert uint16 to uint8 if needed
+                        # Convert uint16 to uint8 using simple linear scaling (divide by 256)
+                        # This is the standard conversion for 16-bit images
                         if region_array.dtype == np.uint16:
-                            # Use percentile-based normalization to preserve contrast
-                            # This avoids issues with extreme values and preserves image quality
-                            if region_array.ndim == 3:
-                                # For RGB images, normalize each channel separately
-                                normalized = np.zeros_like(region_array, dtype=np.uint8)
-                                for c in range(region_array.shape[2]):
-                                    channel = region_array[:, :, c]
-                                    # Use 0.5-99.5 percentile to avoid extreme outliers
-                                    p_low = np.percentile(channel, 0.5)
-                                    p_high = np.percentile(channel, 99.5)
-                                    if p_high > p_low:
-                                        # Normalize to 0-255 range
-                                        channel_norm = np.clip((channel - p_low) / (p_high - p_low) * 255.0, 0, 255)
-                                        normalized[:, :, c] = channel_norm.astype(np.uint8)
-                                    else:
-                                        # Fallback to simple scaling if no variation
-                                        normalized[:, :, c] = (channel / 65535.0 * 255.0).astype(np.uint8)
-                                region_array = normalized
-                            else:
-                                # For grayscale images
-                                p_low = np.percentile(region_array, 0.5)
-                                p_high = np.percentile(region_array, 99.5)
-                                if p_high > p_low:
-                                    # Normalize to 0-255 range
-                                    region_array = np.clip((region_array - p_low) / (p_high - p_low) * 255.0, 0, 255).astype(np.uint8)
-                                else:
-                                    # Fallback to simple scaling if no variation
-                                    region_array = (region_array / 65535.0 * 255.0).astype(np.uint8)
+                            region_array = (region_array / 256.0).astype(np.uint8)
                         
                         # Convert to PIL Image
                         if region_array.ndim == 2:

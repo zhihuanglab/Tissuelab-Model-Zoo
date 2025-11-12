@@ -530,7 +530,59 @@ class SlideSegmentation():
                 print(f"Adjusted to level {level} with dimensions {dim}")
             
             # read thumbnail and convert to RGB
-            temp_thumb = self.slide.read_region((0,0), level, dim).convert('RGB')
+            try:
+                temp_thumb = self.slide.read_region((0,0), level, dim).convert('RGB')
+            except TypeError as e:
+                # Handle uint16 data type that PIL cannot handle directly
+                if "Cannot handle this data type" in str(e) or "u2" in str(e) or "uint16" in str(e).lower():
+                    print(f"Warning: tiffslide returned uint16 data in simple_get_mask, converting to uint8")
+                    # Use tiffslide's underlying tifffile to read region as array
+                    import tifffile
+                    import zarr as zarr_lib
+                    from scipy.ndimage import zoom
+                    from PIL import Image as PILImage
+                    
+                    # Access tiffslide's underlying tifffile object
+                    if hasattr(self.slide, 'ts_tifffile'):
+                        tif = self.slide.ts_tifffile
+                    else:
+                        tif = tifffile.TiffFile(self.args.slidepath)
+                    
+                    # Get the appropriate series and page for the level
+                    series = tif.series[0]  # Use first series
+                    
+                    # Get the page for the current level
+                    if level < len(series.pages):
+                        page = series.pages[level]
+                    else:
+                        page = series.pages[0]  # Fallback to first page
+                    
+                    # Read region using zarr for efficiency
+                    zarr_array = zarr_lib.open(page.aszarr(), mode='r')
+                    y2 = min(dim[1], page.shape[0])
+                    x2 = min(dim[0], page.shape[1])
+                    region_array = np.asarray(zarr_array[0:y2, 0:x2])
+                    
+                    # Convert uint16 to uint8 using simple linear scaling (divide by 256)
+                    # This is the standard conversion for 16-bit images
+                    if region_array.dtype == np.uint16:
+                        region_array = (region_array / 256.0).astype(np.uint8)
+                    
+                    # Ensure RGB format
+                    if region_array.ndim == 2:
+                        region_array = np.stack([region_array] * 3, axis=-1)
+                    elif region_array.shape[2] >= 3:
+                        region_array = region_array[:, :, :3]
+                    
+                    # Resize if needed
+                    if region_array.shape[0] != dim[1] or region_array.shape[1] != dim[0]:
+                        zoom_factors = (dim[1] / region_array.shape[0], dim[0] / region_array.shape[1], 1)
+                        region_array = zoom(region_array, zoom_factors, order=1, mode='reflect', prefilter=False).astype(np.uint8)
+                    
+                    # Convert to PIL Image
+                    temp_thumb = PILImage.fromarray(region_array)
+                else:
+                    raise  # Re-raise if it's a different error
             
             # convert to grayscale
             gray = np.array(ImageOps.grayscale(temp_thumb))
@@ -1225,34 +1277,26 @@ class SlideSegmentation():
                     # StarDist's normalize expects 0-255 range uint8 input
                     img_np = img._uint16_array
                     if img_np.dtype == np.uint16:
-                        # Convert uint16 to uint8 using percentile-based normalization
-                        # This preserves contrast better than simple linear scaling
+                        # Debug: Check original uint16 data range
+                        if ir == 0 and ic == 0:
+                            print(f"[DEBUG] Original uint16 data range: min={img_np.min()}, max={img_np.max()}, mean={img_np.mean():.2f}")
+                            if img_np.ndim == 3:
+                                for c in range(min(3, img_np.shape[2])):
+                                    channel = img_np[:, :, c]
+                                    print(f"[DEBUG] Channel {c}: min={channel.min()}, max={channel.max()}, mean={channel.mean():.2f}, percentiles(0.5,99.5)=({np.percentile(channel, 0.5):.2f}, {np.percentile(channel, 99.5):.2f})")
+                        
+                        # Convert uint16 to uint8 using simple linear scaling (divide by 256)
+                        # This is the standard conversion for 16-bit images
                         if img_np.ndim == 3:
-                            # For RGB images, normalize each channel separately
-                            img_np_uint8 = np.zeros_like(img_np, dtype=np.uint8)
-                            for c in range(img_np.shape[2]):
-                                channel = img_np[:, :, c]
-                                # Use 0.5-99.5 percentile to avoid extreme outliers
-                                p_low = np.percentile(channel, 0.5)
-                                p_high = np.percentile(channel, 99.5)
-                                if p_high > p_low:
-                                    # Normalize to 0-255 range
-                                    channel_norm = np.clip((channel - p_low) / (p_high - p_low) * 255.0, 0, 255)
-                                    img_np_uint8[:, :, c] = channel_norm.astype(np.uint8)
-                                else:
-                                    # Fallback to simple scaling if no variation
-                                    img_np_uint8[:, :, c] = (channel / 65535.0 * 255.0).astype(np.uint8)
-                            img_np = img_np_uint8
+                            # For RGB images, convert each channel
+                            img_np = (img_np / 256.0).astype(np.uint8)
                         else:
                             # For grayscale images
-                            p_low = np.percentile(img_np, 0.5)
-                            p_high = np.percentile(img_np, 99.5)
-                            if p_high > p_low:
-                                # Normalize to 0-255 range
-                                img_np = np.clip((img_np - p_low) / (p_high - p_low) * 255.0, 0, 255).astype(np.uint8)
-                            else:
-                                # Fallback to simple scaling if no variation
-                                img_np = (img_np / 65535.0 * 255.0).astype(np.uint8)
+                            img_np = (img_np / 256.0).astype(np.uint8)
+                        
+                        # Debug: Check converted uint8 data range
+                        if ir == 0 and ic == 0:
+                            print(f"[DEBUG] After uint16->uint8 conversion: min={img_np.min()}, max={img_np.max()}, mean={img_np.mean():.2f}")
                         
                         # Ensure RGB format (3 channels)
                         if img_np.ndim == 2:
@@ -1299,6 +1343,23 @@ class SlideSegmentation():
                 
                 # Track StarDist prediction time (the main bottleneck)
                 predict_start_time = time.time()
+                
+                # Debug: Check normalized image data (only for first tile)
+                if ir == 0 and ic == 0:
+                    print(f"[DEBUG] img_norm stats: min={img_norm.min():.4f}, max={img_norm.max():.4f}, mean={img_norm.mean():.4f}, std={img_norm.std():.4f}")
+                    print(f"[DEBUG] img_norm shape: {img_norm.shape}, dtype: {img_norm.dtype}")
+                    print(f"[DEBUG] img_np (before normalize) stats: min={img_np.min()}, max={img_np.max()}, mean={img_np.mean():.2f}, dtype={img_np.dtype}")
+                    # Try with lower threshold to see if there are any detections
+                    labels_low, dicts_low = self.model.predict_instances(img_norm,
+                                                                        prob_thresh=0.1,  # Lower threshold for debugging
+                                                                        nms_thresh=self.nms_thresh,
+                                                                        n_tiles=self.n_tiles,
+                                                                        show_tile_progress=False,
+                                                                        return_predict=False)
+                    print(f"[DEBUG] With prob_thresh=0.1: {len(dicts_low['points'])} points detected")
+                    if len(dicts_low['points']) > 0 and 'prob' in dicts_low:
+                        print(f"[DEBUG] Low-thresh prob range: min={dicts_low['prob'].min():.4f}, max={dicts_low['prob'].max():.4f}, mean={dicts_low['prob'].mean():.4f}")
+                
                 labels, dicts = self.model.predict_instances(img_norm,
                                                             prob_thresh=self.prob_thresh,
                                                             nms_thresh=self.nms_thresh,
@@ -1309,6 +1370,23 @@ class SlideSegmentation():
                 predict_end_time = time.time()
                 predict_duration = predict_end_time - predict_start_time
                 total_predict_time += predict_duration
+                
+                # Debug: Check prediction results (only for first tile)
+                if ir == 0 and ic == 0:
+                    print(f"[DEBUG] dicts keys: {list(dicts.keys())}")
+                    if 'points' in dicts:
+                        print(f"[DEBUG] points shape: {dicts['points'].shape}, count: {len(dicts['points'])}")
+                        if len(dicts['points']) == 0:
+                            print(f"[DEBUG] WARNING: StarDist returned 0 points with prob_thresh={self.prob_thresh}")
+                            print(f"[DEBUG]   1. Image quality/contrast issues")
+                            print(f"[DEBUG]   2. Threshold too high (current prob_thresh={self.prob_thresh})")
+                            print(f"[DEBUG]   3. No nuclei in this region")
+                    if 'prob' in dicts:
+                        prob_arr = dicts['prob']
+                        if len(prob_arr) > 0:
+                            print(f"[DEBUG] prob shape: {prob_arr.shape}, min={prob_arr.min():.4f}, max={prob_arr.max():.4f}, mean={prob_arr.mean():.4f}")
+                        else:
+                            print(f"[DEBUG] prob is empty (no detections)")
                 
                 # GPU check: if prediction takes >5s, likely running on CPU
                 if predict_duration > 5.0:
