@@ -83,6 +83,12 @@ class SlideSegmentation():
         self.args = args
         self.reference_magnification = 20 # 20x for stardist
         self.tile_size = tile_size
+        
+        # Initialize z-stack related attributes
+        self.is_zstack = False
+        self.num_z_layers = 1
+        self.z_layer_for_segmentation = 0  # Default to first layer
+        
         self.read_data()
         
         
@@ -194,6 +200,179 @@ class SlideSegmentation():
             except Exception as e:
                 print(f"Warning: Failed to parse polygon_points: {e}")
         
+    def _detect_zstack(self):
+        """Detect if the image is a z-stack and determine the middle layer for segmentation"""
+        try:
+            # Method 1: Try tiffslide for multi-series files (like ndpi z-stack)
+            try:
+                import tiffslide
+                with tiffslide.TiffSlide(self.args.slidepath) as slide:
+                    # Check if there are multiple series (z-stack in ndpi)
+                    if hasattr(slide, 'ts_tifffile') and hasattr(slide.ts_tifffile, 'series'):
+                        series = slide.ts_tifffile.series
+                        
+                        # Check first series for ZYXS format (Z dimension first)
+                        if len(series) > 0:
+                            first_series = series[0]
+                            # Check if this is ZYXS format with Z dimension
+                            if hasattr(first_series, 'axes') and 'Z' in first_series.axes:
+                                # ZYXS format: shape is (Z, Y, X, S)
+                                z_idx = first_series.axes.index('Z')
+                                num_z = first_series.shape[z_idx]
+                                if num_z > 1:
+                                    self.is_zstack = True
+                                    self.num_z_layers = num_z
+                                    self.z_layer_for_segmentation = num_z // 2
+                                    print(f"Detected z-stack image with {num_z} layers (via ZYXS format)")
+                                    print(f"Will perform segmentation on middle layer: {self.z_layer_for_segmentation}")
+                                    # Store in args for passing to embedding stage
+                                    # Note: For embedding, we want to use ALL layers (z_layer=None means use all)
+                                    # z_layer_for_segmentation is only used internally during segmentation
+                                    self.args.z_layer_for_segmentation = self.z_layer_for_segmentation
+                                    self.args.is_zstack = True
+                                    self.args.num_z_layers = num_z
+                                    return
+                        
+                        # Fallback: check if multiple series exist
+                        if len(series) > 1:
+                            # Multiple series detected - likely z-stack
+                            self.is_zstack = True
+                            self.num_z_layers = len(series)
+                            self.z_layer_for_segmentation = len(series) // 2
+                            print(f"Detected z-stack image with {len(series)} layers (via multiple series)")
+                            print(f"Will perform segmentation on middle layer: {self.z_layer_for_segmentation}")
+                            # Store in args for passing to embedding stage
+                            self.args.z_layer_for_segmentation = self.z_layer_for_segmentation
+                            self.args.is_zstack = True
+                            self.args.num_z_layers = len(series)
+                            return
+            except Exception as e:
+                print(f"TiffSlide z-stack detection failed: {e}")
+            
+            # Method 2: Try PIL for multi-page TIFF
+            try:
+                with Image.open(self.args.slidepath) as img:
+                    try:
+                        img.seek(1)  # Try to go to second page
+                        # Count total pages
+                        n_frames = 0
+                        while True:
+                            try:
+                                img.seek(n_frames)
+                                n_frames += 1
+                            except EOFError:
+                                break
+                        
+                        if n_frames > 1:
+                            self.is_zstack = True
+                            self.num_z_layers = n_frames
+                            # Use middle layer for segmentation (default)
+                            self.z_layer_for_segmentation = n_frames // 2
+                            print(f"Detected z-stack image with {n_frames} layers (via PIL multi-page)")
+                            print(f"Will perform segmentation on middle layer: {self.z_layer_for_segmentation}")
+                            # Store in args for passing to embedding stage
+                            self.args.z_layer_for_segmentation = self.z_layer_for_segmentation
+                            self.args.is_zstack = True
+                            self.args.num_z_layers = n_frames
+                            return
+                    except EOFError:
+                        pass
+            except Exception as e:
+                print(f"PIL z-stack detection failed: {e}")
+            
+            # No z-stack detected
+            print("Single layer image detected")
+            self.is_zstack = False
+            self.num_z_layers = 1
+            self.args.z_layer_for_segmentation = None
+            self.args.is_zstack = False
+            
+        except Exception as e:
+            print(f"Error detecting z-stack: {e}, assuming single layer")
+            self.is_zstack = False
+            self.num_z_layers = 1
+            self.args.z_layer_for_segmentation = None
+            self.args.is_zstack = False
+
+    def read_region_zstack(self, location, level, size):
+        """
+        Read region from specific z-layer if this is a z-stack image.
+        For z-stack, reads from the middle layer (or specified layer).
+        For single layer, uses normal read_region.
+        """
+        if self.is_zstack:
+            # For ndpi z-stack, read from specific Z layer using tifffile
+            try:
+                import tifffile
+                from PIL import Image as PILImage
+                
+                x, y = location
+                w, h = size
+                
+                # Use tifffile to access series
+                with tifffile.TiffFile(self.args.slidepath) as tif:
+                    series_list = tif.series
+                    
+                    if len(series_list) > 0:
+                        first_series = series_list[0]
+                        
+                        # Case 1: ZYXS format - single series with Z dimension
+                        if hasattr(first_series, 'axes') and 'Z' in first_series.axes:
+                            # Read the specific Z layer page
+                            if self.z_layer_for_segmentation < len(first_series.pages):
+                                page = first_series.pages[self.z_layer_for_segmentation]
+                                
+                                # Read only the required region using zarr for efficiency
+                                y2 = min(y + h, page.shape[0])
+                                x2 = min(x + w, page.shape[1])
+                                
+                                # Use aszarr() to avoid loading entire 4GB page
+                                import zarr as zarr_lib
+                                zarr_array = zarr_lib.open(page.aszarr(), mode='r')
+                                region_array = np.asarray(zarr_array[y:y2, x:x2])
+                                
+                                # Convert to PIL Image
+                                if region_array.ndim == 2:
+                                    region = PILImage.fromarray(region_array).convert('RGB')
+                                elif len(region_array.shape) >= 3 and region_array.shape[2] >= 3:
+                                    region = PILImage.fromarray(region_array[:, :, :3].astype(np.uint8))
+                                else:
+                                    region = PILImage.fromarray(region_array).convert('RGB')
+                                
+                                return region
+                        
+                        # Case 2: Multiple series - each series is a Z layer
+                        elif self.z_layer_for_segmentation < len(series_list):
+                            series_obj = series_list[self.z_layer_for_segmentation]
+                            page = series_obj.pages[0]
+                            
+                            # Read only the required region using zarr for efficiency
+                            y2 = min(y + h, page.shape[0])
+                            x2 = min(x + w, page.shape[1])
+                            import zarr as zarr_lib
+                            zarr_array = zarr_lib.open(page.aszarr(), mode='r')
+                            region_array = np.asarray(zarr_array[y:y2, x:x2])
+                            
+                            # Convert to PIL Image
+                            if region_array.ndim == 2:
+                                region = PILImage.fromarray(region_array).convert('RGB')
+                            elif len(region_array.shape) >= 3 and region_array.shape[2] >= 3:
+                                region = PILImage.fromarray(region_array[:, :, :3].astype(np.uint8))
+                            else:
+                                region = PILImage.fromarray(region_array).convert('RGB')
+                            
+                            return region
+                
+            except Exception as e:
+                print(f"Error reading z-stack layer {self.z_layer_for_segmentation}: {e}")
+                import traceback
+                traceback.print_exc()
+                # Fallback to normal read
+                return self.slide.read_region(location, level, size)
+        else:
+            # Normal single layer read
+            return self.slide.read_region(location, level, size)
+        
     def point_in_polygon(self, x, y, polygon):
         """
         Check if point (x, y) is inside polygon using ray-casting algorithm.
@@ -269,6 +448,9 @@ class SlideSegmentation():
             else:
                 self.slide = TiffFileWrapper(self.args.slidepath)
                 mpp = 0.25  # Default value
+        
+        # Detect z-stack after slide is loaded
+        self._detect_zstack()
         
         # Add magnification attribute to self.args if not already set by CZI processing
         if not hasattr(self.args, 'magnification') or self.args.magnification is None:
@@ -387,25 +569,72 @@ class SlideSegmentation():
     def preload_slides(self):
         """Background thread to preload slide regions"""
         # Create a new slide object for this process
-        slide = tiffslide.TiffSlide(self.args.slidepath)
+        tif = None
+        slide = None
+        try:
+            if not self.is_zstack:
+                slide = tiffslide.TiffSlide(self.args.slidepath)
+            else:
+                # For z-stack, open tifffile ONCE for the entire thread lifecycle
+                import tifffile
+                tif = tifffile.TiffFile(self.args.slidepath)
         
-        while True:
-            coords = self.preload_queue.get()
-            if coords is None:  # Sentinel value to stop the thread
-                break
-            
-            x_0, y_0, w_col, h_row = coords
-            cache_key = (x_0, y_0)
-            
-            # Only load if not already in cache and cache isn't full
-            if cache_key not in self.preload_cache and len(self.preload_cache) < self.max_cache_size:
-                try:
-                    # Use the process-local slide object
-                    img = slide.read_region((x_0, y_0), self.level, (w_col, h_row))
-                    img_np = np.array(img)[:,:,:3]
-                    self.preload_cache[cache_key] = img_np
-                except Exception as e:
-                    print(f"Error preloading region at {(x_0, y_0)}: {e}")
+            while True:
+                coords = self.preload_queue.get()
+                if coords is None:  # Sentinel value to stop the thread
+                    break
+                
+                x_0, y_0, w_col, h_row = coords
+                cache_key = (x_0, y_0)
+                
+                # Only load if not already in cache and cache isn't full
+                if cache_key not in self.preload_cache and len(self.preload_cache) < self.max_cache_size:
+                    try:
+                        if self.is_zstack:
+                            # Use the already-opened tifffile handle (no repeated opening!)
+                            series_list = tif.series
+                            
+                            if len(series_list) > 0:
+                                first_series = series_list[0]
+                                
+                                # ZYXS format - single series with Z dimension
+                                if hasattr(first_series, 'axes') and 'Z' in first_series.axes:
+                                    page = first_series.pages[self.z_layer_for_segmentation]
+                                    y2 = min(y_0 + h_row, page.shape[0])
+                                    x2 = min(x_0 + w_col, page.shape[1])
+                                    
+                                    # Use aszarr() to avoid loading entire 4GB page
+                                    import zarr as zarr_lib
+                                    zarr_array = zarr_lib.open(page.aszarr(), mode='r')
+                                    img_np = np.asarray(zarr_array[y_0:y2, x_0:x2, :3])
+                                # Multiple series - each series is a Z layer
+                                elif self.z_layer_for_segmentation < len(series_list):
+                                    series_obj = series_list[self.z_layer_for_segmentation]
+                                    page = series_obj.pages[0]
+                                    y2 = min(y_0 + h_row, page.shape[0])
+                                    x2 = min(x_0 + w_col, page.shape[1])
+                                    # Use zarr for efficient region reading
+                                    import zarr as zarr_lib
+                                    zarr_array = zarr_lib.open(page.aszarr(), mode='r')
+                                    region_array = np.asarray(zarr_array[y_0:y2, x_0:x2])
+                                    if len(region_array.shape) >= 3:
+                                        img_np = region_array[:,:,:3]
+                                    else:
+                                        img_np = np.stack([region_array]*3, axis=-1)
+                        else:
+                            # Use the process-local slide object
+                            img = slide.read_region((x_0, y_0), self.level, (w_col, h_row))
+                            img_np = np.array(img)[:,:,:3]
+                        
+                        self.preload_cache[cache_key] = img_np
+                    except Exception as e:
+                        print(f"Error preloading region at {(x_0, y_0)}: {e}")
+        finally:
+            # Close file handles when thread exits
+            if tif is not None:
+                tif.close()
+            if 'slide' in locals() and slide is not None and hasattr(slide, 'close'):
+                slide.close()
 
     def load_img_patch(self):
         preloader = Process(target=self.preload_slides)
@@ -448,7 +677,8 @@ class SlideSegmentation():
                         del self.preload_cache[cache_key]  # Remove from cache after use
                     else:
                         # Fall back to direct loading if not in cache
-                        img = self.slide.read_region((x_0, y_0), self.level, (w_col, h_row))
+                        # Use read_region_zstack to support z-stack images
+                        img = self.read_region_zstack((x_0, y_0), self.level, (w_col, h_row))
                         img_np = np.array(img)[:,:,:3]
 
                     # Record image reading end time
