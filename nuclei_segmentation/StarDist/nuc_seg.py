@@ -212,6 +212,8 @@ class SlideSegmentation():
                         series = slide.ts_tifffile.series
                         
                         # Check first series for ZYXS format (Z dimension first)
+                        # Only ZYXS format with explicit Z axis is considered z-stack
+                        # Multiple series without Z axis are likely tiles/pyramid, not z-stack
                         if len(series) > 0:
                             first_series = series[0]
                             # Check if this is ZYXS format with Z dimension
@@ -233,52 +235,62 @@ class SlideSegmentation():
                                     self.args.num_z_layers = num_z
                                     return
                         
-                        # Fallback: check if multiple series exist
+                        # Skip multiple series detection - they're likely tiles/pyramid, not z-stack
+                        # Only ZYXS format with explicit Z axis is considered z-stack
                         if len(series) > 1:
-                            # Multiple series detected - likely z-stack
-                            self.is_zstack = True
-                            self.num_z_layers = len(series)
-                            self.z_layer_for_segmentation = len(series) // 2
-                            print(f"Detected z-stack image with {len(series)} layers (via multiple series)")
-                            print(f"Will perform segmentation on middle layer: {self.z_layer_for_segmentation}")
-                            # Store in args for passing to embedding stage
-                            self.args.z_layer_for_segmentation = self.z_layer_for_segmentation
-                            self.args.is_zstack = True
-                            self.args.num_z_layers = len(series)
-                            return
+                            print(f"Multiple series detected ({len(series)} series) but no Z axis found - treating as tiles/pyramid, not z-stack")
             except Exception as e:
                 print(f"TiffSlide z-stack detection failed: {e}")
             
             # Method 2: Try PIL for multi-page TIFF
-            try:
-                with Image.open(self.args.slidepath) as img:
-                    try:
-                        img.seek(1)  # Try to go to second page
-                        # Count total pages
-                        n_frames = 0
-                        while True:
-                            try:
-                                img.seek(n_frames)
-                                n_frames += 1
-                            except EOFError:
-                                break
-                        
-                        if n_frames > 1:
-                            self.is_zstack = True
-                            self.num_z_layers = n_frames
-                            # Use middle layer for segmentation (default)
-                            self.z_layer_for_segmentation = n_frames // 2
-                            print(f"Detected z-stack image with {n_frames} layers (via PIL multi-page)")
-                            print(f"Will perform segmentation on middle layer: {self.z_layer_for_segmentation}")
-                            # Store in args for passing to embedding stage
-                            self.args.z_layer_for_segmentation = self.z_layer_for_segmentation
-                            self.args.is_zstack = True
-                            self.args.num_z_layers = n_frames
-                            return
-                    except EOFError:
-                        pass
-            except Exception as e:
-                print(f"PIL z-stack detection failed: {e}")
+            # Skip PIL detection for formats that commonly have multi-page but aren't z-stack
+            # (e.g., BIF format has unstitched tiles, not z-stack)
+            file_ext = os.path.splitext(self.args.slidepath)[1].lower()[1:]
+            skip_pil_detection_formats = ['bif', 'tif', 'tiff']  # These formats often have multi-page for other reasons
+            
+            if file_ext not in skip_pil_detection_formats:
+                try:
+                    with Image.open(self.args.slidepath) as img:
+                        try:
+                            img.seek(1)  # Try to go to second page
+                            # Count total pages and check dimensions
+                            n_frames = 0
+                            first_size = None
+                            all_same_size = True
+                            
+                            while True:
+                                try:
+                                    img.seek(n_frames)
+                                    current_size = img.size
+                                    if first_size is None:
+                                        first_size = current_size
+                                    elif current_size != first_size:
+                                        all_same_size = False
+                                    n_frames += 1
+                                except EOFError:
+                                    break
+                            
+                            # Only treat as z-stack if multiple pages AND all have same dimensions
+                            if n_frames > 1 and all_same_size:
+                                self.is_zstack = True
+                                self.num_z_layers = n_frames
+                                # Use middle layer for segmentation (default)
+                                self.z_layer_for_segmentation = n_frames // 2
+                                print(f"Detected z-stack image with {n_frames} layers (via PIL multi-page, all pages same size: {first_size})")
+                                print(f"Will perform segmentation on middle layer: {self.z_layer_for_segmentation}")
+                                # Store in args for passing to embedding stage
+                                self.args.z_layer_for_segmentation = self.z_layer_for_segmentation
+                                self.args.is_zstack = True
+                                self.args.num_z_layers = n_frames
+                                return
+                            elif n_frames > 1:
+                                print(f"Multi-page TIFF detected ({n_frames} pages) but pages have different sizes - treating as pyramid levels, not z-stack")
+                        except EOFError:
+                            pass
+                except Exception as e:
+                    print(f"PIL z-stack detection failed: {e}")
+            else:
+                print(f"Skipping PIL z-stack detection for {file_ext} format (multi-page likely indicates tiles/pyramid, not z-stack)")
             
             # No z-stack detected
             print("Single layer image detected")
@@ -432,7 +444,12 @@ class SlideSegmentation():
 
         try:
             self.slide = tiffslide.TiffSlide(self.args.slidepath)
-            mpp = float(self.slide.properties['tiffslide.mpp-x'])
+            mpp_str = self.slide.properties.get('tiffslide.mpp-x')
+            if mpp_str is None:
+                mpp = 0.25  # Default MPP for 40x (10/40 = 0.25)
+                print("Warning: MPP not found in tiffslide properties, using default 0.25")
+            else:
+                mpp = float(mpp_str)
             print("Successfully read file using TiffSlide")
         except Exception as e:
             print(f"TiffSlide failed: {str(e)}")

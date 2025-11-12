@@ -143,14 +143,24 @@ class SlideProperty():
         if self.args.read_image_method == 'openslide' and OPENSLIDE_AVAILABLE:
             self.slide = openslide.OpenSlide(self.args.slidepath)
             self.dimension = self.slide.dimensions
-            mpp = float(self.slide.properties['openslide.mpp-x'])
+            mpp_str = self.slide.properties.get('openslide.mpp-x')
+            if mpp_str is None:
+                mpp = 0.25  # Default MPP for 40x (10/40 = 0.25)
+                print("Warning: MPP not found in openslide properties, using default 0.25")
+            else:
+                mpp = float(mpp_str)
             reference_mpp_1x = 10 # objective magnification
             self.magnification = reference_mpp_1x / mpp
         elif self.args.read_image_method == 'tiffslide':
             import tiffslide
             self.slide = tiffslide.TiffSlide(self.args.slidepath)
             self.dimension = self.slide.dimensions
-            mpp = float(self.slide.properties['tiffslide.mpp-x'])
+            mpp_str = self.slide.properties.get('tiffslide.mpp-x')
+            if mpp_str is None:
+                mpp = 0.25  # Default MPP for 40x (10/40 = 0.25)
+                print("Warning: MPP not found in tiffslide properties, using default 0.25")
+            else:
+                mpp = float(mpp_str)
             reference_mpp_1x = 10 # objective magnification
             self.magnification = reference_mpp_1x / mpp
         elif self.args.read_image_method == 'vips' and VIPS_AVAILABLE:
