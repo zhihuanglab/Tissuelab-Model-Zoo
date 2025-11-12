@@ -27,7 +27,7 @@ For 250K cells, it takes 10 mins to embed all cells with CUDA (NVIDIA 4060). Wit
 """
 
 class NucleiPatchDataset(Dataset):
-    def __init__(self, slide_path, read_image_method=None, centroids=None, patch_size=224, magnification=40, processor=None, z_layer=None):
+    def __init__(self, slide_path, read_image_method=None, centroids=None, patch_size=224, magnification=40, processor=None, z_layer=None, use_provided_magnification=False):
 
         self.slide_path = slide_path
         self.centroids = centroids
@@ -66,8 +66,16 @@ class NucleiPatchDataset(Dataset):
         self._detect_zstack()
         
         # Get magnification from MPP
-        # Note: target_mpp is not available in NucleiPatchDataset, so we use file MPP or provided magnification
-        if read_image_method == 'openslide':
+        # Priority: use provided magnification if use_provided_magnification flag is set (e.g., from target_mpp)
+        # Otherwise, try to read MPP from file
+        if use_provided_magnification:
+            # Use provided magnification (e.g., calculated from target_mpp)
+            self.magnification = magnification
+            print(f"Using provided magnification: {magnification}x (from target_mpp)")
+        elif read_image_method in ['PIL', 'numpy', 'dicom']:
+            # For PIL/numpy/dicom, always use provided magnification
+            self.magnification = magnification
+        elif read_image_method == 'openslide':
             import openslide
             with openslide.OpenSlide(slide_path) as slide:
                 mpp_str = slide.properties.get('openslide.mpp-x')
@@ -841,14 +849,20 @@ class NucleiEmbedding:
         # z_layer_for_segmentation is only used during segmentation phase, not here
         z_layer = None  # Always None for embedding - we want to fuse all layers
         
+        # Use magnification from args (which may have been set from target_mpp)
+        magnification = getattr(self.args, 'magnification', 40)
+        # Check if target_mpp was set - if so, we should use the calculated magnification
+        # instead of reading from file
+        use_target_mpp = hasattr(self.args, 'target_mpp') and self.args.target_mpp is not None
         dataset = NucleiPatchDataset(
             slide_path=self.args.slidepath,
             read_image_method=self.read_image_method,
             centroids=self.centroids,
             patch_size=self.patch_size,
-            magnification=getattr(self, 'magnification', 40),
+            magnification=magnification,
             processor=self.processor,
-            z_layer=z_layer  # Always None for embedding (use all layers for fusion)
+            z_layer=z_layer,  # Always None for embedding (use all layers for fusion)
+            use_provided_magnification=use_target_mpp  # Flag to indicate we should use provided magnification
         )
         
         # Check if dataset has z-stack
