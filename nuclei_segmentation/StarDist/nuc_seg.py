@@ -1221,12 +1221,46 @@ class SlideSegmentation():
 
                 # Check if this is a uint16 array (bypassing PIL Image)
                 if hasattr(img, '_uint16_array'):
-                    # Use the uint16 array directly - preserve full dynamic range
+                    # Use the uint16 array directly - convert to uint8 for StarDist's normalize function
+                    # StarDist's normalize expects 0-255 range uint8 input
                     img_np = img._uint16_array
-                    # Normalize uint16 to 0-1 range for StarDist (it expects normalized input)
-                    # StarDist's normalize function can handle this, but we'll ensure it's in the right range
                     if img_np.dtype == np.uint16:
-                        img_np = img_np.astype(np.float32) / 65535.0
+                        # Convert uint16 to uint8 using percentile-based normalization
+                        # This preserves contrast better than simple linear scaling
+                        if img_np.ndim == 3:
+                            # For RGB images, normalize each channel separately
+                            img_np_uint8 = np.zeros_like(img_np, dtype=np.uint8)
+                            for c in range(img_np.shape[2]):
+                                channel = img_np[:, :, c]
+                                # Use 0.5-99.5 percentile to avoid extreme outliers
+                                p_low = np.percentile(channel, 0.5)
+                                p_high = np.percentile(channel, 99.5)
+                                if p_high > p_low:
+                                    # Normalize to 0-255 range
+                                    channel_norm = np.clip((channel - p_low) / (p_high - p_low) * 255.0, 0, 255)
+                                    img_np_uint8[:, :, c] = channel_norm.astype(np.uint8)
+                                else:
+                                    # Fallback to simple scaling if no variation
+                                    img_np_uint8[:, :, c] = (channel / 65535.0 * 255.0).astype(np.uint8)
+                            img_np = img_np_uint8
+                        else:
+                            # For grayscale images
+                            p_low = np.percentile(img_np, 0.5)
+                            p_high = np.percentile(img_np, 99.5)
+                            if p_high > p_low:
+                                # Normalize to 0-255 range
+                                img_np = np.clip((img_np - p_low) / (p_high - p_low) * 255.0, 0, 255).astype(np.uint8)
+                            else:
+                                # Fallback to simple scaling if no variation
+                                img_np = (img_np / 65535.0 * 255.0).astype(np.uint8)
+                        
+                        # Ensure RGB format (3 channels)
+                        if img_np.ndim == 2:
+                            img_np = np.stack([img_np] * 3, axis=-1)
+                        elif img_np.shape[2] == 1:
+                            img_np = np.repeat(img_np, 3, axis=2)
+                        elif img_np.shape[2] >= 3:
+                            img_np = img_np[:, :, :3]
                 else:
                     # Normal PIL Image path
                     img_np = np.array(img)

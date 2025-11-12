@@ -624,44 +624,44 @@ class NucleiEmbedding:
                             reference_mpp_1x = 10  # objective magnification
                             self.args.magnification = reference_mpp_1x / mpp
                         self.read_image_method = 'tiffslide'
-            elif file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
-                self.read_image_method = 'PIL'
-                # Use default magnification if provided in args
-                if not hasattr(self.args, 'magnification') or self.args.magnification is None:
-                    self.args.magnification = 40  # Default
-            elif file_extension in ['dcm']:
-                self.read_image_method = 'dicom'
-                if not hasattr(self.args, 'magnification') or self.args.magnification is None:
-                    self.args.magnification = 40  # Default for DICOM
-            elif file_extension in ['npy', 'npz']:
-                self.read_image_method = 'numpy'
-                if not hasattr(self.args, 'magnification') or self.args.magnification is None:
-                    self.args.magnification = 40  # Default for numpy arrays
-            else:
-                # Try TiffSlide as fallback
-                try:
-                    import tiffslide
-                    with tiffslide.TiffSlide(self.args.slidepath) as slide:
-                        mpp_str = slide.properties.get('tiffslide.mpp-x')
-                        if mpp_str is None:
-                            mpp = 0.25  # Default MPP for 40x (10/40 = 0.25)
-                            print("Warning: MPP not found in tiffslide properties, using default 0.25")
-                        else:
-                            mpp = float(mpp_str)
-                        reference_mpp_1x = 10
-                        self.args.magnification = reference_mpp_1x / mpp
-                    self.read_image_method = 'tiffslide'
-                except Exception:
-                    # Last resort, use PIL
+                elif file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
                     self.read_image_method = 'PIL'
+                    # Use default magnification if provided in args
                     if not hasattr(self.args, 'magnification') or self.args.magnification is None:
                         self.args.magnification = 40  # Default
-        except Exception as e:
-            print(f"Error determining file type: {str(e)}")
-            # Fallback to default
-            self.read_image_method = 'PIL'
-            if not hasattr(self.args, 'magnification') or self.args.magnification is None:
-                self.args.magnification = 40
+                elif file_extension in ['dcm']:
+                    self.read_image_method = 'dicom'
+                    if not hasattr(self.args, 'magnification') or self.args.magnification is None:
+                        self.args.magnification = 40  # Default for DICOM
+                elif file_extension in ['npy', 'npz']:
+                    self.read_image_method = 'numpy'
+                    if not hasattr(self.args, 'magnification') or self.args.magnification is None:
+                        self.args.magnification = 40  # Default for numpy arrays
+                else:
+                    # Try TiffSlide as fallback
+                    try:
+                        import tiffslide
+                        with tiffslide.TiffSlide(self.args.slidepath) as slide:
+                            mpp_str = slide.properties.get('tiffslide.mpp-x')
+                            if mpp_str is None:
+                                mpp = 0.25  # Default MPP for 40x (10/40 = 0.25)
+                                print("Warning: MPP not found in tiffslide properties, using default 0.25")
+                            else:
+                                mpp = float(mpp_str)
+                            reference_mpp_1x = 10
+                            self.args.magnification = reference_mpp_1x / mpp
+                        self.read_image_method = 'tiffslide'
+                    except Exception:
+                        # Last resort, use PIL
+                        self.read_image_method = 'PIL'
+                        if not hasattr(self.args, 'magnification') or self.args.magnification is None:
+                            self.args.magnification = 40  # Default
+            except Exception as e:
+                print(f"Error determining file type: {str(e)}")
+                # Fallback to default
+                self.read_image_method = 'PIL'
+                if not hasattr(self.args, 'magnification') or self.args.magnification is None:
+                    self.args.magnification = 40
         
         print(f"Using read method: {self.read_image_method} for file: {self.args.slidepath}")
         print(f"Magnification: {self.args.magnification}x")
