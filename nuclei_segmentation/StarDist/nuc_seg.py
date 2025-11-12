@@ -442,29 +442,50 @@ class SlideSegmentation():
     def read_data(self):
         print("Reading data ...", datetime.now().strftime("%H:%M:%S"))
 
-        try:
-            self.slide = tiffslide.TiffSlide(self.args.slidepath)
-            mpp_str = self.slide.properties.get('tiffslide.mpp-x')
-            if mpp_str is None:
-                mpp = 0.25  # Default MPP for 40x (10/40 = 0.25)
-                print("Warning: MPP not found in tiffslide properties, using default 0.25")
-            else:
-                mpp = float(mpp_str)
-            print("Successfully read file using TiffSlide")
-        except Exception as e:
-            print(f"TiffSlide failed: {str(e)}")
-            
-            # For other formats, use appropriate wrappers
-            file_extension = os.path.splitext(self.args.slidepath)[1].lower()[1:]
-            if file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
-                self.slide = SimpleImageWrapper(self.args.slidepath)
-                mpp = 0.25  # Default value
-            elif file_extension in ['dcm']:
-                self.slide = DicomImageWrapper(self.args.slidepath)
-                mpp = 0.25  # Default value
-            else:
-                self.slide = TiffFileWrapper(self.args.slidepath)
-                mpp = 0.25  # Default value
+        # Check if target_mpp is set by frontend - if so, use it directly
+        if hasattr(self.args, 'target_mpp') and self.args.target_mpp is not None:
+            mpp = self.args.target_mpp
+            print(f"Using frontend-provided target_mpp: {mpp}")
+            # Still need to initialize slide object for reading regions
+            try:
+                self.slide = tiffslide.TiffSlide(self.args.slidepath)
+                print("Successfully initialized TiffSlide for reading regions")
+            except Exception as e:
+                print(f"TiffSlide failed: {str(e)}")
+                # For other formats, use appropriate wrappers
+                file_extension = os.path.splitext(self.args.slidepath)[1].lower()[1:]
+                if file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
+                    self.slide = SimpleImageWrapper(self.args.slidepath)
+                elif file_extension in ['dcm']:
+                    self.slide = DicomImageWrapper(self.args.slidepath)
+                else:
+                    self.slide = TiffFileWrapper(self.args.slidepath)
+        else:
+            # Try to read MPP from file
+            try:
+                self.slide = tiffslide.TiffSlide(self.args.slidepath)
+                mpp_str = self.slide.properties.get('tiffslide.mpp-x')
+                if mpp_str is None:
+                    mpp = 0.25  # Default MPP for 40x (10/40 = 0.25)
+                    print("Warning: MPP not found in tiffslide properties, using default 0.25")
+                else:
+                    mpp = float(mpp_str)
+                    print(f"Read MPP from file: {mpp}")
+                print("Successfully read file using TiffSlide")
+            except Exception as e:
+                print(f"TiffSlide failed: {str(e)}")
+                
+                # For other formats, use appropriate wrappers
+                file_extension = os.path.splitext(self.args.slidepath)[1].lower()[1:]
+                if file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
+                    self.slide = SimpleImageWrapper(self.args.slidepath)
+                    mpp = 0.25  # Default value
+                elif file_extension in ['dcm']:
+                    self.slide = DicomImageWrapper(self.args.slidepath)
+                    mpp = 0.25  # Default value
+                else:
+                    self.slide = TiffFileWrapper(self.args.slidepath)
+                    mpp = 0.25  # Default value
         
         # Detect z-stack after slide is loaded
         self._detect_zstack()
@@ -1077,7 +1098,87 @@ class SlideSegmentation():
                 
                 # Record image reading start time
                 read_start_time = time.time()
-                img = self.slide.read_region((x_0, y_0), self.level, (w_col, h_row))
+                try:
+                    img = self.slide.read_region((x_0, y_0), self.level, (w_col, h_row))
+                except TypeError as e:
+                    # Handle uint16 data type that PIL cannot handle directly
+                    if "Cannot handle this data type" in str(e) or "u2" in str(e) or "uint16" in str(e).lower():
+                        # Use tiffslide's underlying tifffile to read region as numpy array directly
+                        # Keep uint16 format - StarDist's normalize function can handle it
+                        import tifffile
+                        import zarr as zarr_lib
+                        from scipy.ndimage import zoom
+                        
+                        # Access tiffslide's underlying tifffile object
+                        if hasattr(self.slide, 'ts_tifffile'):
+                            tif = self.slide.ts_tifffile
+                        else:
+                            tif = tifffile.TiffFile(self.args.slidepath)
+                        
+                        # Get the appropriate series and page for the level
+                        series = tif.series[0]  # Use first series
+                        
+                        # Calculate scale factor for the level based on level_dimensions
+                        level_0_dims = self.slide.level_dimensions[0]
+                        level_dims = self.slide.level_dimensions[self.level]
+                        scale_factor = level_0_dims[0] / level_dims[0]
+                        
+                        # Calculate actual coordinates in level 0 space
+                        actual_x = int(x_0 * scale_factor)
+                        actual_y = int(y_0 * scale_factor)
+                        actual_w = int(w_col * scale_factor)
+                        actual_h = int(h_row * scale_factor)
+                        
+                        # Get the page for the current level (tiffslide uses pages as levels)
+                        if self.level < len(series.pages):
+                            page = series.pages[self.level]
+                        else:
+                            page = series.pages[0]  # Fallback to first page
+                        
+                        # Read region using zarr for efficiency - keep original dtype (uint16)
+                        zarr_array = zarr_lib.open(page.aszarr(), mode='r')
+                        y2 = min(actual_y + actual_h, page.shape[0])
+                        x2 = min(actual_x + actual_w, page.shape[1])
+                        region_array = np.asarray(zarr_array[actual_y:y2, actual_x:x2])
+                        
+                        # Ensure RGB format (3 channels)
+                        if region_array.ndim == 2:
+                            # Grayscale - convert to RGB
+                            region_array = np.stack([region_array] * 3, axis=-1)
+                        elif region_array.shape[2] == 1:
+                            # Single channel - convert to RGB
+                            region_array = np.repeat(region_array, 3, axis=2)
+                        elif region_array.shape[2] >= 3:
+                            # Take first 3 channels
+                            region_array = region_array[:, :, :3]
+                        
+                        # Resize to requested size if level scaling was applied
+                        if scale_factor != 1.0:
+                            # Use scipy.ndimage.zoom for resizing, preserving dtype
+                            zoom_factors = (h_row / region_array.shape[0], w_col / region_array.shape[1], 1)
+                            region_array = zoom(region_array, zoom_factors, order=1, mode='reflect', prefilter=False)
+                            region_array = region_array.astype(region_array.dtype)  # Ensure correct dtype
+                        
+                        # Keep uint16 format - convert to PIL Image only for compatibility
+                        # The uint16 data will be preserved and used directly in processing
+                        # Create a special attribute to store the uint16 array
+                        if region_array.dtype == np.uint16:
+                            # Store uint16 array for direct use
+                            img = type('obj', (object,), {'_uint16_array': region_array})()
+                            # Also create a PIL Image for compatibility (simple downscale for display only)
+                            img_uint8 = (region_array / 256).astype(np.uint8)
+                            if region_array.ndim == 2:
+                                img._pil_image = Image.fromarray(img_uint8, mode='L').convert('RGB')
+                            else:
+                                img._pil_image = Image.fromarray(img_uint8)
+                        else:
+                            # Already uint8 or other supported type - use normal PIL Image
+                            if region_array.ndim == 2:
+                                img = Image.fromarray(region_array, mode='L').convert('RGB')
+                            else:
+                                img = Image.fromarray(region_array.astype(np.uint8))
+                    else:
+                        raise  # Re-raise if it's a different error
                 # Record image reading end time
                 read_end_time = time.time()
                 read_duration = read_end_time - read_start_time
@@ -1086,7 +1187,20 @@ class SlideSegmentation():
                 if self.args.magnification is not None:
                     st = time.time()
                     resize_factor = self.reference_magnification / self.args.magnification
-                    img = img.resize((int(np.round(w_col*resize_factor)), int(np.round(h_row*resize_factor))))
+                    # Handle resize for both PIL Image and uint16 array
+                    if hasattr(img, '_uint16_array'):
+                        # Resize uint16 array directly
+                        from scipy.ndimage import zoom
+                        target_h = int(np.round(h_row*resize_factor))
+                        target_w = int(np.round(w_col*resize_factor))
+                        zoom_factors = (target_h / img._uint16_array.shape[0], 
+                                       target_w / img._uint16_array.shape[1], 1)
+                        img._uint16_array = zoom(img._uint16_array, zoom_factors, order=1, 
+                                                mode='reflect', prefilter=False).astype(np.uint16)
+                        # Also resize PIL image for compatibility
+                        img._pil_image = img._pil_image.resize((target_w, target_h))
+                    else:
+                        img = img.resize((int(np.round(w_col*resize_factor)), int(np.round(h_row*resize_factor))))
                     et = time.time()
                     
                     x_0 = int(np.round(x_0*resize_factor)) 
@@ -1100,15 +1214,28 @@ class SlideSegmentation():
                     tile_size = self.tile_size*resize_factor
                     overlap = self.overlap*resize_factor
                     dim = (self.dim[0]*resize_factor, self.dim[1]*resize_factor)
-                    normalize_template = np.array(Image.fromarray(self.normalize_template).resize(img.size))
+                    if hasattr(img, '_pil_image'):
+                        normalize_template = np.array(Image.fromarray(self.normalize_template).resize(img._pil_image.size))
+                    else:
+                        normalize_template = np.array(Image.fromarray(self.normalize_template).resize(img.size))
 
-                img_np = np.array(img)
-                if len(img_np.shape) == 3:
-                    #RGB
-                    img_np = img_np[:,:,:3]
+                # Check if this is a uint16 array (bypassing PIL Image)
+                if hasattr(img, '_uint16_array'):
+                    # Use the uint16 array directly - preserve full dynamic range
+                    img_np = img._uint16_array
+                    # Normalize uint16 to 0-1 range for StarDist (it expects normalized input)
+                    # StarDist's normalize function can handle this, but we'll ensure it's in the right range
+                    if img_np.dtype == np.uint16:
+                        img_np = img_np.astype(np.float32) / 65535.0
                 else:
-                    #greyscale
-                    img_np = img_np[:, :, np.newaxis]
+                    # Normal PIL Image path
+                    img_np = np.array(img)
+                    if len(img_np.shape) == 3:
+                        #RGB
+                        img_np = img_np[:,:,:3]
+                    else:
+                        #greyscale
+                        img_np = img_np[:, :, np.newaxis]
                 
                 if self.wsi_mask is not None:
                     help_with_norm = True

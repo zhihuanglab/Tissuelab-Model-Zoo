@@ -66,6 +66,7 @@ class NucleiPatchDataset(Dataset):
         self._detect_zstack()
         
         # Get magnification from MPP
+        # Note: target_mpp is not available in NucleiPatchDataset, so we use file MPP or provided magnification
         if read_image_method == 'openslide':
             import openslide
             with openslide.OpenSlide(slide_path) as slide:
@@ -240,11 +241,75 @@ class NucleiPatchDataset(Dataset):
                     else:
                         slide = TiffFileWrapper(self.slide_path)
 
-                patch = slide.read_region(
-                    location=(x1, y1),
-                    level=0,
-                    size=(self.extraction_size, self.extraction_size)
-                )
+                try:
+                    patch = slide.read_region(
+                        location=(x1, y1),
+                        level=0,
+                        size=(self.extraction_size, self.extraction_size)
+                    )
+                except TypeError as e:
+                    # Handle uint16 data type that PIL cannot handle directly
+                    if "Cannot handle this data type" in str(e) or "u2" in str(e) or "uint16" in str(e).lower():
+                        # Use tiffslide's underlying tifffile to read region as array
+                        import tifffile
+                        import zarr as zarr_lib
+                        
+                        # Access tiffslide's underlying tifffile object
+                        if hasattr(slide, 'ts_tifffile'):
+                            tif = slide.ts_tifffile
+                        else:
+                            tif = tifffile.TiffFile(self.slide_path)
+                        
+                        # Get the appropriate series and page for level 0
+                        series = tif.series[0]  # Use first series
+                        page = series.pages[0]  # Use first page for level 0
+                        
+                        # Read region using zarr for efficiency
+                        zarr_array = zarr_lib.open(page.aszarr(), mode='r')
+                        y2 = min(y1 + self.extraction_size, page.shape[0])
+                        x2 = min(x1 + self.extraction_size, page.shape[1])
+                        region_array = np.asarray(zarr_array[y1:y2, x1:x2])
+                        
+                        # Convert uint16 to uint8 if needed
+                        if region_array.dtype == np.uint16:
+                            # Use percentile-based normalization to preserve contrast
+                            # This avoids issues with extreme values and preserves image quality
+                            if region_array.ndim == 3:
+                                # For RGB images, normalize each channel separately
+                                normalized = np.zeros_like(region_array, dtype=np.uint8)
+                                for c in range(region_array.shape[2]):
+                                    channel = region_array[:, :, c]
+                                    # Use 0.5-99.5 percentile to avoid extreme outliers
+                                    p_low = np.percentile(channel, 0.5)
+                                    p_high = np.percentile(channel, 99.5)
+                                    if p_high > p_low:
+                                        # Normalize to 0-255 range
+                                        channel_norm = np.clip((channel - p_low) / (p_high - p_low) * 255.0, 0, 255)
+                                        normalized[:, :, c] = channel_norm.astype(np.uint8)
+                                    else:
+                                        # Fallback to simple scaling if no variation
+                                        normalized[:, :, c] = (channel / 65535.0 * 255.0).astype(np.uint8)
+                                region_array = normalized
+                            else:
+                                # For grayscale images
+                                p_low = np.percentile(region_array, 0.5)
+                                p_high = np.percentile(region_array, 99.5)
+                                if p_high > p_low:
+                                    # Normalize to 0-255 range
+                                    region_array = np.clip((region_array - p_low) / (p_high - p_low) * 255.0, 0, 255).astype(np.uint8)
+                                else:
+                                    # Fallback to simple scaling if no variation
+                                    region_array = (region_array / 65535.0 * 255.0).astype(np.uint8)
+                        
+                        # Convert to PIL Image
+                        if region_array.ndim == 2:
+                            patch = Image.fromarray(region_array, mode='L').convert('RGB')
+                        elif len(region_array.shape) >= 3 and region_array.shape[2] >= 3:
+                            patch = Image.fromarray(region_array[:, :, :3].astype(np.uint8))
+                        else:
+                            patch = Image.fromarray(region_array).convert('RGB')
+                    else:
+                        raise  # Re-raise if it's a different error
             finally:
                 # Close slide to prevent resource leak
                 if slide is not None and hasattr(slide, 'close'):
@@ -507,38 +572,58 @@ class NucleiEmbedding:
         
         print("Getting slide magnification...")
         
-        # Determine file type by extension
-        file_extension = os.path.splitext(self.args.slidepath)[1].lower()[1:]
-        
-        # Handle different file types
-        try:
+        # Check if target_mpp is set by frontend - if so, use it directly
+        if hasattr(self.args, 'target_mpp') and self.args.target_mpp is not None:
+            mpp = self.args.target_mpp
+            print(f"Using frontend-provided target_mpp: {mpp}")
+            reference_mpp_1x = 10  # objective magnification
+            self.args.magnification = reference_mpp_1x / mpp
+            # Determine read_image_method by extension
+            file_extension = os.path.splitext(self.args.slidepath)[1].lower()[1:]
             if file_extension in ['svs', 'ndpi', 'vms', 'vmu', 'scn', 'mrxs', 'tif', 'tiff', 'bif']:
                 try:
                     import openslide
-                    with openslide.OpenSlide(self.args.slidepath) as slide:
-                        mpp_str = slide.properties.get('openslide.mpp-x')
-                        if mpp_str is None:
-                            mpp = 0.25  # Default MPP for 40x (10/40 = 0.25)
-                            print("Warning: MPP not found in openslide properties, using default 0.25")
-                        else:
-                            mpp = float(mpp_str)
-                        reference_mpp_1x = 10  # objective magnification
-                        self.args.magnification = reference_mpp_1x / mpp
-                        print("openslide success")
                     self.read_image_method = 'openslide'
-                except (ImportError, Exception) as e:
-                    print(f"OpenSlide failed: {str(e)}")
-                    import tiffslide
-                    with tiffslide.TiffSlide(self.args.slidepath) as slide:
-                        mpp_str = slide.properties.get('tiffslide.mpp-x')
-                        if mpp_str is None:
-                            mpp = 0.25  # Default MPP for 40x (10/40 = 0.25)
-                            print("Warning: MPP not found in tiffslide properties, using default 0.25")
-                        else:
-                            mpp = float(mpp_str)
-                        reference_mpp_1x = 10  # objective magnification
-                        self.args.magnification = reference_mpp_1x / mpp
+                except ImportError:
                     self.read_image_method = 'tiffslide'
+            else:
+                self.read_image_method = 'PIL'
+        else:
+            # Try to read MPP from file
+            # Determine file type by extension
+            file_extension = os.path.splitext(self.args.slidepath)[1].lower()[1:]
+            
+            # Handle different file types
+            try:
+                if file_extension in ['svs', 'ndpi', 'vms', 'vmu', 'scn', 'mrxs', 'tif', 'tiff', 'bif']:
+                    try:
+                        import openslide
+                        with openslide.OpenSlide(self.args.slidepath) as slide:
+                            mpp_str = slide.properties.get('openslide.mpp-x')
+                            if mpp_str is None:
+                                mpp = 0.25  # Default MPP for 40x (10/40 = 0.25)
+                                print("Warning: MPP not found in openslide properties, using default 0.25")
+                            else:
+                                mpp = float(mpp_str)
+                                print(f"Read MPP from file: {mpp}")
+                            reference_mpp_1x = 10  # objective magnification
+                            self.args.magnification = reference_mpp_1x / mpp
+                            print("openslide success")
+                        self.read_image_method = 'openslide'
+                    except (ImportError, Exception) as e:
+                        print(f"OpenSlide failed: {str(e)}")
+                        import tiffslide
+                        with tiffslide.TiffSlide(self.args.slidepath) as slide:
+                            mpp_str = slide.properties.get('tiffslide.mpp-x')
+                            if mpp_str is None:
+                                mpp = 0.25  # Default MPP for 40x (10/40 = 0.25)
+                                print("Warning: MPP not found in tiffslide properties, using default 0.25")
+                            else:
+                                mpp = float(mpp_str)
+                                print(f"Read MPP from file: {mpp}")
+                            reference_mpp_1x = 10  # objective magnification
+                            self.args.magnification = reference_mpp_1x / mpp
+                        self.read_image_method = 'tiffslide'
             elif file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
                 self.read_image_method = 'PIL'
                 # Use default magnification if provided in args
