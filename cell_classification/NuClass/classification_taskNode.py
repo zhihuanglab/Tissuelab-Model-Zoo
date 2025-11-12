@@ -201,7 +201,7 @@ def generate_distinct_colors(nuclei_classes: list[str]) -> list[str]:
     for i, nuclei_class in enumerate(nuclei_classes):
         # Use gray color for "other" and "negative control"
         if nuclei_class.lower() == "other" or nuclei_class.lower() == "negative control":
-            colors.append("#F3F4F5")
+            colors.append("#aaaaaa")
             continue
         golden_ratio = 0.618033988749895
         hue = (i * golden_ratio) % 1
@@ -371,9 +371,9 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                                 if old_idx < len(class_colors):
                                     new_class_colors.append(class_colors[old_idx])
                                 else:
-                                    new_class_colors.append("#F3F4F5")
+                                    new_class_colors.append("#aaaaaa")
                             else:
-                                new_class_colors.append("#F3F4F5")
+                                new_class_colors.append("#aaaaaa")
                         class_colors = new_class_colors
                         
                         # Extract cell indices from the cell_ID column
@@ -505,7 +505,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         if cn in class_colors_map:
             class_colors.append(class_colors_map[cn])
         else:
-            class_colors.append("#F3F4F5")
+            class_colors.append("#aaaaaa")
 
     # Extract cell indices from the cell_ID column (sequential annotation structure)
     cell_indices = annotations['cell_ID'].astype(int).values

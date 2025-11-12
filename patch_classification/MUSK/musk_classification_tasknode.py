@@ -119,16 +119,13 @@ def _generate_text_description(tissue_classes: list[str]) -> list[np.ndarray]:
 def generate_distinct_colors(tissue_classes: list[str]) -> list[str]:
     # generate distinct colors for each tissue_class
     # default for Negative control => uniform light gray
-    NEGATIVE_CONTROL_COLOR = "#F3F4F5"
+    NEGATIVE_CONTROL_COLOR = "#aaaaaa"
     colors = []
     num_classes = len(tissue_classes)
     for i, tissue_class in enumerate(tissue_classes):
         name_lower = str(tissue_class).lower()
         if name_lower == "negative control":
             colors.append(NEGATIVE_CONTROL_COLOR)
-            continue
-        if name_lower == "other":
-            colors.append("#F3F4F5")
             continue
         golden_ratio = 0.618033988749895
         hue = (i * golden_ratio) % 1
@@ -306,7 +303,15 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         cell_indices = annotations['patch_ID'].astype(int).values
                         X_update = cell_embeddings[cell_indices]
                         y_update = pd.Categorical(annotations['tissue_class'], categories=class_names).codes
-                        
+
+                        # Filter out annotations that cannot be mapped to existing classes
+                        if np.any(y_update < 0):
+                            invalid_mask = y_update < 0
+                            num_invalid = np.sum(invalid_mask)
+                            print(f"Warning: Found {num_invalid} annotations with unknown classes; removing them from incremental update")
+                            X_update = X_update[~invalid_mask]
+                            y_update = y_update[~invalid_mask]
+
                         # Combine new and previous training data if available
                         if prev_embeddings is not None and prev_labels is not None:
                             X_train = np.vstack([prev_embeddings, X_update])
@@ -315,7 +320,10 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_train = X_update
                             y_train = y_update
 
-                        clf.fit(X_train, y_train)
+                        # Continue training from the existing booster for incremental learning
+                        existing_booster = clf.get_booster()
+                        clf.fit(X_train, y_train, xgb_model=existing_booster)
+                        print("Classifier updated with warm start (incremental training)")
                         
                         # Save updated classifier with new training data
                         train_data = {
@@ -388,9 +396,9 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         else:
             # Default colors when not provided by user annotations
             if str(cn).lower() == "negative control":
-                class_colors.append("#F3F4F5")
+                class_colors.append("#aaaaaa")
             else:
-                class_colors.append("#F3F4F5")
+                class_colors.append("#aaaaaa")
 
     cell_indices = annotations['patch_ID'].astype(int).values
     X_train = cell_embeddings[cell_indices]
