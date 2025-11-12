@@ -565,7 +565,6 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         
         # Force garbage collection every 10 batches to prevent memory accumulation
         if (i // batch_size) % 10 == 0:
-            import gc
             gc.collect()
     
     print(f"Completed prediction for {n_cells} cells")
@@ -661,7 +660,7 @@ def run_classification(args) -> Dict[str, Any]:
             prediction_probs = None # For zero-shot, raw similarity scores might be more informative
             
             # Clear class_embeddings_arr immediately after use to free memory
-            del class_embeddings_arr
+            class_embeddings_arr = None
             if device.startswith('cuda'):
                 torch.cuda.empty_cache()
             
@@ -894,7 +893,6 @@ def execute_node():
             # Clean up zarr file handle
             if zf is not None:
                 del zf
-                import gc
                 gc.collect()
 
 
