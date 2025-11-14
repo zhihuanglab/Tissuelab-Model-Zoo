@@ -27,13 +27,33 @@ For 250K cells, it takes 10 mins to embed all cells with CUDA (NVIDIA 4060). Wit
 """
 
 class NucleiPatchDataset(Dataset):
-    def __init__(self, slide_path, read_image_method=None, centroids=None, patch_size=224, magnification=40, processor=None, z_layer=None):
+    def __init__(self, slide_path, read_image_method=None, centroids=None, contours=None, patch_size=224, magnification=40, processor=None, z_layer=None, padding_ratio=0.1):
 
         self.slide_path = slide_path
         self.centroids = centroids
+        self.contours = contours  # Contours for bounding box extraction
         self.patch_size = patch_size
         self.processor = processor
         self.z_layer = z_layer  # Specific Z layer for segmentation, None means use all layers for embedding
+        self.padding_ratio = padding_ratio  # Padding as fraction of bounding box size (e.g., 0.2 = 20%)
+        
+        # Pre-compute bounding boxes from contours if available (very efficient - just numpy operations)
+        self.use_bounding_boxes = (contours is not None and len(contours) == len(centroids))
+        if self.use_bounding_boxes:
+            print(f"Using contour-based bounding boxes for patch extraction (padding: {padding_ratio*100}%)")
+            self._compute_bounding_boxes()
+        else:
+            print("Using centroid-based fixed-size patch extraction (contours not available)")
+        
+        # DEBUG: Save patches (enabled by default for final check, will disable before PR)
+        self.debug_save_patches = True  # Set to False to disable debug patch saving
+        self.debug_output_dir = None
+        self.debug_patch_counter = 0
+        if self.debug_save_patches:
+            slide_basename = os.path.splitext(os.path.basename(slide_path))[0]
+            self.debug_output_dir = os.path.join(os.path.dirname(slide_path), f"debug_patches_{slide_basename}")
+            os.makedirs(self.debug_output_dir, exist_ok=True)
+            print(f"[DEBUG] Patch saving enabled. Output directory: {self.debug_output_dir}")
         
         # Detect file type by extension if read_image_method is not specified
         if read_image_method is None:
@@ -65,28 +85,49 @@ class NucleiPatchDataset(Dataset):
         self.num_z_layers = 1
         self._detect_zstack()
         
-        # Get magnification from MPP
+        # Get magnification and MPP from slide
+        self.mpp = None
         if read_image_method == 'openslide':
             import openslide
             with openslide.OpenSlide(slide_path) as slide:
-                mpp = float(slide.properties['openslide.mpp-x'])
+                self.mpp = float(slide.properties['openslide.mpp-x'])
                 reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / mpp
+                self.magnification = reference_mpp_1x / self.mpp
         elif read_image_method == 'tiffslide':
             import tiffslide
             with tiffslide.TiffSlide(slide_path) as slide:
-                mpp = float(slide.properties['tiffslide.mpp-x'])
+                self.mpp = float(slide.properties['tiffslide.mpp-x'])
                 reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / mpp
+                self.magnification = reference_mpp_1x / self.mpp
         else:
             # Default to provided magnification for PIL and numpy
             self.magnification = magnification
+            # Estimate MPP from magnification (if not provided)
+            if magnification is not None:
+                self.mpp = 10.0 / magnification
+            else:
+                self.mpp = 0.25  # Default 40x equivalent
         
-        # Calculate scale factor based on target magnification (40x)
-        self.scale_factor = 40 / self.magnification
-        print("Magnification:", self.magnification)
-        print("Scale factor:", self.scale_factor)
-        self.extraction_size = int(self.patch_size * self.scale_factor)
+        # If not using bounding boxes, calculate extraction_size for fixed-size patches
+        if not self.use_bounding_boxes:
+            # Extract a fixed physical size (e.g., 10-15 microns) regardless of magnification
+            # This ensures we get a consistent cell-sized patch, not a huge tissue region
+            target_physical_size_microns = 12.0  # ~12 microns - good for most nuclei with some context
+            
+            # Calculate extraction_size in pixels based on physical size
+            if self.mpp is not None:
+                self.extraction_size = int(target_physical_size_microns / self.mpp)
+                # Ensure minimum size for model input (will upsample if needed)
+                self.extraction_size = max(self.extraction_size, patch_size // 2)
+                print(f"Magnification: {self.magnification}x, MPP: {self.mpp:.4f}")
+                print(f"Target physical size: {target_physical_size_microns} microns")
+                print(f"Extraction size: {self.extraction_size} pixels (physical: {self.extraction_size * self.mpp:.2f} microns)")
+            else:
+                # Fallback: use conservative scale factor
+                self.scale_factor = 1.5  # Much smaller than before (was 40/magnification)
+                self.extraction_size = int(self.patch_size * self.scale_factor)
+                print(f"Magnification: {self.magnification}x (MPP unknown, using fallback)")
+                print(f"Scale factor: {self.scale_factor}, Extraction size: {self.extraction_size} pixels")
 
     def _detect_zstack(self):
         """Detect if the image is a z-stack (multi-layer) image"""
@@ -164,22 +205,135 @@ class NucleiPatchDataset(Dataset):
     def __len__(self):
         return len(self.centroids)
 
+    def _compute_bounding_boxes(self):
+        """Pre-compute bounding boxes from contours - very efficient numpy operations
+        
+        Contours shape: (n_nuclei, n_points, 2) where each contour is (x, y) points
+        This is O(n) per nucleus - just min/max operations, very fast!
+        """
+        import numpy as np
+        
+        self.bounding_boxes = []
+        for i in range(len(self.centroids)):
+            try:
+                # Contours are already numpy arrays with shape (n_points, 2)
+                contour_points = self.contours[i]
+                
+                # Handle different contour formats
+                if isinstance(contour_points, np.ndarray):
+                    if contour_points.ndim == 2 and contour_points.shape[1] == 2:
+                        # Standard format: (n_points, 2)
+                        min_x, min_y = contour_points.min(axis=0)
+                        max_x, max_y = contour_points.max(axis=0)
+                    elif contour_points.ndim == 1 and len(contour_points) >= 2:
+                        # Single point (shouldn't happen but handle it)
+                        min_x = max_x = contour_points[0]
+                        min_y = max_y = contour_points[1]
+                    else:
+                        raise ValueError(f"Unexpected contour shape: {contour_points.shape}")
+                else:
+                    # Convert to numpy if needed
+                    contour_points = np.array(contour_points)
+                    if contour_points.ndim == 2 and contour_points.shape[1] == 2:
+                        min_x, min_y = contour_points.min(axis=0)
+                        max_x, max_y = contour_points.max(axis=0)
+                    else:
+                        raise ValueError(f"Unexpected contour format: {type(contour_points)}")
+                
+                # Calculate bounding box dimensions
+                width = max_x - min_x
+                height = max_y - min_y
+                
+                # Handle edge case: zero-width or zero-height contours
+                if width <= 0 or height <= 0:
+                    # Fallback to small fixed size
+                    width = max(1, width)
+                    height = max(1, height)
+                
+                # Add padding (adaptive based on nucleus size)
+                # For small nuclei, use fixed pixel padding instead of percentage
+                if width < 30 or height < 30:
+                    # Small nuclei: use 30% padding, minimum 5px
+                    pad_x = max(5, int(width * 0.3))
+                    pad_y = max(5, int(height * 0.3))
+                else:
+                    # Larger nuclei: use percentage-based padding (default 10%)
+                    pad_x = max(1, int(width * self.padding_ratio))
+                    pad_y = max(1, int(height * self.padding_ratio))
+                
+                # Don't enforce a large minimum size - let small nuclei stay small
+                # The model will resize to 224x224 anyway, so we don't need to upsample here
+                # Only ensure we have at least a few pixels for very tiny nuclei
+                min_size = 30  # Very small minimum - just enough to avoid single-pixel issues
+                
+                # Only enforce minimum for extremely tiny nuclei (< 10px)
+                if width < 10:
+                    min_width = min_size
+                    if width + 2 * pad_x < min_width:
+                        pad_x = (min_width - width) // 2
+                if height < 10:
+                    min_height = min_size
+                    if height + 2 * pad_y < min_height:
+                        pad_y = (min_height - height) // 2
+                
+                # Calculate final dimensions after all padding adjustments
+                final_width = width + 2 * pad_x
+                final_height = height + 2 * pad_y
+                
+                # Calculate top-left corner with boundary checking
+                x1 = max(0, int(min_x - pad_x))
+                y1 = max(0, int(min_y - pad_y))
+                
+                self.bounding_boxes.append((x1, y1, final_width, final_height))
+                
+                # Debug: Log first few bounding boxes to verify sizes
+                if i < 5:
+                    print(f"[DEBUG] Nucleus {i}: contour bbox=({width}x{height}), padded=({final_width}x{final_height}), padding=({pad_x}, {pad_y})")
+                
+            except Exception as e:
+                # Fallback to centroid-based extraction if contour processing fails
+                x, y = self.centroids[i]
+                if hasattr(self, 'extraction_size'):
+                    size = self.extraction_size
+                else:
+                    size = self.patch_size
+                self.bounding_boxes.append((x - size // 2, y - size // 2, size, size))
+                if i < 5:  # Only log first few errors
+                    print(f"Warning: Failed to compute bounding box for nucleus {i}: {e}, using centroid-based extraction")
+        
+        # Debug: Print statistics about bounding box sizes
+        if len(self.bounding_boxes) > 0:
+            widths = [bb[2] for bb in self.bounding_boxes]
+            heights = [bb[3] for bb in self.bounding_boxes]
+            print(f"[DEBUG] Bounding box stats: width={min(widths)}-{max(widths)}px (avg={np.mean(widths):.1f}), height={min(heights)}-{max(heights)}px (avg={np.mean(heights):.1f})")
+        
+        print(f"Computed {len(self.bounding_boxes)} bounding boxes from contours")
+    
     def __getitem__(self, idx):
-        x, y = self.centroids[idx]
-        x1 = max(0, x - self.extraction_size // 2)
-        y1 = max(0, y - self.extraction_size // 2)
+        if self.use_bounding_boxes:
+            # Use pre-computed bounding box
+            x1, y1, width, height = self.bounding_boxes[idx]
+            x, y = self.centroids[idx]  # Still need centroid for debug saving
+        else:
+            # Fallback to centroid-based extraction
+            x, y = self.centroids[idx]
+            x1 = max(0, x - self.extraction_size // 2)
+            y1 = max(0, y - self.extraction_size // 2)
+            width = height = self.extraction_size
         
         try:
             # For z-stack images, extract patches from all layers (or specific layer)
             if self.is_zstack:
-                return self._extract_zstack_patches(x1, y1, idx)
+                result = self._extract_zstack_patches(x1, y1, width, height, idx)
             else:
-                return self._extract_single_patch(x1, y1, idx, z_layer=0)
+                result = self._extract_single_patch(x1, y1, width, height, idx, x, y, z_layer=0)
+            
+            return result
         except Exception as e:
             print(f"Error processing centroid {self.centroids[idx]}: {str(e)}")
             return None
 
-    def _extract_single_patch(self, x1, y1, idx, z_layer=0):
+    def _extract_single_patch(self, x1, y1, width, height, idx, x, y, z_layer=0):
         """Extract a single patch from one z-layer"""
         from PIL import Image  # Import at the beginning for all branches
         
@@ -187,7 +341,7 @@ class NucleiPatchDataset(Dataset):
         if self.is_zstack:
             with Image.open(self.slide_path) as img:
                 img.seek(z_layer)
-                patch = img.crop((x1, y1, x1 + self.extraction_size, y1 + self.extraction_size))
+                patch = img.crop((x1, y1, x1 + width, y1 + height))
                 patch = patch.copy()  # Make a copy since we're closing the file
         else:
             # Single layer: use original logic with slide wrappers
@@ -215,7 +369,7 @@ class NucleiPatchDataset(Dataset):
                 patch = slide.read_region(
                     location=(x1, y1),
                     level=0,
-                    size=(self.extraction_size, self.extraction_size)
+                    size=(width, height)
                 )
             finally:
                 # Close slide to prevent resource leak
@@ -225,22 +379,38 @@ class NucleiPatchDataset(Dataset):
             if patch.mode != 'RGB':
                 patch = patch.convert('RGB')
                 
-            if self.extraction_size != self.patch_size:
+            # Resize to model input size (always square 224x224)
+            if patch.size[0] != self.patch_size or patch.size[1] != self.patch_size:
                 patch = patch.resize((self.patch_size, self.patch_size), Image.Resampling.LANCZOS)
-                
+            
             # Preprocess the patch if processor is available
             if self.processor is not None:
-                patch = self.processor.image_processor(patch)['pixel_values']
+                processed_patch = self.processor.image_processor(patch)['pixel_values']
                 
-            return patch
+                # DEBUG: Save preprocessed patch (exactly as model sees it)
+                # Calculate centroid position in resized patch
+                centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
+                centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
+                self._debug_save_patch_processed(processed_patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
+                
+                return processed_patch
+            else:
+                # DEBUG: Save raw patch if no processor
+                centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
+                centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
+                self._debug_save_patch(patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
+                
+                return patch
 
-    def _extract_zstack_patches(self, x1, y1, idx):
+    def _extract_zstack_patches(self, x1, y1, width, height, idx):
         """Extract patches from all z-layers for embedding fusion"""
         from PIL import Image
         
+        x, y = self.centroids[idx]
+        
         # If specific z_layer is set (for segmentation), only extract from that layer
         if self.z_layer is not None:
-            return self._extract_single_patch(x1, y1, idx, z_layer=self.z_layer)
+            return self._extract_single_patch(x1, y1, width, height, idx, x, y, z_layer=self.z_layer)
         
         # For embedding: extract from all layers
         patches = []
@@ -270,8 +440,8 @@ class NucleiPatchDataset(Dataset):
                                     page = first_series.pages[z]
                                     
                                     # Calculate bounds
-                                    y2 = min(y1 + self.extraction_size, page.shape[0])
-                                    x2 = min(x1 + self.extraction_size, page.shape[1])
+                                    y2 = min(y1 + height, page.shape[0])
+                                    x2 = min(x1 + width, page.shape[1])
                                     
                                     # Use aszarr() for efficient region reading
                                     # This avoids loading the entire 4GB+ page into memory
@@ -282,14 +452,14 @@ class NucleiPatchDataset(Dataset):
                                     
                                     # Check and pad undersized patches (boundary cells)
                                     actual_h, actual_w = patch_array.shape[:2]
-                                    if actual_h < self.extraction_size or actual_w < self.extraction_size:
+                                    if actual_h < height or actual_w < width:
                                         # Pad to expected size to prevent distortion
                                         if patch_array.ndim == 2:
                                             # Grayscale
-                                            padded = np.zeros((self.extraction_size, self.extraction_size), dtype=patch_array.dtype)
+                                            padded = np.zeros((height, width), dtype=patch_array.dtype)
                                         else:
                                             # RGB/RGBA
-                                            padded = np.zeros((self.extraction_size, self.extraction_size, patch_array.shape[2]), dtype=patch_array.dtype)
+                                            padded = np.zeros((height, width, patch_array.shape[2]), dtype=patch_array.dtype)
                                         padded[:actual_h, :actual_w] = patch_array
                                         patch_array = padded
                                     
@@ -303,7 +473,8 @@ class NucleiPatchDataset(Dataset):
                                     else:
                                         continue
                                     
-                                    if self.extraction_size != self.patch_size:
+                                    # Resize to model input size (always square 224x224)
+                                    if patch.size[0] != self.patch_size or patch.size[1] != self.patch_size:
                                         patch = patch.resize((self.patch_size, self.patch_size), Image.Resampling.LANCZOS)
                                     
                                     # Preprocess
@@ -312,8 +483,20 @@ class NucleiPatchDataset(Dataset):
                                         # pixel_values is a list with one item, extract it
                                         if isinstance(processed, list) and len(processed) > 0:
                                             processed = processed[0]
+                                        
+                                        # DEBUG: Save preprocessed patch (first layer only)
+                                        if z == 0:
+                                            centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
+                                            centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
+                                            self._debug_save_patch_processed(processed, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
+                                        
                                         patches.append(processed)
                                     else:
+                                        # DEBUG: Save raw patch if no processor (first layer only)
+                                        if z == 0:
+                                            centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
+                                            centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
+                                            self._debug_save_patch(patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
                                         patches.append(np.array(patch))
                                 except Exception as e:
                                     print(f"Error extracting Z-layer {z} for centroid {idx}: {str(e)}")
@@ -340,8 +523,8 @@ class NucleiPatchDataset(Dataset):
                                     page = series_obj.pages[0]
                                     
                                     # Calculate bounds
-                                    y2 = min(y1 + self.extraction_size, page.shape[0])
-                                    x2 = min(x1 + self.extraction_size, page.shape[1])
+                                    y2 = min(y1 + height, page.shape[0])
+                                    x2 = min(x1 + width, page.shape[1])
                                     
                                     # Read only the required region using zarr for efficiency
                                     # This avoids loading the entire page into memory
@@ -351,14 +534,14 @@ class NucleiPatchDataset(Dataset):
                                     
                                     # Check and pad undersized patches (boundary cells)
                                     actual_h, actual_w = patch_array.shape[:2]
-                                    if actual_h < self.extraction_size or actual_w < self.extraction_size:
+                                    if actual_h < height or actual_w < width:
                                         # Pad to expected size to prevent distortion
                                         if patch_array.ndim == 2:
                                             # Grayscale
-                                            padded = np.zeros((self.extraction_size, self.extraction_size), dtype=patch_array.dtype)
+                                            padded = np.zeros((height, width), dtype=patch_array.dtype)
                                         else:
                                             # RGB/RGBA
-                                            padded = np.zeros((self.extraction_size, self.extraction_size, patch_array.shape[2]), dtype=patch_array.dtype)
+                                            padded = np.zeros((height, width, patch_array.shape[2]), dtype=patch_array.dtype)
                                         padded[:actual_h, :actual_w] = patch_array
                                         patch_array = padded
                                     
@@ -370,7 +553,8 @@ class NucleiPatchDataset(Dataset):
                                     else:
                                         continue
                                     
-                                    if self.extraction_size != self.patch_size:
+                                    # Resize to model input size (always square 224x224)
+                                    if patch.size[0] != self.patch_size or patch.size[1] != self.patch_size:
                                         patch = patch.resize((self.patch_size, self.patch_size), Image.Resampling.LANCZOS)
                                     
                                     # Preprocess
@@ -379,8 +563,20 @@ class NucleiPatchDataset(Dataset):
                                         # pixel_values is a list with one item, extract it
                                         if isinstance(processed, list) and len(processed) > 0:
                                             processed = processed[0]
+                                        
+                                        # DEBUG: Save preprocessed patch (first layer only)
+                                        if z == 0:
+                                            centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
+                                            centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
+                                            self._debug_save_patch_processed(processed, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
+                                        
                                         patches.append(processed)
                                     else:
+                                        # DEBUG: Save raw patch if no processor (first layer only)
+                                        if z == 0:
+                                            centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
+                                            centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
+                                            self._debug_save_patch(patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
                                         patches.append(np.array(patch))
                                 except Exception as e:
                                     print(f"Error extracting series {z} for centroid {idx}: {str(e)}")
@@ -405,12 +601,13 @@ class NucleiPatchDataset(Dataset):
                 for z in range(self.num_z_layers):
                     try:
                         img.seek(z)
-                        patch = img.crop((x1, y1, x1 + self.extraction_size, y1 + self.extraction_size))
+                        patch = img.crop((x1, y1, x1 + width, y1 + height))
                         
                         if patch.mode != 'RGB':
                             patch = patch.convert('RGB')
                         
-                        if self.extraction_size != self.patch_size:
+                        # Resize to model input size (always square 224x224)
+                        if patch.size[0] != self.patch_size or patch.size[1] != self.patch_size:
                             patch = patch.resize((self.patch_size, self.patch_size), Image.Resampling.LANCZOS)
                         
                         # Preprocess the patch if processor is available
@@ -419,8 +616,20 @@ class NucleiPatchDataset(Dataset):
                             # pixel_values is a list with one item, extract it
                             if isinstance(processed, list) and len(processed) > 0:
                                 processed = processed[0]
+                            
+                            # DEBUG: Save preprocessed patch (first layer only)
+                            if z == 0:
+                                centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
+                                centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
+                                self._debug_save_patch_processed(processed, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
+                            
                             patches.append(processed)
                         else:
+                            # DEBUG: Save raw patch if no processor (first layer only)
+                            if z == 0:
+                                centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
+                                centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
+                                self._debug_save_patch(patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
                             patches.append(np.array(patch))
                     except Exception as e:
                         print(f"Error extracting z-layer {z} for centroid {idx}: {str(e)}")
@@ -444,6 +653,113 @@ class NucleiPatchDataset(Dataset):
             return patches
         else:
             return None
+    
+    def _debug_save_patch(self, patch_img, idx, centroid_x, centroid_y, orig_x, orig_y):
+        """DEBUG: Save patch image with centroid marked"""
+        if not self.debug_save_patches:
+            return
+        try:
+            from PIL import ImageDraw
+            
+            debug_patch = patch_img.copy()
+            draw = ImageDraw.Draw(debug_patch)
+            
+            # Red dot at centroid
+            dot_radius = 5
+            bbox = [centroid_x - dot_radius, centroid_y - dot_radius, 
+                   centroid_x + dot_radius, centroid_y + dot_radius]
+            draw.ellipse(bbox, fill='red', outline='yellow', width=2)
+            
+            # Yellow crosshair
+            crosshair_size = 10
+            draw.line([centroid_x - crosshair_size, centroid_y, centroid_x + crosshair_size, centroid_y], 
+                     fill='yellow', width=2)
+            draw.line([centroid_x, centroid_y - crosshair_size, centroid_x, centroid_y + crosshair_size], 
+                     fill='yellow', width=2)
+            
+            # Save
+            self.debug_patch_counter += 1
+            filename = f"patch_{self.debug_patch_counter:05d}_idx{idx}_centroid({orig_x},{orig_y})_in_patch({centroid_x},{centroid_y}).png"
+            filepath = os.path.join(self.debug_output_dir, filename)
+            debug_patch.save(filepath)
+            
+            if self.debug_patch_counter <= 5:
+                print(f"[DEBUG] Saved patch {self.debug_patch_counter}: {filename}")
+        except Exception as e:
+            print(f"[DEBUG] Failed to save patch {idx}: {str(e)}")
+    
+    def _debug_save_patch_processed(self, processed_patch, idx, centroid_x, centroid_y, orig_x, orig_y):
+        """DEBUG: Save preprocessed patch (exactly as model sees it) with centroid marked"""
+        if not self.debug_save_patches:
+            return
+        try:
+            from PIL import Image, ImageDraw
+            import numpy as np
+            
+            # Convert processed_patch to numpy array if needed
+            if not isinstance(processed_patch, np.ndarray):
+                processed_patch = np.array(processed_patch)
+            
+            # Handle different shapes: (C, H, W) or (H, W, C) or (1, C, H, W)
+            if processed_patch.ndim == 4:
+                processed_patch = processed_patch[0]  # Remove batch dimension
+            if processed_patch.ndim == 3 and processed_patch.shape[0] == 1:
+                processed_patch = processed_patch[0]  # Remove single channel batch
+            if processed_patch.ndim == 3 and processed_patch.shape[0] in [1, 3]:
+                # (C, H, W) -> (H, W, C)
+                processed_patch = np.transpose(processed_patch, (1, 2, 0))
+            
+            # Denormalize: PLIP typically normalizes to [0, 1] or uses ImageNet stats
+            # Try to detect normalization and denormalize
+            if processed_patch.max() <= 1.0:
+                # Likely normalized to [0, 1]
+                processed_patch = (processed_patch * 255).astype(np.uint8)
+            elif processed_patch.min() < 0:
+                # Likely standardized (mean/std normalization) - use ImageNet stats
+                mean = np.array([0.485, 0.456, 0.406])
+                std = np.array([0.229, 0.224, 0.225])
+                processed_patch = processed_patch * std + mean
+                processed_patch = np.clip(processed_patch, 0, 1)
+                processed_patch = (processed_patch * 255).astype(np.uint8)
+            else:
+                # Already in [0, 255] range
+                processed_patch = np.clip(processed_patch, 0, 255).astype(np.uint8)
+            
+            # Ensure 3 channels
+            if processed_patch.shape[2] == 1:
+                processed_patch = np.repeat(processed_patch, 3, axis=2)
+            elif processed_patch.shape[2] > 3:
+                processed_patch = processed_patch[:, :, :3]
+            
+            # Convert to PIL Image
+            debug_patch = Image.fromarray(processed_patch)
+            draw = ImageDraw.Draw(debug_patch)
+            
+            # Red dot at centroid
+            dot_radius = 5
+            bbox = [centroid_x - dot_radius, centroid_y - dot_radius, 
+                   centroid_x + dot_radius, centroid_y + dot_radius]
+            draw.ellipse(bbox, fill='red', outline='yellow', width=2)
+            
+            # Yellow crosshair
+            crosshair_size = 10
+            draw.line([centroid_x - crosshair_size, centroid_y, centroid_x + crosshair_size, centroid_y], 
+                     fill='yellow', width=2)
+            draw.line([centroid_x, centroid_y - crosshair_size, centroid_x, centroid_y + crosshair_size], 
+                     fill='yellow', width=2)
+            
+            # Save
+            self.debug_patch_counter += 1
+            filename = f"patch_{self.debug_patch_counter:05d}_idx{idx}_centroid({orig_x},{orig_y})_in_patch({centroid_x},{centroid_y})_PROCESSED.png"
+            filepath = os.path.join(self.debug_output_dir, filename)
+            debug_patch.save(filepath)
+            
+            if self.debug_patch_counter <= 5:
+                print(f"[DEBUG] Saved PROCESSED patch {self.debug_patch_counter}: {filename}")
+        except Exception as e:
+            print(f"[DEBUG] Failed to save processed patch {idx}: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
 def collate_patches(batch):
     """Custom collate function to handle None values and convert patches to a list.
@@ -473,7 +789,7 @@ def collate_patches(batch):
         return valid_items
 
 class NucleiEmbedding:
-    def __init__(self, args, centroids=None, progress_callback=None):
+    def __init__(self, args, centroids=None, contours=None, progress_callback=None):
         self.args = args
         self.progress_callback = progress_callback
         
@@ -542,6 +858,7 @@ class NucleiEmbedding:
         self.model_key = getattr(self.args, 'model_key', 'plip')
         self.patch_size = getattr(self.args, 'patch_size', 224)
         self.centroids = centroids
+        self.contours = contours  # Store contours for bounding box extraction (can be None)
         self.init_model()
 
     def init_model(self):
@@ -717,10 +1034,12 @@ class NucleiEmbedding:
             slide_path=self.args.slidepath,
             read_image_method=self.read_image_method,
             centroids=self.centroids,
+            contours=self.contours,  # Pass contours for bounding box extraction
             patch_size=self.patch_size,
             magnification=getattr(self, 'magnification', 40),
             processor=self.processor,
-            z_layer=z_layer  # Always None for embedding (use all layers for fusion)
+            z_layer=z_layer,  # Always None for embedding (use all layers for fusion)
+            padding_ratio=0.1  # 10% padding around bounding box (reduced for tighter patches)
         )
         
         # Check if dataset has z-stack
