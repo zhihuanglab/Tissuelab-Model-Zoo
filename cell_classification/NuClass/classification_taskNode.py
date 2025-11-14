@@ -69,6 +69,115 @@ progress_value = 0  # Global variable to store progress
 
 # --------------- utils functions ---------------
 
+def _int_color_to_hex(color_int: int) -> str:
+    """Convert integer RGB value to hex color string.
+    
+    Args:
+        color_int: Integer RGB value (0xRRGGBB format), -1 means not set
+        
+    Returns:
+        Hex color string like "#ff0000", "#000000" for 0 (black), "" for -1 (not set)
+    """
+    if color_int < 0:
+        # -1 or negative values mean not set, return empty string
+        return ""
+    
+    # Ensure value is within valid RGB range (0 to 16777215)
+    if color_int > 0xFFFFFF:
+        color_int = 0xFFFFFF
+    
+    # Convert to hex string and pad to 6 digits
+    hex_str = f"{color_int:06x}"
+    return f"#{hex_str}"
+
+def load_structured_nuclei_annotations(zf, annotation_path: str) -> pd.DataFrame:
+    """
+    Load structured array nuclei annotations and convert to DataFrame.
+    
+    Args:
+        zf: Zarr group object
+        annotation_path: Path to annotation dataset (e.g., 'user_annotation/nuclei_annotations')
+        
+    Returns:
+        DataFrame with columns: cell_ID, cell_class, cell_color
+        Returns None if no annotations found or error occurs
+    """
+    try:
+        # Check if annotation path exists (zarr supports direct path access)
+        if annotation_path not in zf:
+            return None
+        
+        # Get class_names from metadata
+        class_names = None
+        if 'user_annotation' in zf:
+            user_anno_group = zf['user_annotation']
+            if hasattr(user_anno_group, 'attrs') and 'class_names' in user_anno_group.attrs:
+                class_names = user_anno_group.attrs.get('class_names', [])
+        
+        if not class_names:
+            print(f"[load_structured_nuclei_annotations] Warning: No class_names found in metadata, cannot convert IDs to names")
+            return None
+        
+        # Read structured array (zarr supports direct path access)
+        annotations_array = zf[annotation_path][()]
+        
+        # Check if it's already a structured array or needs conversion
+        if isinstance(annotations_array, np.ndarray) and annotations_array.dtype.names:
+            # It's a structured array
+            cell_class_ids = annotations_array['cell_class']
+            cell_color_data = annotations_array['cell_color']
+        else:
+            # Try to decode as JSON (old format compatibility)
+            try:
+                if isinstance(annotations_array, bytes):
+                    ann_dict = json.loads(annotations_array.decode("utf-8"))
+                    return pd.DataFrame(ann_dict).T
+                else:
+                    return None
+            except:
+                return None
+        
+        # Filter valid annotations: cell_class >= 0 and cell_color >= 0
+        valid_mask = (cell_class_ids >= 0) & (cell_color_data >= 0)
+        if not np.any(valid_mask):
+            return None
+        
+        # Get valid indices and data
+        valid_indices = np.where(valid_mask)[0]
+        valid_class_ids = cell_class_ids[valid_indices]
+        valid_colors = cell_color_data[valid_indices]
+        
+        # Convert class IDs to names
+        valid_class_names = []
+        valid_indices_filtered = []
+        valid_colors_filtered = []
+        for idx, class_id, color_int in zip(valid_indices, valid_class_ids, valid_colors):
+            if 0 <= class_id < len(class_names):
+                valid_class_names.append(class_names[class_id])
+                valid_indices_filtered.append(idx)
+                valid_colors_filtered.append(color_int)
+            else:
+                # Invalid class ID, skip this annotation
+                continue
+        
+        # Convert colors from int to hex strings
+        valid_color_hex = [_int_color_to_hex(color_int) for color_int in valid_colors_filtered]
+        
+        # Create DataFrame
+        df = pd.DataFrame({
+            'cell_ID': valid_indices_filtered,
+            'cell_class': valid_class_names,
+            'cell_color': valid_color_hex
+        })
+        
+        return df
+        
+    except Exception as e:
+        print(f"[load_structured_nuclei_annotations] Error loading annotations: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 def print_h5_structure(file_path):
     """Print Zarr group structure"""
     def _visit(group, prefix=""):
@@ -602,15 +711,12 @@ def run_classification(args) -> Dict[str, Any]:
         annotations_data = None
         use_supervised = False
         if 'user_annotation' in zf and 'nuclei_annotations' in zf['user_annotation']:
-            raw_bytes = zf['user_annotation/nuclei_annotations'][()]
-            ann_dict = json.loads(raw_bytes.decode("utf-8"))
-            annotations_data = pd.DataFrame(ann_dict).T
-
-            # unique_classes = annotations_data["cell_class"].unique().tolist()
-            # if ("Negative control" in unique_classes) and (len(unique_classes) >= 2):
-            use_supervised = True
-            # else:
-            #     use_supervised = False
+            annotations_data = load_structured_nuclei_annotations(zf, 'user_annotation/nuclei_annotations')
+            if annotations_data is not None and not annotations_data.empty:
+                use_supervised = True
+            else:
+                annotations_data = None
+                use_supervised = False
         else:
             annotations_data = None
             use_supervised = False
