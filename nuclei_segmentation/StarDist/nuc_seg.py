@@ -81,7 +81,6 @@ class SlideSegmentation():
             print(f"Warning: Could not configure TensorFlow threading: {e}")
             
         self.args = args
-        self.reference_magnification = 20 # 20x for stardist
         self.tile_size = tile_size
         
         # Initialize z-stack related attributes
@@ -451,10 +450,21 @@ class SlideSegmentation():
         
         # Detect z-stack after slide is loaded
         self._detect_zstack()
+        # Store original MPP before any overrides (needed for resize calculation)
+        self.original_mpp = mpp
+        self.args.original_mpp = mpp  # Store in args for embedding to access
+        
+        # Handle target_mpp if provided
+        if hasattr(self.args, 'target_mpp') and self.args.target_mpp is not None:
+            self.mpp_resize_factor = self.original_mpp / self.args.target_mpp
+            mpp = self.args.target_mpp
+            self.args.magnification = None
+        else:
+            self.mpp_resize_factor = None
         
         # Add magnification attribute to self.args if not already set by CZI processing
         if not hasattr(self.args, 'magnification') or self.args.magnification is None:
-            reference_mpp_1x = 10  # Target magnification
+            reference_mpp_1x = 10  # MPP at 1x magnification
             self.args.magnification = reference_mpp_1x / mpp
             print("Magnification: ", self.args.magnification)
         
@@ -883,12 +893,35 @@ class SlideSegmentation():
                 img = self.slide.read_region((0, 0), 0, self.dim)
                 img_np = np.array(img)[:,:,:3]  # Ensure RGB format
                 
+                # Resize to achieve target MPP if provided
+                resize_factor = None
+                if hasattr(self, 'mpp_resize_factor') and self.mpp_resize_factor is not None:
+                    resize_factor = self.mpp_resize_factor
+                    new_width = int(np.round(img_np.shape[1] * resize_factor))
+                    new_height = int(np.round(img_np.shape[0] * resize_factor))
+                    img_pil = Image.fromarray(img_np)
+                    img_pil = img_pil.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                    img_np = np.array(img_pil)
+                
                 if self.progress_callback:
                     self.progress_callback(30)
                     
                 # Normalize image
                 if self.normalize_template is not None:
-                    normalize_template2 = self.normalize_template[:img_np.shape[0],:img_np.shape[1],:]
+                    # Tile/repeat template to match image dimensions instead of resizing
+                    # This preserves the original color distribution without distortion
+                    template_h, template_w = self.normalize_template.shape[:2]
+                    img_h, img_w = img_np.shape[:2]
+                    
+                    # Calculate how many times to tile the template
+                    n_repeats_h = int(np.ceil(img_h / template_h))
+                    n_repeats_w = int(np.ceil(img_w / template_w))
+                    
+                    # Tile the template to cover at least the image size
+                    template_tiled = np.tile(self.normalize_template, (n_repeats_h, n_repeats_w, 1))
+                    
+                    # Slice to exact image dimensions (no distortion, just cropping)
+                    normalize_template2 = template_tiled[:img_h, :img_w, :3]
                     joint_normalize = np.concatenate((img_np, normalize_template2), axis=1)
                     img_norm = normalize(joint_normalize)
                     img_norm = img_norm[:img_np.shape[0],:img_np.shape[1],:]
@@ -925,6 +958,11 @@ class SlideSegmentation():
                 # Ensure final_coord has dimensions (n, m, 2)
                 self.final_coord = np.swapaxes(self.final_coord, 1, 2)
                 self.prob_all = prob
+                
+                # Scale coordinates back to original image space if we resized
+                if resize_factor is not None:
+                    self.final_points = (self.final_points / resize_factor).astype(np.int32)
+                    self.final_coord = (self.final_coord / resize_factor).astype(np.int32)
                 
                 # Apply post-processing for simple images too
                 self.post_process_remove_duplicates_fixed(debug=False)
@@ -1066,9 +1104,10 @@ class SlideSegmentation():
                 read_duration = read_end_time - read_start_time
                 total_read_time += read_duration
                 
-                if self.args.magnification is not None:
-                    st = time.time()
-                    resize_factor = self.reference_magnification / self.args.magnification
+                # Resize to achieve target MPP if provided
+                resize_factor = None
+                if hasattr(self, 'mpp_resize_factor') and self.mpp_resize_factor is not None:
+                    resize_factor = self.mpp_resize_factor
                     img = img.resize((int(np.round(w_col*resize_factor)), int(np.round(h_row*resize_factor))))
                     et = time.time()
                     
@@ -1084,6 +1123,9 @@ class SlideSegmentation():
                     overlap = self.overlap*resize_factor
                     dim = (self.dim[0]*resize_factor, self.dim[1]*resize_factor)
                     normalize_template = np.array(Image.fromarray(self.normalize_template).resize(img.size))
+                else:
+                    et = time.time()
+                    normalize_template = self.normalize_template
 
                 img_np = np.array(img)
                 if len(img_np.shape) == 3:
@@ -1205,9 +1247,9 @@ class SlideSegmentation():
                 
                 self.prob_all = prob_all
                 
-                if self.args.magnification is not None:
-                    # Scale centroids back to Level 0 coordinates
-                    resize_factor = self.reference_magnification / self.args.magnification
+                # Scale centroids back to original image coordinates
+                if hasattr(self, 'mpp_resize_factor') and self.mpp_resize_factor is not None:
+                    resize_factor = self.mpp_resize_factor
                     self.final_points = (self.final_points/resize_factor).astype(np.int32)
                     self.final_coord = (self.final_coord/resize_factor).astype(np.int32)
                 
@@ -1570,15 +1612,11 @@ class SlideSegmentation():
         print(f"Overlap: {self.overlap}")
         print(f"Stride: {self.tile_size - self.overlap}")
         
-        # If magnification is adjusted
-        if hasattr(self.args, 'magnification') and self.args.magnification is not None:
-            resize_factor = self.reference_magnification / self.args.magnification
-            adjusted_tile_size = self.tile_size * resize_factor
-            adjusted_overlap = self.overlap * resize_factor
-            print(f"\nAdjusted (magnification={self.args.magnification}):")
-            print(f"Adjusted tile size: {adjusted_tile_size}")
-            print(f"Adjusted overlap: {adjusted_overlap}")
-            print(f"Resize factor: {resize_factor}")
+        # Show adjusted parameters if target_mpp is provided
+        if hasattr(self, 'mpp_resize_factor') and self.mpp_resize_factor is not None:
+            adjusted_tile_size = self.tile_size * self.mpp_resize_factor
+            adjusted_overlap = self.overlap * self.mpp_resize_factor
+            print(f"Adjusted tile size: {adjusted_tile_size:.0f}, Adjusted overlap: {adjusted_overlap:.0f}")
         
         print("="*60)
 
