@@ -792,6 +792,13 @@ class NucleiEmbedding:
     def __init__(self, args, centroids=None, contours=None, progress_callback=None):
         self.args = args
         self.progress_callback = progress_callback
+
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
+            self.device = torch.device("cuda:0")
+            print("Forcing embeddings to run on GPU 0")
+        else:
+            self.device = torch.device("cpu")
         
         print("Getting slide magnification...")
         
@@ -869,20 +876,20 @@ class NucleiEmbedding:
         
         self.processor = AutoProcessor.from_pretrained("vinid/plip", cache_dir=cache_dir, timeout=None)
         self.model = AutoModelForZeroShotImageClassification.from_pretrained("vinid/plip", cache_dir=cache_dir)
-        self.model = self.model.to("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = self.model.to(self.device)
 
         # Load trained checkpoint if available
         checkpoint_path = os.path.join(os.path.dirname(__file__), 'checkpoints', 'checkpoint_step_10000.pt')
         if os.path.exists(checkpoint_path):
             print(f"Loading trained checkpoint from {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location="cuda" if torch.cuda.is_available() else "cpu", weights_only=False)
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
             
             # Load model state
             self.model.load_state_dict(checkpoint['model_state_dict'])
             
             # Initialize and load image projection layer
             vision_hidden_size = self.model.vision_model.config.hidden_size
-            self.image_projection = torch.nn.Linear(vision_hidden_size, vision_hidden_size).to("cuda" if torch.cuda.is_available() else "cpu")
+            self.image_projection = torch.nn.Linear(vision_hidden_size, vision_hidden_size).to(self.device)
             self.image_projection.load_state_dict(checkpoint['image_projection_state_dict'])
             print("Successfully loaded checkpoint")
         else:
@@ -909,7 +916,7 @@ class NucleiEmbedding:
         Returns:
             Embeddings array of shape (batch_size, embedding_dim)
         """
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = self.device
         
         if is_zstack:
             # Z-stack case: processed_batch is list of [cell1_layers, cell2_layers, ...]
@@ -1093,7 +1100,7 @@ class NucleiEmbedding:
                     batch_embeddings = self.embed_batch(batch, is_zstack=True, num_z_layers=dataset.num_z_layers)
                 else:
                     # Single layer case: original logic
-                    processed_batch = torch.from_numpy(np.concatenate(batch, axis=0)).to("cuda" if torch.cuda.is_available() else "cpu")
+                    processed_batch = torch.from_numpy(np.concatenate(batch, axis=0)).to(self.device)
                     batch_embeddings = self.embed_batch(processed_batch, is_zstack=False)
                 
                 batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
