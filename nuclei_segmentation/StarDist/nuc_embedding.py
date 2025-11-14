@@ -46,7 +46,7 @@ class NucleiPatchDataset(Dataset):
             print("Using centroid-based fixed-size patch extraction (contours not available)")
         
         # DEBUG: Save patches (enabled by default for final check, will disable before PR)
-        self.debug_save_patches = True  # Set to False to disable debug patch saving
+        self.debug_save_patches = False
         self.debug_output_dir = None
         self.debug_patch_counter = 0
         if self.debug_save_patches:
