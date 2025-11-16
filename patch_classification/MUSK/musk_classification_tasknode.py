@@ -384,11 +384,22 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     if len(unique_classes) < 2:
         raise ValueError("Need at least 2 classes in annotation => fallback to zero-shot")
 
+    # Build class_names: ensure "Negative control" is first
+    # IMPORTANT: Even if annotations don't have "Negative control", we need to add it to class_names
+    # BEFORE encoding y_train, so that class indices are consistent
     class_names = []
-    if "Negative control" in unique_classes:
+    has_negative_control = "Negative control" in unique_classes
+    if has_negative_control:
         class_names.append("Negative control")
         unique_classes.remove("Negative control")
     class_names.extend(unique_classes)
+    
+    # If "Negative control" is not in annotations, we need to add it to class_names now
+    # (before encoding y_train) so that when we add negative control vectors later,
+    # the class indices will be correct (0 = "Negative control", 1 = "Class1", 2 = "Class2", etc.)
+    if not has_negative_control:
+        class_names = ["Negative control"] + class_names
+        print(f"Added 'Negative control' to class_names (not in annotations): {class_names}")
 
     # Create class_colors_map: first from ARGS, then fallback to classifier colors
     class_colors_map = {}
@@ -416,6 +427,9 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
 
     cell_indices = annotations['patch_ID'].astype(int).values
     X_train = cell_embeddings[cell_indices]
+    # IMPORTANT: Now class_names always has "Negative control" at index 0
+    # So y_train codes will be: "Class1" -> 1, "Class2" -> 2, etc. (not 0 and 1)
+    # This is correct because we'll add negative control vectors with label 0 later
     y_train = pd.Categorical(annotations['tissue_class'], categories=class_names).codes
     
     if "Negative control" not in annotations["tissue_class"].values.astype(str):
@@ -434,6 +448,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
             negative_control_vectors = train_linear_classifier._negative_control_vectors
             print(f"negative_control_vectors shape: {negative_control_vectors.shape}")
             X_train = np.concatenate([negative_control_vectors, X_train], axis=0)
+            # Add label 0 for negative control vectors (index 0 in class_names = "Negative control")
             y_train = np.concatenate([np.zeros(negative_control_vectors.shape[0]), y_train], axis=0).astype(int)
         else:
             print("Proceeding without negative control vectors as they could not be loaded.")
@@ -630,9 +645,14 @@ def run_classification(args) -> Dict[str, Any]:
         grp_cls.create_dataset('tissue_class_HEX_color', shape=(len(colors_ascii),), dtype='S256', data=colors_ascii)
 
         print("================")
+        # Filter tissue_classes to only include classes that are actually predicted
+        # Negative control (index 0) is a placeholder and should not appear if not in predictions
+        unique_predictions = np.unique(predictions)
+        valid_indices = unique_predictions[unique_predictions < len(final_class_names)]
+        predicted_tissue_classes = [final_class_names[i] for i in valid_indices]
         print({
-            "predictions": list(set(predictions.tolist())), # Convert to list for set
-            "tissue_classes": list(set(final_class_names)), 
+            "predictions": unique_predictions.tolist(),
+            "tissue_classes": predicted_tissue_classes, 
             "classification_method": classification_method
         })
         metadata_dict = {
