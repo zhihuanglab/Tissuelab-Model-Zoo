@@ -285,11 +285,13 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         annotations = pd.DataFrame()
     
     # try to load existing classifier parameters
+    loaded_classifier_colors = None  # Store classifier colors for fallback
     if CLASSIFIER_PATH is not None:
         try:
             loaded_params = load_classifier_params()
             if loaded_params is not None:
                 clf, class_names, class_colors, prev_embeddings, prev_labels = loaded_params
+                loaded_classifier_colors = dict(zip(class_names, class_colors))  # Store for fallback
                 print(f"Loaded existing classifier parameters, classes: {class_names}")
                 
                 if not annotations.empty:
@@ -388,13 +390,25 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         unique_classes.remove("Negative control")
     class_names.extend(unique_classes)
 
-    class_colors_map = annotations.groupby('tissue_class')['tissue_color'].first().to_dict()
+    # Create class_colors_map: first from ARGS, then fallback to classifier colors
+    class_colors_map = {}
+    tissue_classes = getattr(ARGS, "tissue_classes", [])
+    tissue_colors = getattr(ARGS, "tissue_colors", [])
+    if tissue_classes and tissue_colors and len(tissue_classes) == len(tissue_colors):
+        class_colors_map = dict(zip(tissue_classes, tissue_colors))
+        print(f"Using colors from ARGS: {class_colors_map}")
+    
+    # Fallback to classifier colors if ARGS doesn't have colors
+    if not class_colors_map and loaded_classifier_colors is not None:
+        class_colors_map = loaded_classifier_colors
+        print(f"Fallback to classifier colors: {class_colors_map}")
+    
     class_colors = []
     for cn in class_names:
         if cn in class_colors_map and str(class_colors_map[cn]).strip() != "":
             class_colors.append(class_colors_map[cn])
         else:
-            # Default colors when not provided by user annotations
+            # Default colors when not provided by user annotations or classifier
             if str(cn).lower() == "negative control":
                 class_colors.append("#aaaaaa")
             else:
