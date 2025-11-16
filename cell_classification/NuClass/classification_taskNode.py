@@ -836,9 +836,14 @@ def run_classification(args) -> Dict[str, Any]:
             print("Warning: No probability data available to save for active learning")
 
         print("================")
+        # Filter nuclei_classes to only include classes that are actually predicted
+        # Negative control (index 0) is a placeholder and should not appear if not in predictions
+        unique_predictions = np.unique(predictions)
+        valid_indices = unique_predictions[unique_predictions < len(final_class_names)]
+        predicted_nuclei_classes = [final_class_names[i] for i in valid_indices]
         print({
-            "predictions": list(set(predictions)),
-            "nuclei_classes": final_class_names,
+            "predictions": unique_predictions.tolist(),
+            "nuclei_classes": predicted_nuclei_classes,
             "classification_method": classification_method,
             "organ": organ
         })
