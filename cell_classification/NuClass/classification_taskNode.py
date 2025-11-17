@@ -762,11 +762,68 @@ def run_classification(args) -> Dict[str, Any]:
         if classifier_result is not None:
             clf, class_names, class_colors, predictions, prediction_probs, \
                 coef_, intercept_, train_time, test_time = classifier_result
-            final_class_names = class_names
-            final_class_colors = class_colors
             classification_method = "supervised"
             print(f"Supervised classification completed using {classification_method}")
             # Progress for supervised is handled in train_linear_classifier
+            
+            # When CLASSIFIER_PATH is set, directly use classifier's class_names and class_colors
+            # to override user params, preventing issues with incomplete user input
+            # Note: class_names here already includes all classes:
+            # - Original classes from the saved classifier
+            # - New classes from user annotations (if any, added in train_linear_classifier)
+            # This ensures we always use the complete, up-to-date class list
+            if CLASSIFIER_PATH is not None:
+                # Use classifier's class_names and class_colors directly
+                # These are already updated with new classes if user annotations had new classes
+                final_class_names = class_names
+                final_class_colors = class_colors
+                print(f"Using classifier's classes and colors (CLASSIFIER_PATH is set): {final_class_names}")
+            # Map classifier outputs to user input order if user provided nuclei_classes (only when no classifier loaded)
+            elif nuclei_classes and len(nuclei_classes) > 0:
+                # Use user input order for final output
+                final_class_names = nuclei_classes
+                
+                # Use user input colors if provided, otherwise keep classifier colors
+                if nuclei_colors and len(nuclei_colors) == len(nuclei_classes):
+                    final_class_colors = nuclei_colors
+                else:
+                    # Map classifier colors to user input order
+                    classifier_color_map = {name: color for name, color in zip(class_names, class_colors)}
+                    final_class_colors = []
+                    for cls_name in nuclei_classes:
+                        if cls_name in classifier_color_map:
+                            final_class_colors.append(classifier_color_map[cls_name])
+                        else:
+                            # Default color for classes not in classifier
+                            final_class_colors.append("#aaaaaa")
+                
+                # Create mapping from classifier internal indices to user input indices
+                classifier_name_to_idx = {name: idx for idx, name in enumerate(class_names)}
+                remap = np.zeros(len(class_names), dtype=np.int32)
+                for user_idx, cls_name in enumerate(nuclei_classes):
+                    if cls_name in classifier_name_to_idx:
+                        classifier_idx = classifier_name_to_idx[cls_name]
+                        remap[classifier_idx] = user_idx
+                
+                # Remap predictions to user input order
+                remapped_predictions = remap[predictions]
+                predictions = remapped_predictions
+                
+                # Remap prediction_probs columns to user input order
+                if prediction_probs is not None:
+                    remapped_probs = np.zeros((prediction_probs.shape[0], len(nuclei_classes)), dtype=np.float32)
+                    for user_idx, cls_name in enumerate(nuclei_classes):
+                        if cls_name in classifier_name_to_idx:
+                            classifier_idx = classifier_name_to_idx[cls_name]
+                            remapped_probs[:, user_idx] = prediction_probs[:, classifier_idx]
+                        else:
+                            # Set probability to 0 for classes not in classifier
+                            remapped_probs[:, user_idx] = 0.0
+                    prediction_probs = remapped_probs
+            else:
+                # No user input, use classifier output as-is
+                final_class_names = class_names
+                final_class_colors = class_colors
         else:
             classification_method = "zero-shot"
             print(f"Zero-shot classification completed using {classification_method}")
