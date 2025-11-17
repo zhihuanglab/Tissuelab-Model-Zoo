@@ -297,47 +297,112 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 if not annotations.empty:
                     existing_classes = set(class_names)
                     annotated_classes = set(annotations['tissue_class'].unique())
-                    common_classes = existing_classes.intersection(annotated_classes)
+                    new_classes = annotated_classes - existing_classes
                     
-                    if common_classes:
-                        print(f"Found user annotations for classes: {common_classes}, updating classifier...")
+                    # Check if class count changed
+                    classes_changed = len(new_classes) > 0
+                    
+                    if classes_changed:
+                        print(f"Found new classes: {new_classes}, class count changed. Retraining with all data...")
                         
+                        # Merge all classes: existing + new
+                        # Ensure "Negative control" is first if it exists
+                        all_unique_classes = list(existing_classes) + list(new_classes)
+                        if "Negative control" in all_unique_classes:
+                            all_unique_classes.remove("Negative control")
+                            all_unique_classes = ["Negative control"] + all_unique_classes
+                        
+                        # Update class_names
+                        old_class_names = class_names.copy()
+                        class_names = all_unique_classes
+                        
+                        # Update class_colors: keep existing colors, add default for new classes
+                        class_colors_map = annotations.groupby('tissue_class')['tissue_color'].first().to_dict()
+                        new_class_colors = []
+                        for cn in class_names:
+                            if cn in class_colors_map:
+                                new_class_colors.append(class_colors_map[cn])
+                            elif cn in old_class_names:
+                                # Keep existing color for old classes
+                                old_idx = old_class_names.index(cn)
+                                if old_idx < len(class_colors):
+                                    new_class_colors.append(class_colors[old_idx])
+                                else:
+                                    new_class_colors.append("#aaaaaa")
+                            else:
+                                new_class_colors.append("#aaaaaa")
+                        class_colors = new_class_colors
+                        
+                        # Extract cell indices from the patch_ID column
+                        cell_indices = annotations['patch_ID'].astype(int).values
+                        X_update = cell_embeddings[cell_indices]
+                        
+                        # Re-encode all labels with new complete class list
+                        y_update = pd.Categorical(annotations['tissue_class'], categories=class_names).codes
+                        
+                        # Check for invalid labels (shouldn't happen, but safety check)
+                        if np.any(y_update < 0):
+                            invalid_mask = y_update < 0
+                            print(f"Warning: Found {np.sum(invalid_mask)} invalid labels, removing them")
+                            X_update = X_update[~invalid_mask]
+                            y_update = y_update[~invalid_mask]
+                        
+                        # Re-encode previous labels with new class list
+                        if prev_embeddings is not None and prev_labels is not None:
+                            # Convert previous labels (indices) back to class names using old class_names
+                            prev_labels_as_names = [old_class_names[i] for i in prev_labels]
+                            # Re-encode with new complete class list
+                            prev_labels_reencoded = pd.Categorical(prev_labels_as_names, categories=class_names).codes
+                            
+                            # Combine all data
+                            X_train = np.vstack([prev_embeddings, X_update])
+                            y_train = np.concatenate([prev_labels_reencoded, y_update])
+                        else:
+                            X_train = X_update
+                            y_train = y_update
+                        
+                        # Must retrain from scratch when class count changes
+                        clf = xgb.XGBClassifier(**xgb_params)
+                        clf.fit(X_train, y_train)
+                        print("Classifier retrained with new classes")
+                        
+                    else:
+                        # Class count unchanged, can use warm start for faster training
+                        print(f"Class count unchanged, using warm start for incremental training...")
+                        
+                        # Extract cell indices from the patch_ID column
                         cell_indices = annotations['patch_ID'].astype(int).values
                         X_update = cell_embeddings[cell_indices]
                         y_update = pd.Categorical(annotations['tissue_class'], categories=class_names).codes
-
-                        # Filter out annotations that cannot be mapped to existing classes
+                        
+                        # Check for invalid labels
                         if np.any(y_update < 0):
                             invalid_mask = y_update < 0
-                            num_invalid = np.sum(invalid_mask)
-                            print(f"Warning: Found {num_invalid} annotations with unknown classes; removing them from incremental update")
+                            print(f"Warning: Found {np.sum(invalid_mask)} invalid labels, removing them")
                             X_update = X_update[~invalid_mask]
                             y_update = y_update[~invalid_mask]
-
-                        # Combine new and previous training data if available
+                        
+                        # Combine new and previous training data
                         if prev_embeddings is not None and prev_labels is not None:
                             X_train = np.vstack([prev_embeddings, X_update])
                             y_train = np.concatenate([prev_labels, y_update])
                         else:
                             X_train = X_update
                             y_train = y_update
-
-                        # Continue training from the existing booster for incremental learning
+                        
+                        # Use warm start: save the existing booster before fitting
+                        # This allows XGBoost to continue training from the existing model
                         existing_booster = clf.get_booster()
                         clf.fit(X_train, y_train, xgb_model=existing_booster)
                         print("Classifier updated with warm start (incremental training)")
-                        
-                        # Save updated classifier with new training data
-                        train_data = {
-                            'embeddings': X_train,
-                            'labels': y_train
-                        }
-                        save_classifier_params(clf, class_names, class_colors, train_data)
-                        print("Classifier updated with user annotations and saved")
-                    else:
-                        print(f"No common classes found between existing ({existing_classes}) and annotated ({annotated_classes}) classes. Retraining classifier...")
-                        # Force retraining by raising an exception to go to the new classifier creation section
-                        raise ValueError("No common classes, need to retrain classifier")
+                    
+                    # Save updated classifier with new training data
+                    train_data = {
+                        'embeddings': X_train,
+                        'labels': y_train
+                    }
+                    save_classifier_params(clf, class_names, class_colors, train_data)
+                    print("Classifier updated and saved")
                 
                 # predict in chunks to avoid GPU memory issues
                 batch_size = 10000  # Process 10k samples at a time
@@ -381,8 +446,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         return None  # Signal to caller to use zero-shot instead
     
     unique_classes = annotations['tissue_class'].unique().tolist()
-    if len(unique_classes) < 2:
-        raise ValueError("Need at least 2 classes in annotation => fallback to zero-shot")
+    if len(unique_classes) < 1:
+        raise ValueError("Need at least 1 class in annotation => fallback to zero-shot")
 
     # Build class_names: ensure "Negative control" is first
     # IMPORTANT: Even if annotations don't have "Negative control", we need to add it to class_names
@@ -501,7 +566,7 @@ def run_classification(args) -> Dict[str, Any]:
     if ZARR_PATH is None:
         raise ValueError("ZARR_PATH not set => please ensure /read is called first.")
 
-    global MUSK_MODEL, NODE_NAME
+    global MUSK_MODEL, NODE_NAME, CLASSIFIER_PATH
     global progress_value
 
     result = {"status": "success", "message": "", "classification_count": 0}
@@ -578,10 +643,25 @@ def run_classification(args) -> Dict[str, Any]:
         if classifier_result is not None:
             clf, class_names, class_colors, predictions, prediction_probs, \
                 coef_, intercept_, train_time, test_time = classifier_result
-            final_class_names = class_names
-            final_class_colors = class_colors
             classification_method = "supervised"
             print(f"Supervised classification completed using {classification_method}")
+            
+            # When CLASSIFIER_PATH is set, directly use classifier's class_names and class_colors
+            # to override user params, preventing issues with incomplete user input
+            # Note: class_names here already includes all classes:
+            # - Original classes from the saved classifier
+            # - New classes from user annotations (if any, added in train_linear_classifier)
+            # This ensures we always use the complete, up-to-date class list
+            if CLASSIFIER_PATH is not None:
+                # Use classifier's class_names and class_colors directly
+                # These are already updated with new classes if user annotations had new classes
+                final_class_names = class_names
+                final_class_colors = class_colors
+                print(f"Using classifier's classes and colors (CLASSIFIER_PATH is set): {final_class_names}")
+            else:
+                # No classifier path, use classifier output as-is (from annotations)
+                final_class_names = class_names
+                final_class_colors = class_colors
         else:
             classification_method = "zero-shot"
             print(f"Zero-shot classification completed using {classification_method}")
