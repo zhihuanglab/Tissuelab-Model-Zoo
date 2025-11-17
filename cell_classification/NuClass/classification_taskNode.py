@@ -69,6 +69,115 @@ progress_value = 0  # Global variable to store progress
 
 # --------------- utils functions ---------------
 
+def _int_color_to_hex(color_int: int) -> str:
+    """Convert integer RGB value to hex color string.
+    
+    Args:
+        color_int: Integer RGB value (0xRRGGBB format), -1 means not set
+        
+    Returns:
+        Hex color string like "#ff0000", "#000000" for 0 (black), "" for -1 (not set)
+    """
+    if color_int < 0:
+        # -1 or negative values mean not set, return empty string
+        return ""
+    
+    # Ensure value is within valid RGB range (0 to 16777215)
+    if color_int > 0xFFFFFF:
+        color_int = 0xFFFFFF
+    
+    # Convert to hex string and pad to 6 digits
+    hex_str = f"{color_int:06x}"
+    return f"#{hex_str}"
+
+def load_structured_nuclei_annotations(zf, annotation_path: str) -> pd.DataFrame:
+    """
+    Load structured array nuclei annotations and convert to DataFrame.
+    
+    Args:
+        zf: Zarr group object
+        annotation_path: Path to annotation dataset (e.g., 'user_annotation/nuclei_annotations')
+        
+    Returns:
+        DataFrame with columns: cell_ID, cell_class, cell_color
+        Returns None if no annotations found or error occurs
+    """
+    try:
+        # Check if annotation path exists (zarr supports direct path access)
+        if annotation_path not in zf:
+            return None
+        
+        # Get class_names from metadata
+        class_names = None
+        if 'user_annotation' in zf:
+            user_anno_group = zf['user_annotation']
+            if hasattr(user_anno_group, 'attrs') and 'class_names' in user_anno_group.attrs:
+                class_names = user_anno_group.attrs.get('class_names', [])
+        
+        if not class_names:
+            print(f"[load_structured_nuclei_annotations] Warning: No class_names found in metadata, cannot convert IDs to names")
+            return None
+        
+        # Read structured array (zarr supports direct path access)
+        annotations_array = zf[annotation_path][()]
+        
+        # Check if it's already a structured array or needs conversion
+        if isinstance(annotations_array, np.ndarray) and annotations_array.dtype.names:
+            # It's a structured array
+            cell_class_ids = annotations_array['cell_class']
+            cell_color_data = annotations_array['cell_color']
+        else:
+            # Try to decode as JSON (old format compatibility)
+            try:
+                if isinstance(annotations_array, bytes):
+                    ann_dict = json.loads(annotations_array.decode("utf-8"))
+                    return pd.DataFrame(ann_dict).T
+                else:
+                    return None
+            except:
+                return None
+        
+        # Filter valid annotations: cell_class >= 0 and cell_color >= 0
+        valid_mask = (cell_class_ids >= 0) & (cell_color_data >= 0)
+        if not np.any(valid_mask):
+            return None
+        
+        # Get valid indices and data
+        valid_indices = np.where(valid_mask)[0]
+        valid_class_ids = cell_class_ids[valid_indices]
+        valid_colors = cell_color_data[valid_indices]
+        
+        # Convert class IDs to names
+        valid_class_names = []
+        valid_indices_filtered = []
+        valid_colors_filtered = []
+        for idx, class_id, color_int in zip(valid_indices, valid_class_ids, valid_colors):
+            if 0 <= class_id < len(class_names):
+                valid_class_names.append(class_names[class_id])
+                valid_indices_filtered.append(idx)
+                valid_colors_filtered.append(color_int)
+            else:
+                # Invalid class ID, skip this annotation
+                continue
+        
+        # Convert colors from int to hex strings
+        valid_color_hex = [_int_color_to_hex(color_int) for color_int in valid_colors_filtered]
+        
+        # Create DataFrame
+        df = pd.DataFrame({
+            'cell_ID': valid_indices_filtered,
+            'cell_class': valid_class_names,
+            'cell_color': valid_color_hex
+        })
+        
+        return df
+        
+    except Exception as e:
+        print(f"[load_structured_nuclei_annotations] Error loading annotations: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 def print_h5_structure(file_path):
     """Print Zarr group structure"""
     def _visit(group, prefix=""):
@@ -493,11 +602,22 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     if len(unique_classes) < 1:
         raise ValueError("Need at least 2 classes in annotation => fallback to zero-shot")
 
+    # Build class_names: ensure "Negative control" is first
+    # IMPORTANT: Even if annotations don't have "Negative control", we need to add it to class_names
+    # BEFORE encoding y_train, so that class indices are consistent
     class_names = []
-    if "Negative control" in unique_classes:
+    has_negative_control = "Negative control" in unique_classes
+    if has_negative_control:
         class_names.append("Negative control")
         unique_classes.remove("Negative control")
     class_names.extend(unique_classes)
+    
+    # If "Negative control" is not in annotations, we need to add it to class_names now
+    # (before encoding y_train) so that when we add negative control vectors later,
+    # the class indices will be correct (0 = "Negative control", 1 = "Class1", 2 = "Class2", etc.)
+    if not has_negative_control:
+        class_names = ["Negative control"] + class_names
+        print(f"Added 'Negative control' to class_names (not in annotations): {class_names}")
 
     class_colors_map = annotations.groupby('cell_class')['cell_color'].first().to_dict()
     class_colors = []
@@ -505,12 +625,19 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         if cn in class_colors_map:
             class_colors.append(class_colors_map[cn])
         else:
-            class_colors.append("#aaaaaa")
+            # Default color for "Negative control" if not in annotations
+            if cn == "Negative control":
+                class_colors.append("#aaaaaa")
+            else:
+                class_colors.append("#aaaaaa")
 
     # Extract cell indices from the cell_ID column (sequential annotation structure)
     cell_indices = annotations['cell_ID'].astype(int).values
 
     X_train = cell_embeddings[cell_indices]
+    # IMPORTANT: Now class_names always has "Negative control" at index 0
+    # So y_train codes will be: "Class1" -> 1, "Class2" -> 2, etc. (not 0 and 1)
+    # This is correct because we'll add negative control vectors with label 0 later
     y_train = pd.Categorical(annotations['cell_class'], categories=class_names).codes
 
     if "Negative control" not in annotations["cell_class"].values.astype(str):
@@ -530,6 +657,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
             negative_control_vectors = train_linear_classifier._negative_control_vectors
             print(f"negative_control_vectors: {negative_control_vectors.shape}")
             X_train = np.concatenate([negative_control_vectors, X_train], axis=0)
+            # Add label 0 for negative control vectors (index 0 in class_names = "Negative control")
             y_train = np.concatenate([np.zeros(negative_control_vectors.shape[0]), y_train], axis=0).astype(int)
         else:
             print("Proceeding without negative control vectors as they could not be loaded.")
@@ -602,15 +730,12 @@ def run_classification(args) -> Dict[str, Any]:
         annotations_data = None
         use_supervised = False
         if 'user_annotation' in zf and 'nuclei_annotations' in zf['user_annotation']:
-            raw_bytes = zf['user_annotation/nuclei_annotations'][()]
-            ann_dict = json.loads(raw_bytes.decode("utf-8"))
-            annotations_data = pd.DataFrame(ann_dict).T
-
-            # unique_classes = annotations_data["cell_class"].unique().tolist()
-            # if ("Negative control" in unique_classes) and (len(unique_classes) >= 2):
-            use_supervised = True
-            # else:
-            #     use_supervised = False
+            annotations_data = load_structured_nuclei_annotations(zf, 'user_annotation/nuclei_annotations')
+            if annotations_data is not None and not annotations_data.empty:
+                use_supervised = True
+            else:
+                annotations_data = None
+                use_supervised = False
         else:
             annotations_data = None
             use_supervised = False
@@ -637,11 +762,68 @@ def run_classification(args) -> Dict[str, Any]:
         if classifier_result is not None:
             clf, class_names, class_colors, predictions, prediction_probs, \
                 coef_, intercept_, train_time, test_time = classifier_result
-            final_class_names = class_names
-            final_class_colors = class_colors
             classification_method = "supervised"
             print(f"Supervised classification completed using {classification_method}")
             # Progress for supervised is handled in train_linear_classifier
+            
+            # When CLASSIFIER_PATH is set, directly use classifier's class_names and class_colors
+            # to override user params, preventing issues with incomplete user input
+            # Note: class_names here already includes all classes:
+            # - Original classes from the saved classifier
+            # - New classes from user annotations (if any, added in train_linear_classifier)
+            # This ensures we always use the complete, up-to-date class list
+            if CLASSIFIER_PATH is not None:
+                # Use classifier's class_names and class_colors directly
+                # These are already updated with new classes if user annotations had new classes
+                final_class_names = class_names
+                final_class_colors = class_colors
+                print(f"Using classifier's classes and colors (CLASSIFIER_PATH is set): {final_class_names}")
+            # Map classifier outputs to user input order if user provided nuclei_classes (only when no classifier loaded)
+            elif nuclei_classes and len(nuclei_classes) > 0:
+                # Use user input order for final output
+                final_class_names = nuclei_classes
+                
+                # Use user input colors if provided, otherwise keep classifier colors
+                if nuclei_colors and len(nuclei_colors) == len(nuclei_classes):
+                    final_class_colors = nuclei_colors
+                else:
+                    # Map classifier colors to user input order
+                    classifier_color_map = {name: color for name, color in zip(class_names, class_colors)}
+                    final_class_colors = []
+                    for cls_name in nuclei_classes:
+                        if cls_name in classifier_color_map:
+                            final_class_colors.append(classifier_color_map[cls_name])
+                        else:
+                            # Default color for classes not in classifier
+                            final_class_colors.append("#aaaaaa")
+                
+                # Create mapping from classifier internal indices to user input indices
+                classifier_name_to_idx = {name: idx for idx, name in enumerate(class_names)}
+                remap = np.zeros(len(class_names), dtype=np.int32)
+                for user_idx, cls_name in enumerate(nuclei_classes):
+                    if cls_name in classifier_name_to_idx:
+                        classifier_idx = classifier_name_to_idx[cls_name]
+                        remap[classifier_idx] = user_idx
+                
+                # Remap predictions to user input order
+                remapped_predictions = remap[predictions]
+                predictions = remapped_predictions
+                
+                # Remap prediction_probs columns to user input order
+                if prediction_probs is not None:
+                    remapped_probs = np.zeros((prediction_probs.shape[0], len(nuclei_classes)), dtype=np.float32)
+                    for user_idx, cls_name in enumerate(nuclei_classes):
+                        if cls_name in classifier_name_to_idx:
+                            classifier_idx = classifier_name_to_idx[cls_name]
+                            remapped_probs[:, user_idx] = prediction_probs[:, classifier_idx]
+                        else:
+                            # Set probability to 0 for classes not in classifier
+                            remapped_probs[:, user_idx] = 0.0
+                    prediction_probs = remapped_probs
+            else:
+                # No user input, use classifier output as-is
+                final_class_names = class_names
+                final_class_colors = class_colors
         else:
             classification_method = "zero-shot"
             print(f"Zero-shot classification completed using {classification_method}")
@@ -711,9 +893,14 @@ def run_classification(args) -> Dict[str, Any]:
             print("Warning: No probability data available to save for active learning")
 
         print("================")
+        # Filter nuclei_classes to only include classes that are actually predicted
+        # Negative control (index 0) is a placeholder and should not appear if not in predictions
+        unique_predictions = np.unique(predictions)
+        valid_indices = unique_predictions[unique_predictions < len(final_class_names)]
+        predicted_nuclei_classes = [final_class_names[i] for i in valid_indices]
         print({
-            "predictions": list(set(predictions)),
-            "nuclei_classes": final_class_names,
+            "predictions": unique_predictions.tolist(),
+            "nuclei_classes": predicted_nuclei_classes,
             "classification_method": classification_method,
             "organ": organ
         })
