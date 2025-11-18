@@ -1606,19 +1606,21 @@ class NucleiEmbedding:
 
         Args:
             batch_size: Optional batch size for DataLoader
-            num_workers: Optional num_workers for DataLoader (default: 4 if profiling disabled, 0 if enabled)
+            num_workers: Optional num_workers for DataLoader (default: 0 to avoid pickling issues)
             zarr_path: Path to the root Zarr store to write into (required)
             dataset_path: Dataset path under the root group to write (default: 'embedding')
             enable_profiling: If True, force num_workers=0 for accurate profiling. If False, use multi-process loading.
         """
         # Set num_workers based on profiling mode
+        # Note: On Windows, multiprocessing has issues with pickling file handles (slide objects)
+        # So we default to 0 workers to avoid serialization errors
         if enable_profiling:
             # Force num_workers to 0 for accurate performance profiling
             num_workers = 0
         elif num_workers is None:
-            # Default to 4 workers for faster data loading (can be tuned based on CPU cores)
-            import os
-            num_workers = min(4, os.cpu_count() or 1)
+            # Default to 0 workers to avoid pickling issues with slide file handles
+            # The slide object contains file handles that cannot be pickled for multiprocessing
+            num_workers = 0
 
         # Dynamically determine batch size based on available GPU memory
         if batch_size is None and torch.cuda.is_available():
@@ -1634,25 +1636,29 @@ class NucleiEmbedding:
                 print(f"Cached: {cached_memory:.2f} GB")
                 
                 # Reserve some memory for the model and system
-                available_memory = total_memory * 0.5  # Use 90% of total memory
+                # Use more memory for better GPU utilization (increased from 50% to 80%)
+                available_memory = total_memory * 0.8
                 print(f"Setting available memory to: {available_memory:.2f} GB")
-                # Estimate memory per sample (in GB) - PLIP model typically uses about 0.5GB for batch_size=1
-                memory_per_sample = 0.01
+                # Estimate memory per sample (in GB) - PLIP model typically uses about 0.01GB per sample
+                # More accurate estimate: each 224x224x3 image is ~150KB, plus model activations
+                memory_per_sample = 0.005  # More accurate estimate (reduced from 0.01)
                 # Calculate maximum possible batch size
                 max_batch_size = int(available_memory / memory_per_sample)
 
-                # Set a reasonable range for batch size
-                batch_size = max(1, min(max_batch_size, 128))
+                # Set a reasonable range for batch size (increased max from 128 to 256 for better GPU utilization)
+                batch_size = max(32, min(max_batch_size, 256))  # Minimum 32 for better GPU utilization
                 print(f"Automatically set batch size to {batch_size} based on available GPU memory")
             except Exception as e:
                 print(f"Error setting dynamic batch size: {e}")
-                batch_size = 128
+                batch_size = 256  # Increased default from 128 to 256 for better GPU utilization
         elif batch_size is None:
-            batch_size = 128
+            batch_size = 256  # Increased default from 128 to 256 for better GPU utilization
 
         print(f"Generating embeddings using {num_workers} workers and batch size {batch_size}...")
         if enable_profiling:
             print(f"[PERF] Performance profiling enabled - num_workers={num_workers} (forced to 0 for profiling)")
+        elif num_workers == 0:
+            print(f"[PERF] Single-process mode - num_workers={num_workers} (avoids pickling issues with slide file handles)")
         else:
             print(f"[PERF] Multi-process data loading enabled - num_workers={num_workers} (for faster I/O)")
         
@@ -1689,6 +1695,10 @@ class NucleiEmbedding:
         collate_fn_with_processor = partial(collate_patches, processor=self.processor, perf_stats=dataset.perf_stats, use_fast_preprocess=True)
         print("[PERF] Using optimized fast preprocessing (numpy-based) instead of transformers processor")
         
+        # Enable pin_memory even with num_workers=0 to speed up CPU->GPU transfer
+        # This uses pinned (page-locked) memory which allows faster async transfers
+        use_pin_memory = torch.cuda.is_available()  # Enable if GPU is available
+        
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -1697,7 +1707,7 @@ class NucleiEmbedding:
             collate_fn=collate_fn_with_processor,
             prefetch_factor=2 if num_workers > 0 else None,  # Increased from 1 to 2 for better GPU utilization
             persistent_workers=True if num_workers > 0 else False,
-            pin_memory=True if num_workers > 0 else False
+            pin_memory=use_pin_memory  # Enable pin_memory for faster CPU->GPU transfer even with num_workers=0
         )
         
         if zarr_path is None:
