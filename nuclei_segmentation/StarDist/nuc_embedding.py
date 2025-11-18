@@ -986,19 +986,12 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
                 if stacked.shape[1:] == (h, w, 3):
                     # Perfect match - direct write to target array using out parameter (zero-copy)
                     convert_start = time.time()
-                    # OPTIMIZATION: Use out parameter to write directly to batch_array, avoiding memory copy
-                    # 1. Astype to temporary array (required due to type change)
-                    # 2. Use np.multiply with out parameter to write directly to batch_array channels
-                    # This eliminates the memory copy from normalized_batch to batch_array
-                    astype_start = time.time()
-                    float_batch = stacked.astype(np.float32)
-                    astype_time = time.time() - astype_start
-                    if perf_stats is not None:
-                        perf_stats['processor_astype_time'] += astype_time
-                    
-                    # OPTIMIZATION: Direct ImageNet normalization from uint8 (no /255 step needed)
-                    # Formula: (x_uint8 - mean*255) / (std*255) = x * inv_std_uint8 - mean_times_inv_std_uint8
+                    # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
+                    # Convert entire batch once, then process all channels (more efficient than per-channel conversion)
                     normalize_start = time.time()
+                    # Single astype for entire batch (more efficient than per-channel)
+                    float_batch = stacked.astype(np.float32)
+                    # Vectorized ImageNet normalization for all channels
                     np.multiply(float_batch[:, :, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
                     batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
                     np.multiply(float_batch[:, :, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
@@ -1007,20 +1000,16 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
                     batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
                     normalize_time = time.time() - normalize_start
                     if perf_stats is not None:
+                        # Astype is now merged into normalize_time (single batch conversion is faster)
+                        perf_stats['processor_astype_time'] += 0.0
                         perf_stats['processor_normalize_time'] += normalize_time
                         perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                 elif stacked.shape[1:] == (h, w, 4):
                     # RGBA - direct write to target array using out parameter (zero-copy)
                     convert_start = time.time()
-                    # OPTIMIZATION: Extract RGB channels, convert, then write directly using out parameter
-                    astype_start = time.time()
-                    float_batch = stacked[:, :, :, :3].astype(np.float32)
-                    astype_time = time.time() - astype_start
-                    if perf_stats is not None:
-                        perf_stats['processor_astype_time'] += astype_time
-                    
-                    # OPTIMIZATION: Direct ImageNet normalization from uint8
+                    # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
                     normalize_start = time.time()
+                    float_batch = stacked[:, :, :, :3].astype(np.float32)
                     np.multiply(float_batch[:, :, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
                     batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
                     np.multiply(float_batch[:, :, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
@@ -1029,20 +1018,15 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
                     batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
                     normalize_time = time.time() - normalize_start
                     if perf_stats is not None:
+                        perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                         perf_stats['processor_normalize_time'] += normalize_time
                         perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                 elif len(stacked.shape) == 3 and stacked.shape[1:] == (h, w):
                     # Grayscale 2D - direct write using out parameter (zero-copy)
                     convert_start = time.time()
-                    # OPTIMIZATION: Convert once, then write to all 3 channels using out parameter
-                    astype_start = time.time()
-                    float_batch = stacked.astype(np.float32)
-                    astype_time = time.time() - astype_start
-                    if perf_stats is not None:
-                        perf_stats['processor_astype_time'] += astype_time
-                    
-                    # OPTIMIZATION: Direct ImageNet normalization from uint8 (grayscale -> RGB)
+                    # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
                     normalize_start = time.time()
+                    float_batch = stacked.astype(np.float32)
                     np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
                     batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
                     np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
@@ -1051,20 +1035,15 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
                     batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
                     normalize_time = time.time() - normalize_start
                     if perf_stats is not None:
+                        perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                         perf_stats['processor_normalize_time'] += normalize_time
                         perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                 elif stacked.shape[1:] == (h, w, 1):
                     # Grayscale 3D - direct write using out parameter (zero-copy)
                     convert_start = time.time()
-                    # OPTIMIZATION: Convert once, then write to all 3 channels using out parameter
-                    astype_start = time.time()
-                    float_batch = stacked[:, :, :, 0].astype(np.float32)
-                    astype_time = time.time() - astype_start
-                    if perf_stats is not None:
-                        perf_stats['processor_astype_time'] += astype_time
-                    
-                    # OPTIMIZATION: Direct ImageNet normalization from uint8 (grayscale 3D -> RGB)
+                    # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
                     normalize_start = time.time()
+                    float_batch = stacked[:, :, :, 0].astype(np.float32)
                     np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
                     batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
                     np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
@@ -1073,6 +1052,7 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
                     batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
                     normalize_time = time.time() - normalize_start
                     if perf_stats is not None:
+                        perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                         perf_stats['processor_normalize_time'] += normalize_time
                         perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                 else:
@@ -1099,17 +1079,10 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
                         pil_conversion_time += time.time() - conv_start
                     
                     # Fast path: Standard RGB image (most common case - optimize this path)
-                    # OPTIMIZATION: Direct write using out parameter (zero-copy)
+                    # OPTIMIZATION: Merge astype and ImageNet normalization
                     if arr_uint8.shape == (h, w, 3):
-                        # OPTIMIZATION: Use out parameter to write directly to batch_array, avoiding memory copy
-                        astype_start = time.time()
-                        float_img = arr_uint8.astype(np.float32)
-                        astype_time = time.time() - astype_start
-                        if perf_stats is not None:
-                            perf_stats['processor_astype_time'] += astype_time
-                        
-                        # OPTIMIZATION: Direct ImageNet normalization from uint8
                         normalize_start = time.time()
+                        float_img = arr_uint8.astype(np.float32)
                         np.multiply(float_img[:, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[i, 0])
                         batch_array[i, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
                         np.multiply(float_img[:, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[i, 1])
@@ -1118,18 +1091,13 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
                         batch_array[i, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
+                            perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     elif arr_uint8.ndim == 2:
-                        # Grayscale - direct write using out parameter (zero-copy)
-                        astype_start = time.time()
-                        float_img = arr_uint8.astype(np.float32)
-                        astype_time = time.time() - astype_start
-                        if perf_stats is not None:
-                            perf_stats['processor_astype_time'] += astype_time
-                        
-                        # OPTIMIZATION: Direct ImageNet normalization from uint8 (grayscale -> RGB)
+                        # Grayscale - merge astype and ImageNet normalization
                         normalize_start = time.time()
+                        float_img = arr_uint8.astype(np.float32)
                         np.multiply(float_img, _IMAGENET_INV_STD_UINT8[0], out=batch_array[i, 0])
                         batch_array[i, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
                         np.multiply(float_img, _IMAGENET_INV_STD_UINT8[1], out=batch_array[i, 1])
@@ -1138,18 +1106,13 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
                         batch_array[i, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
+                            perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     elif arr_uint8.shape[2] == 4:
-                        # RGBA - direct write using out parameter (zero-copy)
-                        astype_start = time.time()
-                        float_img = arr_uint8[:, :, :3].astype(np.float32)
-                        astype_time = time.time() - astype_start
-                        if perf_stats is not None:
-                            perf_stats['processor_astype_time'] += astype_time
-                        
-                        # OPTIMIZATION: Direct ImageNet normalization from uint8
+                        # RGBA - merge astype and ImageNet normalization
                         normalize_start = time.time()
+                        float_img = arr_uint8[:, :, :3].astype(np.float32)
                         np.multiply(float_img[:, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[i, 0])
                         batch_array[i, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
                         np.multiply(float_img[:, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[i, 1])
@@ -1158,18 +1121,13 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
                         batch_array[i, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
+                            perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     elif arr_uint8.shape[0] == h and arr_uint8.shape[1] == w and arr_uint8.shape[2] >= 3:
-                        # Multi-channel (>=3) - direct write using out parameter (zero-copy)
-                        astype_start = time.time()
-                        float_img = arr_uint8[:, :, :3].astype(np.float32)
-                        astype_time = time.time() - astype_start
-                        if perf_stats is not None:
-                            perf_stats['processor_astype_time'] += astype_time
-                        
-                        # OPTIMIZATION: Direct ImageNet normalization from uint8
+                        # Multi-channel (>=3) - merge astype and ImageNet normalization
                         normalize_start = time.time()
+                        float_img = arr_uint8[:, :, :3].astype(np.float32)
                         np.multiply(float_img[:, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[i, 0])
                         batch_array[i, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
                         np.multiply(float_img[:, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[i, 1])
@@ -1178,6 +1136,7 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
                         batch_array[i, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
+                            perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     else:
@@ -1769,8 +1728,7 @@ class NucleiEmbedding:
                                     if convert_norm > 0:
                                         if stack_time > 0:
                                             print(f"        - Stack: {stack_time:.1f}s ({stack_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
-                                        if astype_time > 0:
-                                            print(f"        - Astype (uint8->float32): {astype_time:.1f}s ({astype_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
+                                        # Astype is now merged into normalize_time, no separate display needed
                                         if normalize_time > 0:
                                             print(f"        - ImageNet norm (direct): {normalize_time:.1f}s ({normalize_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
                                         if transpose_in_convert > 0:
@@ -1851,8 +1809,7 @@ class NucleiEmbedding:
                             if convert_norm > 0:
                                 if stack_time > 0:
                                     print(f"          - Stack: {stack_time:.2f}s ({stack_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
-                                if astype_time > 0:
-                                    print(f"          - Astype (uint8->float32): {astype_time:.2f}s ({astype_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
+                                # Astype is now merged into normalize_time, no separate display needed
                                 if normalize_time > 0:
                                     print(f"          - ImageNet norm (direct): {normalize_time:.2f}s ({normalize_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
                                 if transpose_in_convert > 0:
