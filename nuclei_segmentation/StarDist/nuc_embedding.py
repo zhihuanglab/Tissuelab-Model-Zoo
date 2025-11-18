@@ -934,8 +934,11 @@ def _normalize_imagenet_gpu(tensor, device):
         _IMAGENET_MEAN_TENSOR = torch.tensor(_IMAGENET_MEAN_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
         _IMAGENET_STD_TENSOR = torch.tensor(_IMAGENET_STD_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
     
-    # Convert to float32 and normalize in one step (GPU-accelerated)
-    tensor_float = tensor.to(torch.float32)
+    # OPTIMIZATION: Convert to float32 and normalize in one step (GPU-accelerated)
+    # Use non_blocking=True for faster CPU->GPU transfer
+    tensor_float = tensor.to(torch.float32, non_blocking=True)
+    # Standard ImageNet normalization: (x - mean) / std
+    # PyTorch will fuse these operations automatically on GPU
     normalized = (tensor_float - _IMAGENET_MEAN_TENSOR) / _IMAGENET_STD_TENSOR
     return normalized
 
@@ -1449,19 +1452,33 @@ class NucleiEmbedding:
                 else:
                     print("[OPTIMIZATION] Compiling model with torch.compile...")
                     # Compile the vision model for faster inference
-                    # Using 'default' mode for better performance (can try 'max-autotune' for even better speed but longer compile time)
-                    self.model.vision_model = torch.compile(
-                        self.model.vision_model,
-                        mode='default',  # Changed from 'reduce-overhead' to 'default' for better performance
-                        fullgraph=False  # Allow graph breaks for flexibility
-                    )
-                    # Compile the projection layer
-                    self.image_projection = torch.compile(
-                        self.image_projection,
-                        mode='default',  # Changed from 'reduce-overhead' to 'default'
-                        fullgraph=False
-                    )
-                    print("[OPTIMIZATION] Model compilation completed (mode='default' for better performance)")
+                    # Using 'max-autotune' mode for best performance (longer compile time but faster inference)
+                    # Fallback to 'default' if max-autotune fails
+                    try:
+                        self.model.vision_model = torch.compile(
+                            self.model.vision_model,
+                            mode='max-autotune',  # Best performance mode
+                            fullgraph=False  # Allow graph breaks for flexibility
+                        )
+                        self.image_projection = torch.compile(
+                            self.image_projection,
+                            mode='max-autotune',  # Best performance mode
+                            fullgraph=False
+                        )
+                        print("[OPTIMIZATION] Model compilation completed (mode='max-autotune' for best performance)")
+                    except Exception as compile_error:
+                        print(f"[OPTIMIZATION] max-autotune failed, falling back to 'default' mode: {compile_error}")
+                        self.model.vision_model = torch.compile(
+                            self.model.vision_model,
+                            mode='default',
+                            fullgraph=False
+                        )
+                        self.image_projection = torch.compile(
+                            self.image_projection,
+                            mode='default',
+                            fullgraph=False
+                        )
+                        print("[OPTIMIZATION] Model compilation completed (mode='default')")
         except Exception as e:
             # Catch TritonMissing and other exceptions
             error_type = type(e).__name__
@@ -1524,7 +1541,8 @@ class NucleiEmbedding:
                     if len(all_cell_embeddings) == 0:
                         print(f"[DEBUG] Cell 0: {len(cell_patches)} z-layers, tensor shape: {cell_tensor.shape}")
                     
-                    with torch.no_grad():
+                    # OPTIMIZATION: Use torch.inference_mode() instead of no_grad() for faster inference
+                    with torch.inference_mode():
                         # Optimization: Use mixed precision (AMP) for faster inference
                         if torch.cuda.is_available():
                             with torch.amp.autocast('cuda'):
@@ -1555,7 +1573,8 @@ class NucleiEmbedding:
                     cell_tensor = torch.from_numpy(cell_patches) if isinstance(cell_patches, np.ndarray) else cell_patches
                     cell_tensor = cell_tensor.unsqueeze(0).to(device)
                     
-                    with torch.no_grad():
+                    # OPTIMIZATION: Use torch.inference_mode() instead of no_grad() for faster inference
+                    with torch.inference_mode():
                         # Optimization: Use mixed precision (AMP) for faster inference
                         if torch.cuda.is_available():
                             with torch.amp.autocast('cuda'):
@@ -1570,7 +1589,12 @@ class NucleiEmbedding:
                         all_cell_embeddings.append(embeddings)
             
             # Concatenate all cell embeddings
-            final_embeddings = torch.cat(all_cell_embeddings, dim=0).detach().cpu().numpy()
+            final_embeddings = torch.cat(all_cell_embeddings, dim=0)
+            
+            # OPTIMIZATION: Normalize on GPU before moving to CPU (faster)
+            # Use more efficient normalization: torch.nn.functional.normalize is optimized
+            final_embeddings = torch.nn.functional.normalize(final_embeddings, p=2, dim=1)
+            final_embeddings = final_embeddings.cpu().numpy()
             
             # Final verification log
             print(f"[Z-STACK FUSION] Processed {len(all_cell_embeddings)} cells, final shape: {final_embeddings.shape}")
@@ -1583,7 +1607,8 @@ class NucleiEmbedding:
                 processed_batch = torch.cat(processed_batch)
                 processed_batch = processed_batch.to(device)
             
-            with torch.no_grad():
+            # OPTIMIZATION: Use torch.inference_mode() instead of no_grad() for faster inference
+            with torch.inference_mode():
                 # Optimization: Use mixed precision (AMP) for faster inference
                 if torch.cuda.is_available():
                     with torch.amp.autocast('cuda'):
@@ -1597,7 +1622,12 @@ class NucleiEmbedding:
                     vision_outputs = self.model.vision_model(processed_batch)
                     image_embeds = vision_outputs.last_hidden_state.mean(dim=1)  # Mean pooling
                     embeddings = self.image_projection(image_embeds)
-                embeddings = embeddings.detach().cpu().numpy()
+                # OPTIMIZATION: Normalize on GPU before moving to CPU (faster)
+                # L2 normalization: embeddings / ||embeddings||
+                # Use more efficient normalization: torch.nn.functional.normalize is optimized
+                embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+                # Move to CPU and convert to numpy in one step (inference_mode already handles detach)
+                embeddings = embeddings.cpu().numpy()
 
             return embeddings
 
@@ -1645,14 +1675,15 @@ class NucleiEmbedding:
                 # Calculate maximum possible batch size
                 max_batch_size = int(available_memory / memory_per_sample)
 
-                # Set a reasonable range for batch size (increased max from 128 to 256 for better GPU utilization)
-                batch_size = max(32, min(max_batch_size, 256))  # Minimum 32 for better GPU utilization
+                # Set a reasonable range for batch size (increased max from 256 to 512 for better GPU utilization)
+                # Larger batch sizes improve GPU utilization and reduce overhead
+                batch_size = max(64, min(max_batch_size, 512))  # Minimum 64 for better GPU utilization
                 print(f"Automatically set batch size to {batch_size} based on available GPU memory")
             except Exception as e:
                 print(f"Error setting dynamic batch size: {e}")
-                batch_size = 256  # Increased default from 128 to 256 for better GPU utilization
+                batch_size = 512  # Increased default from 256 to 512 for better GPU utilization
         elif batch_size is None:
-            batch_size = 256  # Increased default from 128 to 256 for better GPU utilization
+            batch_size = 512  # Increased default from 256 to 512 for better GPU utilization
 
         print(f"Generating embeddings using {num_workers} workers and batch size {batch_size}...")
         if enable_profiling:
@@ -1705,9 +1736,10 @@ class NucleiEmbedding:
             num_workers=num_workers,
             shuffle=False,
             collate_fn=collate_fn_with_processor,
-            prefetch_factor=2 if num_workers > 0 else None,  # Increased from 1 to 2 for better GPU utilization
+            prefetch_factor=4 if num_workers > 0 else None,  # Increased from 2 to 4 for better GPU utilization
             persistent_workers=True if num_workers > 0 else False,
-            pin_memory=use_pin_memory  # Enable pin_memory for faster CPU->GPU transfer even with num_workers=0
+            pin_memory=use_pin_memory,  # Enable pin_memory for faster CPU->GPU transfer even with num_workers=0
+            drop_last=False  # Keep all samples
         )
         
         if zarr_path is None:
@@ -1810,8 +1842,9 @@ class NucleiEmbedding:
                     perf_stats['model_time'] += time.time() - model_start
                     
                     # Postprocessing
+                    # OPTIMIZATION: Normalization is now done in embed_batch on GPU (faster)
+                    # Only need to convert to float16 here
                     postprocess_start = time.time()
-                    batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
                     batch_embeddings = batch_embeddings.astype(np.float16)
                     perf_stats['postprocessing_time'] += time.time() - postprocess_start
                     
