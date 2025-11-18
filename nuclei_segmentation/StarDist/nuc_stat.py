@@ -116,17 +116,33 @@ class VipsSlide():
         
         print('Reading slide with libvips...')
         st = time.time()
-        self.wsi = pyvips.Image.new_from_file(filepath, access="sequential")
+        self.wsi = pyvips.Image.new_from_file(filepath, access="random")
+        self.region = pyvips.Region.new(self.wsi)
         et = time.time()
         print(f'Done. Time elapsed: {et-st} seconds.')
         self.dimensions = (self.wsi.width, self.wsi.height)
         
-    def read_region(self, location, level=0, size=(100,100)):
-        # Extract region using libvips
-        region = self.wsi.crop(location[0], location[1], size[0], size[1])
+    def read_region(self, location, level=0, size=(100,100), as_array=False):
+        # Extract region using fast fetch (pyvips Region)
+        x, y = location
+        w, h = size
+        region = self.region.fetch(x, y, w, h)
+        # Region fetch returns a memoryview-compatible bytes object; wrap as Image
+        patch_image = pyvips.Image.new_from_memory(region, w, h, self.wsi.bands, self.wsi.format)
+        
+        if as_array:
+            patch = patch_image.numpy()
+            if patch.dtype != np.uint8:
+                patch = patch.astype(np.uint8)
+            if patch.ndim == 2:
+                patch = np.repeat(patch[:, :, np.newaxis], 3, axis=2)
+            elif patch.shape[-1] == 4:
+                patch = patch[:, :, :3]
+            return patch
+        
         # Convert to PIL image
-        mem_buffer = region.write_to_memory()
-        return PIL.Image.frombuffer('RGB', (region.width, region.height), mem_buffer, 'raw', 'RGB', 0, 1)
+        mem_buffer = patch_image.write_to_memory()
+        return PIL.Image.frombuffer('RGB', (patch_image.width, patch_image.height), mem_buffer, 'raw', 'RGB', 0, 1)
 
 
 class SlideProperty():

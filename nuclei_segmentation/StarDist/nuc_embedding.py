@@ -11,6 +11,7 @@ import os
 # Limit TorchInductor GEMM autotuning to avoid unnecessary compile overhead
 os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM", "0")
 
+import importlib
 import numpy as np
 import torch
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
@@ -20,11 +21,13 @@ from PIL import Image
 import multiprocess as mp
 from tqdm import tqdm
 import zarr
-from nuc_stat import PILSlide, NumpySlide
+from nuc_stat import PILSlide, NumpySlide, VipsSlide
 from torch.utils.data import Dataset, DataLoader
 import time
 from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
 import pathlib
+
+VIPS_AVAILABLE = importlib.util.find_spec("pyvips") is not None
 
 """
 For this embedding, we use PLIP model from vinid/plip.
@@ -56,7 +59,8 @@ class NucleiPatchDataset(Dataset):
             'processor_transpose_time': 0.0,  # Time for final transpose check (should be minimal now)
             'processor_imagenet_norm_time': 0.0,  # Time for ImageNet normalization
             'processor_total_time': 0.0,  # Total processor time
-            'total_calls': 0
+            'total_calls': 0,
+            'slide_open_time': 0.0  # Time spent opening slide objects
         }
         
         # Pre-compute bounding boxes from contours if available (very efficient - just numpy operations)
@@ -81,15 +85,18 @@ class NucleiPatchDataset(Dataset):
         if read_image_method is None:
             file_extension = pathlib.Path(slide_path).suffix.lower()[1:]
             if file_extension in ['svs', 'ndpi', 'vms', 'vmu', 'scn', 'mrxs', 'tif', 'tiff', 'bif']:
-                try:
-                    import openslide
-                    read_image_method = 'openslide'
-                except ImportError:
+                if VIPS_AVAILABLE:
+                    read_image_method = 'vips'
+                else:
                     try:
-                        import tiffslide
-                        read_image_method = 'tiffslide'
+                        import openslide
+                        read_image_method = 'openslide'
                     except ImportError:
-                        read_image_method = 'PIL'
+                        try:
+                            import tiffslide
+                            read_image_method = 'tiffslide'
+                        except ImportError:
+                            read_image_method = 'PIL'
             elif file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
                 read_image_method = 'PIL'
             elif file_extension in ['dcm']:
@@ -105,6 +112,10 @@ class NucleiPatchDataset(Dataset):
             print("[PERF] TiffSlide detected - will use as_array=True to read numpy directly (avoids PIL conversion)")
         elif self.read_image_method == 'openslide':
             print("[PERF] OpenSlide detected - note: OpenSlide doesn't support as_array, will use PIL path")
+        elif self.read_image_method == 'vips':
+            if not VIPS_AVAILABLE:
+                raise ImportError("pyvips is not available but read_image_method='vips' was requested")
+            print("[PERF] pyvips detected - using streaming I/O pipeline for region reads")
         
         # Detect if this is a z-stack image
         # DISABLED: z-stack functionality is disabled
@@ -255,6 +266,8 @@ class NucleiPatchDataset(Dataset):
         elif self.read_image_method == 'tiffslide':
             import tiffslide
             self.slide = tiffslide.TiffSlide(self.slide_path)
+        elif self.read_image_method == 'vips':
+            self.slide = VipsSlide(self.slide_path)
         elif self.read_image_method == 'PIL':
             self.slide = PILSlide(self.slide_path)
         elif self.read_image_method == 'numpy':
@@ -429,7 +442,7 @@ class NucleiPatchDataset(Dataset):
         
         # Check if slide supports as_array parameter (only TiffSlide supports it, not OpenSlide)
         # OpenSlide doesn't support as_array parameter, only TiffSlide does
-        use_numpy_direct = self.read_image_method == 'tiffslide'
+        use_numpy_direct = self.read_image_method in ['tiffslide', 'vips']
         
         if use_numpy_direct:
             # OPTIMIZATION: Read directly as numpy array to avoid PIL conversion
@@ -1336,22 +1349,43 @@ class NucleiEmbedding:
         # Handle different file types
         try:
             if file_extension in ['svs', 'ndpi', 'vms', 'vmu', 'scn', 'mrxs', 'tif', 'tiff', 'bif']:
-                try:
-                    import openslide
-                    with openslide.OpenSlide(self.args.slidepath) as slide:
-                        mpp = float(slide.properties['openslide.mpp-x'])
-                        reference_mpp_1x = 10  # objective magnification
+                reference_mpp_1x = 10  # objective magnification
+                if VIPS_AVAILABLE:
+                    mpp = None
+                    try:
+                        import openslide
+                        with openslide.OpenSlide(self.args.slidepath) as slide:
+                            mpp = float(slide.properties['openslide.mpp-x'])
+                            print("openslide (for MPP) success")
+                    except (ImportError, Exception) as e:
+                        print(f"OpenSlide MPP read failed: {str(e)}")
+                        try:
+                            import tiffslide
+                            with tiffslide.TiffSlide(self.args.slidepath) as slide:
+                                mpp = float(slide.properties['tiffslide.mpp-x'])
+                                print("tiffslide (for MPP) success")
+                        except (ImportError, Exception) as e2:
+                            print(f"TiffSlide MPP read failed: {str(e2)}")
+                    if mpp is not None:
                         self.args.magnification = reference_mpp_1x / mpp
-                        print("openslide success")
-                    self.read_image_method = 'openslide'
-                except (ImportError, Exception) as e:
-                    print(f"OpenSlide failed: {str(e)}")
-                    import tiffslide
-                    with tiffslide.TiffSlide(self.args.slidepath) as slide:
-                        mpp = float(slide.properties['tiffslide.mpp-x'])
-                        reference_mpp_1x = 10  # objective magnification
-                        self.args.magnification = reference_mpp_1x / mpp
-                    self.read_image_method = 'tiffslide'
+                    elif not hasattr(self.args, 'magnification') or self.args.magnification is None:
+                        self.args.magnification = 40  # fallback
+                    self.read_image_method = 'vips'
+                else:
+                    try:
+                        import openslide
+                        with openslide.OpenSlide(self.args.slidepath) as slide:
+                            mpp = float(slide.properties['openslide.mpp-x'])
+                            self.args.magnification = reference_mpp_1x / mpp
+                            print("openslide success")
+                        self.read_image_method = 'openslide'
+                    except (ImportError, Exception) as e:
+                        print(f"OpenSlide failed: {str(e)}")
+                        import tiffslide
+                        with tiffslide.TiffSlide(self.args.slidepath) as slide:
+                            mpp = float(slide.properties['tiffslide.mpp-x'])
+                            self.args.magnification = reference_mpp_1x / mpp
+                        self.read_image_method = 'tiffslide'
             elif file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
                 self.read_image_method = 'PIL'
                 # Use default magnification if provided in args
