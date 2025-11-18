@@ -1873,10 +1873,6 @@ class NucleiEmbedding:
                     if self.progress_callback:
                         progress = int((total_processed / len(dataset)) * 100)
                         self.progress_callback(progress)
-                    
-                    # clean memory
-                    del batch_embeddings, processed_batch
-                    torch.cuda.empty_cache()
                 
                 # Record end time for this batch (for next iteration's dataloader time measurement)
                 prev_batch_end_time = time.time()
@@ -1954,6 +1950,11 @@ class NucleiEmbedding:
             traceback.print_exc()
             raise
         finally:
+            if 'batch_embeddings' in locals():
+                del batch_embeddings
+            if 'processed_batch' in locals():
+                del processed_batch
+            torch.cuda.empty_cache()
             pbar.close()
             total_time = time.time() - total_start_time
             
