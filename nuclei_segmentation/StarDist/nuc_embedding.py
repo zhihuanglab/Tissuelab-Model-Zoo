@@ -981,83 +981,84 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
                 # Direct assignment to (N, C, H, W) format - no transpose needed!
                 convert_norm_start = time.time()
                 if stacked.shape[1:] == (h, w, 3):
-                    # Perfect match - batch conversion then channel assignment (entire batch at once)
+                    # Perfect match - direct write to target array using out parameter (zero-copy)
                     convert_start = time.time()
-                    # OPTIMIZATION: Convert entire batch at once (single pass), then assign channels
-                    # This is faster than per-channel conversion because:
-                    # 1. Single astype operation for entire batch (better vectorization)
-                    # 2. Single multiplication operation (better cache usage)
-                    # 3. Only one temporary array instead of three
+                    # OPTIMIZATION: Use out parameter to write directly to batch_array, avoiding memory copy
+                    # 1. Astype to temporary array (required due to type change)
+                    # 2. Use np.multiply with out parameter to write directly to batch_array channels
+                    # This eliminates the memory copy from normalized_batch to batch_array
                     astype_start = time.time()
                     float_batch = stacked.astype(np.float32)
                     astype_time = time.time() - astype_start
                     if perf_stats is not None:
                         perf_stats['processor_astype_time'] += astype_time
                     
+                    # OPTIMIZATION: Use out parameter to write directly to batch_array (no copy!)
                     normalize_start = time.time()
-                    normalized_batch = float_batch * inv_255
+                    np.multiply(float_batch[:, :, :, 0], inv_255, out=batch_array[:, 0])
+                    np.multiply(float_batch[:, :, :, 1], inv_255, out=batch_array[:, 1])
+                    np.multiply(float_batch[:, :, :, 2], inv_255, out=batch_array[:, 2])
                     normalize_time = time.time() - normalize_start
                     if perf_stats is not None:
                         perf_stats['processor_normalize_time'] += normalize_time
-                    
-                    # Direct channel assignment (no transpose needed)
-                    transpose_start = time.time()
-                    batch_array[:, 0] = normalized_batch[:, :, :, 0]
-                    batch_array[:, 1] = normalized_batch[:, :, :, 1]
-                    batch_array[:, 2] = normalized_batch[:, :, :, 2]
-                    transpose_time = time.time() - transpose_start
-                    if perf_stats is not None:
-                        perf_stats['processor_transpose_in_convert_time'] += transpose_time
+                        perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                 elif stacked.shape[1:] == (h, w, 4):
-                    # RGBA - batch conversion then channel assignment (entire batch at once)
+                    # RGBA - direct write to target array using out parameter (zero-copy)
                     convert_start = time.time()
-                    # OPTIMIZATION: Extract RGB channels, convert entire batch at once
+                    # OPTIMIZATION: Extract RGB channels, convert, then write directly using out parameter
                     astype_start = time.time()
                     float_batch = stacked[:, :, :, :3].astype(np.float32)
                     astype_time = time.time() - astype_start
                     if perf_stats is not None:
                         perf_stats['processor_astype_time'] += astype_time
                     
+                    # OPTIMIZATION: Use out parameter to write directly (no copy!)
                     normalize_start = time.time()
-                    normalized_batch = float_batch * inv_255
+                    np.multiply(float_batch[:, :, :, 0], inv_255, out=batch_array[:, 0])
+                    np.multiply(float_batch[:, :, :, 1], inv_255, out=batch_array[:, 1])
+                    np.multiply(float_batch[:, :, :, 2], inv_255, out=batch_array[:, 2])
                     normalize_time = time.time() - normalize_start
                     if perf_stats is not None:
                         perf_stats['processor_normalize_time'] += normalize_time
-                    
-                    # Direct channel assignment
-                    transpose_start = time.time()
-                    batch_array[:, 0] = normalized_batch[:, :, :, 0]
-                    batch_array[:, 1] = normalized_batch[:, :, :, 1]
-                    batch_array[:, 2] = normalized_batch[:, :, :, 2]
-                    transpose_time = time.time() - transpose_start
-                    if perf_stats is not None:
-                        perf_stats['processor_transpose_in_convert_time'] += transpose_time
+                        perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                 elif len(stacked.shape) == 3 and stacked.shape[1:] == (h, w):
-                    # Grayscale 2D - combined conversion and direct assignment (entire batch at once)
+                    # Grayscale 2D - direct write using out parameter (zero-copy)
                     convert_start = time.time()
-                    # OPTIMIZATION: Convert once, assign to all 3 channels (reuses converted array)
-                    normalized = stacked.astype(np.float32) * inv_255
-                    batch_array[:, 0] = normalized
-                    batch_array[:, 1] = normalized
-                    batch_array[:, 2] = normalized
-                    convert_time = time.time() - convert_start
+                    # OPTIMIZATION: Convert once, then write to all 3 channels using out parameter
+                    astype_start = time.time()
+                    float_batch = stacked.astype(np.float32)
+                    astype_time = time.time() - astype_start
                     if perf_stats is not None:
-                        perf_stats['processor_astype_time'] += convert_time * 0.6
-                        perf_stats['processor_normalize_time'] += convert_time * 0.4
-                        perf_stats['processor_transpose_in_convert_time'] += 0.0
+                        perf_stats['processor_astype_time'] += astype_time
+                    
+                    # OPTIMIZATION: Use out parameter to write directly to all 3 channels (no copy!)
+                    normalize_start = time.time()
+                    np.multiply(float_batch, inv_255, out=batch_array[:, 0])
+                    np.multiply(float_batch, inv_255, out=batch_array[:, 1])
+                    np.multiply(float_batch, inv_255, out=batch_array[:, 2])
+                    normalize_time = time.time() - normalize_start
+                    if perf_stats is not None:
+                        perf_stats['processor_normalize_time'] += normalize_time
+                        perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                 elif stacked.shape[1:] == (h, w, 1):
-                    # Grayscale 3D - combined conversion and direct assignment (entire batch at once)
+                    # Grayscale 3D - direct write using out parameter (zero-copy)
                     convert_start = time.time()
-                    # OPTIMIZATION: Convert once, assign to all 3 channels (reuses converted array)
-                    normalized = stacked[:, :, :, 0].astype(np.float32) * inv_255
-                    batch_array[:, 0] = normalized
-                    batch_array[:, 1] = normalized
-                    batch_array[:, 2] = normalized
-                    convert_time = time.time() - convert_start
+                    # OPTIMIZATION: Convert once, then write to all 3 channels using out parameter
+                    astype_start = time.time()
+                    float_batch = stacked[:, :, :, 0].astype(np.float32)
+                    astype_time = time.time() - astype_start
                     if perf_stats is not None:
-                        perf_stats['processor_astype_time'] += convert_time * 0.6
-                        perf_stats['processor_normalize_time'] += convert_time * 0.4
-                        perf_stats['processor_transpose_in_convert_time'] += 0.0
+                        perf_stats['processor_astype_time'] += astype_time
+                    
+                    # OPTIMIZATION: Use out parameter to write directly to all 3 channels (no copy!)
+                    normalize_start = time.time()
+                    np.multiply(float_batch, inv_255, out=batch_array[:, 0])
+                    np.multiply(float_batch, inv_255, out=batch_array[:, 1])
+                    np.multiply(float_batch, inv_255, out=batch_array[:, 2])
+                    normalize_time = time.time() - normalize_start
+                    if perf_stats is not None:
+                        perf_stats['processor_normalize_time'] += normalize_time
+                        perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                 else:
                     # Fallback to loop for edge cases
                     all_numpy = False
@@ -1082,91 +1083,75 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
                         pil_conversion_time += time.time() - conv_start
                     
                     # Fast path: Standard RGB image (most common case - optimize this path)
-                    # OPTIMIZATION: Convert entire image at once, then assign channels
+                    # OPTIMIZATION: Direct write using out parameter (zero-copy)
                     if arr_uint8.shape == (h, w, 3):
-                        # OPTIMIZATION: Single astype and normalize for entire image, then channel assignment
-                        # This is faster than per-channel conversion because:
-                        # 1. Single vectorized operation for entire image (better SIMD usage)
-                        # 2. Better memory access pattern (sequential)
-                        # 3. Only one temporary array instead of three
+                        # OPTIMIZATION: Use out parameter to write directly to batch_array, avoiding memory copy
                         astype_start = time.time()
                         float_img = arr_uint8.astype(np.float32)
                         astype_time = time.time() - astype_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += astype_time
                         
+                        # OPTIMIZATION: Use out parameter to write directly (no copy!)
                         normalize_start = time.time()
-                        normalized_img = float_img * inv_255
+                        np.multiply(float_img[:, :, 0], inv_255, out=batch_array[i, 0])
+                        np.multiply(float_img[:, :, 1], inv_255, out=batch_array[i, 1])
+                        np.multiply(float_img[:, :, 2], inv_255, out=batch_array[i, 2])
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_normalize_time'] += normalize_time
-                        
-                        # Direct channel assignment (no transpose needed)
-                        transpose_start = time.time()
-                        batch_array[i, 0] = normalized_img[:, :, 0]
-                        batch_array[i, 1] = normalized_img[:, :, 1]
-                        batch_array[i, 2] = normalized_img[:, :, 2]
-                        transpose_time = time.time() - transpose_start
-                        if perf_stats is not None:
-                            perf_stats['processor_transpose_in_convert_time'] += transpose_time
+                            perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     elif arr_uint8.ndim == 2:
-                        # Grayscale - combined conversion and assignment
-                        convert_start = time.time()
-                        # OPTIMIZATION: Convert once, assign to all 3 channels (reuses converted array)
-                        normalized = arr_uint8.astype(np.float32) * inv_255
-                        batch_array[i, 0] = normalized
-                        batch_array[i, 1] = normalized
-                        batch_array[i, 2] = normalized
-                        convert_time = time.time() - convert_start
+                        # Grayscale - direct write using out parameter (zero-copy)
+                        astype_start = time.time()
+                        float_img = arr_uint8.astype(np.float32)
+                        astype_time = time.time() - astype_start
                         if perf_stats is not None:
-                            # Split time estimate: astype ~60%, normalize ~40%
-                            perf_stats['processor_astype_time'] += convert_time * 0.6
-                            perf_stats['processor_normalize_time'] += convert_time * 0.4
-                            perf_stats['processor_transpose_in_convert_time'] += 0.0
+                            perf_stats['processor_astype_time'] += astype_time
+                        
+                        # OPTIMIZATION: Use out parameter to write directly to all 3 channels (no copy!)
+                        normalize_start = time.time()
+                        np.multiply(float_img, inv_255, out=batch_array[i, 0])
+                        np.multiply(float_img, inv_255, out=batch_array[i, 1])
+                        np.multiply(float_img, inv_255, out=batch_array[i, 2])
+                        normalize_time = time.time() - normalize_start
+                        if perf_stats is not None:
+                            perf_stats['processor_normalize_time'] += normalize_time
+                            perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     elif arr_uint8.shape[2] == 4:
-                        # RGBA - convert RGB channels at once, then assign
+                        # RGBA - direct write using out parameter (zero-copy)
                         astype_start = time.time()
                         float_img = arr_uint8[:, :, :3].astype(np.float32)
                         astype_time = time.time() - astype_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += astype_time
                         
+                        # OPTIMIZATION: Use out parameter to write directly (no copy!)
                         normalize_start = time.time()
-                        normalized_img = float_img * inv_255
+                        np.multiply(float_img[:, :, 0], inv_255, out=batch_array[i, 0])
+                        np.multiply(float_img[:, :, 1], inv_255, out=batch_array[i, 1])
+                        np.multiply(float_img[:, :, 2], inv_255, out=batch_array[i, 2])
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_normalize_time'] += normalize_time
-                        
-                        # Direct channel assignment
-                        transpose_start = time.time()
-                        batch_array[i, 0] = normalized_img[:, :, 0]
-                        batch_array[i, 1] = normalized_img[:, :, 1]
-                        batch_array[i, 2] = normalized_img[:, :, 2]
-                        transpose_time = time.time() - transpose_start
-                        if perf_stats is not None:
-                            perf_stats['processor_transpose_in_convert_time'] += transpose_time
+                            perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     elif arr_uint8.shape[0] == h and arr_uint8.shape[1] == w and arr_uint8.shape[2] >= 3:
-                        # Multi-channel (>=3) - convert first 3 channels at once, then assign
+                        # Multi-channel (>=3) - direct write using out parameter (zero-copy)
                         astype_start = time.time()
                         float_img = arr_uint8[:, :, :3].astype(np.float32)
                         astype_time = time.time() - astype_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += astype_time
                         
+                        # OPTIMIZATION: Use out parameter to write directly (no copy!)
                         normalize_start = time.time()
-                        normalized_img = float_img * inv_255
+                        np.multiply(float_img[:, :, 0], inv_255, out=batch_array[i, 0])
+                        np.multiply(float_img[:, :, 1], inv_255, out=batch_array[i, 1])
+                        np.multiply(float_img[:, :, 2], inv_255, out=batch_array[i, 2])
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_normalize_time'] += normalize_time
-                        
-                        # Direct channel assignment
-                        transpose_start = time.time()
-                        batch_array[i, 0] = normalized_img[:, :, 0]
-                        batch_array[i, 1] = normalized_img[:, :, 1]
-                        batch_array[i, 2] = normalized_img[:, :, 2]
-                        transpose_time = time.time() - transpose_start
-                        if perf_stats is not None:
-                            perf_stats['processor_transpose_in_convert_time'] += transpose_time
+                            perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     else:
                         # Edge case: fallback to standard conversion
                         arr_float = np.array(img, dtype=np.float32)
