@@ -1457,12 +1457,12 @@ class NucleiEmbedding:
                     try:
                         self.model.vision_model = torch.compile(
                             self.model.vision_model,
-                            mode='max-autotune',  # Best performance mode
+                            mode='default',
                             fullgraph=False  # Allow graph breaks for flexibility
                         )
                         self.image_projection = torch.compile(
                             self.image_projection,
-                            mode='max-autotune',  # Best performance mode
+                            mode='default',
                             fullgraph=False
                         )
                         print("[OPTIMIZATION] Model compilation completed (mode='max-autotune' for best performance)")
@@ -1675,15 +1675,15 @@ class NucleiEmbedding:
                 # Calculate maximum possible batch size
                 max_batch_size = int(available_memory / memory_per_sample)
 
-                # Set a reasonable range for batch size (increased max from 256 to 512 for better GPU utilization)
+                # Set a reasonable range for batch size (increased max from 256)
                 # Larger batch sizes improve GPU utilization and reduce overhead
-                batch_size = max(64, min(max_batch_size, 512))  # Minimum 64 for better GPU utilization
+                batch_size = max(64, min(max_batch_size, 256))  # Minimum 64 for better GPU utilization
                 print(f"Automatically set batch size to {batch_size} based on available GPU memory")
             except Exception as e:
                 print(f"Error setting dynamic batch size: {e}")
-                batch_size = 512  # Increased default from 256 to 512 for better GPU utilization
+                batch_size = 256  # Increased default from 256
         elif batch_size is None:
-            batch_size = 512  # Increased default from 256 to 512 for better GPU utilization
+            batch_size = 256  # Increased default from 256
 
         print(f"Generating embeddings using {num_workers} workers and batch size {batch_size}...")
         if enable_profiling:
