@@ -6,6 +6,11 @@ Created on Feb 03 2025
 @author: zhihuang
 """
 
+import os
+
+# Limit TorchInductor GEMM autotuning to avoid unnecessary compile overhead
+os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM", "0")
+
 import numpy as np
 import torch
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
@@ -15,7 +20,6 @@ from PIL import Image
 import multiprocess as mp
 from tqdm import tqdm
 import zarr
-import os
 from nuc_stat import PILSlide, NumpySlide
 from torch.utils.data import Dataset, DataLoader
 import time
@@ -1594,6 +1598,8 @@ class NucleiEmbedding:
             # OPTIMIZATION: Normalize on GPU before moving to CPU (faster)
             # Use more efficient normalization: torch.nn.functional.normalize is optimized
             final_embeddings = torch.nn.functional.normalize(final_embeddings, p=2, dim=1)
+            # Convert to float16 while still on device to avoid extra CPU copies
+            final_embeddings = final_embeddings.to(dtype=torch.float16)
             final_embeddings = final_embeddings.cpu().numpy()
             
             # Final verification log
@@ -1626,6 +1632,8 @@ class NucleiEmbedding:
                 # L2 normalization: embeddings / ||embeddings||
                 # Use more efficient normalization: torch.nn.functional.normalize is optimized
                 embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+                # Convert to float16 on device to avoid numpy-side copies
+                embeddings = embeddings.to(dtype=torch.float16)
                 # Move to CPU and convert to numpy in one step (inference_mode already handles detach)
                 embeddings = embeddings.cpu().numpy()
 
@@ -1843,9 +1851,12 @@ class NucleiEmbedding:
                     
                     # Postprocessing
                     # OPTIMIZATION: Normalization is now done in embed_batch on GPU (faster)
-                    # Only need to convert to float16 here
+                    # Ensure embeddings are float16 without redundant numpy copies
                     postprocess_start = time.time()
-                    batch_embeddings = batch_embeddings.astype(np.float16)
+                    if torch.is_tensor(batch_embeddings):
+                        batch_embeddings = batch_embeddings.to(dtype=torch.float16).cpu().numpy()
+                    elif isinstance(batch_embeddings, np.ndarray) and batch_embeddings.dtype != np.float16:
+                        batch_embeddings = batch_embeddings.astype(np.float16, copy=False)
                     perf_stats['postprocessing_time'] += time.time() - postprocess_start
                     
                     # I/O operations
