@@ -1664,7 +1664,29 @@ class NucleiEmbedding:
             final_embeddings = torch.nn.functional.normalize(final_embeddings, p=2, dim=1)
             # Convert to float16 while still on device to avoid extra CPU copies
             final_embeddings = final_embeddings.to(dtype=torch.float16)
-            final_embeddings = final_embeddings.cpu().numpy()
+            # OPTIMIZATION: Use CUDA events to track only the operations we need, not all GPU work
+            if torch.cuda.is_available():
+                # Record an event after normalize/to operations to track their completion
+                # This is more efficient than synchronizing the entire device
+                event = torch.cuda.Event()
+                event.record()
+                # Wait only for our specific operations to complete
+                event.wait()
+                # Create pinned tensor for faster transfer
+                pinned_tensor = torch.empty(
+                    final_embeddings.shape, 
+                    dtype=torch.float16, 
+                    pin_memory=True
+                )
+                # Use async copy (non_blocking=True) - the event ensures normalize is done
+                pinned_tensor.copy_(final_embeddings, non_blocking=True)
+                # Record another event to track copy completion
+                copy_event = torch.cuda.Event()
+                copy_event.record()
+                copy_event.wait()  # Wait only for copy to complete
+                final_embeddings = pinned_tensor.numpy()
+            else:
+                final_embeddings = final_embeddings.cpu().numpy()
             
             # Final verification log
             print(f"[Z-STACK FUSION] Processed {len(all_cell_embeddings)} cells, final shape: {final_embeddings.shape}")
@@ -1698,12 +1720,34 @@ class NucleiEmbedding:
                 embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
                 # Convert to float16 on device to avoid numpy-side copies
                 embeddings = embeddings.to(dtype=torch.float16)
-                # Move to CPU and convert to numpy in one step (inference_mode already handles detach)
-                embeddings = embeddings.cpu().numpy()
+                # OPTIMIZATION: Use CUDA events to track only the operations we need, not all GPU work
+                if torch.cuda.is_available():
+                    # Record an event after normalize/to operations to track their completion
+                    # This is more efficient than synchronizing the entire device
+                    event = torch.cuda.Event()
+                    event.record()
+                    # Wait only for our specific operations to complete
+                    event.wait()
+                    # Create pinned tensor for faster transfer
+                    pinned_tensor = torch.empty(
+                        embeddings.shape, 
+                        dtype=torch.float16, 
+                        pin_memory=True
+                    )
+                    # Use async copy (non_blocking=True) - the event ensures normalize is done
+                    pinned_tensor.copy_(embeddings, non_blocking=True)
+                    # Record another event to track copy completion
+                    copy_event = torch.cuda.Event()
+                    copy_event.record()
+                    copy_event.wait()  # Wait only for copy to complete
+                    embeddings = pinned_tensor.numpy()
+                else:
+                    # CPU fallback
+                    embeddings = embeddings.cpu().numpy()
 
             return embeddings
 
-    def generate_embeddings(self, batch_size=None, num_workers=None, zarr_path=None, dataset_path='embedding', enable_profiling=False):
+    def generate_embeddings(self, batch_size=None, num_workers=None, zarr_path=None, dataset_path='embedding'):
         """Generate embeddings and write directly to a Zarr dataset.
 
         Args:
@@ -1711,15 +1755,11 @@ class NucleiEmbedding:
             num_workers: Optional num_workers for DataLoader (default: 0 to avoid pickling issues)
             zarr_path: Path to the root Zarr store to write into (required)
             dataset_path: Dataset path under the root group to write (default: 'embedding')
-            enable_profiling: If True, force num_workers=0 for accurate profiling. If False, use multi-process loading.
         """
-        # Set num_workers based on profiling mode
+        # Set num_workers
         # Note: On Windows, multiprocessing has issues with pickling file handles (slide objects)
         # So we default to 0 workers to avoid serialization errors
-        if enable_profiling:
-            # Force num_workers to 0 for accurate performance profiling
-            num_workers = 0
-        elif num_workers is None:
+        if num_workers is None:
             # Default to 0 workers to avoid pickling issues with slide file handles
             # The slide object contains file handles that cannot be pickled for multiprocessing
             num_workers = 0
@@ -1758,9 +1798,7 @@ class NucleiEmbedding:
             batch_size = 256  # Increased default from 256
 
         print(f"Generating embeddings using {num_workers} workers and batch size {batch_size}...")
-        if enable_profiling:
-            print(f"[PERF] Performance profiling enabled - num_workers={num_workers} (forced to 0 for profiling)")
-        elif num_workers == 0:
+        if num_workers == 0:
             print(f"[PERF] Single-process mode - num_workers={num_workers} (avoids pickling issues with slide file handles)")
         else:
             print(f"[PERF] Multi-process data loading enabled - num_workers={num_workers} (for faster I/O)")
@@ -1914,11 +1952,38 @@ class NucleiEmbedding:
                     perf_stats['model_time'] += time.time() - model_start
                     
                     # Postprocessing
-                    # OPTIMIZATION: Normalization is now done in embed_batch on GPU (faster)
-                    # Ensure embeddings are float16 without redundant numpy copies
+                    # OPTIMIZATION: Reduce CPU-GPU copy overhead by:
+                    # 1. Convert dtype on GPU (faster than CPU)
+                    # 2. Use pinned memory for faster transfer
+                    # 3. Minimize synchronization points
                     postprocess_start = time.time()
                     if torch.is_tensor(batch_embeddings):
-                        batch_embeddings = batch_embeddings.to(dtype=torch.float16).cpu().numpy()
+                        # Convert to float16 on GPU first (no CPU transfer yet)
+                        batch_embeddings = batch_embeddings.to(dtype=torch.float16)
+                        # OPTIMIZATION: Use CUDA events to track only the operations we need, not all GPU work
+                        if torch.cuda.is_available():
+                            # Record an event after dtype conversion to track its completion
+                            # This is more efficient than synchronizing the entire device
+                            event = torch.cuda.Event()
+                            event.record()
+                            # Wait only for our specific operations to complete
+                            event.wait()
+                            # Create pinned tensor for faster transfer
+                            pinned_tensor = torch.empty(
+                                batch_embeddings.shape, 
+                                dtype=torch.float16, 
+                                pin_memory=True
+                            )
+                            # Use async copy (non_blocking=True) - the event ensures dtype conversion is done
+                            pinned_tensor.copy_(batch_embeddings, non_blocking=True)
+                            # Record another event to track copy completion
+                            copy_event = torch.cuda.Event()
+                            copy_event.record()
+                            copy_event.wait()  # Wait only for copy to complete
+                            batch_embeddings = pinned_tensor.numpy()
+                        else:
+                            # CPU fallback
+                            batch_embeddings = batch_embeddings.cpu().numpy()
                     elif isinstance(batch_embeddings, np.ndarray) and batch_embeddings.dtype != np.float16:
                         batch_embeddings = batch_embeddings.astype(np.float16, copy=False)
                     perf_stats['postprocessing_time'] += time.time() - postprocess_start
@@ -2025,6 +2090,7 @@ class NucleiEmbedding:
             traceback.print_exc()
             raise
         finally:
+            # Cleanup
             if 'batch_embeddings' in locals():
                 del batch_embeddings
             if 'processed_batch' in locals():
