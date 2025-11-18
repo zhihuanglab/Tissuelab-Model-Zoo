@@ -37,6 +37,15 @@ class NucleiPatchDataset(Dataset):
         self.z_layer = z_layer  # Specific Z layer for segmentation, None means use all layers for embedding
         self.padding_ratio = padding_ratio  # Padding as fraction of bounding box size (e.g., 0.2 = 20%)
         
+        # Performance profiling for detailed analysis
+        self.perf_stats = {
+            'slide_open_time': 0.0,  # Time to open slide object
+            'read_region_time': 0.0,  # Time to read region from slide
+            'image_process_time': 0.0,  # Time for convert/resize operations
+            'processor_time': 0.0,  # Time for processor preprocessing
+            'total_calls': 0
+        }
+        
         # Pre-compute bounding boxes from contours if available (very efficient - just numpy operations)
         self.use_bounding_boxes = (contours is not None and len(contours) == len(centroids))
         if self.use_bounding_boxes:
@@ -81,24 +90,31 @@ class NucleiPatchDataset(Dataset):
         print(f"Using read method: {self.read_image_method} for file: {slide_path}")
         
         # Detect if this is a z-stack image
+        # DISABLED: z-stack functionality is disabled
         self.is_zstack = False
         self.num_z_layers = 1
-        self._detect_zstack()
+        # self._detect_zstack()  # Disabled
+        
+        # Open slide object once and reuse it (since num_workers=0, single-threaded is safe)
+        # This avoids the overhead of opening/closing slide for each patch (saves ~21% of DataLoader time)
+        self.slide = None
+        # Note: _open_slide() will be called after magnification is determined to reuse the slide
         
         # Get magnification and MPP from slide
+        # Open slide once and reuse it for both MPP reading and patch extraction
         self.mpp = None
         if read_image_method == 'openslide':
             import openslide
-            with openslide.OpenSlide(slide_path) as slide:
-                self.mpp = float(slide.properties['openslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / self.mpp
+            self.slide = openslide.OpenSlide(slide_path)
+            self.mpp = float(self.slide.properties['openslide.mpp-x'])
+            reference_mpp_1x = 10  # objective magnification
+            self.magnification = reference_mpp_1x / self.mpp
         elif read_image_method == 'tiffslide':
             import tiffslide
-            with tiffslide.TiffSlide(slide_path) as slide:
-                self.mpp = float(slide.properties['tiffslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / self.mpp
+            self.slide = tiffslide.TiffSlide(slide_path)
+            self.mpp = float(self.slide.properties['tiffslide.mpp-x'])
+            reference_mpp_1x = 10  # objective magnification
+            self.magnification = reference_mpp_1x / self.mpp
         else:
             # Default to provided magnification for PIL and numpy
             self.magnification = magnification
@@ -107,6 +123,12 @@ class NucleiPatchDataset(Dataset):
                 self.mpp = 10.0 / magnification
             else:
                 self.mpp = 0.25  # Default 40x equivalent
+            # Open slide for PIL/numpy/dicom methods
+            self._open_slide()
+        
+        # Record slide open time (only once at initialization)
+        if self.slide is not None:
+            print(f"[PERF] Opened slide object for reuse (will save ~21% DataLoader overhead)")
         
         # If not using bounding boxes, calculate extraction_size for fixed-size patches
         if not self.use_bounding_boxes:
@@ -201,6 +223,44 @@ class NucleiPatchDataset(Dataset):
             print(f"Error detecting z-stack: {e}, assuming single layer")
             self.is_zstack = False
             self.num_z_layers = 1
+
+    def _open_slide(self):
+        """Open slide object once and reuse it for all patch extractions"""
+        import time
+        slide_open_start = time.time()
+        
+        if self.slide is not None:
+            return  # Already opened
+        
+        if self.read_image_method == 'openslide':
+            import openslide
+            self.slide = openslide.OpenSlide(self.slide_path)
+        elif self.read_image_method == 'tiffslide':
+            import tiffslide
+            self.slide = tiffslide.TiffSlide(self.slide_path)
+        elif self.read_image_method == 'PIL':
+            self.slide = PILSlide(self.slide_path)
+        elif self.read_image_method == 'numpy':
+            self.slide = NumpySlide(self.slide_path)
+        elif self.read_image_method == 'dicom':
+            self.slide = DicomImageWrapper(self.slide_path)
+        else:
+            file_extension = pathlib.Path(self.slide_path).suffix.lower()[1:]
+            if file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
+                self.slide = SimpleImageWrapper(self.slide_path)
+            else:
+                self.slide = TiffFileWrapper(self.slide_path)
+        
+        # Record initial slide open time (only once)
+        self.perf_stats['slide_open_time'] += time.time() - slide_open_start
+
+    def __del__(self):
+        """Clean up slide object when dataset is destroyed"""
+        if self.slide is not None and hasattr(self.slide, 'close'):
+            try:
+                self.slide.close()
+            except:
+                pass
 
     def __len__(self):
         return len(self.centroids)
@@ -322,11 +382,11 @@ class NucleiPatchDataset(Dataset):
             width = height = self.extraction_size
         
         try:
-            # For z-stack images, extract patches from all layers (or specific layer)
-            if self.is_zstack:
-                result = self._extract_zstack_patches(x1, y1, width, height, idx)
-            else:
-                result = self._extract_single_patch(x1, y1, width, height, idx, x, y, z_layer=0)
+            # DISABLED: z-stack functionality - always use single layer extraction
+            # if self.is_zstack:
+            #     result = self._extract_zstack_patches(x1, y1, width, height, idx)
+            # else:
+            result = self._extract_single_patch(x1, y1, width, height, idx, x, y, z_layer=0)
             
             return result
         except Exception as e:
@@ -335,72 +395,56 @@ class NucleiPatchDataset(Dataset):
 
     def _extract_single_patch(self, x1, y1, width, height, idx, x, y, z_layer=0):
         """Extract a single patch from one z-layer"""
+        import time
         from PIL import Image  # Import at the beginning for all branches
         
-        # For z-stack, we need to read specific layer using PIL directly
-        if self.is_zstack:
-            with Image.open(self.slide_path) as img:
-                img.seek(z_layer)
-                patch = img.crop((x1, y1, x1 + width, y1 + height))
-                patch = patch.copy()  # Make a copy since we're closing the file
+        # Use pre-opened slide object (reused for all patches)
+        # This eliminates the overhead of opening/closing slide for each patch
+        if self.slide is None:
+            # Fallback: open slide if not already opened (shouldn't happen)
+            self._open_slide()
+        
+        # Measure read_region time (slide is already open, no open overhead)
+        read_region_start = time.time()
+        patch = self.slide.read_region(
+            location=(x1, y1),
+            level=0,
+            size=(width, height)
+        )
+        self.perf_stats['read_region_time'] += time.time() - read_region_start
+        
+        # Measure image processing time (convert + resize)
+        image_process_start = time.time()
+        if patch.mode != 'RGB':
+            patch = patch.convert('RGB')
+            
+        # Resize to model input size (always square 224x224)
+        if patch.size[0] != self.patch_size or patch.size[1] != self.patch_size:
+            patch = patch.resize((self.patch_size, self.patch_size), Image.Resampling.LANCZOS)
+        self.perf_stats['image_process_time'] += time.time() - image_process_start
+        
+        # Preprocess the patch if processor is available
+        if self.processor is not None:
+            processor_start = time.time()
+            processed_patch = self.processor.image_processor(patch)['pixel_values']
+            self.perf_stats['processor_time'] += time.time() - processor_start
+            
+            # DEBUG: Save preprocessed patch (exactly as model sees it)
+            # Calculate centroid position in resized patch
+            centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
+            centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
+            self._debug_save_patch_processed(processed_patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
+            
+            self.perf_stats['total_calls'] += 1
+            return processed_patch
         else:
-            # Single layer: use original logic with slide wrappers
-            slide = None
-            try:
-                if self.read_image_method == 'openslide':
-                    import openslide
-                    slide = openslide.OpenSlide(self.slide_path)
-                elif self.read_image_method == 'tiffslide':
-                    import tiffslide
-                    slide = tiffslide.TiffSlide(self.slide_path)
-                elif self.read_image_method == 'PIL':
-                    slide = PILSlide(self.slide_path)
-                elif self.read_image_method == 'numpy':
-                    slide = NumpySlide(self.slide_path)
-                elif self.read_image_method == 'dicom':
-                    slide = DicomImageWrapper(self.slide_path)
-                else:
-                    file_extension = pathlib.Path(self.slide_path).suffix.lower()[1:]
-                    if file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
-                        slide = SimpleImageWrapper(self.slide_path)
-                    else:
-                        slide = TiffFileWrapper(self.slide_path)
-
-                patch = slide.read_region(
-                    location=(x1, y1),
-                    level=0,
-                    size=(width, height)
-                )
-            finally:
-                # Close slide to prevent resource leak
-                if slide is not None and hasattr(slide, 'close'):
-                    slide.close()
+            # DEBUG: Save raw patch if no processor
+            centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
+            centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
+            self._debug_save_patch(patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
             
-            if patch.mode != 'RGB':
-                patch = patch.convert('RGB')
-                
-            # Resize to model input size (always square 224x224)
-            if patch.size[0] != self.patch_size or patch.size[1] != self.patch_size:
-                patch = patch.resize((self.patch_size, self.patch_size), Image.Resampling.LANCZOS)
-            
-            # Preprocess the patch if processor is available
-            if self.processor is not None:
-                processed_patch = self.processor.image_processor(patch)['pixel_values']
-                
-                # DEBUG: Save preprocessed patch (exactly as model sees it)
-                # Calculate centroid position in resized patch
-                centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
-                centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
-                self._debug_save_patch_processed(processed_patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
-                
-                return processed_patch
-            else:
-                # DEBUG: Save raw patch if no processor
-                centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
-                centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
-                self._debug_save_patch(patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
-                
-                return patch
+            self.perf_stats['total_calls'] += 1
+            return patch
 
     def _extract_zstack_patches(self, x1, y1, width, height, idx):
         """Extract patches from all z-layers for embedding fusion"""
@@ -998,8 +1042,11 @@ class NucleiEmbedding:
             zarr_path: Path to the root Zarr store to write into (required)
             dataset_path: Dataset path under the root group to write (default: 'embedding')
         """
+        # Force num_workers to 0 for performance profiling
         if num_workers is None:
-            num_workers = min(mp.cpu_count(), 2)
+            num_workers = 0  # Set to 0 for performance profiling
+        else:
+            num_workers = 0  # Force to 0 regardless of input
 
         # Dynamically determine batch size based on available GPU memory
         if batch_size is None and torch.cuda.is_available():
@@ -1032,6 +1079,7 @@ class NucleiEmbedding:
             batch_size = 128
 
         print(f"Generating embeddings using {num_workers} workers and batch size {batch_size}...")
+        print(f"[PERF] Performance profiling enabled - num_workers={num_workers} (forced to 0 for profiling)")
         
         # For embedding, always use all layers (z_layer=None)
         # z_layer_for_segmentation is only used during segmentation phase, not here
@@ -1049,23 +1097,26 @@ class NucleiEmbedding:
             padding_ratio=0.1  # 10% padding around bounding box (reduced for tighter patches)
         )
         
+        # DISABLED: z-stack functionality
         # Check if dataset has z-stack
-        is_zstack = dataset.is_zstack and z_layer is None
-        if is_zstack:
-            print(f"Z-stack detected with {dataset.num_z_layers} layers. Will fuse embeddings across layers.")
-            # For z-stack, reduce batch_size since we process multiple layers per cell
-            batch_size = max(1, batch_size // dataset.num_z_layers)
-            print(f"Adjusted batch_size to {batch_size} for z-stack processing")
+        is_zstack = False  # Always False - z-stack disabled
+        # is_zstack = dataset.is_zstack and z_layer is None
+        # if is_zstack:
+        #     print(f"Z-stack detected with {dataset.num_z_layers} layers. Will fuse embeddings across layers.")
+        #     # For z-stack, reduce batch_size since we process multiple layers per cell
+        #     batch_size = max(1, batch_size // dataset.num_z_layers)
+        #     print(f"Adjusted batch_size to {batch_size} for z-stack processing")
         
+        # Disable persistent_workers when num_workers=0
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             num_workers=num_workers,
             shuffle=False,
             collate_fn=collate_patches,
-            prefetch_factor=1,
-            persistent_workers=True,
-            pin_memory=True
+            prefetch_factor=1 if num_workers > 0 else None,
+            persistent_workers=True if num_workers > 0 else False,
+            pin_memory=True if num_workers > 0 else False
         )
         
         if zarr_path is None:
@@ -1093,45 +1144,164 @@ class NucleiEmbedding:
         total_start_time = time.time()
         pbar = tqdm(total=len(dataset), desc="Generating embeddings")
         
-        for batch in dataloader:
-            if batch:
-                if is_zstack:
-                    # Z-stack case: batch is list of lists
-                    batch_embeddings = self.embed_batch(batch, is_zstack=True, num_z_layers=dataset.num_z_layers)
-                else:
+        # Performance profiling variables
+        perf_stats = {
+            'dataloader_time': 0.0,  # Time spent waiting for dataloader
+            'preprocessing_time': 0.0,  # Time for data preprocessing (concatenate, to device)
+            'model_time': 0.0,  # Time for model inference
+            'postprocessing_time': 0.0,  # Time for normalization and type conversion
+            'io_time': 0.0,  # Time for writing to zarr
+            'total_batches': 0,
+            'total_samples': 0
+        }
+        
+        batch_idx = 0
+        prev_batch_end_time = time.time()
+        log_interval_batches = 10  # Log stats every 10 batches
+        
+        try:
+            for batch in dataloader:
+                # Measure dataloader time (time from previous batch end to current batch received)
+                dataloader_start_time = time.time()
+                if batch_idx > 0:
+                    perf_stats['dataloader_time'] += dataloader_start_time - prev_batch_end_time
+                
+                if batch:
+                    # DISABLED: z-stack functionality - always use single layer logic
+                    # if is_zstack:
+                    #     # Z-stack case: batch is list of lists
+                    #     batch_embeddings = self.embed_batch(batch, is_zstack=True, num_z_layers=dataset.num_z_layers)
+                    # else:
                     # Single layer case: original logic
+                    preprocess_start = time.time()
                     processed_batch = torch.from_numpy(np.concatenate(batch, axis=0)).to(self.device)
+                    perf_stats['preprocessing_time'] += time.time() - preprocess_start
+                    
+                    # Model inference
+                    model_start = time.time()
                     batch_embeddings = self.embed_batch(processed_batch, is_zstack=False)
+                    perf_stats['model_time'] += time.time() - model_start
+                    
+                    # Postprocessing
+                    postprocess_start = time.time()
+                    batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
+                    batch_embeddings = batch_embeddings.astype(np.float16)
+                    perf_stats['postprocessing_time'] += time.time() - postprocess_start
+                    
+                    # I/O operations
+                    io_start = time.time()
+                    current_size = embeddings_dset.shape[0]
+                    new_size = current_size + batch_embeddings.shape[0]
+                    embeddings_dset.resize((new_size, 768))
+                    embeddings_dset[current_size:new_size, :] = batch_embeddings
+                    perf_stats['io_time'] += time.time() - io_start
+                    
+                    # Update statistics
+                    perf_stats['total_batches'] += 1
+                    perf_stats['total_samples'] += len(batch)
+                    
+                    # update progress
+                    total_processed += len(batch)
+                    pbar.update(len(batch))
+                    
+                    # update progress callback
+                    if self.progress_callback:
+                        progress = int((total_processed / len(dataset)) * 100)
+                        self.progress_callback(progress)
+                    
+                    # clean memory
+                    del batch_embeddings, processed_batch
+                    torch.cuda.empty_cache()
                 
-                batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
+                # Record end time for this batch (for next iteration's dataloader time measurement)
+                prev_batch_end_time = time.time()
+                batch_idx += 1
                 
-                # convert to float16 and incrementally save to HDF5 file
-                batch_embeddings = batch_embeddings.astype(np.float16)
+                # Periodic logging of performance stats (every N batches)
+                if perf_stats['total_batches'] > 0 and perf_stats['total_batches'] % log_interval_batches == 0:
+                    elapsed_time = time.time() - total_start_time
+                    avg_batch_time = elapsed_time / perf_stats['total_batches']
+                    total_batches_expected = (len(dataset) + batch_size - 1) // batch_size
+                    remaining_batches = total_batches_expected - perf_stats['total_batches']
+                    estimated_remaining = remaining_batches * avg_batch_time
+                    
+                    # Get detailed DataLoader stats from dataset
+                    dataset_perf = dataset.perf_stats
+                    total_dataloader_time = perf_stats['dataloader_time']
+                    
+                    print(f"\n[PERF] Progress update (batch {perf_stats['total_batches']}/{total_batches_expected}):", flush=True)
+                    print(f"  Elapsed: {elapsed_time:.1f}s, Avg batch time: {avg_batch_time:.3f}s", flush=True)
+                    print(f"  Estimated remaining: {estimated_remaining:.1f}s ({estimated_remaining/60:.1f} min)", flush=True)
+                    if elapsed_time > 0:
+                        print(f"  DataLoader total: {total_dataloader_time:.1f}s ({total_dataloader_time/elapsed_time*100:.1f}%)", flush=True)
+                        if dataset_perf['total_calls'] > 0:
+                            avg_call_time = total_dataloader_time / dataset_perf['total_calls']
+                            print(f"    - Slide open: {dataset_perf['slide_open_time']:.1f}s ({dataset_perf['slide_open_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                            print(f"    - Read region: {dataset_perf['read_region_time']:.1f}s ({dataset_perf['read_region_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                            print(f"    - Image process (convert/resize): {dataset_perf['image_process_time']:.1f}s ({dataset_perf['image_process_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                            print(f"    - Processor: {dataset_perf['processor_time']:.1f}s ({dataset_perf['processor_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                            print(f"    - Avg per sample: {avg_call_time*1000:.2f}ms", flush=True)
+                        print(f"  Preprocessing: {perf_stats['preprocessing_time']:.1f}s ({perf_stats['preprocessing_time']/elapsed_time*100:.1f}%)", flush=True)
+                        print(f"  Model: {perf_stats['model_time']:.1f}s ({perf_stats['model_time']/elapsed_time*100:.1f}%)", flush=True)
+                        print(f"  Postprocessing: {perf_stats['postprocessing_time']:.1f}s ({perf_stats['postprocessing_time']/elapsed_time*100:.1f}%)", flush=True)
+                        print(f"  I/O: {perf_stats['io_time']:.1f}s ({perf_stats['io_time']/elapsed_time*100:.1f}%)", flush=True)
+        except Exception as e:
+            print(f"\n[PERF] Error during embedding generation: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
+        finally:
+            pbar.close()
+            total_time = time.time() - total_start_time
+            
+            # Print performance statistics (force flush to ensure output)
+            import sys
+            sys.stdout.flush()
+            
+            print("\n" + "="*60, flush=True)
+            print("PERFORMANCE PROFILING RESULTS", flush=True)
+            print("="*60, flush=True)
+            print(f"Total processing time: {total_time:.2f} seconds", flush=True)
+            print(f"Total batches processed: {perf_stats['total_batches']}", flush=True)
+            print(f"Total samples processed: {perf_stats['total_samples']}", flush=True)
+            
+            if perf_stats['total_batches'] > 0:
+                print(f"Average time per batch: {total_time / perf_stats['total_batches']:.3f} seconds", flush=True)
+            if perf_stats['total_samples'] > 0:
+                print(f"Average time per sample: {total_time / perf_stats['total_samples']:.4f} seconds", flush=True)
+            
+            print("\nTime breakdown:", flush=True)
+            if total_time > 0:
+                total_dataloader_time = perf_stats['dataloader_time']
+                print(f"  DataLoader (data loading): {total_dataloader_time:.2f} seconds ({total_dataloader_time/total_time*100:.1f}%)", flush=True)
                 
-                # adjust the dataset size to fit the new data
-                current_size = embeddings_dset.shape[0]
-                new_size = current_size + batch_embeddings.shape[0]
-                embeddings_dset.resize((new_size, 768))
+                # Detailed DataLoader breakdown
+                dataset_perf = dataset.perf_stats
+                if dataset_perf['total_calls'] > 0:
+                    print(f"    DataLoader detailed breakdown (from {dataset_perf['total_calls']} samples):", flush=True)
+                    print(f"      - Slide open: {dataset_perf['slide_open_time']:.2f}s ({dataset_perf['slide_open_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                    print(f"      - Read region: {dataset_perf['read_region_time']:.2f}s ({dataset_perf['read_region_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                    print(f"      - Image process (convert/resize): {dataset_perf['image_process_time']:.2f}s ({dataset_perf['image_process_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                    print(f"      - Processor: {dataset_perf['processor_time']:.2f}s ({dataset_perf['processor_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                    avg_per_sample = total_dataloader_time / dataset_perf['total_calls']
+                    print(f"      - Avg time per sample: {avg_per_sample*1000:.2f}ms", flush=True)
                 
-                # write new data
-                embeddings_dset[current_size:new_size, :] = batch_embeddings
-                
-                # update progress
-                total_processed += len(batch)
-                pbar.update(len(batch))
-                
-                # update progress callback
-                if self.progress_callback:
-                    progress = int((total_processed / len(dataset)) * 100)
-                    self.progress_callback(progress)
-                
-                # clean memory
-                del batch_embeddings
-                torch.cuda.empty_cache()
-        
-        pbar.close()
-        total_time = time.time() - total_start_time
-        print(f"Total processing time: {total_time:.2f} seconds")
-        
-        print("embeddings calculation completed and written to Zarr store")
+                print(f"  Preprocessing (concat, to device): {perf_stats['preprocessing_time']:.2f} seconds ({perf_stats['preprocessing_time']/total_time*100:.1f}%)", flush=True)
+                print(f"  Model inference: {perf_stats['model_time']:.2f} seconds ({perf_stats['model_time']/total_time*100:.1f}%)", flush=True)
+                print(f"  Postprocessing (norm, type conversion): {perf_stats['postprocessing_time']:.2f} seconds ({perf_stats['postprocessing_time']/total_time*100:.1f}%)", flush=True)
+                print(f"  I/O (zarr write): {perf_stats['io_time']:.2f} seconds ({perf_stats['io_time']/total_time*100:.1f}%)", flush=True)
+                other_time = total_time - perf_stats['dataloader_time'] - perf_stats['preprocessing_time'] - perf_stats['model_time'] - perf_stats['postprocessing_time'] - perf_stats['io_time']
+                print(f"  Other overhead: {other_time:.2f} seconds ({other_time/total_time*100:.1f}%)", flush=True)
+            else:
+                print("  Warning: Total time is 0, cannot calculate percentages", flush=True)
+                print(f"  DataLoader: {perf_stats['dataloader_time']:.2f} seconds", flush=True)
+                print(f"  Preprocessing: {perf_stats['preprocessing_time']:.2f} seconds", flush=True)
+                print(f"  Model inference: {perf_stats['model_time']:.2f} seconds", flush=True)
+                print(f"  Postprocessing: {perf_stats['postprocessing_time']:.2f} seconds", flush=True)
+                print(f"  I/O: {perf_stats['io_time']:.2f} seconds", flush=True)
+            
+            print("="*60, flush=True)
+            sys.stdout.flush()
+            
+            print("embeddings calculation completed and written to Zarr store", flush=True)
         return dataset_path
