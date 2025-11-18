@@ -938,7 +938,7 @@ def _normalize_imagenet_gpu(tensor, device):
     """Normalize ImageNet on GPU using PyTorch (faster than CPU numpy).
     
     Args:
-        tensor: torch.Tensor of shape (N, C, H, W) with uint8 values [0, 255]
+        tensor: torch.Tensor of shape (N, C, H, W) with float32 values [0, 255] (already converted from uint8)
         device: torch device to use
         
     Returns:
@@ -951,12 +951,11 @@ def _normalize_imagenet_gpu(tensor, device):
         _IMAGENET_MEAN_TENSOR = torch.tensor(_IMAGENET_MEAN_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
         _IMAGENET_STD_TENSOR = torch.tensor(_IMAGENET_STD_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
     
-    # OPTIMIZATION: Convert to float32 and normalize in one step (GPU-accelerated)
-    # Use non_blocking=True for faster CPU->GPU transfer
-    tensor_float = tensor.to(torch.float32, non_blocking=True)
+    # OPTIMIZATION: Tensor is already float32 on GPU, so just normalize directly
     # Standard ImageNet normalization: (x - mean) / std
     # PyTorch will fuse these operations automatically on GPU
-    normalized = (tensor_float - _IMAGENET_MEAN_TENSOR) / _IMAGENET_STD_TENSOR
+    # Using in-place operations where possible for better memory efficiency
+    normalized = (tensor - _IMAGENET_MEAN_TENSOR) / _IMAGENET_STD_TENSOR
     return normalized
 
 def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return_uint8=False):
@@ -1881,6 +1880,11 @@ class NucleiEmbedding:
         perf_stats = {
             'dataloader_time': 0.0,  # Time spent waiting for dataloader
             'preprocessing_time': 0.0,  # Time for data preprocessing (concatenate, to device)
+            'preprocessing_contiguous_check_time': 0.0,  # Time for checking/making contiguous
+            'preprocessing_from_numpy_time': 0.0,  # Time for torch.from_numpy()
+            'preprocessing_to_device_time': 0.0,  # Time for .to(device)
+            'preprocessing_normalize_time': 0.0,  # Time for normalization
+            'preprocessing_total_batches': 0,  # Total batches processed in preprocessing
             'model_time': 0.0,  # Time for model inference
             'postprocessing_time': 0.0,  # Time for normalization and type conversion
             'io_time': 0.0,  # Time for writing to zarr
@@ -1918,33 +1922,95 @@ class NucleiEmbedding:
                     preprocess_start = time.time()
                     # Batch is already processed by collate_patches (fast preprocessing applied)
                     # Fast preprocessing returns a single array (N, C, H, W) - no stack needed!
+                    # OPTIMIZATION: Streamlined preprocessing with minimal operations
                     if isinstance(batch, np.ndarray):
                         # Already a single stacked array from fast preprocessing
-                        # OPTIMIZATION: Check if data is already normalized (float32) or needs normalization (uint8)
+                        # OPTIMIZATION: Ensure contiguous memory layout for faster transfer
+                        contiguous_start = time.time()
+                        if not batch.flags['C_CONTIGUOUS']:
+                            batch = np.ascontiguousarray(batch)
+                        perf_stats['preprocessing_contiguous_check_time'] += time.time() - contiguous_start
+                        
                         if batch.dtype == np.uint8:
-                            # Data is uint8, not normalized - convert to tensor and normalize on GPU (faster)
-                            processed_batch = torch.from_numpy(batch).contiguous().to(self.device, non_blocking=True)
+                            # OPTIMIZATION: Convert to float32 on GPU in one step (faster than CPU conversion)
+                            # Transfer uint8 to GPU, then convert to float32 and normalize on GPU
+                            # This avoids intermediate CPU float32 tensor allocation
+                            from_numpy_start = time.time()
+                            tensor_cpu = torch.from_numpy(batch)
+                            perf_stats['preprocessing_from_numpy_time'] += time.time() - from_numpy_start
+                            
+                            to_device_start = time.time()
+                            processed_batch = tensor_cpu.to(self.device, dtype=torch.float32, non_blocking=True)
+                            perf_stats['preprocessing_to_device_time'] += time.time() - to_device_start
+                            
+                            # Normalize on GPU (fused operations)
+                            normalize_start = time.time()
                             processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
+                            perf_stats['preprocessing_normalize_time'] += time.time() - normalize_start
                         else:
-                            # Data is already normalized (float32) - convert directly
-                            processed_batch = torch.from_numpy(batch).contiguous().to(self.device, non_blocking=True)
+                            # Data is already normalized (float32) - transfer directly
+                            from_numpy_start = time.time()
+                            tensor_cpu = torch.from_numpy(batch)
+                            perf_stats['preprocessing_from_numpy_time'] += time.time() - from_numpy_start
+                            
+                            to_device_start = time.time()
+                            processed_batch = tensor_cpu.to(self.device, non_blocking=True)
+                            perf_stats['preprocessing_to_device_time'] += time.time() - to_device_start
                     elif isinstance(batch, list) and len(batch) > 0 and isinstance(batch[0], np.ndarray):
                         # Fallback: list of arrays (shouldn't happen with fast preprocessing)
-                        batch_array = np.stack(batch, axis=0)
+                        contiguous_start = time.time()
+                        batch_array = np.ascontiguousarray(np.stack(batch, axis=0))
+                        perf_stats['preprocessing_contiguous_check_time'] += time.time() - contiguous_start
+                        
                         if batch_array.dtype == np.uint8:
-                            processed_batch = torch.from_numpy(batch_array).contiguous().to(self.device, non_blocking=True)
+                            from_numpy_start = time.time()
+                            tensor_cpu = torch.from_numpy(batch_array)
+                            perf_stats['preprocessing_from_numpy_time'] += time.time() - from_numpy_start
+                            
+                            to_device_start = time.time()
+                            processed_batch = tensor_cpu.to(self.device, dtype=torch.float32, non_blocking=True)
+                            perf_stats['preprocessing_to_device_time'] += time.time() - to_device_start
+                            
+                            normalize_start = time.time()
                             processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
+                            perf_stats['preprocessing_normalize_time'] += time.time() - normalize_start
                         else:
-                            processed_batch = torch.from_numpy(batch_array).contiguous().to(self.device, non_blocking=True)
+                            from_numpy_start = time.time()
+                            tensor_cpu = torch.from_numpy(batch_array)
+                            perf_stats['preprocessing_from_numpy_time'] += time.time() - from_numpy_start
+                            
+                            to_device_start = time.time()
+                            processed_batch = tensor_cpu.to(self.device, non_blocking=True)
+                            perf_stats['preprocessing_to_device_time'] += time.time() - to_device_start
                     else:
                         # Fallback: if not processed, process now (shouldn't happen)
-                        batch_array = np.stack([np.array(b) for b in batch], axis=0)
+                        contiguous_start = time.time()
+                        batch_array = np.ascontiguousarray(np.stack([np.array(b) for b in batch], axis=0))
+                        perf_stats['preprocessing_contiguous_check_time'] += time.time() - contiguous_start
+                        
                         if batch_array.dtype == np.uint8:
-                            processed_batch = torch.from_numpy(batch_array).contiguous().to(self.device, non_blocking=True)
+                            from_numpy_start = time.time()
+                            tensor_cpu = torch.from_numpy(batch_array)
+                            perf_stats['preprocessing_from_numpy_time'] += time.time() - from_numpy_start
+                            
+                            to_device_start = time.time()
+                            processed_batch = tensor_cpu.to(self.device, dtype=torch.float32, non_blocking=True)
+                            perf_stats['preprocessing_to_device_time'] += time.time() - to_device_start
+                            
+                            normalize_start = time.time()
                             processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
+                            perf_stats['preprocessing_normalize_time'] += time.time() - normalize_start
                         else:
-                            processed_batch = torch.from_numpy(batch_array).contiguous().to(self.device, non_blocking=True)
+                            from_numpy_start = time.time()
+                            tensor_cpu = torch.from_numpy(batch_array)
+                            perf_stats['preprocessing_from_numpy_time'] += time.time() - from_numpy_start
+                            
+                            to_device_start = time.time()
+                            processed_batch = tensor_cpu.to(self.device, non_blocking=True)
+                            perf_stats['preprocessing_to_device_time'] += time.time() - to_device_start
+                    
                     perf_stats['preprocessing_time'] += time.time() - preprocess_start
+                    perf_stats['preprocessing_total_batches'] += 1
                     
                     # Model inference
                     model_start = time.time()
@@ -2035,54 +2101,35 @@ class NucleiEmbedding:
                     print(f"  Estimated remaining: {estimated_remaining:.1f}s ({estimated_remaining/60:.1f} min)", flush=True)
                     if elapsed_time > 0:
                         print(f"  DataLoader total: {total_dataloader_time:.1f}s ({total_dataloader_time/elapsed_time*100:.1f}%)", flush=True)
-                        if dataset_perf['total_calls'] > 0 and total_dataloader_time > 0:
-                            avg_call_time = total_dataloader_time / dataset_perf['total_calls']
-                            # Read region detailed breakdown
-                            read_region_total = dataset_perf.get('read_region_total_time', 0.0)
-                            read_region_call = dataset_perf.get('read_region_call_time', 0.0)
-                            print(f"    - Read region: {read_region_total:.1f}s ({read_region_total/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
-                            if read_region_total > 0:
-                                print(f"      * read_region() call: {read_region_call:.1f}s ({read_region_call/read_region_total*100:.1f}% of Read region)", flush=True)
-                            print(f"    - Image process (convert/resize): {dataset_perf['image_process_time']:.1f}s ({dataset_perf['image_process_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
-                            # Processor detailed breakdown
-                            processor_total = dataset_perf.get('processor_total_time', 0.0)
-                            print(f"    - Processor: {processor_total:.1f}s ({processor_total/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
-                            if processor_total > 0:
-                                pil_to_numpy = dataset_perf.get('processor_pil_to_numpy_time', 0.0)
-                                convert_norm = dataset_perf.get('processor_convert_normalize_time', 0.0)
-                                transpose = dataset_perf.get('processor_transpose_time', 0.0)
-                                imagenet_norm = dataset_perf.get('processor_imagenet_norm_time', 0.0)
-                                if pil_to_numpy > 0:
-                                    print(f"      * PIL to numpy: {pil_to_numpy:.1f}s ({pil_to_numpy/processor_total*100:.1f}% of Processor)", flush=True)
-                                if convert_norm > 0:
-                                    print(f"      * Convert+normalize: {convert_norm:.1f}s ({convert_norm/processor_total*100:.1f}% of Processor)", flush=True)
-                                    # Detailed breakdown of Convert+normalize
-                                    stack_time = dataset_perf.get('processor_stack_time', 0.0)
-                                    astype_time = dataset_perf.get('processor_astype_time', 0.0)
-                                    normalize_time = dataset_perf.get('processor_normalize_time', 0.0)
-                                    transpose_in_convert = dataset_perf.get('processor_transpose_in_convert_time', 0.0)
-                                    if convert_norm > 0:
-                                        if stack_time > 0:
-                                            print(f"        - Stack: {stack_time:.1f}s ({stack_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
-                                        # Astype is now merged into normalize_time, no separate display needed
-                                        if normalize_time > 0:
-                                            print(f"        - ImageNet norm (direct): {normalize_time:.1f}s ({normalize_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
-                                        if transpose_in_convert > 0:
-                                            print(f"        - Transpose (HWC->CHW): {transpose_in_convert:.1f}s ({transpose_in_convert/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
-                                if transpose > 0:
-                                    print(f"      * Transpose check: {transpose:.1f}s ({transpose/processor_total*100:.1f}% of Processor)", flush=True)
-                                if imagenet_norm > 0:
-                                    print(f"      * ImageNet norm: {imagenet_norm:.1f}s ({imagenet_norm/processor_total*100:.1f}% of Processor)", flush=True)
-                            print(f"    - Avg per sample: {avg_call_time*1000:.2f}ms", flush=True)
-                        elif dataset_perf['total_calls'] > 0:
-                            read_region_total = dataset_perf.get('read_region_total_time', 0.0)
-                            read_region_call = dataset_perf.get('read_region_call_time', 0.0)
-                            print(f"    - Read region: {read_region_total:.1f}s (call: {read_region_call:.1f}s)", flush=True)
-                            print(f"    - Image process (convert/resize): {dataset_perf['image_process_time']:.1f}s", flush=True)
-                            processor_total = dataset_perf.get('processor_total_time', 0.0)
-                            print(f"    - Processor: {processor_total:.1f}s", flush=True)
-                            print(f"    - Note: DataLoader time is 0", flush=True)
-                        print(f"  Preprocessing: {perf_stats['preprocessing_time']:.1f}s ({perf_stats['preprocessing_time']/elapsed_time*100:.1f}%)", flush=True)
+                        
+                        preprocessing_total = perf_stats['preprocessing_time']
+                        print(f"  Preprocessing: {preprocessing_total:.1f}s ({preprocessing_total/elapsed_time*100:.1f}%)", flush=True)
+                        # Show detailed breakdown during progress updates
+                        if preprocessing_total > 0 and perf_stats.get('preprocessing_total_batches', 0) > 0:
+                            print(f"    Preprocessing detailed breakdown (from {perf_stats['preprocessing_total_batches']} batches):", flush=True)
+                            contiguous_time = perf_stats.get('preprocessing_contiguous_check_time', 0.0)
+                            from_numpy_time = perf_stats.get('preprocessing_from_numpy_time', 0.0)
+                            to_device_time = perf_stats.get('preprocessing_to_device_time', 0.0)
+                            normalize_time = perf_stats.get('preprocessing_normalize_time', 0.0)
+                            
+                            if contiguous_time > 0:
+                                print(f"      - Contiguous check/make: {contiguous_time:.2f}s ({contiguous_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
+                            if from_numpy_time > 0:
+                                print(f"      - torch.from_numpy(): {from_numpy_time:.2f}s ({from_numpy_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
+                            if to_device_time > 0:
+                                print(f"      - .to(device): {to_device_time:.2f}s ({to_device_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
+                            if normalize_time > 0:
+                                print(f"      - Normalize (ImageNet): {normalize_time:.2f}s ({normalize_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
+                            
+                            # Calculate other time (overhead, etc.)
+                            accounted_time = contiguous_time + from_numpy_time + to_device_time + normalize_time
+                            other_time = preprocessing_total - accounted_time
+                            if other_time > 0.01:  # Only show if significant (>10ms)
+                                print(f"      - Other (overhead): {other_time:.2f}s ({other_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
+                            
+                            avg_per_batch = preprocessing_total / perf_stats['preprocessing_total_batches']
+                            print(f"      - Avg time per batch: {avg_per_batch*1000:.2f}ms", flush=True)
+                        
                         print(f"  Model: {perf_stats['model_time']:.1f}s ({perf_stats['model_time']/elapsed_time*100:.1f}%)", flush=True)
         except Exception as e:
             print(f"\n[PERF] Error during embedding generation: {e}", flush=True)
@@ -2120,59 +2167,35 @@ class NucleiEmbedding:
                 total_dataloader_time = perf_stats['dataloader_time']
                 print(f"  DataLoader (data loading): {total_dataloader_time:.2f} seconds ({total_dataloader_time/total_time*100:.1f}%)", flush=True)
                 
-                # Detailed DataLoader breakdown
-                dataset_perf = dataset.perf_stats
-                if dataset_perf['total_calls'] > 0 and total_dataloader_time > 0:
-                    print(f"    DataLoader detailed breakdown (from {dataset_perf['total_calls']} samples):", flush=True)
-                    # Read region detailed breakdown
-                    read_region_total = dataset_perf.get('read_region_total_time', 0.0)
-                    read_region_call = dataset_perf.get('read_region_call_time', 0.0)
-                    print(f"      - Read region: {read_region_total:.2f}s ({read_region_total/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
-                    if read_region_total > 0:
-                        print(f"        * read_region() call: {read_region_call:.2f}s ({read_region_call/read_region_total*100:.1f}% of Read region)", flush=True)
-                    print(f"      - Image process (convert/resize): {dataset_perf['image_process_time']:.2f}s ({dataset_perf['image_process_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
-                    # Processor detailed breakdown
-                    processor_total = dataset_perf.get('processor_total_time', 0.0)
-                    print(f"      - Processor: {processor_total:.2f}s ({processor_total/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
-                    if processor_total > 0:
-                        pil_to_numpy = dataset_perf.get('processor_pil_to_numpy_time', 0.0)
-                        convert_norm = dataset_perf.get('processor_convert_normalize_time', 0.0)
-                        transpose = dataset_perf.get('processor_transpose_time', 0.0)
-                        imagenet_norm = dataset_perf.get('processor_imagenet_norm_time', 0.0)
-                        if pil_to_numpy > 0:
-                            print(f"        * PIL to numpy: {pil_to_numpy:.2f}s ({pil_to_numpy/processor_total*100:.1f}% of Processor)", flush=True)
-                        if convert_norm > 0:
-                            print(f"        * Convert+normalize: {convert_norm:.2f}s ({convert_norm/processor_total*100:.1f}% of Processor)", flush=True)
-                            # Detailed breakdown of Convert+normalize
-                            stack_time = dataset_perf.get('processor_stack_time', 0.0)
-                            astype_time = dataset_perf.get('processor_astype_time', 0.0)
-                            normalize_time = dataset_perf.get('processor_normalize_time', 0.0)
-                            transpose_in_convert = dataset_perf.get('processor_transpose_in_convert_time', 0.0)
-                            if convert_norm > 0:
-                                if stack_time > 0:
-                                    print(f"          - Stack: {stack_time:.2f}s ({stack_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
-                                # Astype is now merged into normalize_time, no separate display needed
-                                if normalize_time > 0:
-                                    print(f"          - ImageNet norm (direct): {normalize_time:.2f}s ({normalize_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
-                                if transpose_in_convert > 0:
-                                    print(f"          - Transpose (HWC->CHW): {transpose_in_convert:.2f}s ({transpose_in_convert/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
-                        if transpose > 0:
-                            print(f"        * Transpose check: {transpose:.2f}s ({transpose/processor_total*100:.1f}% of Processor)", flush=True)
-                        if imagenet_norm > 0:
-                            print(f"        * ImageNet norm: {imagenet_norm:.2f}s ({imagenet_norm/processor_total*100:.1f}% of Processor)", flush=True)
-                    avg_per_sample = total_dataloader_time / dataset_perf['total_calls']
-                    print(f"      - Avg time per sample: {avg_per_sample*1000:.2f}ms", flush=True)
-                elif dataset_perf['total_calls'] > 0:
-                    print(f"    DataLoader detailed breakdown (from {dataset_perf['total_calls']} samples):", flush=True)
-                    read_region_total = dataset_perf.get('read_region_total_time', 0.0)
-                    read_region_call = dataset_perf.get('read_region_call_time', 0.0)
-                    print(f"      - Read region: {read_region_total:.2f}s (call: {read_region_call:.2f}s)", flush=True)
-                    print(f"      - Image process (convert/resize): {dataset_perf['image_process_time']:.2f}s", flush=True)
-                    processor_total = dataset_perf.get('processor_total_time', 0.0)
-                    print(f"      - Processor: {processor_total:.2f}s", flush=True)
-                    print(f"      - Note: DataLoader time is 0, cannot calculate percentages", flush=True)
+                preprocessing_total = perf_stats['preprocessing_time']
+                print(f"  Preprocessing (concat, to device): {preprocessing_total:.2f} seconds ({preprocessing_total/total_time*100:.1f}%)", flush=True)
                 
-                print(f"  Preprocessing (concat, to device): {perf_stats['preprocessing_time']:.2f} seconds ({perf_stats['preprocessing_time']/total_time*100:.1f}%)", flush=True)
+                # Detailed Preprocessing breakdown
+                if preprocessing_total > 0 and perf_stats['preprocessing_total_batches'] > 0:
+                    print(f"    Preprocessing detailed breakdown (from {perf_stats['preprocessing_total_batches']} batches):", flush=True)
+                    contiguous_time = perf_stats.get('preprocessing_contiguous_check_time', 0.0)
+                    from_numpy_time = perf_stats.get('preprocessing_from_numpy_time', 0.0)
+                    to_device_time = perf_stats.get('preprocessing_to_device_time', 0.0)
+                    normalize_time = perf_stats.get('preprocessing_normalize_time', 0.0)
+                    
+                    if contiguous_time > 0:
+                        print(f"      - Contiguous check/make: {contiguous_time:.2f}s ({contiguous_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
+                    if from_numpy_time > 0:
+                        print(f"      - torch.from_numpy(): {from_numpy_time:.2f}s ({from_numpy_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
+                    if to_device_time > 0:
+                        print(f"      - .to(device): {to_device_time:.2f}s ({to_device_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
+                    if normalize_time > 0:
+                        print(f"      - Normalize (ImageNet): {normalize_time:.2f}s ({normalize_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
+                    
+                    # Calculate other time (overhead, etc.)
+                    accounted_time = contiguous_time + from_numpy_time + to_device_time + normalize_time
+                    other_time = preprocessing_total - accounted_time
+                    if other_time > 0.01:  # Only show if significant (>10ms)
+                        print(f"      - Other (overhead): {other_time:.2f}s ({other_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
+                    
+                    avg_per_batch = preprocessing_total / perf_stats['preprocessing_total_batches']
+                    print(f"      - Avg time per batch: {avg_per_batch*1000:.2f}ms", flush=True)
+                
                 print(f"  Model inference: {perf_stats['model_time']:.2f} seconds ({perf_stats['model_time']/total_time*100:.1f}%)", flush=True)
             else:
                 print("  Warning: Total time is 0, cannot calculate percentages", flush=True)
