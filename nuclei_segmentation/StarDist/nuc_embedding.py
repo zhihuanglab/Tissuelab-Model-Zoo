@@ -41,11 +41,15 @@ class NucleiPatchDataset(Dataset):
         # Performance profiling for detailed analysis
         self.perf_stats = {
             'read_region_call_time': 0.0,  # Time for read_region() call itself
-            'read_region_total_time': 0.0,  # Total time for read region (including all overhead)
+            'read_region_total_time': 0.0,  # Total time for read region
             'image_process_time': 0.0,  # Time for convert/resize operations
             'processor_pil_to_numpy_time': 0.0,  # Time for PIL to numpy conversion
-            'processor_convert_normalize_time': 0.0,  # Time for type conversion and normalization
-            'processor_transpose_time': 0.0,  # Time for transpose operation
+            'processor_stack_time': 0.0,  # Time for stacking arrays (vectorized path)
+            'processor_astype_time': 0.0,  # Time for type conversion (uint8 to float32)
+            'processor_normalize_time': 0.0,  # Time for normalization (* inv_255)
+            'processor_transpose_in_convert_time': 0.0,  # Time for transpose during convert (HWC->CHW)
+            'processor_convert_normalize_time': 0.0,  # Total time for type conversion and normalization
+            'processor_transpose_time': 0.0,  # Time for final transpose check (should be minimal now)
             'processor_imagenet_norm_time': 0.0,  # Time for ImageNet normalization
             'processor_total_time': 0.0,  # Total processor time
             'total_calls': 0
@@ -902,6 +906,8 @@ class NucleiPatchDataset(Dataset):
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
 _IMAGENET_INV_STD = 1.0 / _IMAGENET_STD  # Pre-compute division constant
+# Pre-compute mean * inv_std for fused multiply-add optimization
+_IMAGENET_MEAN_TIMES_INV_STD = _IMAGENET_MEAN * _IMAGENET_INV_STD
 
 def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
     """Ultra-fast batch preprocessing using optimized numpy operations with minimal overhead.
@@ -932,60 +938,262 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
             # PIL Image: size is (width, height)
             h, w = first_img.size[1], first_img.size[0]
         
-        # OPTIMIZATION 1: Use np.frombuffer for faster conversion when possible
-        # Pre-allocate batch array (N, H, W, C) - more efficient than stack
-        batch_array = np.empty((num_images, h, w, 3), dtype=np.float32)
+        # OPTIMIZATION 1: Pre-allocate batch array directly in (N, C, H, W) format
+        # This avoids expensive transpose + ascontiguousarray operations later
+        # Use empty instead of zeros for slightly faster allocation (values will be overwritten anyway)
+        # Ensure C_CONTIGUOUS layout for optimal memory access
+        batch_array = np.empty((num_images, 3, h, w), dtype=np.float32, order='C')
         
         # OPTIMIZATION 2: Ultra-fast batch conversion with minimal memory allocation
         # Pre-compute constants for faster operations
         inv_255 = 1.0 / 255.0  # Pre-compute division constant
         
-        # OPTIMIZATION: Single-pass processing with combined type conversion and normalization
-        # Process all images in one loop, combining conversion and normalization steps
+        # OPTIMIZATION: Vectorized batch processing when possible
+        # Check if all images are numpy arrays (can be fully vectorized)
         pil_to_numpy_start = time.time()
         pil_conversion_time = 0.0  # Track actual PIL->numpy conversion time
         
-        for i, img in enumerate(images):
-            # Fastest path: Direct array access with minimal overhead
+        # Check if all images are numpy arrays for vectorized processing
+        all_numpy = all(isinstance(img, np.ndarray) for img in images)
+        
+        if all_numpy:
+            # OPTIMIZATION: All numpy arrays - fully vectorized batch processing
+            # Stack all arrays at once (much faster than loop)
             try:
-                # OPTIMIZATION: Check if already numpy array to avoid conversion overhead
-                if isinstance(img, np.ndarray):
-                    # Already numpy - use directly (no conversion needed)
-                    arr_uint8 = img.astype(np.uint8) if img.dtype != np.uint8 else img
-                else:
-                    # PIL Image - convert to numpy (fastest conversion from PIL)
-                    # Track actual conversion time separately
-                    conv_start = time.time()
-                    arr_uint8 = np.asarray(img, dtype=np.uint8)
-                    pil_conversion_time += time.time() - conv_start
+                # First, normalize all arrays to uint8 if needed (vectorized where possible)
+                dtype_normalize_start = time.time()
+                normalized_images = []
+                for img in images:
+                    if img.dtype != np.uint8:
+                        normalized_images.append(img.astype(np.uint8))
+                    else:
+                        normalized_images.append(img)
+                dtype_normalize_time = time.time() - dtype_normalize_start
                 
-                # Fast path: Standard RGB image (most common case - optimize this path)
-                if arr_uint8.shape == (h, w, 3):
-                    # OPTIMIZATION: Combined type conversion and normalization in one operation
-                    # This eliminates the separate multiplication step, reducing memory access
-                    batch_array[i] = arr_uint8.astype(np.float32) * inv_255
-                elif arr_uint8.ndim == 2:
-                    # Grayscale - convert to RGB (vectorized, single conversion)
-                    # Combined conversion and normalization
-                    arr_float = arr_uint8.astype(np.float32) * inv_255
-                    # Use broadcasting for all 3 channels at once (faster than 3 assignments)
-                    batch_array[i, :, :, :] = arr_float[:, :, np.newaxis]
-                elif arr_uint8.shape[2] == 4:
-                    # RGBA - extract RGB channels (single slice, no copy)
-                    # Combined conversion and normalization
-                    batch_array[i] = arr_uint8[:, :, :3].astype(np.float32) * inv_255
-                elif arr_uint8.shape[0] == h and arr_uint8.shape[1] == w and arr_uint8.shape[2] >= 3:
-                    # Multi-channel (>=3) - take first 3 channels
-                    # Combined conversion and normalization
-                    batch_array[i] = arr_uint8[:, :, :3].astype(np.float32) * inv_255
+                # Stack all numpy arrays into a single array (N, H, W, C) - fully vectorized
+                stack_start = time.time()
+                stacked = np.stack(normalized_images, axis=0)
+                stack_time = time.time() - stack_start
+                if perf_stats is not None:
+                    perf_stats['processor_stack_time'] += stack_time
+                
+                # Vectorized shape handling - all operations are batch-level vectorized
+                # Direct assignment to (N, C, H, W) format - no transpose needed!
+                convert_norm_start = time.time()
+                if stacked.shape[1:] == (h, w, 3):
+                    # Perfect match - batch conversion then channel assignment (entire batch at once)
+                    convert_start = time.time()
+                    # OPTIMIZATION: Convert entire batch at once (single pass), then assign channels
+                    # This is faster than per-channel conversion because:
+                    # 1. Single astype operation for entire batch (better vectorization)
+                    # 2. Single multiplication operation (better cache usage)
+                    # 3. Only one temporary array instead of three
+                    astype_start = time.time()
+                    float_batch = stacked.astype(np.float32)
+                    astype_time = time.time() - astype_start
+                    if perf_stats is not None:
+                        perf_stats['processor_astype_time'] += astype_time
+                    
+                    normalize_start = time.time()
+                    normalized_batch = float_batch * inv_255
+                    normalize_time = time.time() - normalize_start
+                    if perf_stats is not None:
+                        perf_stats['processor_normalize_time'] += normalize_time
+                    
+                    # Direct channel assignment (no transpose needed)
+                    transpose_start = time.time()
+                    batch_array[:, 0] = normalized_batch[:, :, :, 0]
+                    batch_array[:, 1] = normalized_batch[:, :, :, 1]
+                    batch_array[:, 2] = normalized_batch[:, :, :, 2]
+                    transpose_time = time.time() - transpose_start
+                    if perf_stats is not None:
+                        perf_stats['processor_transpose_in_convert_time'] += transpose_time
+                elif stacked.shape[1:] == (h, w, 4):
+                    # RGBA - batch conversion then channel assignment (entire batch at once)
+                    convert_start = time.time()
+                    # OPTIMIZATION: Extract RGB channels, convert entire batch at once
+                    astype_start = time.time()
+                    float_batch = stacked[:, :, :, :3].astype(np.float32)
+                    astype_time = time.time() - astype_start
+                    if perf_stats is not None:
+                        perf_stats['processor_astype_time'] += astype_time
+                    
+                    normalize_start = time.time()
+                    normalized_batch = float_batch * inv_255
+                    normalize_time = time.time() - normalize_start
+                    if perf_stats is not None:
+                        perf_stats['processor_normalize_time'] += normalize_time
+                    
+                    # Direct channel assignment
+                    transpose_start = time.time()
+                    batch_array[:, 0] = normalized_batch[:, :, :, 0]
+                    batch_array[:, 1] = normalized_batch[:, :, :, 1]
+                    batch_array[:, 2] = normalized_batch[:, :, :, 2]
+                    transpose_time = time.time() - transpose_start
+                    if perf_stats is not None:
+                        perf_stats['processor_transpose_in_convert_time'] += transpose_time
+                elif len(stacked.shape) == 3 and stacked.shape[1:] == (h, w):
+                    # Grayscale 2D - combined conversion and direct assignment (entire batch at once)
+                    convert_start = time.time()
+                    # OPTIMIZATION: Convert once, assign to all 3 channels (reuses converted array)
+                    normalized = stacked.astype(np.float32) * inv_255
+                    batch_array[:, 0] = normalized
+                    batch_array[:, 1] = normalized
+                    batch_array[:, 2] = normalized
+                    convert_time = time.time() - convert_start
+                    if perf_stats is not None:
+                        perf_stats['processor_astype_time'] += convert_time * 0.6
+                        perf_stats['processor_normalize_time'] += convert_time * 0.4
+                        perf_stats['processor_transpose_in_convert_time'] += 0.0
+                elif stacked.shape[1:] == (h, w, 1):
+                    # Grayscale 3D - combined conversion and direct assignment (entire batch at once)
+                    convert_start = time.time()
+                    # OPTIMIZATION: Convert once, assign to all 3 channels (reuses converted array)
+                    normalized = stacked[:, :, :, 0].astype(np.float32) * inv_255
+                    batch_array[:, 0] = normalized
+                    batch_array[:, 1] = normalized
+                    batch_array[:, 2] = normalized
+                    convert_time = time.time() - convert_start
+                    if perf_stats is not None:
+                        perf_stats['processor_astype_time'] += convert_time * 0.6
+                        perf_stats['processor_normalize_time'] += convert_time * 0.4
+                        perf_stats['processor_transpose_in_convert_time'] += 0.0
                 else:
-                    # Edge case: fallback to standard conversion
+                    # Fallback to loop for edge cases
+                    all_numpy = False
+            except (ValueError, TypeError):
+                # If stack fails (different shapes), fall back to loop
+                all_numpy = False
+        
+        if not all_numpy:
+            # Mixed or all PIL - process with optimized loop
+            for i, img in enumerate(images):
+                # Fastest path: Direct array access with minimal overhead
+                try:
+                    # OPTIMIZATION: Check if already numpy array to avoid conversion overhead
+                    if isinstance(img, np.ndarray):
+                        # Already numpy - use directly (no conversion needed)
+                        arr_uint8 = img.astype(np.uint8) if img.dtype != np.uint8 else img
+                    else:
+                        # PIL Image - convert to numpy (fastest conversion from PIL)
+                        # Track actual conversion time separately
+                        conv_start = time.time()
+                        arr_uint8 = np.asarray(img, dtype=np.uint8)
+                        pil_conversion_time += time.time() - conv_start
+                    
+                    # Fast path: Standard RGB image (most common case - optimize this path)
+                    # OPTIMIZATION: Convert entire image at once, then assign channels
+                    if arr_uint8.shape == (h, w, 3):
+                        # OPTIMIZATION: Single astype and normalize for entire image, then channel assignment
+                        # This is faster than per-channel conversion because:
+                        # 1. Single vectorized operation for entire image (better SIMD usage)
+                        # 2. Better memory access pattern (sequential)
+                        # 3. Only one temporary array instead of three
+                        astype_start = time.time()
+                        float_img = arr_uint8.astype(np.float32)
+                        astype_time = time.time() - astype_start
+                        if perf_stats is not None:
+                            perf_stats['processor_astype_time'] += astype_time
+                        
+                        normalize_start = time.time()
+                        normalized_img = float_img * inv_255
+                        normalize_time = time.time() - normalize_start
+                        if perf_stats is not None:
+                            perf_stats['processor_normalize_time'] += normalize_time
+                        
+                        # Direct channel assignment (no transpose needed)
+                        transpose_start = time.time()
+                        batch_array[i, 0] = normalized_img[:, :, 0]
+                        batch_array[i, 1] = normalized_img[:, :, 1]
+                        batch_array[i, 2] = normalized_img[:, :, 2]
+                        transpose_time = time.time() - transpose_start
+                        if perf_stats is not None:
+                            perf_stats['processor_transpose_in_convert_time'] += transpose_time
+                    elif arr_uint8.ndim == 2:
+                        # Grayscale - combined conversion and assignment
+                        convert_start = time.time()
+                        # OPTIMIZATION: Convert once, assign to all 3 channels (reuses converted array)
+                        normalized = arr_uint8.astype(np.float32) * inv_255
+                        batch_array[i, 0] = normalized
+                        batch_array[i, 1] = normalized
+                        batch_array[i, 2] = normalized
+                        convert_time = time.time() - convert_start
+                        if perf_stats is not None:
+                            # Split time estimate: astype ~60%, normalize ~40%
+                            perf_stats['processor_astype_time'] += convert_time * 0.6
+                            perf_stats['processor_normalize_time'] += convert_time * 0.4
+                            perf_stats['processor_transpose_in_convert_time'] += 0.0
+                    elif arr_uint8.shape[2] == 4:
+                        # RGBA - convert RGB channels at once, then assign
+                        astype_start = time.time()
+                        float_img = arr_uint8[:, :, :3].astype(np.float32)
+                        astype_time = time.time() - astype_start
+                        if perf_stats is not None:
+                            perf_stats['processor_astype_time'] += astype_time
+                        
+                        normalize_start = time.time()
+                        normalized_img = float_img * inv_255
+                        normalize_time = time.time() - normalize_start
+                        if perf_stats is not None:
+                            perf_stats['processor_normalize_time'] += normalize_time
+                        
+                        # Direct channel assignment
+                        transpose_start = time.time()
+                        batch_array[i, 0] = normalized_img[:, :, 0]
+                        batch_array[i, 1] = normalized_img[:, :, 1]
+                        batch_array[i, 2] = normalized_img[:, :, 2]
+                        transpose_time = time.time() - transpose_start
+                        if perf_stats is not None:
+                            perf_stats['processor_transpose_in_convert_time'] += transpose_time
+                    elif arr_uint8.shape[0] == h and arr_uint8.shape[1] == w and arr_uint8.shape[2] >= 3:
+                        # Multi-channel (>=3) - convert first 3 channels at once, then assign
+                        astype_start = time.time()
+                        float_img = arr_uint8[:, :, :3].astype(np.float32)
+                        astype_time = time.time() - astype_start
+                        if perf_stats is not None:
+                            perf_stats['processor_astype_time'] += astype_time
+                        
+                        normalize_start = time.time()
+                        normalized_img = float_img * inv_255
+                        normalize_time = time.time() - normalize_start
+                        if perf_stats is not None:
+                            perf_stats['processor_normalize_time'] += normalize_time
+                        
+                        # Direct channel assignment
+                        transpose_start = time.time()
+                        batch_array[i, 0] = normalized_img[:, :, 0]
+                        batch_array[i, 1] = normalized_img[:, :, 1]
+                        batch_array[i, 2] = normalized_img[:, :, 2]
+                        transpose_time = time.time() - transpose_start
+                        if perf_stats is not None:
+                            perf_stats['processor_transpose_in_convert_time'] += transpose_time
+                    else:
+                        # Edge case: fallback to standard conversion
+                        arr_float = np.array(img, dtype=np.float32)
+                        if arr_float.max() > 1.0:
+                            arr_float = arr_float * inv_255
+                        # Ensure correct shape and transpose to (C, H, W)
+                        if arr_float.ndim == 2:
+                            # Grayscale: (H, W) -> (H, W, 3) -> (3, H, W)
+                            arr_float = np.repeat(arr_float[:, :, np.newaxis], 3, axis=2)
+                        if arr_float.shape[2] == 3:
+                            # (H, W, 3) -> (3, H, W)
+                            batch_array[i] = arr_float.transpose(2, 0, 1)
+                        else:
+                            # Fallback: try to reshape
+                            batch_array[i] = arr_float.reshape(3, h, w) if arr_float.size == 3*h*w else arr_float[:3].reshape(3, h, w)
+                except Exception:
+                    # Ultimate fallback: standard conversion
                     arr_float = np.array(img, dtype=np.float32)
-                    batch_array[i] = arr_float * inv_255 if arr_float.max() > 1.0 else arr_float
-            except Exception:
-                # Ultimate fallback: standard conversion
-                arr_float = np.array(img, dtype=np.float32)
-                batch_array[i] = arr_float * inv_255 if arr_float.max() > 1.0 else arr_float
+                    if arr_float.max() > 1.0:
+                        arr_float = arr_float * inv_255
+                    # Ensure correct shape and transpose to (C, H, W)
+                    if arr_float.ndim == 2:
+                        arr_float = np.repeat(arr_float[:, :, np.newaxis], 3, axis=2)
+                    if arr_float.shape[2] == 3:
+                        batch_array[i] = arr_float.transpose(2, 0, 1)
+                    else:
+                        batch_array[i] = arr_float[:3].reshape(3, h, w) if arr_float.size >= 3*h*w else np.zeros((3, h, w), dtype=np.float32)
         
         # Note: Normalization to [0, 1] is now done during conversion above
         # No need for separate multiplication step
@@ -993,14 +1201,19 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
         if perf_stats is not None:
             # Track actual PIL to numpy conversion time (only when PIL->numpy happens)
             perf_stats['processor_pil_to_numpy_time'] += pil_conversion_time
-            # Track convert+normalize time (the entire loop minus PIL conversion)
-            # This includes type conversion (astype) and normalization (* inv_255)
+            # Track convert+normalize time as total time minus PIL conversion
+            # The detailed steps (stack, astype, normalize, transpose) are tracked separately
+            # and will be displayed in the breakdown
             convert_normalize_time = (pil_to_numpy_end - pil_to_numpy_start) - pil_conversion_time
             perf_stats['processor_convert_normalize_time'] += convert_normalize_time
         
-        # Convert to (N, C, H, W) - use transpose (memory efficient, creates view when possible)
+        # OPTIMIZATION: No transpose needed! batch_array is already in (N, C, H, W) format
+        # This eliminates the expensive transpose + ascontiguousarray operations
+        # Just ensure it's contiguous (should already be, but verify for safety)
         transpose_start = time.time()
-        batch_array = batch_array.transpose(0, 3, 1, 2)
+        if not batch_array.flags['C_CONTIGUOUS']:
+            # Only make contiguous if needed (shouldn't happen with direct allocation)
+            batch_array = np.ascontiguousarray(batch_array, dtype=np.float32)
         transpose_end = time.time()
         if perf_stats is not None:
             perf_stats['processor_transpose_time'] += transpose_end - transpose_start
@@ -1009,11 +1222,12 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
         # Normalize using ImageNet stats (broadcast across batch) - fully vectorized
         # Use module-level constants to avoid any array creation overhead
         imagenet_norm_start = time.time()
-        # OPTIMIZATION: Combined operation - subtract mean and multiply by inv_std in one pass
-        # This reduces memory bandwidth by avoiding intermediate storage
-        # Using in-place operations with pre-computed constants for maximum efficiency
-        batch_array -= _IMAGENET_MEAN
+        # OPTIMIZATION: Use fused multiply-add pattern: x * inv_std - mean * inv_std
+        # This is mathematically equivalent to (x - mean) * inv_std but may have better cache behavior
+        # by doing multiplication first (which is faster) then subtraction
+        # Pre-computed _IMAGENET_MEAN_TIMES_INV_STD avoids repeated computation
         batch_array *= _IMAGENET_INV_STD
+        batch_array -= _IMAGENET_MEAN_TIMES_INV_STD
         imagenet_norm_end = time.time()
         if perf_stats is not None:
             perf_stats['processor_imagenet_norm_time'] += imagenet_norm_end - imagenet_norm_start
@@ -1517,12 +1731,9 @@ class NucleiEmbedding:
                             # Read region detailed breakdown
                             read_region_total = dataset_perf.get('read_region_total_time', 0.0)
                             read_region_call = dataset_perf.get('read_region_call_time', 0.0)
-                            read_region_overhead = read_region_total - read_region_call
                             print(f"    - Read region: {read_region_total:.1f}s ({read_region_total/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
                             if read_region_total > 0:
                                 print(f"      * read_region() call: {read_region_call:.1f}s ({read_region_call/read_region_total*100:.1f}% of Read region)", flush=True)
-                                if read_region_overhead > 0:
-                                    print(f"      * overhead: {read_region_overhead:.1f}s ({read_region_overhead/read_region_total*100:.1f}% of Read region)", flush=True)
                             print(f"    - Image process (convert/resize): {dataset_perf['image_process_time']:.1f}s ({dataset_perf['image_process_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
                             # Processor detailed breakdown
                             processor_total = dataset_perf.get('processor_total_time', 0.0)
@@ -1536,8 +1747,22 @@ class NucleiEmbedding:
                                     print(f"      * PIL to numpy: {pil_to_numpy:.1f}s ({pil_to_numpy/processor_total*100:.1f}% of Processor)", flush=True)
                                 if convert_norm > 0:
                                     print(f"      * Convert+normalize: {convert_norm:.1f}s ({convert_norm/processor_total*100:.1f}% of Processor)", flush=True)
+                                    # Detailed breakdown of Convert+normalize
+                                    stack_time = dataset_perf.get('processor_stack_time', 0.0)
+                                    astype_time = dataset_perf.get('processor_astype_time', 0.0)
+                                    normalize_time = dataset_perf.get('processor_normalize_time', 0.0)
+                                    transpose_in_convert = dataset_perf.get('processor_transpose_in_convert_time', 0.0)
+                                    if convert_norm > 0:
+                                        if stack_time > 0:
+                                            print(f"        - Stack: {stack_time:.1f}s ({stack_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
+                                        if astype_time > 0:
+                                            print(f"        - Astype (uint8->float32): {astype_time:.1f}s ({astype_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
+                                        if normalize_time > 0:
+                                            print(f"        - Normalize (* inv_255): {normalize_time:.1f}s ({normalize_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
+                                        if transpose_in_convert > 0:
+                                            print(f"        - Transpose (HWC->CHW): {transpose_in_convert:.1f}s ({transpose_in_convert/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
                                 if transpose > 0:
-                                    print(f"      * Transpose: {transpose:.1f}s ({transpose/processor_total*100:.1f}% of Processor)", flush=True)
+                                    print(f"      * Transpose check: {transpose:.1f}s ({transpose/processor_total*100:.1f}% of Processor)", flush=True)
                                 if imagenet_norm > 0:
                                     print(f"      * ImageNet norm: {imagenet_norm:.1f}s ({imagenet_norm/processor_total*100:.1f}% of Processor)", flush=True)
                             print(f"    - Avg per sample: {avg_call_time*1000:.2f}ms", flush=True)
@@ -1551,8 +1776,6 @@ class NucleiEmbedding:
                             print(f"    - Note: DataLoader time is 0", flush=True)
                         print(f"  Preprocessing: {perf_stats['preprocessing_time']:.1f}s ({perf_stats['preprocessing_time']/elapsed_time*100:.1f}%)", flush=True)
                         print(f"  Model: {perf_stats['model_time']:.1f}s ({perf_stats['model_time']/elapsed_time*100:.1f}%)", flush=True)
-                        print(f"  Postprocessing: {perf_stats['postprocessing_time']:.1f}s ({perf_stats['postprocessing_time']/elapsed_time*100:.1f}%)", flush=True)
-                        print(f"  I/O: {perf_stats['io_time']:.1f}s ({perf_stats['io_time']/elapsed_time*100:.1f}%)", flush=True)
         except Exception as e:
             print(f"\n[PERF] Error during embedding generation: {e}", flush=True)
             import traceback
@@ -1590,12 +1813,9 @@ class NucleiEmbedding:
                     # Read region detailed breakdown
                     read_region_total = dataset_perf.get('read_region_total_time', 0.0)
                     read_region_call = dataset_perf.get('read_region_call_time', 0.0)
-                    read_region_overhead = read_region_total - read_region_call
                     print(f"      - Read region: {read_region_total:.2f}s ({read_region_total/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
                     if read_region_total > 0:
                         print(f"        * read_region() call: {read_region_call:.2f}s ({read_region_call/read_region_total*100:.1f}% of Read region)", flush=True)
-                        if read_region_overhead > 0:
-                            print(f"        * overhead: {read_region_overhead:.2f}s ({read_region_overhead/read_region_total*100:.1f}% of Read region)", flush=True)
                     print(f"      - Image process (convert/resize): {dataset_perf['image_process_time']:.2f}s ({dataset_perf['image_process_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
                     # Processor detailed breakdown
                     processor_total = dataset_perf.get('processor_total_time', 0.0)
@@ -1609,8 +1829,22 @@ class NucleiEmbedding:
                             print(f"        * PIL to numpy: {pil_to_numpy:.2f}s ({pil_to_numpy/processor_total*100:.1f}% of Processor)", flush=True)
                         if convert_norm > 0:
                             print(f"        * Convert+normalize: {convert_norm:.2f}s ({convert_norm/processor_total*100:.1f}% of Processor)", flush=True)
+                            # Detailed breakdown of Convert+normalize
+                            stack_time = dataset_perf.get('processor_stack_time', 0.0)
+                            astype_time = dataset_perf.get('processor_astype_time', 0.0)
+                            normalize_time = dataset_perf.get('processor_normalize_time', 0.0)
+                            transpose_in_convert = dataset_perf.get('processor_transpose_in_convert_time', 0.0)
+                            if convert_norm > 0:
+                                if stack_time > 0:
+                                    print(f"          - Stack: {stack_time:.2f}s ({stack_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
+                                if astype_time > 0:
+                                    print(f"          - Astype (uint8->float32): {astype_time:.2f}s ({astype_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
+                                if normalize_time > 0:
+                                    print(f"          - Normalize (* inv_255): {normalize_time:.2f}s ({normalize_time/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
+                                if transpose_in_convert > 0:
+                                    print(f"          - Transpose (HWC->CHW): {transpose_in_convert:.2f}s ({transpose_in_convert/convert_norm*100:.1f}% of Convert+normalize)", flush=True)
                         if transpose > 0:
-                            print(f"        * Transpose: {transpose:.2f}s ({transpose/processor_total*100:.1f}% of Processor)", flush=True)
+                            print(f"        * Transpose check: {transpose:.2f}s ({transpose/processor_total*100:.1f}% of Processor)", flush=True)
                         if imagenet_norm > 0:
                             print(f"        * ImageNet norm: {imagenet_norm:.2f}s ({imagenet_norm/processor_total*100:.1f}% of Processor)", flush=True)
                     avg_per_sample = total_dataloader_time / dataset_perf['total_calls']
@@ -1627,17 +1861,11 @@ class NucleiEmbedding:
                 
                 print(f"  Preprocessing (concat, to device): {perf_stats['preprocessing_time']:.2f} seconds ({perf_stats['preprocessing_time']/total_time*100:.1f}%)", flush=True)
                 print(f"  Model inference: {perf_stats['model_time']:.2f} seconds ({perf_stats['model_time']/total_time*100:.1f}%)", flush=True)
-                print(f"  Postprocessing (norm, type conversion): {perf_stats['postprocessing_time']:.2f} seconds ({perf_stats['postprocessing_time']/total_time*100:.1f}%)", flush=True)
-                print(f"  I/O (zarr write): {perf_stats['io_time']:.2f} seconds ({perf_stats['io_time']/total_time*100:.1f}%)", flush=True)
-                other_time = total_time - perf_stats['dataloader_time'] - perf_stats['preprocessing_time'] - perf_stats['model_time'] - perf_stats['postprocessing_time'] - perf_stats['io_time']
-                print(f"  Other overhead: {other_time:.2f} seconds ({other_time/total_time*100:.1f}%)", flush=True)
             else:
                 print("  Warning: Total time is 0, cannot calculate percentages", flush=True)
                 print(f"  DataLoader: {perf_stats['dataloader_time']:.2f} seconds", flush=True)
                 print(f"  Preprocessing: {perf_stats['preprocessing_time']:.2f} seconds", flush=True)
                 print(f"  Model inference: {perf_stats['model_time']:.2f} seconds", flush=True)
-                print(f"  Postprocessing: {perf_stats['postprocessing_time']:.2f} seconds", flush=True)
-                print(f"  I/O: {perf_stats['io_time']:.2f} seconds", flush=True)
             
             print("="*60, flush=True)
             sys.stdout.flush()
