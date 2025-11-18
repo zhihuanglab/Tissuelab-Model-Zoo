@@ -1880,11 +1880,6 @@ class NucleiEmbedding:
         perf_stats = {
             'dataloader_time': 0.0,  # Time spent waiting for dataloader
             'preprocessing_time': 0.0,  # Time for data preprocessing (concatenate, to device)
-            'preprocessing_contiguous_check_time': 0.0,  # Time for checking/making contiguous
-            'preprocessing_from_numpy_time': 0.0,  # Time for torch.from_numpy()
-            'preprocessing_to_device_time': 0.0,  # Time for .to(device)
-            'preprocessing_normalize_time': 0.0,  # Time for normalization
-            'preprocessing_total_batches': 0,  # Total batches processed in preprocessing
             'model_time': 0.0,  # Time for model inference
             'postprocessing_time': 0.0,  # Time for normalization and type conversion
             'io_time': 0.0,  # Time for writing to zarr
@@ -1926,91 +1921,50 @@ class NucleiEmbedding:
                     if isinstance(batch, np.ndarray):
                         # Already a single stacked array from fast preprocessing
                         # OPTIMIZATION: Ensure contiguous memory layout for faster transfer
-                        contiguous_start = time.time()
                         if not batch.flags['C_CONTIGUOUS']:
                             batch = np.ascontiguousarray(batch)
-                        perf_stats['preprocessing_contiguous_check_time'] += time.time() - contiguous_start
                         
                         if batch.dtype == np.uint8:
-                            # OPTIMIZATION: Convert to float32 on GPU in one step (faster than CPU conversion)
-                            # Transfer uint8 to GPU, then convert to float32 and normalize on GPU
-                            # This avoids intermediate CPU float32 tensor allocation
-                            from_numpy_start = time.time()
-                            tensor_cpu = torch.from_numpy(batch)
-                            perf_stats['preprocessing_from_numpy_time'] += time.time() - from_numpy_start
-                            
-                            to_device_start = time.time()
-                            processed_batch = tensor_cpu.to(self.device, dtype=torch.float32, non_blocking=True)
-                            perf_stats['preprocessing_to_device_time'] += time.time() - to_device_start
-                            
+                            # OPTIMIZATION: Use pinned memory tensor for faster CPU->GPU transfer
+                            # Create pinned tensor (page-locked memory) for faster GPU transfer
+                            pinned_tensor = torch.empty(batch.shape, dtype=torch.uint8, pin_memory=True)
+                            # Copy numpy array to pinned tensor (this is fast, just memory copy)
+                            pinned_tensor.copy_(torch.from_numpy(batch), non_blocking=False)
+                            # Transfer pinned tensor to GPU and convert to float32 in one step
+                            processed_batch = pinned_tensor.to(self.device, dtype=torch.float32, non_blocking=True)
                             # Normalize on GPU (fused operations)
-                            normalize_start = time.time()
                             processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
-                            perf_stats['preprocessing_normalize_time'] += time.time() - normalize_start
                         else:
-                            # Data is already normalized (float32) - transfer directly
-                            from_numpy_start = time.time()
-                            tensor_cpu = torch.from_numpy(batch)
-                            perf_stats['preprocessing_from_numpy_time'] += time.time() - from_numpy_start
-                            
-                            to_device_start = time.time()
-                            processed_batch = tensor_cpu.to(self.device, non_blocking=True)
-                            perf_stats['preprocessing_to_device_time'] += time.time() - to_device_start
+                            # Data is already normalized (float32) - transfer directly using pinned memory
+                            pinned_tensor = torch.empty(batch.shape, dtype=torch.float32, pin_memory=True)
+                            pinned_tensor.copy_(torch.from_numpy(batch), non_blocking=False)
+                            processed_batch = pinned_tensor.to(self.device, non_blocking=True)
                     elif isinstance(batch, list) and len(batch) > 0 and isinstance(batch[0], np.ndarray):
                         # Fallback: list of arrays (shouldn't happen with fast preprocessing)
-                        contiguous_start = time.time()
                         batch_array = np.ascontiguousarray(np.stack(batch, axis=0))
-                        perf_stats['preprocessing_contiguous_check_time'] += time.time() - contiguous_start
-                        
                         if batch_array.dtype == np.uint8:
-                            from_numpy_start = time.time()
-                            tensor_cpu = torch.from_numpy(batch_array)
-                            perf_stats['preprocessing_from_numpy_time'] += time.time() - from_numpy_start
-                            
-                            to_device_start = time.time()
-                            processed_batch = tensor_cpu.to(self.device, dtype=torch.float32, non_blocking=True)
-                            perf_stats['preprocessing_to_device_time'] += time.time() - to_device_start
-                            
-                            normalize_start = time.time()
+                            pinned_tensor = torch.empty(batch_array.shape, dtype=torch.uint8, pin_memory=True)
+                            pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
+                            processed_batch = pinned_tensor.to(self.device, dtype=torch.float32, non_blocking=True)
                             processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
-                            perf_stats['preprocessing_normalize_time'] += time.time() - normalize_start
                         else:
-                            from_numpy_start = time.time()
-                            tensor_cpu = torch.from_numpy(batch_array)
-                            perf_stats['preprocessing_from_numpy_time'] += time.time() - from_numpy_start
-                            
-                            to_device_start = time.time()
-                            processed_batch = tensor_cpu.to(self.device, non_blocking=True)
-                            perf_stats['preprocessing_to_device_time'] += time.time() - to_device_start
+                            pinned_tensor = torch.empty(batch_array.shape, dtype=torch.float32, pin_memory=True)
+                            pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
+                            processed_batch = pinned_tensor.to(self.device, non_blocking=True)
                     else:
                         # Fallback: if not processed, process now (shouldn't happen)
-                        contiguous_start = time.time()
                         batch_array = np.ascontiguousarray(np.stack([np.array(b) for b in batch], axis=0))
-                        perf_stats['preprocessing_contiguous_check_time'] += time.time() - contiguous_start
-                        
                         if batch_array.dtype == np.uint8:
-                            from_numpy_start = time.time()
-                            tensor_cpu = torch.from_numpy(batch_array)
-                            perf_stats['preprocessing_from_numpy_time'] += time.time() - from_numpy_start
-                            
-                            to_device_start = time.time()
-                            processed_batch = tensor_cpu.to(self.device, dtype=torch.float32, non_blocking=True)
-                            perf_stats['preprocessing_to_device_time'] += time.time() - to_device_start
-                            
-                            normalize_start = time.time()
+                            pinned_tensor = torch.empty(batch_array.shape, dtype=torch.uint8, pin_memory=True)
+                            pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
+                            processed_batch = pinned_tensor.to(self.device, dtype=torch.float32, non_blocking=True)
                             processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
-                            perf_stats['preprocessing_normalize_time'] += time.time() - normalize_start
                         else:
-                            from_numpy_start = time.time()
-                            tensor_cpu = torch.from_numpy(batch_array)
-                            perf_stats['preprocessing_from_numpy_time'] += time.time() - from_numpy_start
-                            
-                            to_device_start = time.time()
-                            processed_batch = tensor_cpu.to(self.device, non_blocking=True)
-                            perf_stats['preprocessing_to_device_time'] += time.time() - to_device_start
+                            pinned_tensor = torch.empty(batch_array.shape, dtype=torch.float32, pin_memory=True)
+                            pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
+                            processed_batch = pinned_tensor.to(self.device, non_blocking=True)
                     
                     perf_stats['preprocessing_time'] += time.time() - preprocess_start
-                    perf_stats['preprocessing_total_batches'] += 1
                     
                     # Model inference
                     model_start = time.time()
@@ -2104,31 +2058,6 @@ class NucleiEmbedding:
                         
                         preprocessing_total = perf_stats['preprocessing_time']
                         print(f"  Preprocessing: {preprocessing_total:.1f}s ({preprocessing_total/elapsed_time*100:.1f}%)", flush=True)
-                        # Show detailed breakdown during progress updates
-                        if preprocessing_total > 0 and perf_stats.get('preprocessing_total_batches', 0) > 0:
-                            print(f"    Preprocessing detailed breakdown (from {perf_stats['preprocessing_total_batches']} batches):", flush=True)
-                            contiguous_time = perf_stats.get('preprocessing_contiguous_check_time', 0.0)
-                            from_numpy_time = perf_stats.get('preprocessing_from_numpy_time', 0.0)
-                            to_device_time = perf_stats.get('preprocessing_to_device_time', 0.0)
-                            normalize_time = perf_stats.get('preprocessing_normalize_time', 0.0)
-                            
-                            if contiguous_time > 0:
-                                print(f"      - Contiguous check/make: {contiguous_time:.2f}s ({contiguous_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
-                            if from_numpy_time > 0:
-                                print(f"      - torch.from_numpy(): {from_numpy_time:.2f}s ({from_numpy_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
-                            if to_device_time > 0:
-                                print(f"      - .to(device): {to_device_time:.2f}s ({to_device_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
-                            if normalize_time > 0:
-                                print(f"      - Normalize (ImageNet): {normalize_time:.2f}s ({normalize_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
-                            
-                            # Calculate other time (overhead, etc.)
-                            accounted_time = contiguous_time + from_numpy_time + to_device_time + normalize_time
-                            other_time = preprocessing_total - accounted_time
-                            if other_time > 0.01:  # Only show if significant (>10ms)
-                                print(f"      - Other (overhead): {other_time:.2f}s ({other_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
-                            
-                            avg_per_batch = preprocessing_total / perf_stats['preprocessing_total_batches']
-                            print(f"      - Avg time per batch: {avg_per_batch*1000:.2f}ms", flush=True)
                         
                         print(f"  Model: {perf_stats['model_time']:.1f}s ({perf_stats['model_time']/elapsed_time*100:.1f}%)", flush=True)
         except Exception as e:
@@ -2169,32 +2098,6 @@ class NucleiEmbedding:
                 
                 preprocessing_total = perf_stats['preprocessing_time']
                 print(f"  Preprocessing (concat, to device): {preprocessing_total:.2f} seconds ({preprocessing_total/total_time*100:.1f}%)", flush=True)
-                
-                # Detailed Preprocessing breakdown
-                if preprocessing_total > 0 and perf_stats['preprocessing_total_batches'] > 0:
-                    print(f"    Preprocessing detailed breakdown (from {perf_stats['preprocessing_total_batches']} batches):", flush=True)
-                    contiguous_time = perf_stats.get('preprocessing_contiguous_check_time', 0.0)
-                    from_numpy_time = perf_stats.get('preprocessing_from_numpy_time', 0.0)
-                    to_device_time = perf_stats.get('preprocessing_to_device_time', 0.0)
-                    normalize_time = perf_stats.get('preprocessing_normalize_time', 0.0)
-                    
-                    if contiguous_time > 0:
-                        print(f"      - Contiguous check/make: {contiguous_time:.2f}s ({contiguous_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
-                    if from_numpy_time > 0:
-                        print(f"      - torch.from_numpy(): {from_numpy_time:.2f}s ({from_numpy_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
-                    if to_device_time > 0:
-                        print(f"      - .to(device): {to_device_time:.2f}s ({to_device_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
-                    if normalize_time > 0:
-                        print(f"      - Normalize (ImageNet): {normalize_time:.2f}s ({normalize_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
-                    
-                    # Calculate other time (overhead, etc.)
-                    accounted_time = contiguous_time + from_numpy_time + to_device_time + normalize_time
-                    other_time = preprocessing_total - accounted_time
-                    if other_time > 0.01:  # Only show if significant (>10ms)
-                        print(f"      - Other (overhead): {other_time:.2f}s ({other_time/preprocessing_total*100:.1f}% of Preprocessing)", flush=True)
-                    
-                    avg_per_batch = preprocessing_total / perf_stats['preprocessing_total_batches']
-                    print(f"      - Avg time per batch: {avg_per_batch*1000:.2f}ms", flush=True)
                 
                 print(f"  Model inference: {perf_stats['model_time']:.2f} seconds ({perf_stats['model_time']/total_time*100:.1f}%)", flush=True)
             else:
