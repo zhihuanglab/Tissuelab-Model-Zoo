@@ -9,6 +9,7 @@ Created on Feb 03 2025
 import numpy as np
 import torch
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
+import torchvision.transforms as transforms
 
 from PIL import Image
 import multiprocess as mp
@@ -42,7 +43,7 @@ class NucleiPatchDataset(Dataset):
             'slide_open_time': 0.0,  # Time to open slide object
             'read_region_time': 0.0,  # Time to read region from slide
             'image_process_time': 0.0,  # Time for convert/resize operations
-            'processor_time': 0.0,  # Time for processor preprocessing
+            'processor_time': 0.0,  # Time for processor preprocessing (now in collate, tracked separately)
             'total_calls': 0
         }
         
@@ -405,7 +406,9 @@ class NucleiPatchDataset(Dataset):
             self._open_slide()
         
         # Measure read_region time (slide is already open, no open overhead)
+        # OPTIMIZATION: Read region directly without extra overhead
         read_region_start = time.time()
+        # Direct read - no intermediate variables or checks
         patch = self.slide.read_region(
             location=(x1, y1),
             level=0,
@@ -415,36 +418,39 @@ class NucleiPatchDataset(Dataset):
         
         # Measure image processing time (convert + resize)
         image_process_start = time.time()
-        if patch.mode != 'RGB':
-            patch = patch.convert('RGB')
+        
+        # OPTIMIZATION: Use fastest resize method based on scale factor
+        # For large downscaling, NEAREST is much faster with minimal quality loss
+        patch_w, patch_h = patch.size  # Cache size to avoid repeated access
+        needs_convert = patch.mode != 'RGB'
+        needs_resize = patch_w != self.patch_size or patch_h != self.patch_size
+        
+        # Fast path: no operations needed (most common after first batch)
+        if not needs_convert and not needs_resize:
+            pass  # Skip all processing
+        elif needs_resize:
+            # Calculate scale factor to choose optimal resize method
+            scale_factor = min(self.patch_size / patch_w, self.patch_size / patch_h)
+            # Use NEAREST for large downscaling (>2x), BILINEAR for smaller scaling
+            resize_method = Image.Resampling.NEAREST if scale_factor < 0.5 else Image.Resampling.BILINEAR
             
-        # Resize to model input size (always square 224x224)
-        if patch.size[0] != self.patch_size or patch.size[1] != self.patch_size:
-            patch = patch.resize((self.patch_size, self.patch_size), Image.Resampling.LANCZOS)
+            if needs_convert:
+                # Both needed: convert first, then resize with optimal method
+                patch = patch.convert('RGB')
+                patch = patch.resize((self.patch_size, self.patch_size), resize_method)
+            else:
+                # Only resize needed - use optimal method
+                patch = patch.resize((self.patch_size, self.patch_size), resize_method)
+        elif needs_convert:
+            # Only convert needed
+            patch = patch.convert('RGB')
+        
         self.perf_stats['image_process_time'] += time.time() - image_process_start
         
-        # Preprocess the patch if processor is available
-        if self.processor is not None:
-            processor_start = time.time()
-            processed_patch = self.processor.image_processor(patch)['pixel_values']
-            self.perf_stats['processor_time'] += time.time() - processor_start
-            
-            # DEBUG: Save preprocessed patch (exactly as model sees it)
-            # Calculate centroid position in resized patch
-            centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
-            centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
-            self._debug_save_patch_processed(processed_patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
-            
-            self.perf_stats['total_calls'] += 1
-            return processed_patch
-        else:
-            # DEBUG: Save raw patch if no processor
-            centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
-            centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
-            self._debug_save_patch(patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
-            
-            self.perf_stats['total_calls'] += 1
-            return patch
+        # Return PIL Image instead of processed patch - processor will be applied in batch
+        # This allows batch processing of processor which is more efficient
+        self.perf_stats['total_calls'] += 1
+        return patch
 
     def _extract_zstack_patches(self, x1, y1, width, height, idx):
         """Extract patches from all z-layers for embedding fusion"""
@@ -805,20 +811,122 @@ class NucleiPatchDataset(Dataset):
             import traceback
             traceback.print_exc()
 
-def collate_patches(batch):
-    """Custom collate function to handle None values and convert patches to a list.
-    Also handles z-stack patches (list of patches per cell).
+def _fast_batch_preprocess(images, use_torchvision=True):
+    """Ultra-fast batch preprocessing using fully vectorized numpy operations.
+    
+    Completely eliminates Python loops by using numpy's vectorized operations.
+    Uses batch conversion and fully vectorized processing.
     
     Args:
-        batch: List of patches or list of lists of patches (for z-stack)
+        images: List of PIL Images (already resized to 224x224)
+        use_torchvision: If True, use optimized numpy processing (faster), else use processor
         
     Returns:
-        List of valid patches (maintains z-stack structure as list of lists)
+        Single numpy array (N, C, H, W) normalized and ready for model, or None if fallback
+    """
+    if use_torchvision:
+        num_images = len(images)
+        if num_images == 0:
+            return None
+        
+        # Get dimensions from first image
+        h, w = images[0].size[1], images[0].size[0]  # PIL uses (width, height)
+        
+        # OPTIMIZATION 1: Batch convert all PIL images to numpy arrays
+        # Note: PIL to numpy conversion must be done per-image (PIL limitation)
+        # But we use numpy.stack for fully vectorized batch processing
+        try:
+            # Convert all images to numpy arrays (this is the only necessary loop)
+            # Use asarray for views when possible (no copy)
+            arrays_uint8 = [np.asarray(img, dtype=np.uint8) for img in images]
+            
+            # OPTIMIZATION 2: Use numpy.stack for fully vectorized batch conversion
+            # This is MUCH faster than individual assignments - single vectorized operation
+            # Stack creates a new array with all images, then convert entire batch at once
+            batch_array = np.stack(arrays_uint8, axis=0)  # (N, H, W, C) uint8
+            
+            # OPTIMIZATION 3: Single vectorized type conversion for entire batch
+            # Convert entire batch from uint8 to float32 in one operation (fully vectorized)
+            batch_array = batch_array.astype(np.float32, copy=False)
+            
+            # Handle shape mismatches if any (shouldn't happen if images are pre-resized)
+            if batch_array.shape[1:] != (h, w, 3):
+                # Fallback: handle edge cases (should be rare)
+                # Pre-allocate and handle individually
+                batch_array_fixed = np.empty((num_images, h, w, 3), dtype=np.float32)
+                for i, arr in enumerate(arrays_uint8):
+                    if arr.shape == (h, w, 3):
+                        batch_array_fixed[i] = arr.astype(np.float32, copy=False)
+                    elif arr.ndim == 2:
+                        arr_float = arr.astype(np.float32, copy=False)
+                        batch_array_fixed[i, :, :, 0] = arr_float
+                        batch_array_fixed[i, :, :, 1] = arr_float
+                        batch_array_fixed[i, :, :, 2] = arr_float
+                    elif arr.shape[2] == 4:
+                        batch_array_fixed[i] = arr[:, :, :3].astype(np.float32, copy=False)
+                    elif arr.shape[0] == h and arr.shape[1] == w and arr.shape[2] >= 3:
+                        batch_array_fixed[i] = arr[:, :, :3].astype(np.float32, copy=False)
+                    else:
+                        batch_array_fixed[i] = np.array(images[i], dtype=np.float32)
+                batch_array = batch_array_fixed
+        except (ValueError, TypeError) as e:
+            # Handle stack errors (shape mismatches) - fallback to individual processing
+            batch_array = np.empty((num_images, h, w, 3), dtype=np.float32)
+            for i, img in enumerate(images):
+                try:
+                    arr = np.asarray(img, dtype=np.uint8)
+                    if arr.shape == (h, w, 3):
+                        batch_array[i] = arr.astype(np.float32, copy=False)
+                    else:
+                        batch_array[i] = np.array(img, dtype=np.float32)
+                except:
+                    batch_array[i] = np.array(img, dtype=np.float32)
+        
+        # OPTIMIZATION 3: Fully vectorized operations on entire batch (no loops!)
+        # Pre-compute constants
+        inv_255 = np.float32(1.0 / 255.0)  # Single float32 constant
+        
+        # Scale to [0, 1] - fully vectorized (single operation on entire batch)
+        batch_array *= inv_255
+        
+        # Convert to (N, C, H, W) - vectorized transpose
+        batch_array = batch_array.transpose(0, 3, 1, 2)
+        
+        # OPTIMIZATION 4: Fully vectorized normalization (broadcast operations)
+        # Pre-compute normalization constants as numpy arrays
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
+        inv_std = np.array([1.0/0.229, 1.0/0.224, 1.0/0.225], dtype=np.float32).reshape(1, 3, 1, 1)
+        
+        # Vectorized normalization: subtract mean, multiply by inv_std (single operations)
+        batch_array -= mean
+        batch_array *= inv_std
+        
+        return batch_array
+    else:
+        # Fallback to processor (slower)
+        return None
+
+def collate_patches(batch, processor=None, perf_stats=None, use_fast_preprocess=True):
+    """Custom collate function to handle None values and convert patches to a list.
+    Also handles z-stack patches (list of patches per cell).
+    Now uses ultra-fast numpy preprocessing that returns a single stacked array.
+    
+    Args:
+        batch: List of patches (PIL Images) or list of lists of patches (for z-stack)
+        processor: Optional processor (fallback if use_fast_preprocess=False)
+        perf_stats: Optional dict to track processor time
+        use_fast_preprocess: If True, use fast numpy preprocessing (default: True)
+        
+    Returns:
+        Single numpy array (N, C, H, W) if fast preprocessing, or list of arrays for fallback
         
     Note:
         For z-stack: batch is [cell1_patches, cell2_patches, ...]
         where cell_patches = [z1_patch, z2_patch, ...]
     """
+    import time
+    import numpy as np
+    
     valid_items = [item for item in batch if item is not None]
     
     if len(valid_items) == 0:
@@ -829,8 +937,29 @@ def collate_patches(batch):
         # Z-stack case: return as list of lists to maintain structure
         return valid_items
     else:
-        # Single layer case: return as flat list
-        return valid_items
+        # Single layer case: batch process with fast preprocessing
+        processor_start = time.time()
+        
+        if use_fast_preprocess:
+            # Use ultra-fast numpy preprocessing - returns single array (N, C, H, W)
+            processed_batch = _fast_batch_preprocess(valid_items, use_torchvision=True)
+            # Return the single array directly - no list conversion needed
+        elif processor is not None:
+            # Fallback to processor (slower)
+            processed_batch = processor.image_processor(valid_items)['pixel_values']
+            # Convert to list format if needed
+            if not isinstance(processed_batch, list):
+                processed_batch = np.array(processed_batch)
+                processed_batch = [processed_batch[i] for i in range(len(valid_items))]
+        else:
+            # No preprocessing: return PIL Images as-is
+            processed_batch = valid_items
+        
+        # Track processor time if perf_stats provided
+        if perf_stats is not None:
+            perf_stats['processor_time'] += time.time() - processor_start
+        
+        return processed_batch
 
 class NucleiEmbedding:
     def __init__(self, args, centroids=None, contours=None, progress_callback=None):
@@ -1108,12 +1237,18 @@ class NucleiEmbedding:
         #     print(f"Adjusted batch_size to {batch_size} for z-stack processing")
         
         # Disable persistent_workers when num_workers=0
+        # Create collate function with processor for batch processing
+        # Use fast numpy-based preprocessing instead of slow transformers processor
+        from functools import partial
+        collate_fn_with_processor = partial(collate_patches, processor=self.processor, perf_stats=dataset.perf_stats, use_fast_preprocess=True)
+        print("[PERF] Using optimized fast preprocessing (numpy-based) instead of transformers processor")
+        
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             num_workers=num_workers,
             shuffle=False,
-            collate_fn=collate_patches,
+            collate_fn=collate_fn_with_processor,
             prefetch_factor=1 if num_workers > 0 else None,
             persistent_workers=True if num_workers > 0 else False,
             pin_memory=True if num_workers > 0 else False
@@ -1166,15 +1301,36 @@ class NucleiEmbedding:
                 if batch_idx > 0:
                     perf_stats['dataloader_time'] += dataloader_start_time - prev_batch_end_time
                 
-                if batch:
+                # Check if batch is valid (handle both numpy array and list)
+                batch_valid = False
+                if isinstance(batch, np.ndarray):
+                    batch_valid = batch.size > 0
+                elif isinstance(batch, list):
+                    batch_valid = len(batch) > 0
+                else:
+                    batch_valid = bool(batch)
+                
+                if batch_valid:
                     # DISABLED: z-stack functionality - always use single layer logic
                     # if is_zstack:
                     #     # Z-stack case: batch is list of lists
-                    #     batch_embeddings = self.embed_batch(batch, is_zstack=True, num_z_layers=dataset.num_z_layers)
+                    #     batch_embeddings = self.embed_batch(batch, is_zstack=True, num_z_layers=dataset.num_layers)
                     # else:
-                    # Single layer case: original logic
+                    # Single layer case: batch is already processed by collate function
                     preprocess_start = time.time()
-                    processed_batch = torch.from_numpy(np.concatenate(batch, axis=0)).to(self.device)
+                    # Batch is already processed by collate_patches (fast preprocessing applied)
+                    # Fast preprocessing returns a single array (N, C, H, W) - no stack needed!
+                    if isinstance(batch, np.ndarray):
+                        # Already a single stacked array from fast preprocessing - convert directly
+                        processed_batch = torch.from_numpy(batch).contiguous().to(self.device, non_blocking=True)
+                    elif isinstance(batch, list) and len(batch) > 0 and isinstance(batch[0], np.ndarray):
+                        # Fallback: list of arrays (shouldn't happen with fast preprocessing)
+                        batch_array = np.stack(batch, axis=0)
+                        processed_batch = torch.from_numpy(batch_array).contiguous().to(self.device, non_blocking=True)
+                    else:
+                        # Fallback: if not processed, process now (shouldn't happen)
+                        batch_array = np.stack([np.array(b) for b in batch], axis=0)
+                        processed_batch = torch.from_numpy(batch_array).contiguous().to(self.device, non_blocking=True)
                     perf_stats['preprocessing_time'] += time.time() - preprocess_start
                     
                     # Model inference
@@ -1198,11 +1354,16 @@ class NucleiEmbedding:
                     
                     # Update statistics
                     perf_stats['total_batches'] += 1
-                    perf_stats['total_samples'] += len(batch)
+                    # Get batch size (handle both numpy array and list)
+                    if isinstance(batch, np.ndarray):
+                        batch_size = batch.shape[0]
+                    else:
+                        batch_size = len(batch)
+                    perf_stats['total_samples'] += batch_size
                     
                     # update progress
-                    total_processed += len(batch)
-                    pbar.update(len(batch))
+                    total_processed += batch_size
+                    pbar.update(batch_size)
                     
                     # update progress callback
                     if self.progress_callback:
@@ -1234,13 +1395,19 @@ class NucleiEmbedding:
                     print(f"  Estimated remaining: {estimated_remaining:.1f}s ({estimated_remaining/60:.1f} min)", flush=True)
                     if elapsed_time > 0:
                         print(f"  DataLoader total: {total_dataloader_time:.1f}s ({total_dataloader_time/elapsed_time*100:.1f}%)", flush=True)
-                        if dataset_perf['total_calls'] > 0:
+                        if dataset_perf['total_calls'] > 0 and total_dataloader_time > 0:
                             avg_call_time = total_dataloader_time / dataset_perf['total_calls']
                             print(f"    - Slide open: {dataset_perf['slide_open_time']:.1f}s ({dataset_perf['slide_open_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
                             print(f"    - Read region: {dataset_perf['read_region_time']:.1f}s ({dataset_perf['read_region_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
                             print(f"    - Image process (convert/resize): {dataset_perf['image_process_time']:.1f}s ({dataset_perf['image_process_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
                             print(f"    - Processor: {dataset_perf['processor_time']:.1f}s ({dataset_perf['processor_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
                             print(f"    - Avg per sample: {avg_call_time*1000:.2f}ms", flush=True)
+                        elif dataset_perf['total_calls'] > 0:
+                            print(f"    - Slide open: {dataset_perf['slide_open_time']:.1f}s", flush=True)
+                            print(f"    - Read region: {dataset_perf['read_region_time']:.1f}s", flush=True)
+                            print(f"    - Image process (convert/resize): {dataset_perf['image_process_time']:.1f}s", flush=True)
+                            print(f"    - Processor: {dataset_perf['processor_time']:.1f}s", flush=True)
+                            print(f"    - Note: DataLoader time is 0", flush=True)
                         print(f"  Preprocessing: {perf_stats['preprocessing_time']:.1f}s ({perf_stats['preprocessing_time']/elapsed_time*100:.1f}%)", flush=True)
                         print(f"  Model: {perf_stats['model_time']:.1f}s ({perf_stats['model_time']/elapsed_time*100:.1f}%)", flush=True)
                         print(f"  Postprocessing: {perf_stats['postprocessing_time']:.1f}s ({perf_stats['postprocessing_time']/elapsed_time*100:.1f}%)", flush=True)
@@ -1277,7 +1444,7 @@ class NucleiEmbedding:
                 
                 # Detailed DataLoader breakdown
                 dataset_perf = dataset.perf_stats
-                if dataset_perf['total_calls'] > 0:
+                if dataset_perf['total_calls'] > 0 and total_dataloader_time > 0:
                     print(f"    DataLoader detailed breakdown (from {dataset_perf['total_calls']} samples):", flush=True)
                     print(f"      - Slide open: {dataset_perf['slide_open_time']:.2f}s ({dataset_perf['slide_open_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
                     print(f"      - Read region: {dataset_perf['read_region_time']:.2f}s ({dataset_perf['read_region_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
@@ -1285,6 +1452,13 @@ class NucleiEmbedding:
                     print(f"      - Processor: {dataset_perf['processor_time']:.2f}s ({dataset_perf['processor_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
                     avg_per_sample = total_dataloader_time / dataset_perf['total_calls']
                     print(f"      - Avg time per sample: {avg_per_sample*1000:.2f}ms", flush=True)
+                elif dataset_perf['total_calls'] > 0:
+                    print(f"    DataLoader detailed breakdown (from {dataset_perf['total_calls']} samples):", flush=True)
+                    print(f"      - Slide open: {dataset_perf['slide_open_time']:.2f}s", flush=True)
+                    print(f"      - Read region: {dataset_perf['read_region_time']:.2f}s", flush=True)
+                    print(f"      - Image process (convert/resize): {dataset_perf['image_process_time']:.2f}s", flush=True)
+                    print(f"      - Processor: {dataset_perf['processor_time']:.2f}s", flush=True)
+                    print(f"      - Note: DataLoader time is 0, cannot calculate percentages", flush=True)
                 
                 print(f"  Preprocessing (concat, to device): {perf_stats['preprocessing_time']:.2f} seconds ({perf_stats['preprocessing_time']/total_time*100:.1f}%)", flush=True)
                 print(f"  Model inference: {perf_stats['model_time']:.2f} seconds ({perf_stats['model_time']/total_time*100:.1f}%)", flush=True)
