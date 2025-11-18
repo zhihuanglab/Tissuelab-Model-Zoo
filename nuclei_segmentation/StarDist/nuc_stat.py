@@ -108,6 +108,16 @@ class NumpySlide():
 
 class VipsSlide():
     """Efficient slide implementation using libvips."""
+    _VIPS_FORMAT_TO_DTYPE = {
+        'uchar': np.uint8,
+        'char': np.int8,
+        'ushort': np.uint16,
+        'short': np.int16,
+        'uint': np.uint32,
+        'int': np.int32,
+        'float': np.float32,
+        'double': np.float64,
+    }
     
     def __init__(self, filepath):
         super(VipsSlide, self).__init__()
@@ -127,22 +137,31 @@ class VipsSlide():
         x, y = location
         w, h = size
         region = self.region.fetch(x, y, w, h)
+        if as_array:
+            return self._region_to_numpy(region, w, h)
         # Region fetch returns a memoryview-compatible bytes object; wrap as Image
         patch_image = pyvips.Image.new_from_memory(region, w, h, self.wsi.bands, self.wsi.format)
-        
-        if as_array:
-            patch = patch_image.numpy()
-            if patch.dtype != np.uint8:
-                patch = patch.astype(np.uint8)
-            if patch.ndim == 2:
-                patch = np.repeat(patch[:, :, np.newaxis], 3, axis=2)
-            elif patch.shape[-1] == 4:
-                patch = patch[:, :, :3]
-            return patch
         
         # Convert to PIL image
         mem_buffer = patch_image.write_to_memory()
         return PIL.Image.frombuffer('RGB', (patch_image.width, patch_image.height), mem_buffer, 'raw', 'RGB', 0, 1)
+
+    def _region_to_numpy(self, region_buffer, width, height):
+        """Convert a pyvips Region fetch buffer to a detached numpy array."""
+        band_format = getattr(self.wsi, 'format', 'uchar')
+        dtype = self._VIPS_FORMAT_TO_DTYPE.get(str(band_format).lower())
+        if dtype is None:
+            raise ValueError(f"Unsupported VIPS band format: {band_format}")
+        expected = width * height * self.wsi.bands
+        np_view = np.frombuffer(region_buffer, dtype=dtype, count=expected)
+        np_view = np_view.reshape(height, width, self.wsi.bands).copy()
+        if np_view.ndim == 2:
+            np_view = np.repeat(np_view[:, :, np.newaxis], 3, axis=2)
+        elif np_view.shape[2] == 1:
+            np_view = np.repeat(np_view, 3, axis=2)
+        elif np_view.shape[2] >= 4:
+            np_view = np_view[:, :, :3]
+        return np_view.astype(np.uint8, copy=False)
 
 
 class SlideProperty():
