@@ -1371,6 +1371,72 @@ class NucleiEmbedding:
             print("Successfully loaded checkpoint")
         else:
             raise FileNotFoundError(f"Required checkpoint not found at {checkpoint_path}. Cannot proceed without trained model.")
+        
+        # Optimization: Set model to eval mode for inference
+        self.model.eval()
+        self.image_projection.eval()
+        
+        # Optimization: Enable cuDNN benchmark for fixed input sizes (faster convolutions)
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            print("[OPTIMIZATION] Enabled cuDNN benchmark for faster convolutions")
+        
+        # Optimization: Compile model with torch.compile (PyTorch 2.0+)
+        # This can provide 20-30% speedup on modern GPUs
+        # Note: On Windows, requires triton-windows (https://github.com/woct0rdho/triton-windows)
+        try:
+            if hasattr(torch, 'compile') and torch.cuda.is_available():
+                # Check if Triton is available (including triton-windows for Windows)
+                try:
+                    import triton
+                    triton_available = True
+                except ImportError:
+                    triton_available = False
+                
+                if not triton_available:
+                    import platform
+                    is_windows = platform.system() == 'Windows'
+                    if is_windows:
+                        print("[OPTIMIZATION] Triton not found. For Windows, install triton-windows:")
+                        print("[OPTIMIZATION]   pip install triton-windows")
+                        print("[OPTIMIZATION]   See: https://github.com/woct0rdho/triton-windows")
+                    else:
+                        print("[OPTIMIZATION] Triton not available - skipping torch.compile")
+                else:
+                    print("[OPTIMIZATION] Compiling model with torch.compile...")
+                    # Compile the vision model for faster inference
+                    self.model.vision_model = torch.compile(
+                        self.model.vision_model,
+                        mode='reduce-overhead',  # Good balance between compile time and runtime speed
+                        fullgraph=False  # Allow graph breaks for flexibility
+                    )
+                    # Compile the projection layer
+                    self.image_projection = torch.compile(
+                        self.image_projection,
+                        mode='reduce-overhead',
+                        fullgraph=False
+                    )
+                    print("[OPTIMIZATION] Model compilation completed")
+        except Exception as e:
+            # Catch TritonMissing and other exceptions
+            error_type = type(e).__name__
+            error_msg = str(e)
+            
+            # Check for Triton-related errors
+            if 'TritonMissing' in error_type or 'triton' in error_msg.lower():
+                import platform
+                is_windows = platform.system() == 'Windows'
+                if is_windows:
+                    print(f"[OPTIMIZATION] torch.compile requires Triton (triton-windows on Windows)")
+                    print(f"[OPTIMIZATION] Install with: pip install triton-windows")
+                    print(f"[OPTIMIZATION] See: https://github.com/woct0rdho/triton-windows")
+                else:
+                    print(f"[OPTIMIZATION] torch.compile requires Triton which is not available")
+                print(f"[OPTIMIZATION] Error: {error_msg}")
+            else:
+                print(f"[OPTIMIZATION] torch.compile not available or failed: {error_msg}")
+            print("[OPTIMIZATION] Continuing without compilation (this is fine)")
+            # Models remain in their original uncompiled state
 
     def preprocess_images(self, images):
         """Preprocess a batch of PIL images."""
@@ -1414,10 +1480,18 @@ class NucleiEmbedding:
                         print(f"[DEBUG] Cell 0: {len(cell_patches)} z-layers, tensor shape: {cell_tensor.shape}")
                     
                     with torch.no_grad():
-                        # Get embeddings for all z-layers of this cell
-                        vision_outputs = self.model.vision_model(cell_tensor)
-                        image_embeds = vision_outputs.last_hidden_state.mean(dim=1)
-                        embeddings = self.image_projection(image_embeds)
+                        # Optimization: Use mixed precision (AMP) for faster inference
+                        if torch.cuda.is_available():
+                            with torch.amp.autocast('cuda'):
+                                # Get embeddings for all z-layers of this cell
+                                vision_outputs = self.model.vision_model(cell_tensor)
+                                image_embeds = vision_outputs.last_hidden_state.mean(dim=1)
+                                embeddings = self.image_projection(image_embeds)
+                        else:
+                            # CPU fallback
+                            vision_outputs = self.model.vision_model(cell_tensor)
+                            image_embeds = vision_outputs.last_hidden_state.mean(dim=1)
+                            embeddings = self.image_projection(image_embeds)
                         
                         # Debug: print embedding shape before and after fusion for first cell
                         if len(all_cell_embeddings) == 0:
@@ -1437,9 +1511,17 @@ class NucleiEmbedding:
                     cell_tensor = cell_tensor.unsqueeze(0).to(device)
                     
                     with torch.no_grad():
-                        vision_outputs = self.model.vision_model(cell_tensor)
-                        image_embeds = vision_outputs.last_hidden_state.mean(dim=1)
-                        embeddings = self.image_projection(image_embeds)
+                        # Optimization: Use mixed precision (AMP) for faster inference
+                        if torch.cuda.is_available():
+                            with torch.amp.autocast('cuda'):
+                                vision_outputs = self.model.vision_model(cell_tensor)
+                                image_embeds = vision_outputs.last_hidden_state.mean(dim=1)
+                                embeddings = self.image_projection(image_embeds)
+                        else:
+                            # CPU fallback
+                            vision_outputs = self.model.vision_model(cell_tensor)
+                            image_embeds = vision_outputs.last_hidden_state.mean(dim=1)
+                            embeddings = self.image_projection(image_embeds)
                         all_cell_embeddings.append(embeddings)
             
             # Concatenate all cell embeddings
@@ -1457,11 +1539,19 @@ class NucleiEmbedding:
                 processed_batch = processed_batch.to(device)
             
             with torch.no_grad():
-                # Get vision model outputs
-                vision_outputs = self.model.vision_model(processed_batch)
-                image_embeds = vision_outputs.last_hidden_state.mean(dim=1)  # Mean pooling
-                # Use trained projection layer
-                embeddings = self.image_projection(image_embeds)
+                # Optimization: Use mixed precision (AMP) for faster inference
+                if torch.cuda.is_available():
+                    with torch.amp.autocast('cuda'):
+                        # Get vision model outputs
+                        vision_outputs = self.model.vision_model(processed_batch)
+                        image_embeds = vision_outputs.last_hidden_state.mean(dim=1)  # Mean pooling
+                        # Use trained projection layer
+                        embeddings = self.image_projection(image_embeds)
+                else:
+                    # CPU fallback
+                    vision_outputs = self.model.vision_model(processed_batch)
+                    image_embeds = vision_outputs.last_hidden_state.mean(dim=1)  # Mean pooling
+                    embeddings = self.image_projection(image_embeds)
                 embeddings = embeddings.detach().cpu().numpy()
 
             return embeddings
