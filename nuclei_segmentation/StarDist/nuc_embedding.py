@@ -1009,121 +1009,151 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
         
         # Check if all images are numpy arrays for vectorized processing
         all_numpy = all(isinstance(img, np.ndarray) for img in images)
+        processing_done = False
         
         if all_numpy:
-            # OPTIMIZATION: All numpy arrays - fully vectorized batch processing
-            # Stack all arrays at once (much faster than loop)
-            try:
-                # First, normalize all arrays to uint8 if needed (vectorized where possible)
-                dtype_normalize_start = time.time()
-                normalized_images = []
-                for img in images:
-                    if img.dtype != np.uint8:
-                        normalized_images.append(img.astype(np.uint8))
-                    else:
-                        normalized_images.append(img)
-                dtype_normalize_time = time.time() - dtype_normalize_start
-                
-                # Stack all numpy arrays into a single array (N, H, W, C) - fully vectorized
-                stack_start = time.time()
-                stacked = np.stack(normalized_images, axis=0)
-                stack_time = time.time() - stack_start
-                if perf_stats is not None:
-                    perf_stats['processor_stack_time'] += stack_time
-                
-                # Vectorized shape handling - all operations are batch-level vectorized
-                # Direct assignment to (N, C, H, W) format - no transpose needed!
-                convert_norm_start = time.time()
-                if stacked.shape[1:] == (h, w, 3):
-                    # Perfect match - direct write to target array using out parameter (zero-copy)
-                    convert_start = time.time()
-                    if return_uint8:
-                        # Skip normalization - just transpose from (N, H, W, C) to (N, C, H, W)
-                        # This is much faster as we avoid float conversion and normalization
-                        # Use efficient transpose and assign to pre-allocated array
-                        transposed = stacked.transpose(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
-                        batch_array[:] = transposed  # Copy into pre-allocated array
-                    else:
+            # Special fast-path: if we only need uint8 tensors, avoid the extra np.stack copy
+            if return_uint8:
+                try:
+                    uint8_copy_start = time.time()
+                    for idx, img in enumerate(images):
+                        arr_uint8 = img if img.dtype == np.uint8 else img.astype(np.uint8)
+                        
+                        # Normalize channel count to RGB
+                        if arr_uint8.ndim == 2:
+                            arr_uint8 = np.repeat(arr_uint8[:, :, np.newaxis], 3, axis=2)
+                        elif arr_uint8.shape[2] == 1:
+                            arr_uint8 = np.repeat(arr_uint8, 3, axis=2)
+                        elif arr_uint8.shape[2] > 3:
+                            arr_uint8 = arr_uint8[:, :, :3]
+                        
+                        if arr_uint8.shape[:2] != (h, w):
+                            raise ValueError("Mismatched spatial shape for fast uint8 packing")
+                        
+                        # Copy directly into (N, C, H, W) buffer (single pass memory copy)
+                        batch_array[idx] = np.transpose(arr_uint8, (2, 0, 1))
+                    
+                    processing_done = True
+                    if perf_stats is not None:
+                        perf_stats['processor_stack_time'] += time.time() - uint8_copy_start
+                except Exception:
+                    # Fall back to general vectorized path
+                    processing_done = False
+            
+            if not processing_done:
+                # OPTIMIZATION: All numpy arrays - fully vectorized batch processing
+                # Stack all arrays at once (much faster than loop)
+                try:
+                    # First, normalize all arrays to uint8 if needed (vectorized where possible)
+                    dtype_normalize_start = time.time()
+                    normalized_images = []
+                    for img in images:
+                        if img.dtype != np.uint8:
+                            normalized_images.append(img.astype(np.uint8))
+                        else:
+                            normalized_images.append(img)
+                    dtype_normalize_time = time.time() - dtype_normalize_start
+                    
+                    # Stack all numpy arrays into a single array (N, H, W, C) - fully vectorized
+                    stack_start = time.time()
+                    stacked = np.stack(normalized_images, axis=0)
+                    stack_time = time.time() - stack_start
+                    if perf_stats is not None:
+                        perf_stats['processor_stack_time'] += stack_time
+                    
+                    # Vectorized shape handling - all operations are batch-level vectorized
+                    # Direct assignment to (N, C, H, W) format - no transpose needed!
+                    convert_norm_start = time.time()
+                    if stacked.shape[1:] == (h, w, 3):
+                        # Perfect match - direct write to target array using out parameter (zero-copy)
+                        convert_start = time.time()
+                        if return_uint8:
+                            # Skip normalization - just transpose from (N, H, W, C) to (N, C, H, W)
+                            # This is much faster as we avoid float conversion and normalization
+                            # Use efficient transpose and assign to pre-allocated array
+                            transposed = stacked.transpose(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
+                            batch_array[:] = transposed  # Copy into pre-allocated array
+                        else:
+                            # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
+                            # Convert entire batch once, then process all channels (more efficient than per-channel conversion)
+                            normalize_start = time.time()
+                            # Single astype for entire batch (more efficient than per-channel)
+                            float_batch = stacked.astype(np.float32)
+                            # Vectorized ImageNet normalization for all channels
+                            np.multiply(float_batch[:, :, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
+                            batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
+                            np.multiply(float_batch[:, :, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
+                            batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
+                            np.multiply(float_batch[:, :, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
+                            batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                            normalize_time = time.time() - normalize_start
+                            if perf_stats is not None:
+                                # Astype is now merged into normalize_time (single batch conversion is faster)
+                                perf_stats['processor_astype_time'] += 0.0
+                                perf_stats['processor_normalize_time'] += normalize_time
+                                perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
+                    elif stacked.shape[1:] == (h, w, 4):
+                        # RGBA - direct write to target array using out parameter (zero-copy)
+                        convert_start = time.time()
+                        if return_uint8:
+                            # Skip normalization - just transpose and take RGB channels (drop alpha)
+                            transposed = stacked[:, :, :, :3].transpose(0, 3, 1, 2)  # (N, H, W, 3) -> (N, 3, H, W)
+                            batch_array[:] = transposed  # Copy into pre-allocated array
+                        else:
+                            # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
+                            normalize_start = time.time()
+                            float_batch = stacked[:, :, :, :3].astype(np.float32)
+                            np.multiply(float_batch[:, :, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
+                            batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
+                            np.multiply(float_batch[:, :, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
+                            batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
+                            np.multiply(float_batch[:, :, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
+                            batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                            normalize_time = time.time() - normalize_start
+                            if perf_stats is not None:
+                                perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
+                                perf_stats['processor_normalize_time'] += normalize_time
+                                perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
+                    elif len(stacked.shape) == 3 and stacked.shape[1:] == (h, w):
+                        # Grayscale 2D - direct write using out parameter (zero-copy)
+                        convert_start = time.time()
                         # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
-                        # Convert entire batch once, then process all channels (more efficient than per-channel conversion)
                         normalize_start = time.time()
-                        # Single astype for entire batch (more efficient than per-channel)
                         float_batch = stacked.astype(np.float32)
-                        # Vectorized ImageNet normalization for all channels
-                        np.multiply(float_batch[:, :, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
+                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
                         batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                        np.multiply(float_batch[:, :, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
+                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
                         batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                        np.multiply(float_batch[:, :, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
-                        batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
-                        normalize_time = time.time() - normalize_start
-                        if perf_stats is not None:
-                            # Astype is now merged into normalize_time (single batch conversion is faster)
-                            perf_stats['processor_astype_time'] += 0.0
-                            perf_stats['processor_normalize_time'] += normalize_time
-                            perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
-                elif stacked.shape[1:] == (h, w, 4):
-                    # RGBA - direct write to target array using out parameter (zero-copy)
-                    convert_start = time.time()
-                    if return_uint8:
-                        # Skip normalization - just transpose and take RGB channels (drop alpha)
-                        transposed = stacked[:, :, :, :3].transpose(0, 3, 1, 2)  # (N, H, W, 3) -> (N, 3, H, W)
-                        batch_array[:] = transposed  # Copy into pre-allocated array
-                    else:
-                        # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
-                        normalize_start = time.time()
-                        float_batch = stacked[:, :, :, :3].astype(np.float32)
-                        np.multiply(float_batch[:, :, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
-                        batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                        np.multiply(float_batch[:, :, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
-                        batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                        np.multiply(float_batch[:, :, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
+                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
                         batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
-                elif len(stacked.shape) == 3 and stacked.shape[1:] == (h, w):
-                    # Grayscale 2D - direct write using out parameter (zero-copy)
-                    convert_start = time.time()
-                    # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
-                    normalize_start = time.time()
-                    float_batch = stacked.astype(np.float32)
-                    np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
-                    batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                    np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
-                    batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                    np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
-                    batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
-                    normalize_time = time.time() - normalize_start
-                    if perf_stats is not None:
-                        perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
-                        perf_stats['processor_normalize_time'] += normalize_time
-                        perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
-                elif stacked.shape[1:] == (h, w, 1):
-                    # Grayscale 3D - direct write using out parameter (zero-copy)
-                    convert_start = time.time()
-                    # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
-                    normalize_start = time.time()
-                    float_batch = stacked[:, :, :, 0].astype(np.float32)
-                    np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
-                    batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                    np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
-                    batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                    np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
-                    batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
-                    normalize_time = time.time() - normalize_start
-                    if perf_stats is not None:
-                        perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
-                        perf_stats['processor_normalize_time'] += normalize_time
-                        perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
-                else:
-                    # Fallback to loop for edge cases
+                    elif stacked.shape[1:] == (h, w, 1):
+                        # Grayscale 3D - direct write using out parameter (zero-copy)
+                        convert_start = time.time()
+                        # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
+                        normalize_start = time.time()
+                        float_batch = stacked[:, :, :, 0].astype(np.float32)
+                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
+                        batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
+                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
+                        batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
+                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
+                        batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                        normalize_time = time.time() - normalize_start
+                        if perf_stats is not None:
+                            perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
+                            perf_stats['processor_normalize_time'] += normalize_time
+                            perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
+                    else:
+                        # Fallback to loop for edge cases
+                        all_numpy = False
+                except (ValueError, TypeError):
+                    # If stack fails (different shapes), fall back to loop
                     all_numpy = False
-            except (ValueError, TypeError):
-                # If stack fails (different shapes), fall back to loop
-                all_numpy = False
         
         if not all_numpy:
             # Mixed or all PIL - process with optimized loop
