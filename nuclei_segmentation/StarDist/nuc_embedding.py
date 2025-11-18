@@ -913,7 +913,33 @@ _IMAGENET_STD_UINT8 = _IMAGENET_STD * 255.0    # [58.395, 57.12, 57.375]
 _IMAGENET_INV_STD_UINT8 = 1.0 / _IMAGENET_STD_UINT8  # Pre-compute division constant
 _IMAGENET_MEAN_TIMES_INV_STD_UINT8 = _IMAGENET_MEAN_UINT8 * _IMAGENET_INV_STD_UINT8
 
-def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
+# PyTorch tensor constants for GPU normalization (faster than numpy)
+_IMAGENET_MEAN_TENSOR = None  # Will be initialized on first use
+_IMAGENET_STD_TENSOR = None   # Will be initialized on first use
+
+def _normalize_imagenet_gpu(tensor, device):
+    """Normalize ImageNet on GPU using PyTorch (faster than CPU numpy).
+    
+    Args:
+        tensor: torch.Tensor of shape (N, C, H, W) with uint8 values [0, 255]
+        device: torch device to use
+        
+    Returns:
+        Normalized tensor of shape (N, C, H, W) with float32 values
+    """
+    global _IMAGENET_MEAN_TENSOR, _IMAGENET_STD_TENSOR
+    
+    # Initialize constants on first use (lazy initialization)
+    if _IMAGENET_MEAN_TENSOR is None or _IMAGENET_MEAN_TENSOR.device != device:
+        _IMAGENET_MEAN_TENSOR = torch.tensor(_IMAGENET_MEAN_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+        _IMAGENET_STD_TENSOR = torch.tensor(_IMAGENET_STD_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+    
+    # Convert to float32 and normalize in one step (GPU-accelerated)
+    tensor_float = tensor.to(torch.float32)
+    normalized = (tensor_float - _IMAGENET_MEAN_TENSOR) / _IMAGENET_STD_TENSOR
+    return normalized
+
+def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return_uint8=False):
     """Ultra-fast batch preprocessing using optimized numpy operations with minimal overhead.
     
     Uses the fastest possible PIL to numpy conversion methods and vectorized operations.
@@ -922,9 +948,13 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
         images: List of PIL Images (already resized to 224x224)
         use_torchvision: If True, use optimized numpy processing (faster), else use processor
         perf_stats: Optional dict to track detailed processor timing
+        return_uint8: If True, return uint8 data (N, C, H, W) without normalization for GPU normalization.
+                     If False, return normalized float32 data (default, backward compatible).
         
     Returns:
-        Single numpy array (N, C, H, W) normalized and ready for model, or None if fallback
+        Single numpy array (N, C, H, W):
+        - If return_uint8=True: uint8 values [0, 255] (not normalized)
+        - If return_uint8=False: float32 normalized values (ready for model)
     """
     import time
     
@@ -946,7 +976,8 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
         # This avoids expensive transpose + ascontiguousarray operations later
         # Use empty instead of zeros for slightly faster allocation (values will be overwritten anyway)
         # Ensure C_CONTIGUOUS layout for optimal memory access
-        batch_array = np.empty((num_images, 3, h, w), dtype=np.float32, order='C')
+        # If return_uint8, use uint8 dtype (faster, less memory), else use float32 for normalized data
+        batch_array = np.empty((num_images, 3, h, w), dtype=np.uint8 if return_uint8 else np.float32, order='C')
         
         # OPTIMIZATION 2: Direct ImageNet normalization from uint8 (no intermediate /255 step)
         # We skip the * inv_255 normalization since ImageNet norm will handle it
@@ -986,41 +1017,53 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
                 if stacked.shape[1:] == (h, w, 3):
                     # Perfect match - direct write to target array using out parameter (zero-copy)
                     convert_start = time.time()
-                    # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
-                    # Convert entire batch once, then process all channels (more efficient than per-channel conversion)
-                    normalize_start = time.time()
-                    # Single astype for entire batch (more efficient than per-channel)
-                    float_batch = stacked.astype(np.float32)
-                    # Vectorized ImageNet normalization for all channels
-                    np.multiply(float_batch[:, :, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
-                    batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                    np.multiply(float_batch[:, :, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
-                    batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                    np.multiply(float_batch[:, :, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
-                    batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
-                    normalize_time = time.time() - normalize_start
-                    if perf_stats is not None:
-                        # Astype is now merged into normalize_time (single batch conversion is faster)
-                        perf_stats['processor_astype_time'] += 0.0
-                        perf_stats['processor_normalize_time'] += normalize_time
-                        perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
+                    if return_uint8:
+                        # Skip normalization - just transpose from (N, H, W, C) to (N, C, H, W)
+                        # This is much faster as we avoid float conversion and normalization
+                        # Use efficient transpose and assign to pre-allocated array
+                        transposed = stacked.transpose(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
+                        batch_array[:] = transposed  # Copy into pre-allocated array
+                    else:
+                        # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
+                        # Convert entire batch once, then process all channels (more efficient than per-channel conversion)
+                        normalize_start = time.time()
+                        # Single astype for entire batch (more efficient than per-channel)
+                        float_batch = stacked.astype(np.float32)
+                        # Vectorized ImageNet normalization for all channels
+                        np.multiply(float_batch[:, :, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
+                        batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
+                        np.multiply(float_batch[:, :, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
+                        batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
+                        np.multiply(float_batch[:, :, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
+                        batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                        normalize_time = time.time() - normalize_start
+                        if perf_stats is not None:
+                            # Astype is now merged into normalize_time (single batch conversion is faster)
+                            perf_stats['processor_astype_time'] += 0.0
+                            perf_stats['processor_normalize_time'] += normalize_time
+                            perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                 elif stacked.shape[1:] == (h, w, 4):
                     # RGBA - direct write to target array using out parameter (zero-copy)
                     convert_start = time.time()
-                    # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
-                    normalize_start = time.time()
-                    float_batch = stacked[:, :, :, :3].astype(np.float32)
-                    np.multiply(float_batch[:, :, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
-                    batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                    np.multiply(float_batch[:, :, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
-                    batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                    np.multiply(float_batch[:, :, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
-                    batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
-                    normalize_time = time.time() - normalize_start
-                    if perf_stats is not None:
-                        perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
-                        perf_stats['processor_normalize_time'] += normalize_time
-                        perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
+                    if return_uint8:
+                        # Skip normalization - just transpose and take RGB channels (drop alpha)
+                        transposed = stacked[:, :, :, :3].transpose(0, 3, 1, 2)  # (N, H, W, 3) -> (N, 3, H, W)
+                        batch_array[:] = transposed  # Copy into pre-allocated array
+                    else:
+                        # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
+                        normalize_start = time.time()
+                        float_batch = stacked[:, :, :, :3].astype(np.float32)
+                        np.multiply(float_batch[:, :, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
+                        batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
+                        np.multiply(float_batch[:, :, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
+                        batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
+                        np.multiply(float_batch[:, :, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
+                        batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                        normalize_time = time.time() - normalize_start
+                        if perf_stats is not None:
+                            perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
+                            perf_stats['processor_normalize_time'] += normalize_time
+                            perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                 elif len(stacked.shape) == 3 and stacked.shape[1:] == (h, w):
                     # Grayscale 2D - direct write using out parameter (zero-copy)
                     convert_start = time.time()
@@ -1246,7 +1289,8 @@ def collate_patches(batch, processor=None, perf_stats=None, use_fast_preprocess=
         
         if use_fast_preprocess:
             # Use ultra-fast numpy preprocessing - returns single array (N, C, H, W)
-            processed_batch = _fast_batch_preprocess(valid_items, use_torchvision=True, perf_stats=perf_stats)
+            # OPTIMIZATION: Use return_uint8=True to skip CPU normalization, do it on GPU instead (faster)
+            processed_batch = _fast_batch_preprocess(valid_items, use_torchvision=True, perf_stats=perf_stats, return_uint8=True)
             # Return the single array directly - no list conversion needed
         elif processor is not None:
             # Fallback to processor (slower)
@@ -1405,18 +1449,19 @@ class NucleiEmbedding:
                 else:
                     print("[OPTIMIZATION] Compiling model with torch.compile...")
                     # Compile the vision model for faster inference
+                    # Using 'default' mode for better performance (can try 'max-autotune' for even better speed but longer compile time)
                     self.model.vision_model = torch.compile(
                         self.model.vision_model,
-                        mode='reduce-overhead',  # Good balance between compile time and runtime speed
+                        mode='default',  # Changed from 'reduce-overhead' to 'default' for better performance
                         fullgraph=False  # Allow graph breaks for flexibility
                     )
                     # Compile the projection layer
                     self.image_projection = torch.compile(
                         self.image_projection,
-                        mode='reduce-overhead',
+                        mode='default',  # Changed from 'reduce-overhead' to 'default'
                         fullgraph=False
                     )
-                    print("[OPTIMIZATION] Model compilation completed")
+                    print("[OPTIMIZATION] Model compilation completed (mode='default' for better performance)")
         except Exception as e:
             # Catch TritonMissing and other exceptions
             error_type = type(e).__name__
@@ -1556,20 +1601,24 @@ class NucleiEmbedding:
 
             return embeddings
 
-    def generate_embeddings(self, batch_size=None, num_workers=None, zarr_path=None, dataset_path='embedding'):
+    def generate_embeddings(self, batch_size=None, num_workers=None, zarr_path=None, dataset_path='embedding', enable_profiling=False):
         """Generate embeddings and write directly to a Zarr dataset.
 
         Args:
             batch_size: Optional batch size for DataLoader
-            num_workers: Optional num_workers for DataLoader
+            num_workers: Optional num_workers for DataLoader (default: 4 if profiling disabled, 0 if enabled)
             zarr_path: Path to the root Zarr store to write into (required)
             dataset_path: Dataset path under the root group to write (default: 'embedding')
+            enable_profiling: If True, force num_workers=0 for accurate profiling. If False, use multi-process loading.
         """
-        # Force num_workers to 0 for performance profiling
-        if num_workers is None:
-            num_workers = 0  # Set to 0 for performance profiling
-        else:
-            num_workers = 0  # Force to 0 regardless of input
+        # Set num_workers based on profiling mode
+        if enable_profiling:
+            # Force num_workers to 0 for accurate performance profiling
+            num_workers = 0
+        elif num_workers is None:
+            # Default to 4 workers for faster data loading (can be tuned based on CPU cores)
+            import os
+            num_workers = min(4, os.cpu_count() or 1)
 
         # Dynamically determine batch size based on available GPU memory
         if batch_size is None and torch.cuda.is_available():
@@ -1602,7 +1651,10 @@ class NucleiEmbedding:
             batch_size = 128
 
         print(f"Generating embeddings using {num_workers} workers and batch size {batch_size}...")
-        print(f"[PERF] Performance profiling enabled - num_workers={num_workers} (forced to 0 for profiling)")
+        if enable_profiling:
+            print(f"[PERF] Performance profiling enabled - num_workers={num_workers} (forced to 0 for profiling)")
+        else:
+            print(f"[PERF] Multi-process data loading enabled - num_workers={num_workers} (for faster I/O)")
         
         # For embedding, always use all layers (z_layer=None)
         # z_layer_for_segmentation is only used during segmentation phase, not here
@@ -1643,7 +1695,7 @@ class NucleiEmbedding:
             num_workers=num_workers,
             shuffle=False,
             collate_fn=collate_fn_with_processor,
-            prefetch_factor=1 if num_workers > 0 else None,
+            prefetch_factor=2 if num_workers > 0 else None,  # Increased from 1 to 2 for better GPU utilization
             persistent_workers=True if num_workers > 0 else False,
             pin_memory=True if num_workers > 0 else False
         )
@@ -1715,16 +1767,31 @@ class NucleiEmbedding:
                     # Batch is already processed by collate_patches (fast preprocessing applied)
                     # Fast preprocessing returns a single array (N, C, H, W) - no stack needed!
                     if isinstance(batch, np.ndarray):
-                        # Already a single stacked array from fast preprocessing - convert directly
-                        processed_batch = torch.from_numpy(batch).contiguous().to(self.device, non_blocking=True)
+                        # Already a single stacked array from fast preprocessing
+                        # OPTIMIZATION: Check if data is already normalized (float32) or needs normalization (uint8)
+                        if batch.dtype == np.uint8:
+                            # Data is uint8, not normalized - convert to tensor and normalize on GPU (faster)
+                            processed_batch = torch.from_numpy(batch).contiguous().to(self.device, non_blocking=True)
+                            processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
+                        else:
+                            # Data is already normalized (float32) - convert directly
+                            processed_batch = torch.from_numpy(batch).contiguous().to(self.device, non_blocking=True)
                     elif isinstance(batch, list) and len(batch) > 0 and isinstance(batch[0], np.ndarray):
                         # Fallback: list of arrays (shouldn't happen with fast preprocessing)
                         batch_array = np.stack(batch, axis=0)
-                        processed_batch = torch.from_numpy(batch_array).contiguous().to(self.device, non_blocking=True)
+                        if batch_array.dtype == np.uint8:
+                            processed_batch = torch.from_numpy(batch_array).contiguous().to(self.device, non_blocking=True)
+                            processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
+                        else:
+                            processed_batch = torch.from_numpy(batch_array).contiguous().to(self.device, non_blocking=True)
                     else:
                         # Fallback: if not processed, process now (shouldn't happen)
                         batch_array = np.stack([np.array(b) for b in batch], axis=0)
-                        processed_batch = torch.from_numpy(batch_array).contiguous().to(self.device, non_blocking=True)
+                        if batch_array.dtype == np.uint8:
+                            processed_batch = torch.from_numpy(batch_array).contiguous().to(self.device, non_blocking=True)
+                            processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
+                        else:
+                            processed_batch = torch.from_numpy(batch_array).contiguous().to(self.device, non_blocking=True)
                     perf_stats['preprocessing_time'] += time.time() - preprocess_start
                     
                     # Model inference
