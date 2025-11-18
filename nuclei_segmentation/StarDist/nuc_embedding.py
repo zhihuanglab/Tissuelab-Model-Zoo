@@ -40,10 +40,14 @@ class NucleiPatchDataset(Dataset):
         
         # Performance profiling for detailed analysis
         self.perf_stats = {
-            'slide_open_time': 0.0,  # Time to open slide object
-            'read_region_time': 0.0,  # Time to read region from slide
+            'read_region_call_time': 0.0,  # Time for read_region() call itself
+            'read_region_total_time': 0.0,  # Total time for read region (including all overhead)
             'image_process_time': 0.0,  # Time for convert/resize operations
-            'processor_time': 0.0,  # Time for processor preprocessing (now in collate, tracked separately)
+            'processor_pil_to_numpy_time': 0.0,  # Time for PIL to numpy conversion
+            'processor_convert_normalize_time': 0.0,  # Time for type conversion and normalization
+            'processor_transpose_time': 0.0,  # Time for transpose operation
+            'processor_imagenet_norm_time': 0.0,  # Time for ImageNet normalization
+            'processor_total_time': 0.0,  # Total processor time
             'total_calls': 0
         }
         
@@ -89,6 +93,10 @@ class NucleiPatchDataset(Dataset):
                 
         self.read_image_method = read_image_method
         print(f"Using read method: {self.read_image_method} for file: {slide_path}")
+        if self.read_image_method == 'tiffslide':
+            print("[PERF] TiffSlide detected - will use as_array=True to read numpy directly (avoids PIL conversion)")
+        elif self.read_image_method == 'openslide':
+            print("[PERF] OpenSlide detected - note: OpenSlide doesn't support as_array, will use PIL path")
         
         # Detect if this is a z-stack image
         # DISABLED: z-stack functionality is disabled
@@ -406,49 +414,128 @@ class NucleiPatchDataset(Dataset):
             self._open_slide()
         
         # Measure read_region time (slide is already open, no open overhead)
-        # OPTIMIZATION: Read region directly without extra overhead
+        # OPTIMIZATION: Use as_array=True for TiffSlide/OpenSlide to get numpy directly
+        # This avoids PIL Image creation and subsequent PIL->numpy conversion
         read_region_start = time.time()
-        # Direct read - no intermediate variables or checks
-        patch = self.slide.read_region(
-            location=(x1, y1),
-            level=0,
-            size=(width, height)
-        )
-        self.perf_stats['read_region_time'] += time.time() - read_region_start
+        read_call_start = time.time()
+        
+        # Check if slide supports as_array parameter (only TiffSlide supports it, not OpenSlide)
+        # OpenSlide doesn't support as_array parameter, only TiffSlide does
+        use_numpy_direct = self.read_image_method == 'tiffslide'
+        
+        if use_numpy_direct:
+            # OPTIMIZATION: Read directly as numpy array to avoid PIL conversion
+            try:
+                patch = self.slide.read_region(
+                    location=(x1, y1),
+                    level=0,
+                    size=(width, height),
+                    as_array=True
+                )
+                # Ensure it's uint8 and correct shape
+                if patch.dtype != np.uint8:
+                    patch = patch.astype(np.uint8)
+                # Handle RGBA -> RGB if needed
+                if len(patch.shape) == 3 and patch.shape[2] == 4:
+                    patch = patch[:, :, :3]
+            except (TypeError, AttributeError) as e:
+                # Fallback if as_array not supported (shouldn't happen for TiffSlide)
+                patch = self.slide.read_region(
+                    location=(x1, y1),
+                    level=0,
+                    size=(width, height)
+                )
+                use_numpy_direct = False
+        else:
+            # For other methods (PIL, numpy), use standard read_region
+            patch = self.slide.read_region(
+                location=(x1, y1),
+                level=0,
+                size=(width, height)
+            )
+        
+        self.perf_stats['read_region_call_time'] += time.time() - read_call_start
+        self.perf_stats['read_region_total_time'] += time.time() - read_region_start
         
         # Measure image processing time (convert + resize)
         image_process_start = time.time()
         
-        # OPTIMIZATION: Use fastest resize method based on scale factor
-        # For large downscaling, NEAREST is much faster with minimal quality loss
-        patch_w, patch_h = patch.size  # Cache size to avoid repeated access
-        needs_convert = patch.mode != 'RGB'
-        needs_resize = patch_w != self.patch_size or patch_h != self.patch_size
+        # OPTIMIZATION: Use known width/height from extraction instead of querying
+        patch_w, patch_h = width, height
         
-        # Fast path: no operations needed (most common after first batch)
-        if not needs_convert and not needs_resize:
-            pass  # Skip all processing
-        elif needs_resize:
-            # Calculate scale factor to choose optimal resize method
-            scale_factor = min(self.patch_size / patch_w, self.patch_size / patch_h)
-            # Use NEAREST for large downscaling (>2x), BILINEAR for smaller scaling
-            resize_method = Image.Resampling.NEAREST if scale_factor < 0.5 else Image.Resampling.BILINEAR
+        # Handle numpy array vs PIL Image differently
+        if isinstance(patch, np.ndarray):
+            # Numpy array path - use numpy/cv2 operations (faster than PIL)
+            needs_resize = patch_w != self.patch_size or patch_h != self.patch_size
             
-            if needs_convert:
-                # Both needed: convert first, then resize with optimal method
+            if needs_resize:
+                # Use cv2 for faster resize (if available) or scipy.ndimage
+                try:
+                    import cv2
+                    # Choose interpolation method based on scale factor
+                    scale_factor = min(self.patch_size / patch_w, self.patch_size / patch_h)
+                    if scale_factor < 0.5:
+                        # Large downscaling - use AREA for better quality
+                        interpolation = cv2.INTER_AREA
+                    else:
+                        # Small scaling - use LINEAR
+                        interpolation = cv2.INTER_LINEAR
+                    patch = cv2.resize(patch, (self.patch_size, self.patch_size), interpolation=interpolation)
+                except ImportError:
+                    # Fallback to scipy.ndimage.zoom
+                    from scipy.ndimage import zoom
+                    scale_h = self.patch_size / patch_h
+                    scale_w = self.patch_size / patch_w
+                    patch = zoom(patch, (scale_h, scale_w, 1), order=1).astype(np.uint8)
+            
+            # Ensure RGB format (3 channels)
+            if len(patch.shape) == 2:
+                # Grayscale -> RGB
+                patch = np.repeat(patch[:, :, np.newaxis], 3, axis=2)
+            elif patch.shape[2] == 1:
+                # Single channel -> RGB
+                patch = np.repeat(patch, 3, axis=2)
+            elif patch.shape[2] == 4:
+                # RGBA -> RGB
+                patch = patch[:, :, :3]
+            elif patch.shape[2] > 3:
+                # Multi-channel -> RGB (take first 3)
+                patch = patch[:, :, :3]
+            
+            # OPTIMIZATION: Keep as numpy array - processor can handle it directly
+            # This avoids numpy -> PIL -> numpy conversion overhead
+            # No need to convert to PIL since processor supports numpy arrays
+        else:
+            # PIL Image path (for non-tiffslide/openslide methods)
+            needs_convert = patch.mode != 'RGB'
+            needs_resize = patch_w != self.patch_size or patch_h != self.patch_size
+            
+            # Fast path: no operations needed (most common after first batch)
+            if not needs_convert and not needs_resize:
+                pass  # Skip all processing
+            elif needs_resize:
+                # Calculate scale factor to choose optimal resize method
+                scale_factor = min(self.patch_size / patch_w, self.patch_size / patch_h)
+                # Use NEAREST for large downscaling (>2x), BILINEAR for smaller scaling
+                resize_method = Image.Resampling.NEAREST if scale_factor < 0.5 else Image.Resampling.BILINEAR
+                
+                if needs_convert:
+                    # Both needed: convert first, then resize with optimal method
+                    patch = patch.convert('RGB')
+                    patch = patch.resize((self.patch_size, self.patch_size), resize_method)
+                else:
+                    # Only resize needed - use optimal method
+                    patch = patch.resize((self.patch_size, self.patch_size), resize_method)
+            elif needs_convert:
+                # Only convert needed
                 patch = patch.convert('RGB')
-                patch = patch.resize((self.patch_size, self.patch_size), resize_method)
-            else:
-                # Only resize needed - use optimal method
-                patch = patch.resize((self.patch_size, self.patch_size), resize_method)
-        elif needs_convert:
-            # Only convert needed
-            patch = patch.convert('RGB')
         
         self.perf_stats['image_process_time'] += time.time() - image_process_start
         
-        # Return PIL Image instead of processed patch - processor will be applied in batch
-        # This allows batch processing of processor which is more efficient
+        # Return patch (PIL Image or numpy array depending on read method)
+        # - For TiffSlide/OpenSlide with as_array=True: returns numpy array
+        # - For other methods: returns PIL Image
+        # Processor can handle both types efficiently
         self.perf_stats['total_calls'] += 1
         return patch
 
@@ -811,7 +898,12 @@ class NucleiPatchDataset(Dataset):
             import traceback
             traceback.print_exc()
 
-def _fast_batch_preprocess(images, use_torchvision=True):
+# Pre-compute ImageNet normalization constants (module-level for reuse)
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
+_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
+_IMAGENET_INV_STD = 1.0 / _IMAGENET_STD  # Pre-compute division constant
+
+def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None):
     """Ultra-fast batch preprocessing using optimized numpy operations with minimal overhead.
     
     Uses the fastest possible PIL to numpy conversion methods and vectorized operations.
@@ -819,17 +911,26 @@ def _fast_batch_preprocess(images, use_torchvision=True):
     Args:
         images: List of PIL Images (already resized to 224x224)
         use_torchvision: If True, use optimized numpy processing (faster), else use processor
+        perf_stats: Optional dict to track detailed processor timing
         
     Returns:
         Single numpy array (N, C, H, W) normalized and ready for model, or None if fallback
     """
+    import time
+    
     if use_torchvision:
         num_images = len(images)
         if num_images == 0:
             return None
         
-        # Get dimensions from first image
-        h, w = images[0].size[1], images[0].size[0]  # PIL uses (width, height)
+        # Get dimensions from first image (handle both PIL Image and numpy array)
+        first_img = images[0]
+        if isinstance(first_img, np.ndarray):
+            # Numpy array: shape is (height, width, channels)
+            h, w = first_img.shape[0], first_img.shape[1]
+        else:
+            # PIL Image: size is (width, height)
+            h, w = first_img.size[1], first_img.size[0]
         
         # OPTIMIZATION 1: Use np.frombuffer for faster conversion when possible
         # Pre-allocate batch array (N, H, W, C) - more efficient than stack
@@ -839,55 +940,83 @@ def _fast_batch_preprocess(images, use_torchvision=True):
         # Pre-compute constants for faster operations
         inv_255 = 1.0 / 255.0  # Pre-compute division constant
         
-        # Use the most efficient conversion path for each image
+        # OPTIMIZATION: Single-pass processing with combined type conversion and normalization
+        # Process all images in one loop, combining conversion and normalization steps
+        pil_to_numpy_start = time.time()
+        pil_conversion_time = 0.0  # Track actual PIL->numpy conversion time
+        
         for i, img in enumerate(images):
             # Fastest path: Direct array access with minimal overhead
             try:
-                # Get uint8 array (fastest conversion from PIL)
-                # Use asarray to avoid copy when possible
-                arr_uint8 = np.asarray(img, dtype=np.uint8)
+                # OPTIMIZATION: Check if already numpy array to avoid conversion overhead
+                if isinstance(img, np.ndarray):
+                    # Already numpy - use directly (no conversion needed)
+                    arr_uint8 = img.astype(np.uint8) if img.dtype != np.uint8 else img
+                else:
+                    # PIL Image - convert to numpy (fastest conversion from PIL)
+                    # Track actual conversion time separately
+                    conv_start = time.time()
+                    arr_uint8 = np.asarray(img, dtype=np.uint8)
+                    pil_conversion_time += time.time() - conv_start
                 
                 # Fast path: Standard RGB image (most common case - optimize this path)
                 if arr_uint8.shape == (h, w, 3):
-                    # OPTIMIZATION: Direct assignment with type conversion
-                    # Convert uint8 to float32 and scale in one operation
-                    # This is faster than separate astype + division
-                    batch_array[i] = arr_uint8.astype(np.float32)
+                    # OPTIMIZATION: Combined type conversion and normalization in one operation
+                    # This eliminates the separate multiplication step, reducing memory access
+                    batch_array[i] = arr_uint8.astype(np.float32) * inv_255
                 elif arr_uint8.ndim == 2:
                     # Grayscale - convert to RGB (vectorized, single conversion)
-                    arr_float = arr_uint8.astype(np.float32)
+                    # Combined conversion and normalization
+                    arr_float = arr_uint8.astype(np.float32) * inv_255
                     # Use broadcasting for all 3 channels at once (faster than 3 assignments)
                     batch_array[i, :, :, :] = arr_float[:, :, np.newaxis]
                 elif arr_uint8.shape[2] == 4:
                     # RGBA - extract RGB channels (single slice, no copy)
-                    batch_array[i] = arr_uint8[:, :, :3].astype(np.float32)
+                    # Combined conversion and normalization
+                    batch_array[i] = arr_uint8[:, :, :3].astype(np.float32) * inv_255
                 elif arr_uint8.shape[0] == h and arr_uint8.shape[1] == w and arr_uint8.shape[2] >= 3:
                     # Multi-channel (>=3) - take first 3 channels
-                    batch_array[i] = arr_uint8[:, :, :3].astype(np.float32)
+                    # Combined conversion and normalization
+                    batch_array[i] = arr_uint8[:, :, :3].astype(np.float32) * inv_255
                 else:
                     # Edge case: fallback to standard conversion
-                    batch_array[i] = np.array(img, dtype=np.float32)
+                    arr_float = np.array(img, dtype=np.float32)
+                    batch_array[i] = arr_float * inv_255 if arr_float.max() > 1.0 else arr_float
             except Exception:
                 # Ultimate fallback: standard conversion
-                batch_array[i] = np.array(img, dtype=np.float32)
+                arr_float = np.array(img, dtype=np.float32)
+                batch_array[i] = arr_float * inv_255 if arr_float.max() > 1.0 else arr_float
         
-        # OPTIMIZATION 3: Vectorized operations on entire batch (single pass)
-        # Scale to [0, 1] in-place using pre-computed constant
-        batch_array *= inv_255  # Use pre-computed constant (faster than division)
+        # Note: Normalization to [0, 1] is now done during conversion above
+        # No need for separate multiplication step
+        pil_to_numpy_end = time.time()
+        if perf_stats is not None:
+            # Track actual PIL to numpy conversion time (only when PIL->numpy happens)
+            perf_stats['processor_pil_to_numpy_time'] += pil_conversion_time
+            # Track convert+normalize time (the entire loop minus PIL conversion)
+            # This includes type conversion (astype) and normalization (* inv_255)
+            convert_normalize_time = (pil_to_numpy_end - pil_to_numpy_start) - pil_conversion_time
+            perf_stats['processor_convert_normalize_time'] += convert_normalize_time
         
         # Convert to (N, C, H, W) - use transpose (memory efficient, creates view when possible)
+        transpose_start = time.time()
         batch_array = batch_array.transpose(0, 3, 1, 2)
+        transpose_end = time.time()
+        if perf_stats is not None:
+            perf_stats['processor_transpose_time'] += transpose_end - transpose_start
         
-        # OPTIMIZATION 4: Pre-compute normalization constants (do once, reuse)
+        # OPTIMIZATION 4: Use pre-computed module-level constants (zero allocation overhead)
         # Normalize using ImageNet stats (broadcast across batch) - fully vectorized
-        # Pre-compute mean and std as constants (avoid repeated array creation)
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
-        inv_std = 1.0 / std  # Pre-compute division for faster operation
-        
-        # In-place operations: subtract mean, then multiply by inv_std (faster than divide)
-        batch_array -= mean
-        batch_array *= inv_std
+        # Use module-level constants to avoid any array creation overhead
+        imagenet_norm_start = time.time()
+        # OPTIMIZATION: Combined operation - subtract mean and multiply by inv_std in one pass
+        # This reduces memory bandwidth by avoiding intermediate storage
+        # Using in-place operations with pre-computed constants for maximum efficiency
+        batch_array -= _IMAGENET_MEAN
+        batch_array *= _IMAGENET_INV_STD
+        imagenet_norm_end = time.time()
+        if perf_stats is not None:
+            perf_stats['processor_imagenet_norm_time'] += imagenet_norm_end - imagenet_norm_start
         
         return batch_array
     else:
@@ -930,7 +1059,7 @@ def collate_patches(batch, processor=None, perf_stats=None, use_fast_preprocess=
         
         if use_fast_preprocess:
             # Use ultra-fast numpy preprocessing - returns single array (N, C, H, W)
-            processed_batch = _fast_batch_preprocess(valid_items, use_torchvision=True)
+            processed_batch = _fast_batch_preprocess(valid_items, use_torchvision=True, perf_stats=perf_stats)
             # Return the single array directly - no list conversion needed
         elif processor is not None:
             # Fallback to processor (slower)
@@ -945,7 +1074,7 @@ def collate_patches(batch, processor=None, perf_stats=None, use_fast_preprocess=
         
         # Track processor time if perf_stats provided
         if perf_stats is not None:
-            perf_stats['processor_time'] += time.time() - processor_start
+            perf_stats['processor_total_time'] += time.time() - processor_start
         
         return processed_batch
 
@@ -1385,16 +1514,40 @@ class NucleiEmbedding:
                         print(f"  DataLoader total: {total_dataloader_time:.1f}s ({total_dataloader_time/elapsed_time*100:.1f}%)", flush=True)
                         if dataset_perf['total_calls'] > 0 and total_dataloader_time > 0:
                             avg_call_time = total_dataloader_time / dataset_perf['total_calls']
-                            print(f"    - Slide open: {dataset_perf['slide_open_time']:.1f}s ({dataset_perf['slide_open_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
-                            print(f"    - Read region: {dataset_perf['read_region_time']:.1f}s ({dataset_perf['read_region_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                            # Read region detailed breakdown
+                            read_region_total = dataset_perf.get('read_region_total_time', 0.0)
+                            read_region_call = dataset_perf.get('read_region_call_time', 0.0)
+                            read_region_overhead = read_region_total - read_region_call
+                            print(f"    - Read region: {read_region_total:.1f}s ({read_region_total/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                            if read_region_total > 0:
+                                print(f"      * read_region() call: {read_region_call:.1f}s ({read_region_call/read_region_total*100:.1f}% of Read region)", flush=True)
+                                if read_region_overhead > 0:
+                                    print(f"      * overhead: {read_region_overhead:.1f}s ({read_region_overhead/read_region_total*100:.1f}% of Read region)", flush=True)
                             print(f"    - Image process (convert/resize): {dataset_perf['image_process_time']:.1f}s ({dataset_perf['image_process_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
-                            print(f"    - Processor: {dataset_perf['processor_time']:.1f}s ({dataset_perf['processor_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                            # Processor detailed breakdown
+                            processor_total = dataset_perf.get('processor_total_time', 0.0)
+                            print(f"    - Processor: {processor_total:.1f}s ({processor_total/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                            if processor_total > 0:
+                                pil_to_numpy = dataset_perf.get('processor_pil_to_numpy_time', 0.0)
+                                convert_norm = dataset_perf.get('processor_convert_normalize_time', 0.0)
+                                transpose = dataset_perf.get('processor_transpose_time', 0.0)
+                                imagenet_norm = dataset_perf.get('processor_imagenet_norm_time', 0.0)
+                                if pil_to_numpy > 0:
+                                    print(f"      * PIL to numpy: {pil_to_numpy:.1f}s ({pil_to_numpy/processor_total*100:.1f}% of Processor)", flush=True)
+                                if convert_norm > 0:
+                                    print(f"      * Convert+normalize: {convert_norm:.1f}s ({convert_norm/processor_total*100:.1f}% of Processor)", flush=True)
+                                if transpose > 0:
+                                    print(f"      * Transpose: {transpose:.1f}s ({transpose/processor_total*100:.1f}% of Processor)", flush=True)
+                                if imagenet_norm > 0:
+                                    print(f"      * ImageNet norm: {imagenet_norm:.1f}s ({imagenet_norm/processor_total*100:.1f}% of Processor)", flush=True)
                             print(f"    - Avg per sample: {avg_call_time*1000:.2f}ms", flush=True)
                         elif dataset_perf['total_calls'] > 0:
-                            print(f"    - Slide open: {dataset_perf['slide_open_time']:.1f}s", flush=True)
-                            print(f"    - Read region: {dataset_perf['read_region_time']:.1f}s", flush=True)
+                            read_region_total = dataset_perf.get('read_region_total_time', 0.0)
+                            read_region_call = dataset_perf.get('read_region_call_time', 0.0)
+                            print(f"    - Read region: {read_region_total:.1f}s (call: {read_region_call:.1f}s)", flush=True)
                             print(f"    - Image process (convert/resize): {dataset_perf['image_process_time']:.1f}s", flush=True)
-                            print(f"    - Processor: {dataset_perf['processor_time']:.1f}s", flush=True)
+                            processor_total = dataset_perf.get('processor_total_time', 0.0)
+                            print(f"    - Processor: {processor_total:.1f}s", flush=True)
                             print(f"    - Note: DataLoader time is 0", flush=True)
                         print(f"  Preprocessing: {perf_stats['preprocessing_time']:.1f}s ({perf_stats['preprocessing_time']/elapsed_time*100:.1f}%)", flush=True)
                         print(f"  Model: {perf_stats['model_time']:.1f}s ({perf_stats['model_time']/elapsed_time*100:.1f}%)", flush=True)
@@ -1434,18 +1587,42 @@ class NucleiEmbedding:
                 dataset_perf = dataset.perf_stats
                 if dataset_perf['total_calls'] > 0 and total_dataloader_time > 0:
                     print(f"    DataLoader detailed breakdown (from {dataset_perf['total_calls']} samples):", flush=True)
-                    print(f"      - Slide open: {dataset_perf['slide_open_time']:.2f}s ({dataset_perf['slide_open_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
-                    print(f"      - Read region: {dataset_perf['read_region_time']:.2f}s ({dataset_perf['read_region_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                    # Read region detailed breakdown
+                    read_region_total = dataset_perf.get('read_region_total_time', 0.0)
+                    read_region_call = dataset_perf.get('read_region_call_time', 0.0)
+                    read_region_overhead = read_region_total - read_region_call
+                    print(f"      - Read region: {read_region_total:.2f}s ({read_region_total/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                    if read_region_total > 0:
+                        print(f"        * read_region() call: {read_region_call:.2f}s ({read_region_call/read_region_total*100:.1f}% of Read region)", flush=True)
+                        if read_region_overhead > 0:
+                            print(f"        * overhead: {read_region_overhead:.2f}s ({read_region_overhead/read_region_total*100:.1f}% of Read region)", flush=True)
                     print(f"      - Image process (convert/resize): {dataset_perf['image_process_time']:.2f}s ({dataset_perf['image_process_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
-                    print(f"      - Processor: {dataset_perf['processor_time']:.2f}s ({dataset_perf['processor_time']/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                    # Processor detailed breakdown
+                    processor_total = dataset_perf.get('processor_total_time', 0.0)
+                    print(f"      - Processor: {processor_total:.2f}s ({processor_total/total_dataloader_time*100:.1f}% of DataLoader)", flush=True)
+                    if processor_total > 0:
+                        pil_to_numpy = dataset_perf.get('processor_pil_to_numpy_time', 0.0)
+                        convert_norm = dataset_perf.get('processor_convert_normalize_time', 0.0)
+                        transpose = dataset_perf.get('processor_transpose_time', 0.0)
+                        imagenet_norm = dataset_perf.get('processor_imagenet_norm_time', 0.0)
+                        if pil_to_numpy > 0:
+                            print(f"        * PIL to numpy: {pil_to_numpy:.2f}s ({pil_to_numpy/processor_total*100:.1f}% of Processor)", flush=True)
+                        if convert_norm > 0:
+                            print(f"        * Convert+normalize: {convert_norm:.2f}s ({convert_norm/processor_total*100:.1f}% of Processor)", flush=True)
+                        if transpose > 0:
+                            print(f"        * Transpose: {transpose:.2f}s ({transpose/processor_total*100:.1f}% of Processor)", flush=True)
+                        if imagenet_norm > 0:
+                            print(f"        * ImageNet norm: {imagenet_norm:.2f}s ({imagenet_norm/processor_total*100:.1f}% of Processor)", flush=True)
                     avg_per_sample = total_dataloader_time / dataset_perf['total_calls']
                     print(f"      - Avg time per sample: {avg_per_sample*1000:.2f}ms", flush=True)
                 elif dataset_perf['total_calls'] > 0:
                     print(f"    DataLoader detailed breakdown (from {dataset_perf['total_calls']} samples):", flush=True)
-                    print(f"      - Slide open: {dataset_perf['slide_open_time']:.2f}s", flush=True)
-                    print(f"      - Read region: {dataset_perf['read_region_time']:.2f}s", flush=True)
+                    read_region_total = dataset_perf.get('read_region_total_time', 0.0)
+                    read_region_call = dataset_perf.get('read_region_call_time', 0.0)
+                    print(f"      - Read region: {read_region_total:.2f}s (call: {read_region_call:.2f}s)", flush=True)
                     print(f"      - Image process (convert/resize): {dataset_perf['image_process_time']:.2f}s", flush=True)
-                    print(f"      - Processor: {dataset_perf['processor_time']:.2f}s", flush=True)
+                    processor_total = dataset_perf.get('processor_total_time', 0.0)
+                    print(f"      - Processor: {processor_total:.2f}s", flush=True)
                     print(f"      - Note: DataLoader time is 0, cannot calculate percentages", flush=True)
                 
                 print(f"  Preprocessing (concat, to device): {perf_stats['preprocessing_time']:.2f} seconds ({perf_stats['preprocessing_time']/total_time*100:.1f}%)", flush=True)
