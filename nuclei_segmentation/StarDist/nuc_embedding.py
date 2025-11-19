@@ -1786,10 +1786,14 @@ class NucleiEmbedding:
                 # Calculate maximum possible batch size
                 max_batch_size = int(available_memory / memory_per_sample)
 
-                # Set a reasonable range for batch size (increased max from 256)
+                # Set a reasonable range for batch size (increased max from 256 to 512)
                 # Larger batch sizes improve GPU utilization and reduce overhead
-                batch_size = max(64, min(max_batch_size, 256))  # Minimum 64 for better GPU utilization
-                print(f"Automatically set batch size to {batch_size} based on available GPU memory")
+                # Available batch size tiers: 64, 128, 256, 384, 512
+                calculated_size = max(64, min(max_batch_size, 512))  # Minimum 64, maximum 512
+                # Round to nearest tier: 64, 128, 256, 384, 512
+                batch_size_tiers = [64, 128, 256, 384, 512]
+                batch_size = min(batch_size_tiers, key=lambda x: abs(x - calculated_size))
+                print(f"Automatically set batch size to {batch_size} based on available GPU memory (calculated: {calculated_size})")
             except Exception as e:
                 print(f"Error setting dynamic batch size: {e}")
                 batch_size = 256  # Increased default from 256
