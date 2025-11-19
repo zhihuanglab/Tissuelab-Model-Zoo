@@ -38,6 +38,15 @@ from collections import OrderedDict
 import gc
 from os.path import join
 
+base = os.path.dirname(os.path.abspath(__file__))
+vips_bin_dir = os.path.join(base, "vips", "bin")
+
+# Configure DLL path for Windows
+if platform.system() == 'Windows':
+    # Add to PATH environment variable (required for pyvips on Windows)
+    if vips_bin_dir not in os.environ.get('PATH', ''):
+        os.environ['PATH'] = vips_bin_dir + os.pathsep + os.environ.get('PATH', '')
+
 # Try importing specialized slide libraries, with fallbacks
 try:
     import openslide
@@ -48,8 +57,10 @@ except ImportError:
 try:
     import pyvips
     VIPS_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError) as e:
     VIPS_AVAILABLE = False
+    print(f"Warning: pyvips import failed: {e}")
+    print(f"  Make sure libvips DLLs are available in: {vips_bin_dir}")
 
 
 class PILSlide():
