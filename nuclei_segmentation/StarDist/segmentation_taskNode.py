@@ -25,6 +25,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from pathlib import Path
 
+# Ensure only GPU 0 is visible to the process unless the user has explicitly set otherwise.
+# Setting this before importing modules that may import torch/triton prevents other GPUs
+# from being used/initialized by mistake.
+# Force process to only see GPU 0. This will overwrite any external setting and
+# ensure TensorFlow/PyTorch only initialize GPU 0 for this process.
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
 from nuc_seg import SlideSegmentation
 from nuc_embedding import NucleiEmbedding
 
@@ -164,7 +171,7 @@ def run_segmentation(args):
             import torch
             if torch.cuda.is_available():
                 # With GPU: use more aggressive tiling for parallelization
-                n_tiles_config = (4, 4, 1)  # 16 workers - will be auto-adjusted by SlideSegmentation
+                n_tiles_config = (1, 1, 1)  # 16 workers - will be auto-adjusted by SlideSegmentation
                 print(f"GPU available: Using n_tiles={n_tiles_config} for StarDist (will auto-scale)")
             else:
                 # Without GPU: more conservative
