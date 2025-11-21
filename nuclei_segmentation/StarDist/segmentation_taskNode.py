@@ -30,8 +30,8 @@ from pathlib import Path
 # from being used/initialized by mistake.
 # Force process to only see GPU 0. This will overwrite any external setting and
 # ensure TensorFlow/PyTorch only initialize GPU 0 for this process.
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-
+os.environ["TF_INTER_OP_PARALLELISM_THREADS"] = "2"
+os.environ["TF_INTRA_OP_PARALLELISM_THREADS"] = "16"
 from nuc_seg import SlideSegmentation
 from nuc_embedding import NucleiEmbedding
 
@@ -171,7 +171,7 @@ def run_segmentation(args):
             import torch
             if torch.cuda.is_available():
                 # With GPU: use more aggressive tiling for parallelization
-                n_tiles_config = (1, 1, 1)  # 16 workers - will be auto-adjusted by SlideSegmentation
+                n_tiles_config = (4, 4, 1)  # 16 workers - will be auto-adjusted by SlideSegmentation
                 print(f"GPU available: Using n_tiles={n_tiles_config} for StarDist (will auto-scale)")
             else:
                 # Without GPU: more conservative
