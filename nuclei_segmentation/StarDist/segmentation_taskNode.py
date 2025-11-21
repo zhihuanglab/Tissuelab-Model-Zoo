@@ -25,6 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from pathlib import Path
 
+os.environ["TF_INTER_OP_PARALLELISM_THREADS"] = "2"
+os.environ["TF_INTRA_OP_PARALLELISM_THREADS"] = "16"
 from nuc_seg import SlideSegmentation
 from nuc_embedding import NucleiEmbedding
 
