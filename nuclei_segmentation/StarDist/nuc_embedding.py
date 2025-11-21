@@ -1934,43 +1934,69 @@ class NucleiEmbedding:
                         
                         if batch.dtype == np.uint8:
                             # OPTIMIZATION: Use pinned memory tensor for faster CPU->GPU transfer
-                            # Create pinned tensor (page-locked memory) for faster GPU transfer
-                            pinned_tensor = torch.empty(batch.shape, dtype=torch.uint8, pin_memory=True)
-                            # Copy numpy array to pinned tensor (this is fast, just memory copy)
-                            pinned_tensor.copy_(torch.from_numpy(batch), non_blocking=False)
-                            # Transfer pinned tensor to GPU and convert to float32 in one step
-                            processed_batch = pinned_tensor.to(self.device, dtype=torch.float32, non_blocking=True)
+                            if torch.cuda.is_available() and self.device.type == 'cuda':
+                                # Create pinned tensor (page-locked memory) for faster GPU transfer
+                                pinned_tensor = torch.empty(batch.shape, dtype=torch.uint8, pin_memory=True)
+                                # Copy numpy array to pinned tensor (this is fast, just memory copy)
+                                pinned_tensor.copy_(torch.from_numpy(batch), non_blocking=False)
+                                # Transfer pinned tensor to GPU and convert to float32 in one step
+                                processed_batch = pinned_tensor.to(self.device, dtype=torch.float32, non_blocking=True)
+                            else:
+                                # CPU mode: use regular tensor
+                                tensor = torch.from_numpy(batch)
+                                processed_batch = tensor.to(self.device, dtype=torch.float32, non_blocking=False)
                             # Normalize on GPU (fused operations)
                             processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
                         else:
                             # Data is already normalized (float32) - transfer directly using pinned memory
-                            pinned_tensor = torch.empty(batch.shape, dtype=torch.float32, pin_memory=True)
-                            pinned_tensor.copy_(torch.from_numpy(batch), non_blocking=False)
-                            processed_batch = pinned_tensor.to(self.device, non_blocking=True)
+                            if torch.cuda.is_available() and self.device.type == 'cuda':
+                                pinned_tensor = torch.empty(batch.shape, dtype=torch.float32, pin_memory=True)
+                                pinned_tensor.copy_(torch.from_numpy(batch), non_blocking=False)
+                                processed_batch = pinned_tensor.to(self.device, non_blocking=True)
+                            else:
+                                # CPU mode: use regular tensor
+                                tensor = torch.from_numpy(batch)
+                                processed_batch = tensor.to(self.device, non_blocking=False)
                     elif isinstance(batch, list) and len(batch) > 0 and isinstance(batch[0], np.ndarray):
                         # Fallback: list of arrays (shouldn't happen with fast preprocessing)
                         batch_array = np.ascontiguousarray(np.stack(batch, axis=0))
                         if batch_array.dtype == np.uint8:
-                            pinned_tensor = torch.empty(batch_array.shape, dtype=torch.uint8, pin_memory=True)
-                            pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
-                            processed_batch = pinned_tensor.to(self.device, dtype=torch.float32, non_blocking=True)
+                            if torch.cuda.is_available() and self.device.type == 'cuda':
+                                pinned_tensor = torch.empty(batch_array.shape, dtype=torch.uint8, pin_memory=True)
+                                pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
+                                processed_batch = pinned_tensor.to(self.device, dtype=torch.float32, non_blocking=True)
+                            else:
+                                tensor = torch.from_numpy(batch_array)
+                                processed_batch = tensor.to(self.device, dtype=torch.float32, non_blocking=False)
                             processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
                         else:
-                            pinned_tensor = torch.empty(batch_array.shape, dtype=torch.float32, pin_memory=True)
-                            pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
-                            processed_batch = pinned_tensor.to(self.device, non_blocking=True)
+                            if torch.cuda.is_available() and self.device.type == 'cuda':
+                                pinned_tensor = torch.empty(batch_array.shape, dtype=torch.float32, pin_memory=True)
+                                pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
+                                processed_batch = pinned_tensor.to(self.device, non_blocking=True)
+                            else:
+                                tensor = torch.from_numpy(batch_array)
+                                processed_batch = tensor.to(self.device, non_blocking=False)
                     else:
                         # Fallback: if not processed, process now (shouldn't happen)
                         batch_array = np.ascontiguousarray(np.stack([np.array(b) for b in batch], axis=0))
                         if batch_array.dtype == np.uint8:
-                            pinned_tensor = torch.empty(batch_array.shape, dtype=torch.uint8, pin_memory=True)
-                            pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
-                            processed_batch = pinned_tensor.to(self.device, dtype=torch.float32, non_blocking=True)
+                            if torch.cuda.is_available() and self.device.type == 'cuda':
+                                pinned_tensor = torch.empty(batch_array.shape, dtype=torch.uint8, pin_memory=True)
+                                pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
+                                processed_batch = pinned_tensor.to(self.device, dtype=torch.float32, non_blocking=True)
+                            else:
+                                tensor = torch.from_numpy(batch_array)
+                                processed_batch = tensor.to(self.device, dtype=torch.float32, non_blocking=False)
                             processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
                         else:
-                            pinned_tensor = torch.empty(batch_array.shape, dtype=torch.float32, pin_memory=True)
-                            pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
-                            processed_batch = pinned_tensor.to(self.device, non_blocking=True)
+                            if torch.cuda.is_available() and self.device.type == 'cuda':
+                                pinned_tensor = torch.empty(batch_array.shape, dtype=torch.float32, pin_memory=True)
+                                pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
+                                processed_batch = pinned_tensor.to(self.device, non_blocking=True)
+                            else:
+                                tensor = torch.from_numpy(batch_array)
+                                processed_batch = tensor.to(self.device, non_blocking=False)
                     
                     perf_stats['preprocessing_time'] += time.time() - preprocess_start
                     
