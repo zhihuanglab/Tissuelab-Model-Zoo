@@ -25,11 +25,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from pathlib import Path
 
-# Ensure only GPU 0 is visible to the process unless the user has explicitly set otherwise.
-# Setting this before importing modules that may import torch/triton prevents other GPUs
-# from being used/initialized by mistake.
-# Force process to only see GPU 0. This will overwrite any external setting and
-# ensure TensorFlow/PyTorch only initialize GPU 0 for this process.
 os.environ["TF_INTER_OP_PARALLELISM_THREADS"] = "2"
 os.environ["TF_INTRA_OP_PARALLELISM_THREADS"] = "16"
 from nuc_seg import SlideSegmentation
