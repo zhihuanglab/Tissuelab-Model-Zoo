@@ -1497,70 +1497,74 @@ class NucleiEmbedding:
         
         # Optimization: Compile model with torch.compile (PyTorch 2.0+)
         # This can provide 20-30% speedup on modern GPUs
-        # Note: On Windows, requires triton-windows (https://github.com/woct0rdho/triton-windows)
+        # NOTE: Per project policy, only enable torch.compile on Windows machines
         try:
-            if hasattr(torch, 'compile') and torch.cuda.is_available():
-                # Check if Triton is available (including triton-windows for Windows)
-                try:
-                    import triton
-                    triton_available = True
-                except ImportError:
-                    triton_available = False
-                
-                if not triton_available:
-                    import platform
-                    is_windows = platform.system() == 'Windows'
-                    if is_windows:
+            import platform
+            is_windows = platform.system() == 'Windows'
+
+            if not is_windows:
+                # Explicitly skip compilation on non-Windows platforms
+                print("[OPTIMIZATION] torch.compile is enabled only on Windows in this build; skipping compilation on this platform.")
+            else:
+                # Only attempt compilation on Windows (user requested)
+                if hasattr(torch, 'compile') and torch.cuda.is_available():
+                    # Check if Triton is available (including triton-windows for Windows)
+                    try:
+                        import triton
+                        triton_available = True
+                    except ImportError:
+                        triton_available = False
+
+                    if not triton_available:
                         print("[OPTIMIZATION] Triton not found. For Windows, install triton-windows:")
                         print("[OPTIMIZATION]   pip install triton-windows")
                         print("[OPTIMIZATION]   See: https://github.com/woct0rdho/triton-windows")
                     else:
-                        print("[OPTIMIZATION] Triton not available - skipping torch.compile")
+                        print("[OPTIMIZATION] Compiling model with torch.compile...")
+                        # Compile the vision model for faster inference
+                        # Using 'max-autotune' mode for best performance (longer compile time but faster inference)
+                        # Fallback to 'default' if max-autotune fails
+                        try:
+                            self.model.vision_model = torch.compile(
+                                self.model.vision_model,
+                                mode='default',
+                                fullgraph=False  # Allow graph breaks for flexibility
+                            )
+                            self.image_projection = torch.compile(
+                                self.image_projection,
+                                mode='default',
+                                fullgraph=False
+                            )
+                            print("[OPTIMIZATION] Model compilation completed (mode='max-autotune' for best performance)")
+                        except Exception as compile_error:
+                            print(f"[OPTIMIZATION] max-autotune failed, falling back to 'default' mode: {compile_error}")
+                            self.model.vision_model = torch.compile(
+                                self.model.vision_model,
+                                mode='default',
+                                fullgraph=False
+                            )
+                            self.image_projection = torch.compile(
+                                self.image_projection,
+                                mode='default',
+                                fullgraph=False
+                            )
+                            print("[OPTIMIZATION] Model compilation completed (mode='default')")
                 else:
-                    print("[OPTIMIZATION] Compiling model with torch.compile...")
-                    # Compile the vision model for faster inference
-                    # Using 'max-autotune' mode for best performance (longer compile time but faster inference)
-                    # Fallback to 'default' if max-autotune fails
-                    try:
-                        self.model.vision_model = torch.compile(
-                            self.model.vision_model,
-                            mode='default',
-                            fullgraph=False  # Allow graph breaks for flexibility
-                        )
-                        self.image_projection = torch.compile(
-                            self.image_projection,
-                            mode='default',
-                            fullgraph=False
-                        )
-                        print("[OPTIMIZATION] Model compilation completed (mode='max-autotune' for best performance)")
-                    except Exception as compile_error:
-                        print(f"[OPTIMIZATION] max-autotune failed, falling back to 'default' mode: {compile_error}")
-                        self.model.vision_model = torch.compile(
-                            self.model.vision_model,
-                            mode='default',
-                            fullgraph=False
-                        )
-                        self.image_projection = torch.compile(
-                            self.image_projection,
-                            mode='default',
-                            fullgraph=False
-                        )
-                        print("[OPTIMIZATION] Model compilation completed (mode='default')")
+                    # Informative message when compile isn't available or GPU is missing
+                    if not hasattr(torch, 'compile'):
+                        print("[OPTIMIZATION] torch.compile not available in this PyTorch build - skipping compilation")
+                    elif not torch.cuda.is_available():
+                        print("[OPTIMIZATION] CUDA not available - skipping torch.compile")
         except Exception as e:
             # Catch TritonMissing and other exceptions
             error_type = type(e).__name__
             error_msg = str(e)
-            
+
             # Check for Triton-related errors
             if 'TritonMissing' in error_type or 'triton' in error_msg.lower():
-                import platform
-                is_windows = platform.system() == 'Windows'
-                if is_windows:
-                    print(f"[OPTIMIZATION] torch.compile requires Triton (triton-windows on Windows)")
-                    print(f"[OPTIMIZATION] Install with: pip install triton-windows")
-                    print(f"[OPTIMIZATION] See: https://github.com/woct0rdho/triton-windows")
-                else:
-                    print(f"[OPTIMIZATION] torch.compile requires Triton which is not available")
+                print(f"[OPTIMIZATION] torch.compile requires Triton (triton-windows on Windows)")
+                print(f"[OPTIMIZATION] Install with: pip install triton-windows")
+                print(f"[OPTIMIZATION] See: https://github.com/woct0rdho/triton-windows")
                 print(f"[OPTIMIZATION] Error: {error_msg}")
             else:
                 print(f"[OPTIMIZATION] torch.compile not available or failed: {error_msg}")
