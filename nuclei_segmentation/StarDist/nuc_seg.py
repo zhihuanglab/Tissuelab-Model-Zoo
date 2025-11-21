@@ -1,6 +1,25 @@
 # -*- coding: utf-8 -*-
 
 
+import os
+# FORCE TensorFlow thread limits on high-core servers
+import multiprocessing
+cpu_count = multiprocessing.cpu_count()
+if cpu_count > 64:
+    os.environ['TF_NUM_INTEROP_THREADS'] = '2'
+    os.environ['TF_NUM_INTRAOP_THREADS'] = '16'
+    os.environ['OMP_NUM_THREADS'] = '16'
+    os.environ['MKL_NUM_THREADS'] = '16'
+    print(f"High-core server ({cpu_count} cores) detected: Limiting TensorFlow threads")
+
+# Must import TensorFlow AFTER setting env vars
+import tensorflow as tf
+# Also configure TensorFlow directly
+if cpu_count > 64:
+    tf.config.threading.set_inter_op_parallelism_threads(2)
+    tf.config.threading.set_intra_op_parallelism_threads(16)
+    print("TensorFlow thread limits applied: inter_op=2, intra_op=16")
+
 from stardist.models import StarDist2D
 from stardist.data import test_image_nuclei_2d
 from stardist.plot import render_label
@@ -128,9 +147,10 @@ class SlideSegmentation():
             
             # On servers with GPUs, allow more workers
             if gpus:
-                # With GPU: allow up to 80% of CPU cores for n_tiles
-                max_workers = max(16, int(cpu_count * 0.8))
-                print(f"GPU detected: Allowing up to {max_workers} StarDist workers")
+                # With GPU: limit workers even on high-core servers
+                # GPU does the heavy lifting, don't need many CPU workers
+                max_workers = min(32, max(16, int(cpu_count * 0.8)))  # Cap at 32
+                print(f"GPU detected: Limiting to {max_workers} StarDist workers (GPU handles computation)")
             else:
                 # Without GPU: be more conservative but still scale with CPU count
                 max_workers = max(15, int(cpu_count * 0.5))
@@ -202,7 +222,33 @@ class SlideSegmentation():
     def _detect_zstack(self):
         """Detect if the image is a z-stack and determine the middle layer for segmentation"""
         try:
-            # Method 1: Try tiffslide for multi-series files (like ndpi z-stack)
+            # Use ndpi_utils for correct z-stack detection (based on NDPIReader.java logic)
+            try:
+                from ndpi_utils import analyze_ndpi_structure
+                meta = analyze_ndpi_structure(self.args.slidepath)
+                sizeZ = meta["sizeZ"]
+                
+                if sizeZ > 1:
+                    self.is_zstack = True
+                    self.num_z_layers = sizeZ
+                    self.z_layer_for_segmentation = sizeZ // 2
+                    print(f"Detected z-stack image with {sizeZ} layers (via ndpi_utils)")
+                    print(f"Will perform segmentation on middle layer: {self.z_layer_for_segmentation}")
+                    # Store in args for passing to embedding stage
+                    self.args.z_layer_for_segmentation = self.z_layer_for_segmentation
+                    self.args.is_zstack = True
+                    self.args.num_z_layers = sizeZ
+                    return
+                else:
+                    # Single layer detected
+                    print(f"Single-layer image detected (sizeZ={sizeZ})")
+                    self.is_zstack = False
+                    self.num_z_layers = 1
+                    return
+            except Exception as e:
+                print(f"ndpi_utils detection failed: {e}, falling back to legacy detection")
+            
+            # Fallback: Try tiffslide for multi-series files (legacy method)
             try:
                 import tiffslide
                 with tiffslide.TiffSlide(self.args.slidepath) as slide:
@@ -222,29 +268,12 @@ class SlideSegmentation():
                                     self.is_zstack = True
                                     self.num_z_layers = num_z
                                     self.z_layer_for_segmentation = num_z // 2
-                                    print(f"Detected z-stack image with {num_z} layers (via ZYXS format)")
+                                    print(f"Detected z-stack image with {num_z} layers (via ZYXS format - legacy)")
                                     print(f"Will perform segmentation on middle layer: {self.z_layer_for_segmentation}")
-                                    # Store in args for passing to embedding stage
-                                    # Note: For embedding, we want to use ALL layers (z_layer=None means use all)
-                                    # z_layer_for_segmentation is only used internally during segmentation
                                     self.args.z_layer_for_segmentation = self.z_layer_for_segmentation
                                     self.args.is_zstack = True
                                     self.args.num_z_layers = num_z
                                     return
-                        
-                        # Fallback: check if multiple series exist
-                        if len(series) > 1:
-                            # Multiple series detected - likely z-stack
-                            self.is_zstack = True
-                            self.num_z_layers = len(series)
-                            self.z_layer_for_segmentation = len(series) // 2
-                            print(f"Detected z-stack image with {len(series)} layers (via multiple series)")
-                            print(f"Will perform segmentation on middle layer: {self.z_layer_for_segmentation}")
-                            # Store in args for passing to embedding stage
-                            self.args.z_layer_for_segmentation = self.z_layer_for_segmentation
-                            self.args.is_zstack = True
-                            self.args.num_z_layers = len(series)
-                            return
             except Exception as e:
                 print(f"TiffSlide z-stack detection failed: {e}")
             

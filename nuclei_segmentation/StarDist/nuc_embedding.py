@@ -6,6 +6,9 @@ Created on Feb 03 2025
 @author: zhihuang
 """
 
+import os
+import platform
+
 import numpy as np
 import torch
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
@@ -14,7 +17,6 @@ from PIL import Image
 import multiprocess as mp
 from tqdm import tqdm
 import zarr
-import os
 from nuc_stat import PILSlide, NumpySlide
 from torch.utils.data import Dataset, DataLoader
 import time
@@ -36,6 +38,10 @@ class NucleiPatchDataset(Dataset):
         self.processor = processor
         self.z_layer = z_layer  # Specific Z layer for segmentation, None means use all layers for embedding
         self.padding_ratio = padding_ratio  # Padding as fraction of bounding box size (e.g., 0.2 = 20%)
+        
+        # Z-stack in-memory cache (preload all layers to RAM for fast access)
+        self._zstack_layers = None  # Will be a list of numpy arrays if z-stack detected
+        self._zstack_preloaded = False
         
         # Pre-compute bounding boxes from contours if available (very efficient - just numpy operations)
         self.use_bounding_boxes = (contours is not None and len(contours) == len(centroids))
@@ -60,14 +66,10 @@ class NucleiPatchDataset(Dataset):
             file_extension = pathlib.Path(slide_path).suffix.lower()[1:]
             if file_extension in ['svs', 'ndpi', 'vms', 'vmu', 'scn', 'mrxs', 'tif', 'tiff', 'bif']:
                 try:
-                    import openslide
-                    read_image_method = 'openslide'
+                    import tiffslide
+                    read_image_method = 'tiffslide'
                 except ImportError:
-                    try:
-                        import tiffslide
-                        read_image_method = 'tiffslide'
-                    except ImportError:
-                        read_image_method = 'PIL'
+                    read_image_method = 'PIL'
             elif file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
                 read_image_method = 'PIL'
             elif file_extension in ['dcm']:
@@ -80,6 +82,11 @@ class NucleiPatchDataset(Dataset):
         self.read_image_method = read_image_method
         print(f"Using read method: {self.read_image_method} for file: {slide_path}")
         
+        # Get image dimensions for boundary checking
+        self.slide_width = None
+        self.slide_height = None
+        self._get_slide_dimensions()
+        
         # Detect if this is a z-stack image
         self.is_zstack = False
         self.num_z_layers = 1
@@ -87,18 +94,36 @@ class NucleiPatchDataset(Dataset):
         
         # Get magnification and MPP from slide
         self.mpp = None
-        if read_image_method == 'openslide':
-            import openslide
-            with openslide.OpenSlide(slide_path) as slide:
-                self.mpp = float(slide.properties['openslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / self.mpp
-        elif read_image_method == 'tiffslide':
-            import tiffslide
-            with tiffslide.TiffSlide(slide_path) as slide:
-                self.mpp = float(slide.properties['tiffslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / self.mpp
+        if read_image_method == 'tiffslide':
+            # Use tifffile instead of tiffslide to avoid RESUNIT bug
+            try:
+                import tifffile
+                with tifffile.TiffFile(slide_path) as tif:
+                    # Try to get resolution from TIFF tags
+                    if tif.pages and len(tif.pages) > 0:
+                        page = tif.pages[0]
+                        # Check for XResolution/YResolution tags
+                        if hasattr(page, 'tags') and 'XResolution' in page.tags:
+                            x_res = page.tags['XResolution'].value
+                            if isinstance(x_res, tuple) and len(x_res) == 2:
+                                # Resolution is stored as (numerator, denominator)
+                                pixels_per_unit = x_res[0] / x_res[1]
+                                # Assume unit is centimeter (common for NDPI)
+                                self.mpp = 10000.0 / pixels_per_unit  # Convert to microns/pixel
+                            else:
+                                self.mpp = 0.25  # Default
+                        else:
+                            self.mpp = 0.25  # Default
+                    else:
+                        self.mpp = 0.25  # Default
+                    
+                    reference_mpp_1x = 10
+                    self.magnification = reference_mpp_1x / self.mpp
+                    print(f"tifffile: magnification={self.magnification:.2f}x, MPP={self.mpp:.4f}")
+            except Exception as e:
+                print(f"Warning: Could not get MPP from tifffile: {e}, using defaults")
+                self.mpp = 0.25  # Default 40x equivalent
+                self.magnification = 40.0
         else:
             # Default to provided magnification for PIL and numpy
             self.magnification = magnification
@@ -132,8 +157,31 @@ class NucleiPatchDataset(Dataset):
     def _detect_zstack(self):
         """Detect if the image is a z-stack (multi-layer) image"""
         try:
-            # Method 1: Try tiffslide for multi-series files (like ndpi z-stack)
-            if self.read_image_method in ['tiffslide', 'openslide']:
+            # Use ndpi_utils for correct z-stack detection (based on NDPIReader.java logic)
+            try:
+                from ndpi_utils import analyze_ndpi_structure
+                meta = analyze_ndpi_structure(self.slide_path)
+                sizeZ = meta["sizeZ"]
+                
+                if sizeZ > 1:
+                    self.is_zstack = True
+                    self.num_z_layers = sizeZ
+                    print(f"Detected z-stack image with {sizeZ} layers (via ndpi_utils)")
+                    
+                    # Preload all z-layers to memory for fast access
+                    self._preload_zstack_layers()
+                    return
+                else:
+                    # Single layer detected
+                    print(f"Single-layer image detected (sizeZ={sizeZ})")
+                    self.is_zstack = False
+                    self.num_z_layers = 1
+                    return
+            except Exception as e:
+                print(f"ndpi_utils detection failed: {e}, falling back to legacy detection")
+            
+            # Fallback: Try tiffslide for multi-series files (legacy method)
+            if self.read_image_method == 'tiffslide':
                 try:
                     import tiffslide
                     with tiffslide.TiffSlide(self.slide_path) as slide:
@@ -152,16 +200,8 @@ class NucleiPatchDataset(Dataset):
                                     if num_z > 1:
                                         self.is_zstack = True
                                         self.num_z_layers = num_z
-                                        print(f"Detected z-stack image with {num_z} layers (via ZYXS format)")
+                                        print(f"Detected z-stack image with {num_z} layers (via ZYXS format - legacy)")
                                         return
-                            
-                            # Fallback: check if multiple series exist
-                            if len(series) > 1:
-                                # Multiple series detected - likely z-stack
-                                self.is_zstack = True
-                                self.num_z_layers = len(series)
-                                print(f"Detected z-stack image with {len(series)} layers (via multiple series)")
-                                return
                         
                 except Exception as e:
                     print(f"TiffSlide z-stack detection failed: {e}")
@@ -201,9 +241,102 @@ class NucleiPatchDataset(Dataset):
             print(f"Error detecting z-stack: {e}, assuming single layer")
             self.is_zstack = False
             self.num_z_layers = 1
+    
+    def _preload_zstack_layers(self):
+        """Preload all z-layers into memory for fast access (only for z-stack images)"""
+        if not self.is_zstack:
+            return
+        
+        print(f"\n{'='*80}")
+        print(f"PRELOADING Z-STACK TO MEMORY")
+        print(f"{'='*80}")
+        print(f"File: {os.path.basename(self.slide_path)}")
+        print(f"Layers: {self.num_z_layers}")
+        
+        start_time = time.time()
+        self._zstack_layers = []
+        
+        try:
+            import tifffile
+            with tifffile.TiffFile(self.slide_path) as tif:
+                # Load each z-layer into memory
+                for z_idx in range(self.num_z_layers):
+                    print(f"Loading layer {z_idx+1}/{self.num_z_layers}...", end='', flush=True)
+                    layer_start = time.time()
+                    
+                    page = tif.pages[z_idx]
+                    # Load entire layer to RAM (not memmap)
+                    layer_array = page.asarray()
+                    self._zstack_layers.append(layer_array)
+                    
+                    layer_time = time.time() - layer_start
+                    layer_size_mb = layer_array.nbytes / (1024**2)
+                    print(f" done in {layer_time:.2f}s ({layer_size_mb:.1f} MB)")
+            
+            total_time = time.time() - start_time
+            total_size_gb = sum(layer.nbytes for layer in self._zstack_layers) / (1024**3)
+            
+            print(f"{'='*80}")
+            print(f"✓ Preloading complete!")
+            print(f"  Total time: {total_time:.2f}s")
+            print(f"  Total memory: {total_size_gb:.2f} GB")
+            print(f"  Now all patch extraction will be instant from RAM")
+            print(f"{'='*80}\n")
+            
+            self._zstack_preloaded = True
+            
+        except Exception as e:
+            print(f"\n✗ Failed to preload z-stack: {e}")
+            print("Falling back to on-demand loading...")
+            self._zstack_layers = None
+            self._zstack_preloaded = False
 
     def __len__(self):
         return len(self.centroids)
+    
+    def __del__(self):
+        """Clean up resources (no longer needed as we preload to memory)"""
+        pass
+    
+    def _get_slide_dimensions(self):
+        """Get slide dimensions for boundary checking."""
+        try:
+            if self.read_image_method == 'tiffslide':
+                # Use tifffile instead of tiffslide to avoid RESUNIT bug
+                import tifffile
+                with tifffile.TiffFile(self.slide_path) as tif:
+                    if tif.pages and len(tif.pages) > 0:
+                        page = tif.pages[0]
+                        # Get dimensions from first page (base layer)
+                        self.slide_height, self.slide_width = page.shape[:2]
+                    else:
+                        self.slide_width, self.slide_height = 999999, 999999
+            elif self.read_image_method == 'PIL':
+                from PIL import Image
+                with Image.open(self.slide_path) as img:
+                    self.slide_width, self.slide_height = img.size
+            elif self.read_image_method == 'numpy':
+                import numpy as np
+                from PIL import Image
+                with Image.open(self.slide_path) as img:
+                    self.slide_width, self.slide_height = img.size
+            elif self.read_image_method == 'dicom':
+                slide = DicomImageWrapper(self.slide_path)
+                self.slide_width, self.slide_height = slide.dimensions
+                if hasattr(slide, 'close'):
+                    slide.close()
+            else:
+                # Fallback to PIL
+                from PIL import Image
+                with Image.open(self.slide_path) as img:
+                    self.slide_width, self.slide_height = img.size
+            
+            print(f"Slide dimensions: {self.slide_width} x {self.slide_height}")
+        except Exception as e:
+            print(f"Warning: Could not determine slide dimensions: {e}")
+            # Set to very large values as fallback (won't restrict anything)
+            self.slide_width = 999999
+            self.slide_height = 999999
 
     def _compute_bounding_boxes(self):
         """Pre-compute bounding boxes from contours - very efficient numpy operations
@@ -321,38 +454,105 @@ class NucleiPatchDataset(Dataset):
             y1 = max(0, y - self.extraction_size // 2)
             width = height = self.extraction_size
         
+        # Apply boundary checking to prevent out-of-bounds errors
+        if self.slide_width is not None and self.slide_height is not None:
+            # Ensure x1, y1 are within bounds
+            x1 = max(0, min(x1, self.slide_width - 1))
+            y1 = max(0, min(y1, self.slide_height - 1))
+            
+            # Adjust width and height to not exceed image boundaries
+            width = min(width, self.slide_width - x1)
+            height = min(height, self.slide_height - y1)
+            
+            # Ensure minimum size (at least 1 pixel)
+            if width <= 0 or height <= 0:
+                print(f"Warning: Invalid patch size for centroid {self.centroids[idx]}, skipping")
+                return None
+        
         try:
             # For z-stack images, extract patches from all layers (or specific layer)
-            if self.is_zstack:
+            if self.is_zstack and self.z_layer is None:
+                # Extract all layers for fusion
                 result = self._extract_zstack_patches(x1, y1, width, height, idx)
             else:
-                result = self._extract_single_patch(x1, y1, width, height, idx, x, y, z_layer=0)
+                # Extract single layer (either non-z-stack or specific z_layer for layer-wise processing)
+                layer_to_extract = self.z_layer if self.z_layer is not None else 0
+                result = self._extract_single_patch(x1, y1, width, height, idx, x, y, z_layer=layer_to_extract)
             
             return result
         except Exception as e:
-            print(f"Error processing centroid {self.centroids[idx]}: {str(e)}")
+            import traceback
+            print(f"Error processing centroid {self.centroids[idx]} (idx={idx}): {str(e)}")
+            if str(e) == "-9" or "Bad file descriptor" in str(e):
+                print(f"  File descriptor error detected. x1={x1}, y1={y1}, width={width}, height={height}")
+                print(f"  Slide dimensions: {self.slide_width} x {self.slide_height}")
+                print(f"  Read method: {self.read_image_method}")
+            traceback.print_exc()
             return None
 
     def _extract_single_patch(self, x1, y1, width, height, idx, x, y, z_layer=0):
         """Extract a single patch from one z-layer"""
         from PIL import Image  # Import at the beginning for all branches
+        import tifffile
         
-        # For z-stack, we need to read specific layer using PIL directly
-        if self.is_zstack:
-            with Image.open(self.slide_path) as img:
-                img.seek(z_layer)
-                patch = img.crop((x1, y1, x1 + width, y1 + height))
-                patch = patch.copy()  # Make a copy since we're closing the file
+        # Check if this is a TIFF/NDPI file - if so, ALWAYS use tifffile (avoid tiffslide RESUNIT bug)
+        is_tiff_file = self.slide_path.lower().endswith(('.tif', '.tiff', '.ndpi'))
+        
+        if is_tiff_file:
+            # Use tifffile for all TIFF/NDPI files (avoids tiffslide bugs)
+            try:
+                # FAST PATH: Use preloaded z-stack data if available
+                if self._zstack_preloaded and z_layer < len(self._zstack_layers):
+                    layer_array = self._zstack_layers[z_layer]
+                    y2 = min(y1 + height, layer_array.shape[0])
+                    x2 = min(x1 + width, layer_array.shape[1])
+                    
+                    # Direct slice from RAM (instant)
+                    patch_array = layer_array[y1:y2, x1:x2]
+                    
+                    # Convert to PIL Image
+                    if patch_array.ndim == 2:
+                        patch = Image.fromarray(patch_array).convert('RGB')
+                    elif patch_array.ndim >= 3 and patch_array.shape[2] >= 3:
+                        patch = Image.fromarray(patch_array[:, :, :3].astype(np.uint8))
+                    else:
+                        patch = Image.new('RGB', (width, height), (255, 255, 255))
+                
+                # SLOW PATH: Read from file (fallback if preloading failed)
+                else:
+                    with tifffile.TiffFile(self.slide_path) as tif:
+                        page = tif.pages[z_layer]
+                        y2 = min(y1 + height, page.shape[0])
+                        x2 = min(x1 + width, page.shape[1])
+                        
+                        try:
+                            patch_array = page.asarray(out='memmap')[y1:y2, x1:x2].copy()
+                        except:
+                            patch_array = page.asarray()[y1:y2, x1:x2]
+                        
+                        if patch_array.ndim == 2:
+                            patch = Image.fromarray(patch_array).convert('RGB')
+                        elif patch_array.ndim >= 3 and patch_array.shape[2] >= 3:
+                            patch = Image.fromarray(patch_array[:, :, :3].astype(np.uint8))
+                        else:
+                            patch = Image.new('RGB', (width, height), (255, 255, 255))
+            except Exception as e:
+                print(f"Warning: Failed to read layer {z_layer} with tifffile: {e}, using blank patch")
+                patch = Image.new('RGB', (width, height), (255, 255, 255))
         else:
-            # Single layer: use original logic with slide wrappers
+            # Non-TIFF files: use original logic with slide wrappers
             slide = None
             try:
-                if self.read_image_method == 'openslide':
-                    import openslide
-                    slide = openslide.OpenSlide(self.slide_path)
-                elif self.read_image_method == 'tiffslide':
+                if self.read_image_method == 'tiffslide':
                     import tiffslide
-                    slide = tiffslide.TiffSlide(self.slide_path)
+                    # Use context manager to ensure proper file closing
+                    with tiffslide.TiffSlide(self.slide_path) as ts:
+                        patch = ts.read_region(
+                            location=(x1, y1),
+                            level=0,
+                            size=(width, height)
+                        )
+                    slide = None  # Reading completed, no further processing needed
                 elif self.read_image_method == 'PIL':
                     slide = PILSlide(self.slide_path)
                 elif self.read_image_method == 'numpy':
@@ -366,41 +566,44 @@ class NucleiPatchDataset(Dataset):
                     else:
                         slide = TiffFileWrapper(self.slide_path)
 
-                patch = slide.read_region(
-                    location=(x1, y1),
-                    level=0,
-                    size=(width, height)
-                )
+                # Only non-tiffslide cases need to read
+                if slide is not None:
+                    patch = slide.read_region(
+                        location=(x1, y1),
+                        level=0,
+                        size=(width, height)
+                    )
             finally:
                 # Close slide to prevent resource leak
                 if slide is not None and hasattr(slide, 'close'):
                     slide.close()
+        
+        # Common post-processing for both TIFF and non-TIFF files
+        if patch.mode != 'RGB':
+            patch = patch.convert('RGB')
             
-            if patch.mode != 'RGB':
-                patch = patch.convert('RGB')
-                
-            # Resize to model input size (always square 224x224)
-            if patch.size[0] != self.patch_size or patch.size[1] != self.patch_size:
-                patch = patch.resize((self.patch_size, self.patch_size), Image.Resampling.LANCZOS)
+        # Resize to model input size (always square 224x224)
+        if patch.size[0] != self.patch_size or patch.size[1] != self.patch_size:
+            patch = patch.resize((self.patch_size, self.patch_size), Image.Resampling.LANCZOS)
+        
+        # Preprocess the patch if processor is available
+        if self.processor is not None:
+            processed_patch = self.processor.image_processor(patch)['pixel_values']
             
-            # Preprocess the patch if processor is available
-            if self.processor is not None:
-                processed_patch = self.processor.image_processor(patch)['pixel_values']
-                
-                # DEBUG: Save preprocessed patch (exactly as model sees it)
-                # Calculate centroid position in resized patch
-                centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
-                centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
-                self._debug_save_patch_processed(processed_patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
-                
-                return processed_patch
-            else:
-                # DEBUG: Save raw patch if no processor
-                centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
-                centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
-                self._debug_save_patch(patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
-                
-                return patch
+            # DEBUG: Save preprocessed patch (exactly as model sees it)
+            # Calculate centroid position in resized patch
+            centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
+            centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
+            self._debug_save_patch_processed(processed_patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
+            
+            return processed_patch
+        else:
+            # DEBUG: Save raw patch if no processor
+            centroid_x_in_patch = int((x - x1) * (self.patch_size / width))
+            centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
+            self._debug_save_patch(patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
+            
+            return patch
 
     def _extract_zstack_patches(self, x1, y1, width, height, idx):
         """Extract patches from all z-layers for embedding fusion"""
@@ -415,40 +618,54 @@ class NucleiPatchDataset(Dataset):
         # For embedding: extract from all layers
         patches = []
         
-        # Try method 1: tifffile for ndpi z-stack (ZYXS format or multiple series)
-        if self.read_image_method in ['tiffslide', 'openslide']:
+        # OPTIMIZATION: For network storage, batch read all z-layers at once
+        if self.read_image_method == 'tiffslide':
             try:
                 import tifffile
+                import os
                 
-                with tifffile.TiffFile(self.slide_path) as tif:
-                    series_list = tif.series
+                # Multi-process safe: each worker opens its own file handle
+                # Use process ID to ensure per-process caching
+                current_pid = os.getpid()
+                if not hasattr(self, '_tiff_pid') or self._tiff_pid != current_pid:
+                    # First access in this process, open file
+                    if self._tiff_handle is not None:
+                        try:
+                            self._tiff_handle.close()
+                        except:
+                            pass
+                    self._tiff_handle = tifffile.TiffFile(self.slide_path)
+                    self._tiff_series = self._tiff_handle.series
+                    self._tiff_pid = current_pid
+                    print(f"Opened z-stack file handle in process {current_pid} (will reuse for this worker)")
+                
+                tif = self._tiff_handle
+                series_list = self._tiff_series
+                
+                if len(series_list) > 0:
+                    first_series = series_list[0]
                     
-                    if len(series_list) > 0:
-                        first_series = series_list[0]
-                        
-                        # Case 1: ZYXS format - single series with Z dimension
-                        if hasattr(first_series, 'axes') and 'Z' in first_series.axes:
-                            if idx == 0:
+                    # Case 1: ZYXS format - single series with Z dimension
+                    if hasattr(first_series, 'axes') and 'Z' in first_series.axes:
+                        if idx == 0:
                                 print(f"Reading ZYXS format z-stack (will process {self.num_z_layers} layers per cell)")
-                            z_idx = first_series.axes.index('Z')
-                            
-                            # Extract patches from each Z layer
-                            for z in range(self.num_z_layers):
+                        z_idx = first_series.axes.index('Z')
+                        
+                        # Extract patches from each Z layer
+                        for z in range(self.num_z_layers):
                                 try:
-                                    # Read the specific Z layer
-                                    # For ZYXS: shape is (Z, Y, X, S)
+                                    # Read the specific Z layer using memmap for efficiency
                                     page = first_series.pages[z]
                                     
                                     # Calculate bounds
                                     y2 = min(y1 + height, page.shape[0])
                                     x2 = min(x1 + width, page.shape[1])
                                     
-                                    # Use aszarr() for efficient region reading
-                                    # This avoids loading the entire 4GB+ page into memory
-                                    import zarr as zarr_lib
-                                    zarr_array = zarr_lib.open(page.aszarr(), mode='r')
-                                    # Read only the required region
-                                    patch_array = np.asarray(zarr_array[y1:y2, x1:x2])
+                                    # Use memmap for efficient reading (process-safe)
+                                    try:
+                                        patch_array = page.asarray(out='memmap')[y1:y2, x1:x2].copy()
+                                    except:
+                                        patch_array = page.asarray()[y1:y2, x1:x2]
                                     
                                     # Check and pad undersized patches (boundary cells)
                                     actual_h, actual_w = patch_array.shape[:2]
@@ -502,23 +719,23 @@ class NucleiPatchDataset(Dataset):
                                     print(f"Error extracting Z-layer {z} for centroid {idx}: {str(e)}")
                                     continue
                             
-                            # Ensure we extracted all expected z-layers for data integrity
-                            if len(patches) == self.num_z_layers:
-                                return patches
-                            elif len(patches) > 0:
-                                print(f"Warning: Expected {self.num_z_layers} layers, got {len(patches)} for cell {idx}. Padding missing layers.")
-                                # Pad with last valid layer to maintain consistency
-                                while len(patches) < self.num_z_layers:
-                                    patches.append(patches[-1])
-                                return patches
+                        # Ensure we extracted all expected z-layers for data integrity
+                        if len(patches) == self.num_z_layers:
+                            return patches
+                    elif len(patches) > 0:
+                        print(f"Warning: Expected {self.num_z_layers} layers, got {len(patches)} for cell {idx}. Padding missing layers.")
+                        # Pad with last valid layer to maintain consistency
+                        while len(patches) < self.num_z_layers:
+                            patches.append(patches[-1])
+                        return patches
                         
-                        # Case 2: Multiple series - each series is a Z layer
-                        elif len(series_list) == self.num_z_layers:
-                            # Only log first cell to avoid spam
-                            if idx == 0:
-                                print(f"Reading multiple-series z-stack (will process {self.num_z_layers} series per cell)")
-                            for z in range(self.num_z_layers):
-                                try:
+                    # Case 2: Multiple series - each series is a Z layer
+                    elif len(series_list) == self.num_z_layers:
+                        # Only log first cell to avoid spam
+                        if idx == 0:
+                            print(f"Reading multiple-series z-stack (will process {self.num_z_layers} series per cell)")
+                        for z in range(self.num_z_layers):
+                            try:
                                     series_obj = series_list[z]
                                     page = series_obj.pages[0]
                                     
@@ -526,11 +743,14 @@ class NucleiPatchDataset(Dataset):
                                     y2 = min(y1 + height, page.shape[0])
                                     x2 = min(x1 + width, page.shape[1])
                                     
-                                    # Read only the required region using zarr for efficiency
-                                    # This avoids loading the entire page into memory
-                                    import zarr as zarr_lib
-                                    zarr_array = zarr_lib.open(page.aszarr(), mode='r')
-                                    patch_array = np.asarray(zarr_array[y1:y2, x1:x2])
+                                    # Use direct asarray with memmap to avoid zarr overhead
+                                    # This is more efficient and avoids resource leaks
+                                    try:
+                                        # Try to use memmap for efficient reading
+                                        patch_array = page.asarray(out='memmap')[y1:y2, x1:x2].copy()
+                                    except:
+                                        # Fallback to regular array if memmap fails
+                                        patch_array = page.asarray()[y1:y2, x1:x2]
                                     
                                     # Check and pad undersized patches (boundary cells)
                                     actual_h, actual_w = patch_array.shape[:2]
@@ -578,19 +798,19 @@ class NucleiPatchDataset(Dataset):
                                             centroid_y_in_patch = int((y - y1) * (self.patch_size / height))
                                             self._debug_save_patch(patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y)
                                         patches.append(np.array(patch))
-                                except Exception as e:
-                                    print(f"Error extracting series {z} for centroid {idx}: {str(e)}")
-                                    continue
+                            except Exception as e:
+                                print(f"Error extracting series {z} for centroid {idx}: {str(e)}")
+                                continue
                         
-                        # Ensure we extracted all expected z-layers for data integrity
-                        if len(patches) == self.num_z_layers:
-                            return patches
-                        elif len(patches) > 0:
-                            print(f"Warning: Expected {self.num_z_layers} layers, got {len(patches)} for cell {idx}. Padding missing layers.")
-                            # Pad with last valid layer to maintain consistency
-                            while len(patches) < self.num_z_layers:
-                                patches.append(patches[-1])
-                            return patches
+                    # Ensure we extracted all expected z-layers for data integrity
+                    if len(patches) == self.num_z_layers:
+                        return patches
+                    elif len(patches) > 0:
+                        print(f"Warning: Expected {self.num_z_layers} layers, got {len(patches)} for cell {idx}. Padding missing layers.")
+                        # Pad with last valid layer to maintain consistency
+                        while len(patches) < self.num_z_layers:
+                            patches.append(patches[-1])
+                        return patches
                                 
             except Exception as e:
                 print(f"Failed to read z-stack via tifffile: {e}")
@@ -809,21 +1029,28 @@ class NucleiEmbedding:
         try:
             if file_extension in ['svs', 'ndpi', 'vms', 'vmu', 'scn', 'mrxs', 'tif', 'tiff', 'bif']:
                 try:
-                    import openslide
-                    with openslide.OpenSlide(self.args.slidepath) as slide:
-                        mpp = float(slide.properties['openslide.mpp-x'])
-                        reference_mpp_1x = 10  # objective magnification
-                        self.args.magnification = reference_mpp_1x / mpp
-                        print("openslide success")
-                    self.read_image_method = 'openslide'
-                except (ImportError, Exception) as e:
-                    print(f"OpenSlide failed: {str(e)}")
                     import tiffslide
-                    with tiffslide.TiffSlide(self.args.slidepath) as slide:
-                        mpp = float(slide.properties['tiffslide.mpp-x'])
-                        reference_mpp_1x = 10  # objective magnification
-                        self.args.magnification = reference_mpp_1x / mpp
-                    self.read_image_method = 'tiffslide'
+                    self.read_image_method = 'tiffslide'  # 先设置方法，不管后面是否出错
+                    
+                    # 尝试获取放大倍数，但即使失败也继续使用 tiffslide
+                    try:
+                        with tiffslide.TiffSlide(self.args.slidepath) as slide:
+                            mpp = float(slide.properties.get('tiffslide.mpp-x', 0.25))  # 使用 get 避免 KeyError
+                            reference_mpp_1x = 10
+                            self.args.magnification = reference_mpp_1x / mpp
+                            print(f"tiffslide success with magnification: {self.args.magnification}")
+                    except Exception as mag_error:
+                        # 获取放大倍数失败不影响使用 tiffslide
+                        print(f"Warning: Could not get magnification ({mag_error}), using default 40")
+                        if not hasattr(self.args, 'magnification') or self.args.magnification is None:
+                            self.args.magnification = 40
+                            
+                except ImportError as e:
+                    # 只有在导入失败时才回退到 PIL
+                    print(f"TiffSlide import failed: {str(e)}, falling back to PIL")
+                    self.read_image_method = 'PIL'
+                    if not hasattr(self.args, 'magnification') or self.args.magnification is None:
+                        self.args.magnification = 40  # Default
             elif file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
                 self.read_image_method = 'PIL'
                 # Use default magnification if provided in args
@@ -921,56 +1148,57 @@ class NucleiEmbedding:
         if is_zstack:
             # Z-stack case: processed_batch is list of [cell1_layers, cell2_layers, ...]
             # Each cell_layers is a list of z-layer patches
-            all_cell_embeddings = []
             
-            for cell_idx, cell_patches in enumerate(processed_batch):
-                # cell_patches is a list of patches from different z-layers
+            # OPTIMIZED: Batch process all z-layers at once instead of per-cell
+            # This dramatically improves GPU utilization
+            
+            # Step 1: Flatten all patches into a single batch
+            all_patches = []
+            num_cells = len(processed_batch)
+            
+            for cell_patches in processed_batch:
                 if isinstance(cell_patches, list):
-                    # Stack all z-layer patches for this cell
-                    # Use stack instead of cat to create a batch dimension
-                    patch_tensors = [torch.from_numpy(p) if isinstance(p, np.ndarray) else torch.tensor(p) 
-                                    for p in cell_patches]
-                    cell_tensor = torch.stack(patch_tensors, dim=0).to(device)
-                    
-                    # Debug: print shape for first cell in first batch
-                    if len(all_cell_embeddings) == 0:
-                        print(f"[DEBUG] Cell 0: {len(cell_patches)} z-layers, tensor shape: {cell_tensor.shape}")
-                    
-                    with torch.no_grad():
-                        # Get embeddings for all z-layers of this cell
-                        vision_outputs = self.model.vision_model(cell_tensor)
-                        image_embeds = vision_outputs.last_hidden_state.mean(dim=1)
-                        embeddings = self.image_projection(image_embeds)
-                        
-                        # Debug: print embedding shape before and after fusion for first cell
-                        if len(all_cell_embeddings) == 0:
-                            print(f"[DEBUG] Before fusion: {embeddings.shape} (should be [5, 768])")
-                        
-                        # Average embeddings across z-layers
-                        fused_embedding = embeddings.mean(dim=0, keepdim=True)
-                        
-                        # Debug: print fused shape for first cell
-                        if len(all_cell_embeddings) == 0:
-                            print(f"[DEBUG] After fusion: {fused_embedding.shape} (should be [1, 768])")
-                        
-                        all_cell_embeddings.append(fused_embedding)
+                    # Convert each z-layer patch to tensor
+                    for patch in cell_patches:
+                        if isinstance(patch, np.ndarray):
+                            all_patches.append(torch.from_numpy(patch))
+                        else:
+                            all_patches.append(torch.tensor(patch))
                 else:
-                    # Single patch (shouldn't happen in z-stack mode but handle it)
-                    cell_tensor = torch.from_numpy(cell_patches) if isinstance(cell_patches, np.ndarray) else cell_patches
-                    cell_tensor = cell_tensor.unsqueeze(0).to(device)
-                    
-                    with torch.no_grad():
-                        vision_outputs = self.model.vision_model(cell_tensor)
-                        image_embeds = vision_outputs.last_hidden_state.mean(dim=1)
-                        embeddings = self.image_projection(image_embeds)
-                        all_cell_embeddings.append(embeddings)
+                    # Single patch case (shouldn't happen but handle it)
+                    if isinstance(cell_patches, np.ndarray):
+                        all_patches.append(torch.from_numpy(cell_patches))
+                    else:
+                        all_patches.append(torch.tensor(cell_patches))
             
-            # Concatenate all cell embeddings
-            final_embeddings = torch.cat(all_cell_embeddings, dim=0).detach().cpu().numpy()
+            # Step 2: Stack all patches into a single tensor for batch processing
+            # Shape: (num_cells * num_z_layers, C, H, W)
+            all_patches_tensor = torch.stack(all_patches, dim=0).to(device)
             
-            # Final verification log
-            print(f"[Z-STACK FUSION] Processed {len(all_cell_embeddings)} cells, final shape: {final_embeddings.shape}")
-            print(f"[Z-STACK FUSION] Each cell fused from {num_z_layers if num_z_layers else 'N/A'} z-layers")
+            # Debug: print batch info for first batch only
+            if not hasattr(self, '_first_batch_logged'):
+                print(f"[Z-STACK BATCH PROCESSING] Batch size: {num_cells} cells")
+                print(f"[Z-STACK BATCH PROCESSING] Z-layers per cell: {num_z_layers}")
+                print(f"[Z-STACK BATCH PROCESSING] Total patches in GPU batch: {all_patches_tensor.shape[0]}")
+                print(f"[Z-STACK BATCH PROCESSING] Tensor shape: {all_patches_tensor.shape}")
+                self._first_batch_logged = True
+            
+            # Step 3: Single GPU forward pass for all patches
+            with torch.no_grad():
+                vision_outputs = self.model.vision_model(all_patches_tensor)
+                image_embeds = vision_outputs.last_hidden_state.mean(dim=1)
+                all_embeddings = self.image_projection(image_embeds)
+            
+            # Step 4: Reshape embeddings back to (num_cells, num_z_layers, embedding_dim)
+            # Then average across z-layers for each cell
+            embedding_dim = all_embeddings.shape[1]
+            all_embeddings = all_embeddings.view(num_cells, num_z_layers, embedding_dim)
+            
+            # Step 5: Fuse embeddings by averaging across z-layers
+            fused_embeddings = all_embeddings.mean(dim=1)  # Shape: (num_cells, embedding_dim)
+            
+            # Convert to numpy
+            final_embeddings = fused_embeddings.detach().cpu().numpy()
             
             return final_embeddings
         else:
@@ -1033,6 +1261,18 @@ class NucleiEmbedding:
 
         print(f"Generating embeddings using {num_workers} workers and batch size {batch_size}...")
         
+        # Check file handle limits on Linux
+        import platform
+        if platform.system() == 'Linux':
+            try:
+                import resource
+                soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+                print(f"Linux file handle limits: soft={soft}, hard={hard}")
+                if soft < 4096:
+                    print(f"WARNING: Low file handle limit detected ({soft}). Consider increasing with 'ulimit -n 4096'")
+            except Exception as e:
+                print(f"Could not check file handle limits: {e}")
+        
         # For embedding, always use all layers (z_layer=None)
         # z_layer_for_segmentation is only used during segmentation phase, not here
         z_layer = None  # Always None for embedding - we want to fuse all layers
@@ -1052,86 +1292,263 @@ class NucleiEmbedding:
         # Check if dataset has z-stack
         is_zstack = dataset.is_zstack and z_layer is None
         if is_zstack:
-            print(f"Z-stack detected with {dataset.num_z_layers} layers. Will fuse embeddings across layers.")
-            # For z-stack, reduce batch_size since we process multiple layers per cell
-            batch_size = max(1, batch_size // dataset.num_z_layers)
-            print(f"Adjusted batch_size to {batch_size} for z-stack processing")
+            print(f"Z-stack detected with {dataset.num_z_layers} layers. Will use layer-wise processing for stability.")
+            print(f"Strategy: Process each z-layer independently, then fuse embeddings by cell_id")
+            print(f"This ensures sequential I/O and avoids multi-process file handle conflicts")
+            # Use original batch_size for layer-wise processing (no reduction needed)
+            # Each layer is processed separately like a single-layer image
         
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            shuffle=False,
-            collate_fn=collate_patches,
-            prefetch_factor=1,
-            persistent_workers=True,
-            pin_memory=True
-        )
+        # Detect if running on Linux (server), adjust DataLoader strategy
+        import platform
+        is_linux = platform.system() == 'Linux'
+        
+        if is_linux:
+            print("Linux environment detected - using resource-safe DataLoader settings")
+            
+            # Smart worker allocation based on image type
+            if dataset.is_zstack:
+                # If z-stack is preloaded to RAM, we can safely use multiple workers
+                if dataset._zstack_preloaded:
+                    max_workers = min(num_workers, 4)
+                    print(f"Z-stack preloaded to RAM: using {max_workers} workers for parallel loading")
+                    print(f"Processing {dataset.num_z_layers} layers per cell")
+                else:
+                    # Fallback to single process if preloading failed
+                    max_workers = 0
+                    print(f"Z-stack NOT preloaded: using single-process mode (slower)")
+            else:
+                max_workers = min(num_workers, 4)  # Normal multi-process for single-layer
+                print(f"Single-layer image: using {max_workers} workers for faster processing")
+            
+            # Disable persistent_workers on Linux to avoid file handle accumulation
+            if max_workers > 0:
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    num_workers=max_workers,
+                    shuffle=False,
+                    collate_fn=collate_patches,
+                    prefetch_factor=1,
+                    persistent_workers=False,  # Key: don't keep worker processes
+                    pin_memory=False  # Reduce memory locking
+                )
+            else:
+                # Single process mode (workers=0)
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    num_workers=0,
+                    shuffle=False,
+                    collate_fn=collate_patches,
+                    # No prefetch_factor or persistent_workers when workers=0
+                    pin_memory=False
+                )
+        else:
+            # Windows/Mac can use more aggressive settings
+            if dataset.is_zstack:
+                print(f"Z-stack detected on {platform.system()}: using {num_workers} workers (no deadlock issues on non-Linux)")
+            else:
+                print(f"Single-layer image on {platform.system()}: using {num_workers} workers")
+            
+            dataloader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                shuffle=False,
+                collate_fn=collate_patches,
+                prefetch_factor=1,
+                persistent_workers=True,
+                pin_memory=True
+            )
         
         if zarr_path is None:
             raise ValueError("zarr_path must be provided to write embeddings directly")
         print(f"store embeddings directly to: {zarr_path}:{dataset_path}")
-        total_processed = 0
 
         # Open root and ensure parent group exists
         root = zarr.open_group(zarr_path, mode='a')
-        # Navigate or create nested groups for dataset_path
         parts = dataset_path.strip('/').split('/')
         parent = root
         for group_name in parts[:-1]:
             parent = parent.require_group(group_name)
         ds_name = parts[-1]
-        if ds_name in parent:
-            del parent[ds_name]
-        embeddings_dset = parent.create_dataset(
-            ds_name,
-            shape=(0, 768),
-            chunks=(min(1000, batch_size), 768),
-            dtype=np.float16
-        )
         
         total_start_time = time.time()
-        pbar = tqdm(total=len(dataset), desc="Generating embeddings")
+        import gc
         
-        for batch in dataloader:
-            if batch:
-                if is_zstack:
-                    # Z-stack case: batch is list of lists
-                    batch_embeddings = self.embed_batch(batch, is_zstack=True, num_z_layers=dataset.num_z_layers)
-                else:
-                    # Single layer case: original logic
+        # Z-stack layer-wise processing
+        if is_zstack:
+            num_cells = len(dataset)
+            num_layers = dataset.num_z_layers
+            
+            print(f"\n{'='*80}")
+            print(f"LAYER-WISE Z-STACK PROCESSING")
+            print(f"{'='*80}")
+            print(f"Total cells: {num_cells}")
+            print(f"Z-layers: {num_layers}")
+            print(f"Total embeddings to generate: {num_cells} cells × {num_layers} layers")
+            print(f"{'='*80}\n")
+            
+            # Create temporary storage for per-layer embeddings
+            if ds_name in parent:
+                del parent[ds_name]
+            
+            # Clean up any existing temporary layer datasets from previous runs
+            for layer_idx in range(num_layers):
+                temp_name = f'_temp_layer_{layer_idx}'
+                if temp_name in parent:
+                    del parent[temp_name]
+                    print(f"Cleaned up existing temporary dataset: {temp_name}")
+            
+            temp_layer_embeddings = []
+            
+            # Process each layer independently
+            for layer_idx in range(num_layers):
+                print(f"\n{'='*80}")
+                print(f"Processing Layer {layer_idx + 1}/{num_layers}")
+                print(f"{'='*80}")
+                
+                # Set dataset to extract only this specific layer
+                dataset.z_layer = layer_idx
+                # Keep is_zstack=True to force tifffile usage (avoid tiffslide RESUNIT bug)
+                # The z_layer setting will make it extract only one layer
+                
+                # Create temporary dataset for this layer
+                layer_dset = parent.create_dataset(
+                    f'_temp_layer_{layer_idx}',
+                    shape=(num_cells, 768),
+                    chunks=(min(1000, batch_size), 768),
+                    dtype=np.float16
+                )
+                
+                # Process this layer
+                cell_idx = 0
+                pbar = tqdm(total=num_cells, desc=f"Layer {layer_idx + 1}/{num_layers}")
+                
+                batch_count = 0
+                for batch in dataloader:
+                    if batch_count == 0:
+                        print(f"First batch received! Size: {len(batch) if batch else 0}")
+                    batch_count += 1
+                    if batch:
+                        # Single layer processing (fast, like CMU-1.svs)
+                        processed_batch = torch.from_numpy(np.concatenate(batch, axis=0)).to(self.device)
+                        batch_embeddings = self.embed_batch(processed_batch, is_zstack=False)
+                        
+                        # Normalize
+                        batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
+                        batch_embeddings = batch_embeddings.astype(np.float16)
+                        
+                        # Write to temporary layer dataset
+                        batch_size_actual = batch_embeddings.shape[0]
+                        layer_dset[cell_idx:cell_idx + batch_size_actual] = batch_embeddings
+                        cell_idx += batch_size_actual
+                        
+                        pbar.update(len(batch))
+                        
+                        # Clean memory
+                        del batch_embeddings
+                        torch.cuda.empty_cache()
+                
+                pbar.close()
+                temp_layer_embeddings.append(f'_temp_layer_{layer_idx}')
+                print(f"✓ Layer {layer_idx + 1} complete: {num_cells} embeddings saved")
+                
+                # Reset dataset for next layer
+                dataset.z_layer = None
+                dataset.is_zstack = True
+                gc.collect()
+            
+            # Fuse embeddings across layers
+            print(f"\n{'='*80}")
+            print(f"FUSING EMBEDDINGS ACROSS {num_layers} LAYERS")
+            print(f"{'='*80}")
+            
+            # Create final dataset
+            final_dset = parent.create_dataset(
+                ds_name,
+                shape=(num_cells, 768),
+                chunks=(min(1000, batch_size), 768),
+                dtype=np.float16
+            )
+            
+            # Fuse by averaging across layers for each cell
+            fusion_batch_size = 1000  # Process cells in batches for memory efficiency
+            pbar = tqdm(total=num_cells, desc="Fusing layers")
+            
+            for start_idx in range(0, num_cells, fusion_batch_size):
+                end_idx = min(start_idx + fusion_batch_size, num_cells)
+                
+                # Load embeddings from all layers for this batch of cells
+                layer_embs = []
+                for temp_name in temp_layer_embeddings:
+                    layer_embs.append(parent[temp_name][start_idx:end_idx])
+                
+                # Average across layers (axis=0)
+                fused_embs = np.mean(layer_embs, axis=0).astype(np.float16)
+                
+                # Write to final dataset
+                final_dset[start_idx:end_idx] = fused_embs
+                
+                pbar.update(end_idx - start_idx)
+            
+            pbar.close()
+            
+            # Clean up temporary datasets
+            print(f"\nCleaning up temporary layer datasets...")
+            for temp_name in temp_layer_embeddings:
+                del parent[temp_name]
+            
+            print(f"✓ Fusion complete: {num_cells} final embeddings saved")
+            
+        else:
+            # Single layer case: original logic
+            total_processed = 0
+            
+            if ds_name in parent:
+                del parent[ds_name]
+            embeddings_dset = parent.create_dataset(
+                ds_name,
+                shape=(0, 768),
+                chunks=(min(1000, batch_size), 768),
+                dtype=np.float16
+            )
+            
+            pbar = tqdm(total=len(dataset), desc="Generating embeddings")
+            batch_count = 0
+            
+            for batch in dataloader:
+                if batch:
                     processed_batch = torch.from_numpy(np.concatenate(batch, axis=0)).to(self.device)
                     batch_embeddings = self.embed_batch(processed_batch, is_zstack=False)
-                
-                batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
-                
-                # convert to float16 and incrementally save to HDF5 file
-                batch_embeddings = batch_embeddings.astype(np.float16)
-                
-                # adjust the dataset size to fit the new data
-                current_size = embeddings_dset.shape[0]
-                new_size = current_size + batch_embeddings.shape[0]
-                embeddings_dset.resize((new_size, 768))
-                
-                # write new data
-                embeddings_dset[current_size:new_size, :] = batch_embeddings
-                
-                # update progress
-                total_processed += len(batch)
-                pbar.update(len(batch))
-                
-                # update progress callback
-                if self.progress_callback:
-                    progress = int((total_processed / len(dataset)) * 100)
-                    self.progress_callback(progress)
-                
-                # clean memory
-                del batch_embeddings
-                torch.cuda.empty_cache()
+                    
+                    batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
+                    batch_embeddings = batch_embeddings.astype(np.float16)
+                    
+                    current_size = embeddings_dset.shape[0]
+                    new_size = current_size + batch_embeddings.shape[0]
+                    embeddings_dset.resize((new_size, 768))
+                    embeddings_dset[current_size:new_size, :] = batch_embeddings
+                    
+                    total_processed += len(batch)
+                    pbar.update(len(batch))
+                    
+                    if self.progress_callback:
+                        progress = int((total_processed / len(dataset)) * 100)
+                        self.progress_callback(progress)
+                    
+                    del batch_embeddings
+                    torch.cuda.empty_cache()
+                    
+                    batch_count += 1
+                    if is_linux and batch_count % 10 == 0:
+                        gc.collect()
+            
+            pbar.close()
         
-        pbar.close()
         total_time = time.time() - total_start_time
-        print(f"Total processing time: {total_time:.2f} seconds")
-        
+        print(f"\n{'='*80}")
+        print(f"Total processing time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+        print(f"{'='*80}")
         print("embeddings calculation completed and written to Zarr store")
         return dataset_path

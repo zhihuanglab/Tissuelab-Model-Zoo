@@ -6,6 +6,9 @@ Created on Feb 03 2025
 @author: zhihuang
 """
 
+import os
+import platform
+
 import numpy as np
 import torch
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
@@ -15,7 +18,6 @@ import multiprocess as mp
 from tqdm import tqdm
 import h5py
 from safe_h5_utils import safe_h5_open
-import os
 from nuc_stat import PILSlide, NumpySlide
 from torch.utils.data import Dataset, DataLoader
 import time
@@ -40,14 +42,10 @@ class NucleiPatchDataset(Dataset):
             file_extension = pathlib.Path(slide_path).suffix.lower()[1:]
             if file_extension in ['svs', 'ndpi', 'vms', 'vmu', 'scn', 'mrxs', 'tif', 'tiff', 'bif']:
                 try:
-                    import openslide
-                    read_image_method = 'openslide'
+                    import tiffslide
+                    read_image_method = 'tiffslide'
                 except ImportError:
-                    try:
-                        import tiffslide
-                        read_image_method = 'tiffslide'
-                    except ImportError:
-                        read_image_method = 'PIL'
+                    read_image_method = 'PIL'
             elif file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
                 read_image_method = 'PIL'
             elif file_extension in ['dcm']:
@@ -60,19 +58,25 @@ class NucleiPatchDataset(Dataset):
         self.read_image_method = read_image_method
         print(f"Using read method: {self.read_image_method} for file: {slide_path}")
         
+        # Get image dimensions for boundary checking
+        self.slide_width = None
+        self.slide_height = None
+        self._get_slide_dimensions()
+        
         # Get magnification from MPP
-        if read_image_method == 'openslide':
-            import openslide
-            with openslide.OpenSlide(slide_path) as slide:
-                mpp = float(slide.properties['openslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / mpp
-        elif read_image_method == 'tiffslide':
+        if read_image_method == 'tiffslide':
             import tiffslide
-            with tiffslide.TiffSlide(slide_path) as slide:
-                mpp = float(slide.properties['tiffslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / mpp
+            try:
+                with tiffslide.TiffSlide(slide_path) as slide:
+                    # Use .get() to safely access properties
+                    props = slide.properties
+                    mpp = float(props.get('tiffslide.mpp-x', 0.25))
+                    reference_mpp_1x = 10  # objective magnification
+                    self.magnification = reference_mpp_1x / mpp
+            except (AttributeError, KeyError) as e:
+                print(f"Warning: Could not get MPP from tiffslide: {e}, using defaults")
+                mpp = 0.25  # Default 40x equivalent
+                self.magnification = 40.0
         else:
             # Default to provided magnification for PIL and numpy
             self.magnification = magnification
@@ -85,15 +89,89 @@ class NucleiPatchDataset(Dataset):
 
     def __len__(self):
         return len(self.centroids)
+    
+    def _get_slide_dimensions(self):
+        """Get slide dimensions for boundary checking."""
+        try:
+            if self.read_image_method == 'tiffslide':
+                import tiffslide
+                with tiffslide.TiffSlide(self.slide_path) as slide:
+                    self.slide_width, self.slide_height = slide.dimensions
+            elif self.read_image_method == 'PIL':
+                from PIL import Image
+                with Image.open(self.slide_path) as img:
+                    self.slide_width, self.slide_height = img.size
+            elif self.read_image_method == 'numpy':
+                import numpy as np
+                from PIL import Image
+                with Image.open(self.slide_path) as img:
+                    self.slide_width, self.slide_height = img.size
+            elif self.read_image_method == 'dicom':
+                slide = DicomImageWrapper(self.slide_path)
+                self.slide_width, self.slide_height = slide.dimensions
+                if hasattr(slide, 'close'):
+                    slide.close()
+            else:
+                # Fallback to PIL
+                from PIL import Image
+                with Image.open(self.slide_path) as img:
+                    self.slide_width, self.slide_height = img.size
+            
+            print(f"Slide dimensions: {self.slide_width} x {self.slide_height}")
+        except Exception as e:
+            print(f"Warning: Could not determine slide dimensions: {e}")
+            # Set to very large values as fallback (won't restrict anything)
+            self.slide_width = 999999
+            self.slide_height = 999999
 
     def __getitem__(self, idx):
         # Create slide object for each access
-        if self.read_image_method == 'openslide':
-            import openslide
-            slide = openslide.OpenSlide(self.slide_path)
-        elif self.read_image_method == 'tiffslide':
+        if self.read_image_method == 'tiffslide':
             import tiffslide
-            slide = tiffslide.TiffSlide(self.slide_path)
+            # Use context manager to ensure proper file closing
+            with tiffslide.TiffSlide(self.slide_path) as slide:
+                x, y = self.centroids[idx]
+                x1 = max(0, x - self.extraction_size // 2)
+                y1 = max(0, y - self.extraction_size // 2)
+                width = height = self.extraction_size
+                
+                # Apply boundary checking to prevent out-of-bounds errors
+                if self.slide_width is not None and self.slide_height is not None:
+                    # Ensure x1, y1 are within bounds
+                    x1 = max(0, min(x1, self.slide_width - 1))
+                    y1 = max(0, min(y1, self.slide_height - 1))
+                    
+                    # Adjust width and height to not exceed image boundaries
+                    width = min(width, self.slide_width - x1)
+                    height = min(height, self.slide_height - y1)
+                    
+                    # Ensure minimum size (at least 1 pixel)
+                    if width <= 0 or height <= 0:
+                        print(f"Warning: Invalid patch size for centroid {self.centroids[idx]}, skipping")
+                        return None
+                
+                try:
+                    patch = slide.read_region(
+                        location=(x1, y1),
+                        level=0,
+                        size=(width, height)
+                    )
+                    
+                    if patch.mode != 'RGB':
+                        patch = patch.convert('RGB')
+                        
+                    # Always resize to target patch size (224x224)
+                    if patch.size[0] != self.patch_size or patch.size[1] != self.patch_size:
+                        patch = patch.resize((self.patch_size, self.patch_size), Image.Resampling.LANCZOS)
+                        
+                    # Preprocess the patch if processor is available
+                    if self.processor is not None:
+                        patch = self.processor.image_processor(patch)['pixel_values']
+                        
+                    return patch
+                except Exception as e:
+                    print(f"Error processing centroid {self.centroids[idx]}: {str(e)}")
+                    return None
         elif self.read_image_method == 'PIL':
             slide = PILSlide(self.slide_path)
         elif self.read_image_method == 'numpy':
@@ -111,18 +189,35 @@ class NucleiPatchDataset(Dataset):
         x, y = self.centroids[idx]
         x1 = max(0, x - self.extraction_size // 2)
         y1 = max(0, y - self.extraction_size // 2)
+        width = height = self.extraction_size
+        
+        # Apply boundary checking to prevent out-of-bounds errors
+        if self.slide_width is not None and self.slide_height is not None:
+            # Ensure x1, y1 are within bounds
+            x1 = max(0, min(x1, self.slide_width - 1))
+            y1 = max(0, min(y1, self.slide_height - 1))
+            
+            # Adjust width and height to not exceed image boundaries
+            width = min(width, self.slide_width - x1)
+            height = min(height, self.slide_height - y1)
+            
+            # Ensure minimum size (at least 1 pixel)
+            if width <= 0 or height <= 0:
+                print(f"Warning: Invalid patch size for centroid {self.centroids[idx]}, skipping")
+                return None
         
         try:
             patch = slide.read_region(
                 location=(x1, y1),
                 level=0,
-                size=(self.extraction_size, self.extraction_size)
+                size=(width, height)
             )
             
             if patch.mode != 'RGB':
                 patch = patch.convert('RGB')
                 
-            if self.extraction_size != self.patch_size:
+            # Always resize to target patch size (224x224)
+            if patch.size[0] != self.patch_size or patch.size[1] != self.patch_size:
                 patch = patch.resize((self.patch_size, self.patch_size), Image.Resampling.LANCZOS)
                 
             # Preprocess the patch if processor is available
@@ -160,21 +255,28 @@ class NucleiEmbedding:
         try:
             if file_extension in ['svs', 'ndpi', 'vms', 'vmu', 'scn', 'mrxs', 'tif', 'tiff', 'bif']:
                 try:
-                    import openslide
-                    with openslide.OpenSlide(self.args.slidepath) as slide:
-                        mpp = float(slide.properties['openslide.mpp-x'])
-                        reference_mpp_1x = 10  # objective magnification
-                        self.args.magnification = reference_mpp_1x / mpp
-                        print("openslide success")
-                    self.read_image_method = 'openslide'
-                except (ImportError, Exception) as e:
-                    print(f"OpenSlide failed: {str(e)}")
                     import tiffslide
-                    with tiffslide.TiffSlide(self.args.slidepath) as slide:
-                        mpp = float(slide.properties['tiffslide.mpp-x'])
-                        reference_mpp_1x = 10  # objective magnification
-                        self.args.magnification = reference_mpp_1x / mpp
-                    self.read_image_method = 'tiffslide'
+                    self.read_image_method = 'tiffslide'  # 先设置方法，不管后面是否出错
+                    
+                    # 尝试获取放大倍数，但即使失败也继续使用 tiffslide
+                    try:
+                        with tiffslide.TiffSlide(self.args.slidepath) as slide:
+                            mpp = float(slide.properties.get('tiffslide.mpp-x', 0.25))  # 使用 get 避免 KeyError
+                            reference_mpp_1x = 10
+                            self.args.magnification = reference_mpp_1x / mpp
+                            print(f"tiffslide success with magnification: {self.args.magnification}")
+                    except Exception as mag_error:
+                        # 获取放大倍数失败不影响使用 tiffslide
+                        print(f"Warning: Could not get magnification ({mag_error}), using default 40")
+                        if not hasattr(self.args, 'magnification') or self.args.magnification is None:
+                            self.args.magnification = 40
+                            
+                except ImportError as e:
+                    # 只有在导入失败时才回退到 PIL
+                    print(f"TiffSlide import failed: {str(e)}, falling back to PIL")
+                    self.read_image_method = 'PIL'
+                    if not hasattr(self.args, 'magnification') or self.args.magnification is None:
+                        self.args.magnification = 40  # Default
             elif file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
                 self.read_image_method = 'PIL'
                 # Use default magnification if provided in args
@@ -328,16 +430,42 @@ class NucleiEmbedding:
             processor=self.processor
         )
         
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            shuffle=False,
-            collate_fn=collate_patches,
-            prefetch_factor=4,  # Increased from 1 to 4 for better pipeline
-            persistent_workers=True,
-            pin_memory=True
-        )
+        # Detect if running on Linux (server), adjust DataLoader strategy
+        import platform
+        is_linux = platform.system() == 'Linux'
+        
+        if is_linux:
+            print("Linux environment detected - using resource-safe DataLoader settings")
+            
+            # Limit workers to prevent resource exhaustion
+            max_workers = min(num_workers, 4)  # Reasonable limit for multi-processing
+            actual_batch_size = batch_size  # Keep original batch size
+            
+            print(f"Linux processing: workers={max_workers} (was {num_workers})")
+            
+            # Disable persistent_workers on Linux to avoid file handle accumulation
+            dataloader = DataLoader(
+                dataset,
+                batch_size=actual_batch_size,
+                num_workers=max_workers,
+                shuffle=False,
+                collate_fn=collate_patches,
+                prefetch_factor=2,  # Reduce prefetch
+                persistent_workers=False,  # Key: don't keep worker processes
+                pin_memory=False  # Reduce memory locking
+            )
+        else:
+            # Windows/Mac can use more aggressive settings
+            dataloader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                shuffle=False,
+                collate_fn=collate_patches,
+                prefetch_factor=4,
+                persistent_workers=True,
+                pin_memory=True
+            )
         
         # use the provided temp_h5_path or generate a new one
         if temp_h5_path is None:

@@ -53,19 +53,31 @@ except ImportError:
 
 
 class PILSlide():
-    """Basic slide implementation using PIL."""
+    """Basic slide implementation using PIL.
+    
+    Note: For multi-process safety, each read_region call opens the file independently.
+    This prevents file descriptor conflicts in DataLoader with multiple workers.
+    """
     
     def __init__(self, filepath):
         super(PILSlide, self).__init__()
-        self.wsi = Image.open(filepath)
-        self.dimensions = self.wsi.size
+        self.filepath = filepath
+        # Open once to get dimensions, then close
+        with Image.open(filepath) as img:
+            self.dimensions = img.size
         
     def read_region(self, location, level=0, size=(100,100)):
-        # Define the region to crop (left, upper, right, lower)
-        crop_region = (location[0], location[1], location[0]+size[0], location[1]+size[1])
-        # Crop the image
-        region = self.wsi.crop(crop_region)
+        # Open file for each read to ensure multi-process safety
+        with Image.open(self.filepath) as img:
+            # Define the region to crop (left, upper, right, lower)
+            crop_region = (location[0], location[1], location[0]+size[0], location[1]+size[1])
+            # Crop the image and make a copy (important: copy before context manager closes)
+            region = img.crop(crop_region).copy()
         return region
+    
+    def close(self):
+        """Dummy close method for compatibility."""
+        pass
 
 
 class NumpySlide():
