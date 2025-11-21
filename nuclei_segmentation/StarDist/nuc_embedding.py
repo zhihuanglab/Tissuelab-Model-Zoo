@@ -134,12 +134,14 @@ class NucleiPatchDataset(Dataset):
         if read_image_method == 'openslide':
             import openslide
             self.slide = openslide.OpenSlide(slide_path)
+            self.slide_dimensions = self.slide.dimensions
             self.mpp = float(self.slide.properties['openslide.mpp-x'])
             reference_mpp_1x = 10  # objective magnification
             self.magnification = reference_mpp_1x / self.mpp
         elif read_image_method == 'tiffslide':
             import tiffslide
             self.slide = tiffslide.TiffSlide(slide_path)
+            self.slide_dimensions = self.slide.dimensions
             self.mpp = float(self.slide.properties['tiffslide.mpp-x'])
             reference_mpp_1x = 10  # objective magnification
             self.magnification = reference_mpp_1x / self.mpp
@@ -147,6 +149,8 @@ class NucleiPatchDataset(Dataset):
             # Default to provided magnification for PIL and numpy
             self.magnification = magnification
             # Estimate MPP from magnification (if not provided)
+            # Note: slide will be opened later in _open_slide() and dimensions will be set there
+            self.slide_dimensions = None
             if magnification is not None:
                 self.mpp = 10.0 / magnification
             else:
@@ -263,23 +267,30 @@ class NucleiPatchDataset(Dataset):
         if self.read_image_method == 'openslide':
             import openslide
             self.slide = openslide.OpenSlide(self.slide_path)
+            self.slide_dimensions = self.slide.dimensions
         elif self.read_image_method == 'tiffslide':
             import tiffslide
             self.slide = tiffslide.TiffSlide(self.slide_path)
+            self.slide_dimensions = self.slide.dimensions
         elif self.read_image_method == 'vips':
             self.slide = VipsSlide(self.slide_path)
+            self.slide_dimensions = self.slide.dimensions
         elif self.read_image_method == 'PIL':
             self.slide = PILSlide(self.slide_path)
+            self.slide_dimensions = self.slide.dimensions
         elif self.read_image_method == 'numpy':
             self.slide = NumpySlide(self.slide_path)
+            self.slide_dimensions = self.slide.dimensions
         elif self.read_image_method == 'dicom':
             self.slide = DicomImageWrapper(self.slide_path)
+            self.slide_dimensions = self.slide.dimensions
         else:
             file_extension = pathlib.Path(self.slide_path).suffix.lower()[1:]
             if file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
                 self.slide = SimpleImageWrapper(self.slide_path)
             else:
                 self.slide = TiffFileWrapper(self.slide_path)
+            self.slide_dimensions = self.slide.dimensions
         
         # Record initial slide open time (only once)
         self.perf_stats['slide_open_time'] += time.time() - slide_open_start
@@ -434,6 +445,39 @@ class NucleiPatchDataset(Dataset):
             # Fallback: open slide if not already opened (shouldn't happen)
             self._open_slide()
         
+        # Boundary checking: ensure coordinates and size are within image bounds
+        # This is critical for edge cells where pyvips fetch might fail
+        # Reference: nuc_stat.py lines 395-399
+        # Get slide dimensions if not already stored
+        if not hasattr(self, 'slide_dimensions') or self.slide_dimensions is None:
+            if hasattr(self.slide, 'dimensions'):
+                self.slide_dimensions = self.slide.dimensions
+            elif hasattr(self.slide, 'level_dimensions'):
+                self.slide_dimensions = self.slide.level_dimensions[0]
+            else:
+                # Fallback: try to get dimensions from slide properties
+                raise ValueError(f"Cannot determine slide dimensions for {self.read_image_method}")
+        slide_width, slide_height = self.slide_dimensions[0], self.slide_dimensions[1]
+        
+        # Ensure starting coordinates are within bounds
+        x1 = max(0, int(x1))
+        y1 = max(0, int(y1))
+        
+        # Ensure the requested region doesn't exceed image boundaries
+        # Adjust width and height if necessary
+        x2 = min(x1 + width, slide_width)
+        y2 = min(y1 + height, slide_height)
+        
+        # Recalculate width and height after boundary adjustment
+        width = x2 - x1
+        height = y2 - y1
+        
+        # Skip if the region is too small (shouldn't happen, but safety check)
+        if width <= 0 or height <= 0:
+            print(f"Warning: Invalid patch size for cell {idx} at ({x1}, {y1}): {width}x{height}, creating empty patch")
+            patch = Image.new("RGB", (self.patch_size, self.patch_size), (0, 0, 0))
+            return patch
+        
         # Measure read_region time (slide is already open, no open overhead)
         # OPTIMIZATION: Use as_array=True for TiffSlide/OpenSlide to get numpy directly
         # This avoids PIL Image creation and subsequent PIL->numpy conversion
@@ -467,6 +511,12 @@ class NucleiPatchDataset(Dataset):
                     size=(width, height)
                 )
                 use_numpy_direct = False
+            except Exception as e:
+                # Handle edge cases where fetch fails (e.g., pyvips fetch error for edge cells)
+                # Reference: nuc_stat.py lines 571-574
+                print(f"Error reading region for cell {idx} at ({x1}, {y1}) size ({width}, {height}): {str(e)}")
+                # Create empty patch with requested size, will be resized later
+                patch = np.zeros((height, width, 3), dtype=np.uint8)
         else:
             # For other methods (PIL, numpy), use standard read_region
             patch = self.slide.read_region(
