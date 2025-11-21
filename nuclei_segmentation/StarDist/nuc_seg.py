@@ -1,5 +1,20 @@
 # -*- coding: utf-8 -*-
 
+# CRITICAL: Set environment variables BEFORE importing TensorFlow/StarDist
+# Configure for optimal performance (using GPU if available!)
+import os
+os.environ['OMP_NUM_THREADS'] = '16'       # Limit OpenMP threads
+os.environ['MKL_NUM_THREADS'] = '16'      # Limit MKL threads
+# Use GPU if available - H200 GPUs will be MUCH faster than CPU!
+# os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Uncomment to force CPU
+
+# Import Intel Extension for TensorFlow (works great on AMD EPYC too!)
+try:
+    import intel_extension_for_tensorflow as itex
+    # Just importing ITEX is enough - it automatically optimizes TensorFlow
+    print("✓ Intel Extension for TensorFlow loaded")
+except ImportError:
+    print("Intel Extension for TensorFlow not available, using standard TensorFlow")
 
 from stardist.models import StarDist2D
 from stardist.data import test_image_nuclei_2d
@@ -15,7 +30,6 @@ from PIL import Image, ImageOps, ImageDraw
 import cv2
 import skimage
 from tqdm import tqdm
-import os
 from datetime import datetime
 from multiprocessing import Process, Queue, Pool
 from scipy.ndimage import zoom
@@ -101,6 +115,14 @@ class SlideSegmentation():
         else:
             print(f"Local model not found at {local_model_path}, attempting to download...")
             self.model = StarDist2D.from_pretrained(stardist_pretrain)
+        
+        # Optimize model prediction performance
+        try:
+            from server.optimize_stardist import optimize_model_prediction, configure_tensorflow_optimizations
+            configure_tensorflow_optimizations()
+            self.model = optimize_model_prediction(self.model)
+        except Exception as e:
+            print(f"Warning: Could not optimize model: {e}")
         
         self.level = 0
         try:

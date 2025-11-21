@@ -38,6 +38,15 @@ from collections import OrderedDict
 import gc
 from os.path import join
 
+base = os.path.dirname(os.path.abspath(__file__))
+vips_bin_dir = os.path.join(base, "vips", "bin")
+
+# Configure DLL path for Windows
+if platform.system() == 'Windows':
+    # Add to PATH environment variable (required for pyvips on Windows)
+    if vips_bin_dir not in os.environ.get('PATH', ''):
+        os.environ['PATH'] = vips_bin_dir + os.pathsep + os.environ.get('PATH', '')
+
 # Try importing specialized slide libraries, with fallbacks
 try:
     import openslide
@@ -48,8 +57,10 @@ except ImportError:
 try:
     import pyvips
     VIPS_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError) as e:
     VIPS_AVAILABLE = False
+    print(f"Warning: pyvips import failed: {e}")
+    print(f"  Make sure libvips DLLs are available in: {vips_bin_dir}")
 
 
 class PILSlide():
@@ -108,6 +119,16 @@ class NumpySlide():
 
 class VipsSlide():
     """Efficient slide implementation using libvips."""
+    _VIPS_FORMAT_TO_DTYPE = {
+        'uchar': np.uint8,
+        'char': np.int8,
+        'ushort': np.uint16,
+        'short': np.int16,
+        'uint': np.uint32,
+        'int': np.int32,
+        'float': np.float32,
+        'double': np.float64,
+    }
     
     def __init__(self, filepath):
         super(VipsSlide, self).__init__()
@@ -116,17 +137,42 @@ class VipsSlide():
         
         print('Reading slide with libvips...')
         st = time.time()
-        self.wsi = pyvips.Image.new_from_file(filepath, access="sequential")
+        self.wsi = pyvips.Image.new_from_file(filepath, access="random")
+        self.region = pyvips.Region.new(self.wsi)
         et = time.time()
         print(f'Done. Time elapsed: {et-st} seconds.')
         self.dimensions = (self.wsi.width, self.wsi.height)
         
-    def read_region(self, location, level=0, size=(100,100)):
-        # Extract region using libvips
-        region = self.wsi.crop(location[0], location[1], size[0], size[1])
+    def read_region(self, location, level=0, size=(100,100), as_array=False):
+        # Extract region using fast fetch (pyvips Region)
+        x, y = location
+        w, h = size
+        region = self.region.fetch(x, y, w, h)
+        if as_array:
+            return self._region_to_numpy(region, w, h)
+        # Region fetch returns a memoryview-compatible bytes object; wrap as Image
+        patch_image = pyvips.Image.new_from_memory(region, w, h, self.wsi.bands, self.wsi.format)
+        
         # Convert to PIL image
-        mem_buffer = region.write_to_memory()
-        return PIL.Image.frombuffer('RGB', (region.width, region.height), mem_buffer, 'raw', 'RGB', 0, 1)
+        mem_buffer = patch_image.write_to_memory()
+        return PIL.Image.frombuffer('RGB', (patch_image.width, patch_image.height), mem_buffer, 'raw', 'RGB', 0, 1)
+
+    def _region_to_numpy(self, region_buffer, width, height):
+        """Convert a pyvips Region fetch buffer to a detached numpy array."""
+        band_format = getattr(self.wsi, 'format', 'uchar')
+        dtype = self._VIPS_FORMAT_TO_DTYPE.get(str(band_format).lower())
+        if dtype is None:
+            raise ValueError(f"Unsupported VIPS band format: {band_format}")
+        expected = width * height * self.wsi.bands
+        np_view = np.frombuffer(region_buffer, dtype=dtype, count=expected)
+        np_view = np_view.reshape(height, width, self.wsi.bands).copy()
+        if np_view.ndim == 2:
+            np_view = np.repeat(np_view[:, :, np.newaxis], 3, axis=2)
+        elif np_view.shape[2] == 1:
+            np_view = np.repeat(np_view, 3, axis=2)
+        elif np_view.shape[2] >= 4:
+            np_view = np_view[:, :, :3]
+        return np_view.astype(np.uint8, copy=False)
 
 
 class SlideProperty():

@@ -180,3 +180,6 @@ cython_debug/
 # TotalSegmentator model weights (very large files)
 tissue_segmentation/TotalSegmentator/models/nnunet/results/
 tissue_segmentation/TotalSegmentator/TotalSegmentator-master/tests/
+
+# Vips
+vips/
