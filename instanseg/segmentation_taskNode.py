@@ -483,7 +483,8 @@ def run_segmentation(args):
                 batch_size=args.batch_size,
                 overlap=args.overlap,
                 normalise=args.normalise,
-                use_otsu_threshold=args.use_otsu
+                use_otsu_threshold=args.use_otsu,
+                use_tissue_mask=args.use_otsu is False  # if not Otsu, allow color-based mask
             )
             inference_time = time.time() - inference_start
             print(f"[SEG LOG] Inference completed in {inference_time:.2f}s")
