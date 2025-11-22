@@ -527,16 +527,11 @@ class NucleiPatchDataset(Dataset):
                 if self._tiff_handle is not None:
                     tif = self._tiff_handle
                     close_after = False
-                    # Print once to confirm using persistent handle
-                    if idx == 0:
-                        print(f"[PERF] Using persistent TiffFile handle for z-stack (avoids {len(self.centroids) * self.num_z_layers:,} file open operations!)")
                 else:
                     # Fallback: open temporarily (slower)
                     import tifffile
                     tif = tifffile.TiffFile(self.slide_path)
                     close_after = True
-                    if idx == 0:
-                        print(f"[WARNING] Persistent TiffFile handle not available - performance will be degraded")
                 
                 try:
                     # Access the specific z-layer page
@@ -549,8 +544,6 @@ class NucleiPatchDataset(Dataset):
                     # Use cached zarr array if available (avoids repeated aszarr() calls)
                     if z_layer not in self._zarr_cache:
                         self._zarr_cache[z_layer] = zarr_lib.open(page.aszarr(), mode='r')
-                        if idx < 5:  # Print for first few cells
-                            print(f"[PERF] Cached zarr array for layer {z_layer} (reused for all {len(self.centroids):,} cells)")
                     zarr_array = self._zarr_cache[z_layer]
                     
                     # Read only the required region (efficient - no full layer load!)
