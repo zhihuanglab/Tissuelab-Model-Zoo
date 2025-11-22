@@ -64,7 +64,7 @@ class NucleiPatchDataset(Dataset):
         }
         
         # Pre-compute bounding boxes from contours if available (very efficient - just numpy operations)
-        self.use_bounding_boxes = (contours is not None and len(contours) == len(centroids))
+        self.use_bounding_boxes = False
         if self.use_bounding_boxes:
             print(f"Using contour-based bounding boxes for patch extraction (padding: {padding_ratio*100}%)")
             self._compute_bounding_boxes()
@@ -153,32 +153,69 @@ class NucleiPatchDataset(Dataset):
         # Note: _open_slide() will be called after magnification is determined to reuse the slide
         
         # Get magnification and MPP from slide
+        # FIXED: Prioritize tiffslide/openslide for accurate MPP reading (same as old code)
         # Open slide once and reuse it for both MPP reading and patch extraction
         self.mpp = None
+        self.magnification = None
+        
+        # FIXED: Try tiffslide/openslide first to get accurate MPP (same as old code)
+        # This ensures magnification is calculated correctly even when using vips
+        if read_image_method in ['vips', 'PIL', 'numpy', 'dicom']:
+            # For methods that can't read MPP directly, try tiffslide/openslide first
+            try:
+                import tiffslide
+                temp_slide = tiffslide.TiffSlide(slide_path)
+                self.mpp = float(temp_slide.properties['tiffslide.mpp-x'])
+                reference_mpp_1x = 10  # objective magnification
+                self.magnification = reference_mpp_1x / self.mpp
+                temp_slide.close()
+                print(f"[FIXED] Read MPP using tiffslide: {self.mpp:.4f}, magnification: {self.magnification:.2f}x")
+            except Exception:
+                try:
+                    import openslide
+                    temp_slide = openslide.OpenSlide(slide_path)
+                    self.mpp = float(temp_slide.properties['openslide.mpp-x'])
+                    reference_mpp_1x = 10
+                    self.magnification = reference_mpp_1x / self.mpp
+                    temp_slide.close()
+                    print(f"[FIXED] Read MPP using openslide: {self.mpp:.4f}, magnification: {self.magnification:.2f}x")
+                except Exception:
+                    # Fallback to provided magnification
+                    self.magnification = magnification
+                    if magnification is not None:
+                        self.mpp = 10.0 / magnification
+                    else:
+                        self.mpp = 0.25  # Default 40x equivalent
+                    print(f"[WARNING] Could not read MPP, using provided magnification: {self.magnification}x")
+        
         if read_image_method == 'openslide':
             import openslide
             self.slide = openslide.OpenSlide(slide_path)
             self.slide_dimensions = self.slide.dimensions
-            self.mpp = float(self.slide.properties['openslide.mpp-x'])
-            reference_mpp_1x = 10  # objective magnification
-            self.magnification = reference_mpp_1x / self.mpp
+            if self.mpp is None:
+                self.mpp = float(self.slide.properties['openslide.mpp-x'])
+                reference_mpp_1x = 10  # objective magnification
+                self.magnification = reference_mpp_1x / self.mpp
         elif read_image_method == 'tiffslide':
             import tiffslide
             self.slide = tiffslide.TiffSlide(slide_path)
             self.slide_dimensions = self.slide.dimensions
-            self.mpp = float(self.slide.properties['tiffslide.mpp-x'])
-            reference_mpp_1x = 10  # objective magnification
-            self.magnification = reference_mpp_1x / self.mpp
+            if self.mpp is None:
+                self.mpp = float(self.slide.properties['tiffslide.mpp-x'])
+                reference_mpp_1x = 10  # objective magnification
+                self.magnification = reference_mpp_1x / self.mpp
         else:
             # Default to provided magnification for PIL and numpy
-            self.magnification = magnification
+            if self.magnification is None:
+                self.magnification = magnification
             # Estimate MPP from magnification (if not provided)
             # Note: slide will be opened later in _open_slide() and dimensions will be set there
             self.slide_dimensions = None
-            if magnification is not None:
-                self.mpp = 10.0 / magnification
-            else:
-                self.mpp = 0.25  # Default 40x equivalent
+            if self.mpp is None:
+                if self.magnification is not None:
+                    self.mpp = 10.0 / self.magnification
+                else:
+                    self.mpp = 0.25  # Default 40x equivalent
             # Open slide for PIL/numpy/dicom methods
             self._open_slide()
         
@@ -186,26 +223,13 @@ class NucleiPatchDataset(Dataset):
         if self.slide is not None:
             print(f"[PERF] Opened slide object for reuse (will save ~21% DataLoader overhead)")
         
-        # If not using bounding boxes, calculate extraction_size for fixed-size patches
-        if not self.use_bounding_boxes:
-            # Extract a fixed physical size (e.g., 10-15 microns) regardless of magnification
-            # This ensures we get a consistent cell-sized patch, not a huge tissue region
-            target_physical_size_microns = 12.0  # ~12 microns - good for most nuclei with some context
-            
-            # Calculate extraction_size in pixels based on physical size
-            if self.mpp is not None:
-                self.extraction_size = int(target_physical_size_microns / self.mpp)
-                # Ensure minimum size for model input (will upsample if needed)
-                self.extraction_size = max(self.extraction_size, patch_size // 2)
-                print(f"Magnification: {self.magnification}x, MPP: {self.mpp:.4f}")
-                print(f"Target physical size: {target_physical_size_microns} microns")
-                print(f"Extraction size: {self.extraction_size} pixels (physical: {self.extraction_size * self.mpp:.2f} microns)")
-            else:
-                # Fallback: use conservative scale factor
-                self.scale_factor = 1.5  # Much smaller than before (was 40/magnification)
-                self.extraction_size = int(self.patch_size * self.scale_factor)
-                print(f"Magnification: {self.magnification}x (MPP unknown, using fallback)")
-                print(f"Scale factor: {self.scale_factor}, Extraction size: {self.extraction_size} pixels")
+        # FIXED: Use the same calculation method as old code (centroid-based fixed-size extraction)
+        # Calculate extraction_size using the same formula as old code
+        self.scale_factor = 40 / self.magnification
+        self.extraction_size = int(self.patch_size * self.scale_factor)
+        print("Magnification:", self.magnification)
+        print("Scale factor:", self.scale_factor)
+        print(f"Extraction size: {self.extraction_size} pixels")
 
     def _detect_zstack(self):
         """Detect if the image is a z-stack (multi-layer) image"""
