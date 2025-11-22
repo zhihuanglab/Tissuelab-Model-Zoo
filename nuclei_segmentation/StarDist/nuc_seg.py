@@ -3,8 +3,22 @@
 # CRITICAL: Set environment variables BEFORE importing TensorFlow/StarDist
 # Configure for optimal performance (using GPU if available!)
 import os
-os.environ['OMP_NUM_THREADS'] = '16'       # Limit OpenMP threads
-os.environ['MKL_NUM_THREADS'] = '16'      # Limit MKL threads
+
+# Dynamic CPU thread limits based on server core count
+import multiprocessing
+cpu_count = multiprocessing.cpu_count()
+if cpu_count > 64:
+    # High-core server detected: Apply strict thread limits to prevent CPU overload
+    os.environ['TF_NUM_INTEROP_THREADS'] = '2'
+    os.environ['TF_NUM_INTRAOP_THREADS'] = '16'
+    os.environ['OMP_NUM_THREADS'] = '16'
+    os.environ['MKL_NUM_THREADS'] = '16'
+    print(f"High-core server ({cpu_count} cores) detected: Limiting TensorFlow threads")
+else:
+    # Normal server/workstation: Use reasonable defaults
+    os.environ['OMP_NUM_THREADS'] = '16'       # Limit OpenMP threads
+    os.environ['MKL_NUM_THREADS'] = '16'      # Limit MKL threads
+
 # Use GPU if available - H200 GPUs will be MUCH faster than CPU!
 # os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Uncomment to force CPU
 
@@ -36,6 +50,13 @@ from scipy.ndimage import zoom
 from skimage.feature import graycomatrix, graycoprops
 from skimage import draw
 import tensorflow as tf
+
+# Apply TensorFlow thread limits directly (after TF import)
+if cpu_count > 64:
+    tf.config.threading.set_inter_op_parallelism_threads(2)
+    tf.config.threading.set_intra_op_parallelism_threads(16)
+    print("TensorFlow thread limits applied: inter_op=2, intra_op=16")
+
 from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
 import tiffslide
 from collections import defaultdict
@@ -104,6 +125,8 @@ class SlideSegmentation():
         
         self.read_data()
         
+        # Detect if this is a z-stack image and set the middle layer for segmentation
+        self._detect_zstack()
         
         self.wsi_mask = self.simple_get_mask()
         
@@ -224,7 +247,29 @@ class SlideSegmentation():
     def _detect_zstack(self):
         """Detect if the image is a z-stack and determine the middle layer for segmentation"""
         try:
-            # Method 1: Try tiffslide for multi-series files (like ndpi z-stack)
+            # Method 1: Use ndpi_utils for robust z-stack detection (based on NDPIReader.java logic)
+            try:
+                from ndpi_utils import analyze_ndpi_structure
+                meta = analyze_ndpi_structure(self.args.slidepath)
+                sizeZ = meta["sizeZ"]
+                
+                if sizeZ > 1:
+                    self.is_zstack = True
+                    self.num_z_layers = sizeZ
+                    self.z_layer_for_segmentation = sizeZ // 2
+                    print(f"Z-stack detected: {sizeZ} layers (via ndpi_utils), using layer {self.z_layer_for_segmentation} for segmentation")
+                    # Store in args for passing to embedding stage
+                    self.args.z_layer_for_segmentation = self.z_layer_for_segmentation
+                    self.args.is_zstack = True
+                    self.args.num_z_layers = sizeZ
+                    return
+                else:
+                    print(f"Single-layer image detected (sizeZ={sizeZ})")
+                    return
+            except Exception as e:
+                print(f"ndpi_utils detection failed: {e}, falling back to legacy detection")
+            
+            # Method 2: Try tiffslide for multi-series files (like ndpi z-stack)
             try:
                 import tiffslide
                 with tiffslide.TiffSlide(self.args.slidepath) as slide:
