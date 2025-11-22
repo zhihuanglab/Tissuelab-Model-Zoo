@@ -432,9 +432,8 @@ class NucleiPatchDataset(Dataset):
             # Ensure we never return None to maintain embedding order
             # If extraction failed, return an empty patch instead
             if result is None:
-                import numpy as np
-                from PIL import Image
                 # Return empty patch to maintain order (will be processed but produce zero embedding)
+                # numpy is already imported at module level
                 if isinstance(self.patch_size, (int, float)):
                     patch_size = int(self.patch_size)
                 else:
@@ -447,7 +446,7 @@ class NucleiPatchDataset(Dataset):
         except Exception as e:
             print(f"Error processing centroid {self.centroids[idx]}: {str(e)}")
             # Return empty patch instead of None to maintain embedding order
-            import numpy as np
+            # numpy is already imported at module level
             if isinstance(self.patch_size, (int, float)):
                 patch_size = int(self.patch_size)
             else:
