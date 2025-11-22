@@ -53,11 +53,11 @@ class NucleiPatchDataset(Dataset):
             'processor_pil_to_numpy_time': 0.0,  # Time for PIL to numpy conversion
             'processor_stack_time': 0.0,  # Time for stacking arrays (vectorized path)
             'processor_astype_time': 0.0,  # Time for type conversion (uint8 to float32)
-            'processor_normalize_time': 0.0,  # Time for ImageNet normalization (direct from uint8)
+            'processor_normalize_time': 0.0,  # Time for CLIP normalization (direct from uint8)
             'processor_transpose_in_convert_time': 0.0,  # Time for transpose during convert (HWC->CHW)
             'processor_convert_normalize_time': 0.0,  # Total time for type conversion and normalization
             'processor_transpose_time': 0.0,  # Time for final transpose check (should be minimal now)
-            'processor_imagenet_norm_time': 0.0,  # Time for ImageNet normalization
+            'processor_imagenet_norm_time': 0.0,  # Time for CLIP normalization
             'processor_total_time': 0.0,  # Total processor time
             'total_calls': 0,
             'slide_open_time': 0.0  # Time spent opening slide objects
@@ -1081,15 +1081,15 @@ class NucleiPatchDataset(Dataset):
                 # (C, H, W) -> (H, W, C)
                 processed_patch = np.transpose(processed_patch, (1, 2, 0))
             
-            # Denormalize: PLIP typically normalizes to [0, 1] or uses ImageNet stats
+            # Denormalize: PLIP typically normalizes to [0, 1] or uses CLIP stats
             # Try to detect normalization and denormalize
             if processed_patch.max() <= 1.0:
                 # Likely normalized to [0, 1]
                 processed_patch = (processed_patch * 255).astype(np.uint8)
             elif processed_patch.min() < 0:
-                # Likely standardized (mean/std normalization) - use ImageNet stats
-                mean = np.array([0.485, 0.456, 0.406])
-                std = np.array([0.229, 0.224, 0.225])
+                # Likely standardized (mean/std normalization) - use CLIP stats
+                mean = np.array([0.48145466, 0.4578275, 0.40821073])
+                std = np.array([0.26862954, 0.26130258, 0.27577711])
                 processed_patch = processed_patch * std + mean
                 processed_patch = np.clip(processed_patch, 0, 1)
                 processed_patch = (processed_patch * 255).astype(np.uint8)
@@ -1133,23 +1133,23 @@ class NucleiPatchDataset(Dataset):
             import traceback
             traceback.print_exc()
 
-# Pre-compute ImageNet normalization constants (module-level for reuse)
-# For uint8 input [0, 255], directly apply ImageNet norm: (x - mean*255) / (std*255)
+# Pre-compute CLIP normalization constants (module-level for reuse)
+# For uint8 input [0, 255], directly apply CLIP norm: (x - mean*255) / (std*255)
 # This avoids the intermediate step of normalizing to [0, 1] first
-_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+_CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
+_CLIP_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
 # Pre-compute constants for uint8 input (no need for /255 step)
-_IMAGENET_MEAN_UINT8 = _IMAGENET_MEAN * 255.0  # [123.675, 116.28, 103.53]
-_IMAGENET_STD_UINT8 = _IMAGENET_STD * 255.0    # [58.395, 57.12, 57.375]
-_IMAGENET_INV_STD_UINT8 = 1.0 / _IMAGENET_STD_UINT8  # Pre-compute division constant
-_IMAGENET_MEAN_TIMES_INV_STD_UINT8 = _IMAGENET_MEAN_UINT8 * _IMAGENET_INV_STD_UINT8
+_CLIP_MEAN_UINT8 = _CLIP_MEAN * 255.0  # CLIP mean scaled to uint8 range
+_CLIP_STD_UINT8 = _CLIP_STD * 255.0    # CLIP std scaled to uint8 range
+_CLIP_INV_STD_UINT8 = 1.0 / _CLIP_STD_UINT8  # Pre-compute division constant
+_CLIP_MEAN_TIMES_INV_STD_UINT8 = _CLIP_MEAN_UINT8 * _CLIP_INV_STD_UINT8
 
 # PyTorch tensor constants for GPU normalization (faster than numpy)
-_IMAGENET_MEAN_TENSOR = None  # Will be initialized on first use
-_IMAGENET_STD_TENSOR = None   # Will be initialized on first use
+_CLIP_MEAN_TENSOR = None  # Will be initialized on first use
+_CLIP_STD_TENSOR = None   # Will be initialized on first use
 
-def _normalize_imagenet_gpu(tensor, device):
-    """Normalize ImageNet on GPU using PyTorch (faster than CPU numpy).
+def _normalize_clip_gpu(tensor, device):
+    """Normalize CLIP on GPU using PyTorch (faster than CPU numpy).
     
     Args:
         tensor: torch.Tensor of shape (N, C, H, W) with float32 values [0, 255] (already converted from uint8)
@@ -1158,18 +1158,18 @@ def _normalize_imagenet_gpu(tensor, device):
     Returns:
         Normalized tensor of shape (N, C, H, W) with float32 values
     """
-    global _IMAGENET_MEAN_TENSOR, _IMAGENET_STD_TENSOR
+    global _CLIP_MEAN_TENSOR, _CLIP_STD_TENSOR
     
     # Initialize constants on first use (lazy initialization)
-    if _IMAGENET_MEAN_TENSOR is None or _IMAGENET_MEAN_TENSOR.device != device:
-        _IMAGENET_MEAN_TENSOR = torch.tensor(_IMAGENET_MEAN_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
-        _IMAGENET_STD_TENSOR = torch.tensor(_IMAGENET_STD_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+    if _CLIP_MEAN_TENSOR is None or _CLIP_MEAN_TENSOR.device != device:
+        _CLIP_MEAN_TENSOR = torch.tensor(_CLIP_MEAN_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+        _CLIP_STD_TENSOR = torch.tensor(_CLIP_STD_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
     
     # OPTIMIZATION: Tensor is already float32 on GPU, so just normalize directly
-    # Standard ImageNet normalization: (x - mean) / std
+    # CLIP normalization: (x - mean) / std
     # PyTorch will fuse these operations automatically on GPU
     # Using in-place operations where possible for better memory efficiency
-    normalized = (tensor - _IMAGENET_MEAN_TENSOR) / _IMAGENET_STD_TENSOR
+    normalized = (tensor - _CLIP_MEAN_TENSOR) / _CLIP_STD_TENSOR
     return normalized
 
 def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return_uint8=False):
@@ -1212,8 +1212,8 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
         # If return_uint8, use uint8 dtype (faster, less memory), else use float32 for normalized data
         batch_array = np.empty((num_images, 3, h, w), dtype=np.uint8 if return_uint8 else np.float32, order='C')
         
-        # OPTIMIZATION 2: Direct ImageNet normalization from uint8 (no intermediate /255 step)
-        # We skip the * inv_255 normalization since ImageNet norm will handle it
+        # OPTIMIZATION 2: Direct CLIP normalization from uint8 (no intermediate /255 step)
+        # We skip the * inv_255 normalization since CLIP norm will handle it
         
         # OPTIMIZATION: Vectorized batch processing when possible
         # Check if all images are numpy arrays (can be fully vectorized)
@@ -1287,18 +1287,18 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                             transposed = stacked.transpose(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
                             batch_array[:] = transposed  # Copy into pre-allocated array
                         else:
-                            # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
+                            # OPTIMIZATION: Merge astype and CLIP normalization - single batch conversion
                             # Convert entire batch once, then process all channels (more efficient than per-channel conversion)
                             normalize_start = time.time()
                             # Single astype for entire batch (more efficient than per-channel)
                             float_batch = stacked.astype(np.float32)
-                            # Vectorized ImageNet normalization for all channels
-                            np.multiply(float_batch[:, :, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
-                            batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                            np.multiply(float_batch[:, :, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
-                            batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                            np.multiply(float_batch[:, :, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
-                            batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                            # Vectorized CLIP normalization for all channels
+                            np.multiply(float_batch[:, :, :, 0], _CLIP_INV_STD_UINT8[0], out=batch_array[:, 0])
+                            batch_array[:, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                            np.multiply(float_batch[:, :, :, 1], _CLIP_INV_STD_UINT8[1], out=batch_array[:, 1])
+                            batch_array[:, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                            np.multiply(float_batch[:, :, :, 2], _CLIP_INV_STD_UINT8[2], out=batch_array[:, 2])
+                            batch_array[:, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                             normalize_time = time.time() - normalize_start
                             if perf_stats is not None:
                                 # Astype is now merged into normalize_time (single batch conversion is faster)
@@ -1313,15 +1313,15 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                             transposed = stacked[:, :, :, :3].transpose(0, 3, 1, 2)  # (N, H, W, 3) -> (N, 3, H, W)
                             batch_array[:] = transposed  # Copy into pre-allocated array
                         else:
-                            # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
+                            # OPTIMIZATION: Merge astype and CLIP normalization - single batch conversion
                             normalize_start = time.time()
                             float_batch = stacked[:, :, :, :3].astype(np.float32)
-                            np.multiply(float_batch[:, :, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
-                            batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                            np.multiply(float_batch[:, :, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
-                            batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                            np.multiply(float_batch[:, :, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
-                            batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                            np.multiply(float_batch[:, :, :, 0], _CLIP_INV_STD_UINT8[0], out=batch_array[:, 0])
+                            batch_array[:, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                            np.multiply(float_batch[:, :, :, 1], _CLIP_INV_STD_UINT8[1], out=batch_array[:, 1])
+                            batch_array[:, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                            np.multiply(float_batch[:, :, :, 2], _CLIP_INV_STD_UINT8[2], out=batch_array[:, 2])
+                            batch_array[:, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                             normalize_time = time.time() - normalize_start
                             if perf_stats is not None:
                                 perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
@@ -1330,15 +1330,15 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                     elif len(stacked.shape) == 3 and stacked.shape[1:] == (h, w):
                         # Grayscale 2D - direct write using out parameter (zero-copy)
                         convert_start = time.time()
-                        # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
+                        # OPTIMIZATION: Merge astype and CLIP normalization - single batch conversion
                         normalize_start = time.time()
                         float_batch = stacked.astype(np.float32)
-                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
-                        batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
-                        batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
-                        batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                        np.multiply(float_batch, _CLIP_INV_STD_UINT8[0], out=batch_array[:, 0])
+                        batch_array[:, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                        np.multiply(float_batch, _CLIP_INV_STD_UINT8[1], out=batch_array[:, 1])
+                        batch_array[:, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                        np.multiply(float_batch, _CLIP_INV_STD_UINT8[2], out=batch_array[:, 2])
+                        batch_array[:, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
@@ -1347,15 +1347,15 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                     elif stacked.shape[1:] == (h, w, 1):
                         # Grayscale 3D - direct write using out parameter (zero-copy)
                         convert_start = time.time()
-                        # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
+                        # OPTIMIZATION: Merge astype and CLIP normalization - single batch conversion
                         normalize_start = time.time()
                         float_batch = stacked[:, :, :, 0].astype(np.float32)
-                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
-                        batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
-                        batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
-                        batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                        np.multiply(float_batch, _CLIP_INV_STD_UINT8[0], out=batch_array[:, 0])
+                        batch_array[:, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                        np.multiply(float_batch, _CLIP_INV_STD_UINT8[1], out=batch_array[:, 1])
+                        batch_array[:, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                        np.multiply(float_batch, _CLIP_INV_STD_UINT8[2], out=batch_array[:, 2])
+                        batch_array[:, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
@@ -1385,75 +1385,75 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                         pil_conversion_time += time.time() - conv_start
                     
                     # Fast path: Standard RGB image (most common case - optimize this path)
-                    # OPTIMIZATION: Merge astype and ImageNet normalization
+                    # OPTIMIZATION: Merge astype and CLIP normalization
                     if arr_uint8.shape == (h, w, 3):
                         normalize_start = time.time()
                         float_img = arr_uint8.astype(np.float32)
-                        np.multiply(float_img[:, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[i, 0])
-                        batch_array[i, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                        np.multiply(float_img[:, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[i, 1])
-                        batch_array[i, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                        np.multiply(float_img[:, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[i, 2])
-                        batch_array[i, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                        np.multiply(float_img[:, :, 0], _CLIP_INV_STD_UINT8[0], out=batch_array[i, 0])
+                        batch_array[i, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                        np.multiply(float_img[:, :, 1], _CLIP_INV_STD_UINT8[1], out=batch_array[i, 1])
+                        batch_array[i, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                        np.multiply(float_img[:, :, 2], _CLIP_INV_STD_UINT8[2], out=batch_array[i, 2])
+                        batch_array[i, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     elif arr_uint8.ndim == 2:
-                        # Grayscale - merge astype and ImageNet normalization
+                        # Grayscale - merge astype and CLIP normalization
                         normalize_start = time.time()
                         float_img = arr_uint8.astype(np.float32)
-                        np.multiply(float_img, _IMAGENET_INV_STD_UINT8[0], out=batch_array[i, 0])
-                        batch_array[i, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                        np.multiply(float_img, _IMAGENET_INV_STD_UINT8[1], out=batch_array[i, 1])
-                        batch_array[i, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                        np.multiply(float_img, _IMAGENET_INV_STD_UINT8[2], out=batch_array[i, 2])
-                        batch_array[i, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                        np.multiply(float_img, _CLIP_INV_STD_UINT8[0], out=batch_array[i, 0])
+                        batch_array[i, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                        np.multiply(float_img, _CLIP_INV_STD_UINT8[1], out=batch_array[i, 1])
+                        batch_array[i, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                        np.multiply(float_img, _CLIP_INV_STD_UINT8[2], out=batch_array[i, 2])
+                        batch_array[i, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     elif arr_uint8.shape[2] == 4:
-                        # RGBA - merge astype and ImageNet normalization
+                        # RGBA - merge astype and CLIP normalization
                         normalize_start = time.time()
                         float_img = arr_uint8[:, :, :3].astype(np.float32)
-                        np.multiply(float_img[:, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[i, 0])
-                        batch_array[i, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                        np.multiply(float_img[:, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[i, 1])
-                        batch_array[i, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                        np.multiply(float_img[:, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[i, 2])
-                        batch_array[i, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                        np.multiply(float_img[:, :, 0], _CLIP_INV_STD_UINT8[0], out=batch_array[i, 0])
+                        batch_array[i, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                        np.multiply(float_img[:, :, 1], _CLIP_INV_STD_UINT8[1], out=batch_array[i, 1])
+                        batch_array[i, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                        np.multiply(float_img[:, :, 2], _CLIP_INV_STD_UINT8[2], out=batch_array[i, 2])
+                        batch_array[i, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     elif arr_uint8.shape[0] == h and arr_uint8.shape[1] == w and arr_uint8.shape[2] >= 3:
-                        # Multi-channel (>=3) - merge astype and ImageNet normalization
+                        # Multi-channel (>=3) - merge astype and CLIP normalization
                         normalize_start = time.time()
                         float_img = arr_uint8[:, :, :3].astype(np.float32)
-                        np.multiply(float_img[:, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[i, 0])
-                        batch_array[i, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                        np.multiply(float_img[:, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[i, 1])
-                        batch_array[i, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                        np.multiply(float_img[:, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[i, 2])
-                        batch_array[i, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                        np.multiply(float_img[:, :, 0], _CLIP_INV_STD_UINT8[0], out=batch_array[i, 0])
+                        batch_array[i, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                        np.multiply(float_img[:, :, 1], _CLIP_INV_STD_UINT8[1], out=batch_array[i, 1])
+                        batch_array[i, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                        np.multiply(float_img[:, :, 2], _CLIP_INV_STD_UINT8[2], out=batch_array[i, 2])
+                        batch_array[i, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     else:
-                        # Edge case: fallback to standard conversion with ImageNet normalization
+                        # Edge case: fallback to standard conversion with CLIP normalization
                         arr_float = np.array(img, dtype=np.float32)
-                        # Apply ImageNet normalization directly (no /255 step)
+                        # Apply CLIP normalization directly (no /255 step)
                         if arr_float.max() > 1.0:
-                            # uint8 input - apply ImageNet norm directly
-                            arr_float[:, :, 0] = (arr_float[:, :, 0] - _IMAGENET_MEAN_UINT8[0]) / _IMAGENET_STD_UINT8[0]
-                            arr_float[:, :, 1] = (arr_float[:, :, 1] - _IMAGENET_MEAN_UINT8[1]) / _IMAGENET_STD_UINT8[1]
-                            arr_float[:, :, 2] = (arr_float[:, :, 2] - _IMAGENET_MEAN_UINT8[2]) / _IMAGENET_STD_UINT8[2]
+                            # uint8 input - apply CLIP norm directly
+                            arr_float[:, :, 0] = (arr_float[:, :, 0] - _CLIP_MEAN_UINT8[0]) / _CLIP_STD_UINT8[0]
+                            arr_float[:, :, 1] = (arr_float[:, :, 1] - _CLIP_MEAN_UINT8[1]) / _CLIP_STD_UINT8[1]
+                            arr_float[:, :, 2] = (arr_float[:, :, 2] - _CLIP_MEAN_UINT8[2]) / _CLIP_STD_UINT8[2]
                         # Ensure correct shape and transpose to (C, H, W)
                         if arr_float.ndim == 2:
                             # Grayscale: (H, W) -> (H, W, 3) -> (3, H, W)
@@ -1465,15 +1465,15 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                             # Fallback: try to reshape
                             batch_array[i] = arr_float.reshape(3, h, w) if arr_float.size == 3*h*w else arr_float[:3].reshape(3, h, w)
                 except Exception:
-                    # Ultimate fallback: standard conversion with ImageNet normalization
+                    # Ultimate fallback: standard conversion with CLIP normalization
                     arr_float = np.array(img, dtype=np.float32)
-                    # Apply ImageNet normalization directly (no /255 step)
+                    # Apply CLIP normalization directly (no /255 step)
                     if arr_float.max() > 1.0:
-                        # uint8 input - apply ImageNet norm directly
+                        # uint8 input - apply CLIP norm directly
                         if arr_float.ndim == 3 and arr_float.shape[2] >= 3:
-                            arr_float[:, :, 0] = (arr_float[:, :, 0] - _IMAGENET_MEAN_UINT8[0]) / _IMAGENET_STD_UINT8[0]
-                            arr_float[:, :, 1] = (arr_float[:, :, 1] - _IMAGENET_MEAN_UINT8[1]) / _IMAGENET_STD_UINT8[1]
-                            arr_float[:, :, 2] = (arr_float[:, :, 2] - _IMAGENET_MEAN_UINT8[2]) / _IMAGENET_STD_UINT8[2]
+                            arr_float[:, :, 0] = (arr_float[:, :, 0] - _CLIP_MEAN_UINT8[0]) / _CLIP_STD_UINT8[0]
+                            arr_float[:, :, 1] = (arr_float[:, :, 1] - _CLIP_MEAN_UINT8[1]) / _CLIP_STD_UINT8[1]
+                            arr_float[:, :, 2] = (arr_float[:, :, 2] - _CLIP_MEAN_UINT8[2]) / _CLIP_STD_UINT8[2]
                     # Ensure correct shape and transpose to (C, H, W)
                     if arr_float.ndim == 2:
                         arr_float = np.repeat(arr_float[:, :, np.newaxis], 3, axis=2)
@@ -1505,10 +1505,10 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
         if perf_stats is not None:
             perf_stats['processor_transpose_time'] += transpose_end - transpose_start
         
-        # OPTIMIZATION: ImageNet normalization is already done during conversion above
-        # No separate ImageNet normalization step needed - already applied directly from uint8
+        # OPTIMIZATION: CLIP normalization is already done during conversion above
+        # No separate CLIP normalization step needed - already applied directly from uint8
         if perf_stats is not None:
-            # ImageNet norm time is now included in normalize_time
+            # CLIP norm time is now included in normalize_time
             perf_stats['processor_imagenet_norm_time'] += 0.0
         
         return batch_array
@@ -2317,7 +2317,7 @@ class NucleiEmbedding:
                                 tensor = torch.from_numpy(batch)
                                 processed_batch = tensor.to(self.device, dtype=torch.float32, non_blocking=False)
                             # Normalize on GPU (fused operations)
-                            processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
+                            processed_batch = _normalize_clip_gpu(processed_batch, self.device)
                         else:
                             # Data is already normalized (float32) - transfer directly using pinned memory
                             if torch.cuda.is_available() and self.device.type == 'cuda':
@@ -2339,7 +2339,7 @@ class NucleiEmbedding:
                             else:
                                 tensor = torch.from_numpy(batch_array)
                                 processed_batch = tensor.to(self.device, dtype=torch.float32, non_blocking=False)
-                            processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
+                            processed_batch = _normalize_clip_gpu(processed_batch, self.device)
                         else:
                             if torch.cuda.is_available() and self.device.type == 'cuda':
                                 pinned_tensor = torch.empty(batch_array.shape, dtype=torch.float32, pin_memory=True)
@@ -2359,7 +2359,7 @@ class NucleiEmbedding:
                             else:
                                 tensor = torch.from_numpy(batch_array)
                                 processed_batch = tensor.to(self.device, dtype=torch.float32, non_blocking=False)
-                            processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
+                            processed_batch = _normalize_clip_gpu(processed_batch, self.device)
                         else:
                             if torch.cuda.is_available() and self.device.type == 'cuda':
                                 pinned_tensor = torch.empty(batch_array.shape, dtype=torch.float32, pin_memory=True)
