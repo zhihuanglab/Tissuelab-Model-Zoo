@@ -1172,6 +1172,123 @@ def _normalize_clip_gpu(tensor, device):
     normalized = (tensor - _CLIP_MEAN_TENSOR) / _CLIP_STD_TENSOR
     return normalized
 
+def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
+    """GPU-accelerated preprocessing matching processor's behavior:
+    1. Resize shortest edge to target_size (maintain aspect ratio, BICUBIC)
+    2. Center crop to target_size x target_size
+    3. Normalize with CLIP statistics
+    
+    Args:
+        images: List of PIL Images or numpy arrays (H, W, C) with uint8 values [0, 255]
+        device: torch device to use
+        target_size: Target size for resize and crop (default: 224)
+        perf_stats: Optional dict to track preprocessing timing
+        
+    Returns:
+        torch.Tensor of shape (N, C, H, W) with normalized float32 values
+    """
+    import time
+    import numpy as np
+    from PIL import Image
+    
+    if len(images) == 0:
+        return torch.zeros((0, 3, target_size, target_size), device=device, dtype=torch.float32)
+    
+    preprocess_start = time.time()
+    
+    # Convert PIL Images to numpy arrays and ensure uint8 format
+    numpy_images = []
+    for img in images:
+        if isinstance(img, Image.Image):
+            # Convert PIL to numpy (H, W, C)
+            arr = np.array(img, dtype=np.uint8)
+            if len(arr.shape) == 2:
+                arr = np.repeat(arr[:, :, np.newaxis], 3, axis=2)
+            elif arr.shape[2] == 1:
+                arr = np.repeat(arr, 3, axis=2)
+            elif arr.shape[2] > 3:
+                arr = arr[:, :, :3]
+        elif isinstance(img, np.ndarray):
+            arr = img.astype(np.uint8) if img.dtype != np.uint8 else img
+            if len(arr.shape) == 2:
+                arr = np.repeat(arr[:, :, np.newaxis], 3, axis=2)
+            elif arr.shape[2] == 1:
+                arr = np.repeat(arr, 3, axis=2)
+            elif arr.shape[2] > 3:
+                arr = arr[:, :, :3]
+        else:
+            raise ValueError(f"Unsupported image type: {type(img)}")
+        numpy_images.append(arr)
+    
+    # Stack into batch (N, H, W, C) - handle variable sizes
+    # We'll process each image individually for resize/crop, then stack
+    processed_tensors = []
+    
+    for arr in numpy_images:
+        h, w = arr.shape[:2]
+        
+        # Convert to tensor and move to GPU (H, W, C) -> (1, C, H, W)
+        img_tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().to(device)
+        
+        # Step 1: Resize shortest edge to target_size (maintain aspect ratio)
+        # Processor uses BICUBIC (resample=3), which corresponds to mode='bicubic' in F.interpolate
+        # CRITICAL: Processor ALWAYS resizes shortest edge to target_size, even if already target_size
+        # This means processor will resize 224x224 images to 224x224 (identity resize with BICUBIC)
+        # We must match this behavior exactly!
+        shortest_edge = min(h, w)
+        
+        # Calculate scale factor based on shortest edge (always resize, even if scale=1.0)
+        scale = target_size / shortest_edge
+        new_h = int(round(h * scale))
+        new_w = int(round(w * scale))
+        
+        # Ensure at least target_size for both dimensions (for center crop)
+        if new_h < target_size:
+            new_h = target_size
+        if new_w < target_size:
+            new_w = target_size
+        
+        # ALWAYS resize using BICUBIC interpolation (matches processor's resample=3)
+        # This includes identity resize (224x224 -> 224x224) to match processor behavior
+        img_tensor = torch.nn.functional.interpolate(
+            img_tensor, 
+            size=(new_h, new_w), 
+            mode='bicubic', 
+            align_corners=False,
+            antialias=True  # Better quality for downscaling
+        )
+        
+        # Step 2: Center crop to target_size x target_size
+        if new_h != target_size or new_w != target_size:
+            # Calculate crop coordinates (center crop)
+            top = (new_h - target_size) // 2
+            left = (new_w - target_size) // 2
+            img_tensor = img_tensor[:, :, top:top+target_size, left:left+target_size]
+        
+        # Ensure final size is exactly target_size x target_size
+        if img_tensor.shape[2] != target_size or img_tensor.shape[3] != target_size:
+            # Final resize if crop didn't work (shouldn't happen, but safety check)
+            img_tensor = torch.nn.functional.interpolate(
+                img_tensor,
+                size=(target_size, target_size),
+                mode='bicubic',
+                align_corners=False,
+                antialias=True
+            )
+        
+        processed_tensors.append(img_tensor.squeeze(0))  # Remove batch dim: (C, H, W)
+    
+    # Stack all processed images: (N, C, H, W)
+    batch_tensor = torch.stack(processed_tensors, dim=0)
+    
+    # Step 3: Normalize with CLIP statistics (GPU-accelerated)
+    normalized_batch = _normalize_clip_gpu(batch_tensor, device)
+    
+    if perf_stats is not None:
+        perf_stats['gpu_preprocessing_time'] = perf_stats.get('gpu_preprocessing_time', 0) + (time.time() - preprocess_start)
+    
+    return normalized_batch
+
 def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return_uint8=False):
     """Ultra-fast batch preprocessing using optimized numpy operations with minimal overhead.
     
@@ -1931,36 +2048,10 @@ class NucleiEmbedding:
                     vision_outputs = self.model.vision_model(processed_batch)
                     image_embeds = vision_outputs.last_hidden_state.mean(dim=1)  # Mean pooling
                     embeddings = self.image_projection(image_embeds)
-                # OPTIMIZATION: Normalize on GPU before moving to CPU (faster)
-                # L2 normalization: embeddings / ||embeddings||
-                # Use more efficient normalization: torch.nn.functional.normalize is optimized
-                embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-                # Convert to float16 on device to avoid numpy-side copies
-                embeddings = embeddings.to(dtype=torch.float16)
-                # OPTIMIZATION: Use CUDA events to track only the operations we need, not all GPU work
-                if torch.cuda.is_available():
-                    # Record an event after normalize/to operations to track their completion
-                    # This is more efficient than synchronizing the entire device
-                    event = torch.cuda.Event()
-                    event.record()
-                    # Wait only for our specific operations to complete
-                    event.wait()
-                    # Create pinned tensor for faster transfer
-                    pinned_tensor = torch.empty(
-                        embeddings.shape, 
-                        dtype=torch.float16, 
-                        pin_memory=True
-                    )
-                    # Use async copy (non_blocking=True) - the event ensures normalize is done
-                    pinned_tensor.copy_(embeddings, non_blocking=True)
-                    # Record another event to track copy completion
-                    copy_event = torch.cuda.Event()
-                    copy_event.record()
-                    copy_event.wait()  # Wait only for copy to complete
-                    embeddings = pinned_tensor.numpy()
-                else:
-                    # CPU fallback
-                    embeddings = embeddings.cpu().numpy()
+                # Keep as float32 for numerical consistency with original implementation
+                # L2 normalization will be done in generate_embeddings postprocessing
+                embeddings = embeddings.to(dtype=torch.float32)
+                embeddings = embeddings.detach().cpu().numpy()
 
             return embeddings
 
@@ -2072,12 +2163,97 @@ class NucleiEmbedding:
                 # Single-layer on Windows: can use workers
                 print(f"Single-layer image on Windows: using {num_workers} workers")
         
+        # Performance profiling variables (needed for GPU preprocessing)
+        perf_stats = {
+            'dataloader_time': 0.0,
+            'preprocessing_time': 0.0,
+            'model_time': 0.0,
+            'postprocessing_time': 0.0,
+            'io_time': 0.0,
+            'total_batches': 0,
+            'total_samples': 0,
+            'gpu_preprocessing_time': 0.0  # Track GPU preprocessing time separately
+        }
+        
         # Disable persistent_workers when num_workers=0
         # Create collate function with processor for batch processing
-        # Use fast numpy-based preprocessing instead of slow transformers processor
-        from functools import partial
-        collate_fn_with_processor = partial(collate_patches, processor=self.processor, perf_stats=dataset.perf_stats, use_fast_preprocess=True)
-        print("[PERF] Using optimized fast preprocessing (numpy-based) instead of transformers processor")
+        # Use GPU-accelerated preprocessing for better performance while matching processor behavior
+        use_gpu_preprocess = torch.cuda.is_available()
+        
+        # Debug flag to log first image only
+        _debug_first_image_logged = {'value': False}
+        
+        if use_gpu_preprocess:
+            def collate_with_gpu_preprocess(batch):
+                """GPU-accelerated preprocessing matching processor's behavior:
+                1. Resize shortest edge to 224 (maintain aspect ratio, BICUBIC)
+                2. Center crop to 224x224
+                3. Normalize with CLIP statistics
+                """
+                if len(batch) == 0:
+                    return torch.zeros((0, 3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
+                
+                # Process all items, handling None values
+                processed_batch = []
+                for item in batch:
+                    if item is None:
+                        # Create empty normalized patch (will be normalized to zeros)
+                        empty_patch = torch.zeros((3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
+                        processed_batch.append(empty_patch)
+                    else:
+                        # Process single item with GPU preprocessing
+                        # Debug: Check input image size (only log first image)
+                        if not _debug_first_image_logged['value']:
+                            if isinstance(item, np.ndarray):
+                                item_h, item_w = item.shape[:2]
+                                print(f"[DEBUG] GPU preprocessing: input image size = {item_w}x{item_h}, target_size = {dataset.patch_size}")
+                                _debug_first_image_logged['value'] = True
+                            elif hasattr(item, 'size'):
+                                item_w, item_h = item.size
+                                print(f"[DEBUG] GPU preprocessing: input image size = {item_w}x{item_h}, target_size = {dataset.patch_size}")
+                                _debug_first_image_logged['value'] = True
+                        
+                        processed_tensor = _preprocess_clip_gpu([item], self.device, target_size=dataset.patch_size, perf_stats=perf_stats)
+                        processed_batch.append(processed_tensor.squeeze(0))  # Remove batch dimension: (C, H, W)
+                
+                return torch.stack(processed_batch, dim=0)  # Stack to (N, C, H, W)
+            
+            collate_fn = collate_with_gpu_preprocess
+            print("[PERF] Using GPU-accelerated preprocessing (resize + center crop + normalize) matching processor behavior")
+            print(f"[DEBUG] GPU preprocessing enabled: CUDA available={torch.cuda.is_available()}, device={self.device}")
+        else:
+            def collate_with_original_processor(batch):
+                """Use original transformers processor for consistency"""
+                if len(batch) == 0:
+                    return torch.zeros((0, 3, dataset.patch_size, dataset.patch_size), dtype=torch.float32)
+
+                processed_batch = []
+                for item in batch:
+                    if item is None:
+                        # Handle None values by creating empty patch
+                        empty_patch = torch.zeros((3, dataset.patch_size, dataset.patch_size), dtype=torch.float32)
+                        processed_batch.append(empty_patch)
+                    else:
+                        # Use original processor
+                        # Debug: Check input image size (only log first image)
+                        if not _debug_first_image_logged['value']:
+                            if isinstance(item, np.ndarray):
+                                item_h, item_w = item.shape[:2]
+                                print(f"[DEBUG] CPU processor: input image size = {item_w}x{item_h}, target_size = {dataset.patch_size}")
+                                _debug_first_image_logged['value'] = True
+                            elif hasattr(item, 'size'):
+                                item_w, item_h = item.size
+                                print(f"[DEBUG] CPU processor: input image size = {item_w}x{item_h}, target_size = {dataset.patch_size}")
+                                _debug_first_image_logged['value'] = True
+                        
+                        processed = self.processor(item, return_tensors="pt")['pixel_values']
+                        processed_batch.append(processed.squeeze(0))  # Remove batch dimension
+
+                return torch.stack(processed_batch, dim=0)
+
+            collate_fn = collate_with_original_processor
+            print("[PERF] Using original transformers processor (CPU mode - GPU not available)")
+            print(f"[DEBUG] CPU processor mode: CUDA available={torch.cuda.is_available()}, device={self.device}")
         
         # Enable pin_memory even with num_workers=0 to speed up CPU->GPU transfer
         # This uses pinned (page-locked) memory which allows faster async transfers
@@ -2088,10 +2264,10 @@ class NucleiEmbedding:
             batch_size=batch_size,
             num_workers=num_workers,
             shuffle=False,
-            collate_fn=collate_fn_with_processor,
+            collate_fn=collate_fn,
             prefetch_factor=4 if num_workers > 0 else None,  # Increased from 2 to 4 for better GPU utilization
             persistent_workers=True if num_workers > 0 else False,
-            pin_memory=use_pin_memory,  # Enable pin_memory for faster CPU->GPU transfer even with num_workers=0
+            pin_memory=use_pin_memory and not use_gpu_preprocess,  # Only use pin_memory if not using GPU preprocessing (already on GPU)
             drop_last=False  # Keep all samples
         )
         
@@ -2255,16 +2431,8 @@ class NucleiEmbedding:
         )
         pbar = tqdm(total=len(dataset), desc="Generating embeddings")
         
-        # Performance profiling variables
-        perf_stats = {
-            'dataloader_time': 0.0,  # Time spent waiting for dataloader
-            'preprocessing_time': 0.0,  # Time for data preprocessing (concatenate, to device)
-            'model_time': 0.0,  # Time for model inference
-            'postprocessing_time': 0.0,  # Time for normalization and type conversion
-            'io_time': 0.0,  # Time for writing to zarr
-            'total_batches': 0,
-            'total_samples': 0
-        }
+        # Performance profiling variables (already defined above for collate function)
+        # perf_stats is already defined before collate function creation
         
         batch_idx = 0
         prev_batch_end_time = time.time()
@@ -2277,9 +2445,11 @@ class NucleiEmbedding:
                 if batch_idx > 0:
                     perf_stats['dataloader_time'] += dataloader_start_time - prev_batch_end_time
                 
-                # Check if batch is valid (handle both numpy array and list)
+                # Check if batch is valid (handle tensor, numpy array, and list)
                 batch_valid = False
-                if isinstance(batch, np.ndarray):
+                if isinstance(batch, torch.Tensor):
+                    batch_valid = batch.numel() > 0
+                elif isinstance(batch, np.ndarray):
                     batch_valid = batch.size > 0
                 elif isinstance(batch, list):
                     batch_valid = len(batch) > 0
@@ -2292,82 +2462,17 @@ class NucleiEmbedding:
                     #     # Z-stack case: batch is list of lists
                     #     batch_embeddings = self.embed_batch(batch, is_zstack=True, num_z_layers=dataset.num_layers)
                     # else:
-                    # Single layer case: batch is already processed by collate function
+                    # Use processor output (tensor already in correct format)
                     preprocess_start = time.time()
-                    # Batch is already processed by collate_patches (fast preprocessing applied)
-                    # Fast preprocessing returns a single array (N, C, H, W) - no stack needed!
-                    # OPTIMIZATION: Streamlined preprocessing with minimal operations
-                    if isinstance(batch, np.ndarray):
-                        # Already a single stacked array from fast preprocessing
-                        # OPTIMIZATION: Ensure contiguous memory layout for faster transfer
-                        if not batch.flags['C_CONTIGUOUS']:
-                            batch = np.ascontiguousarray(batch)
-                        
-                        if batch.dtype == np.uint8:
-                            # OPTIMIZATION: Use pinned memory tensor for faster CPU->GPU transfer
-                            if torch.cuda.is_available() and self.device.type == 'cuda':
-                                # Create pinned tensor (page-locked memory) for faster GPU transfer
-                                pinned_tensor = torch.empty(batch.shape, dtype=torch.uint8, pin_memory=True)
-                                # Copy numpy array to pinned tensor (this is fast, just memory copy)
-                                pinned_tensor.copy_(torch.from_numpy(batch), non_blocking=False)
-                                # Transfer pinned tensor to GPU and convert to float32 in one step
-                                processed_batch = pinned_tensor.to(self.device, dtype=torch.float32, non_blocking=True)
-                            else:
-                                # CPU mode: use regular tensor
-                                tensor = torch.from_numpy(batch)
-                                processed_batch = tensor.to(self.device, dtype=torch.float32, non_blocking=False)
-                            # Normalize on GPU (fused operations)
-                            processed_batch = _normalize_clip_gpu(processed_batch, self.device)
-                        else:
-                            # Data is already normalized (float32) - transfer directly using pinned memory
-                            if torch.cuda.is_available() and self.device.type == 'cuda':
-                                pinned_tensor = torch.empty(batch.shape, dtype=torch.float32, pin_memory=True)
-                                pinned_tensor.copy_(torch.from_numpy(batch), non_blocking=False)
-                                processed_batch = pinned_tensor.to(self.device, non_blocking=True)
-                            else:
-                                # CPU mode: use regular tensor
-                                tensor = torch.from_numpy(batch)
-                                processed_batch = tensor.to(self.device, non_blocking=False)
-                    elif isinstance(batch, list) and len(batch) > 0 and isinstance(batch[0], np.ndarray):
-                        # Fallback: list of arrays (shouldn't happen with fast preprocessing)
-                        batch_array = np.ascontiguousarray(np.stack(batch, axis=0))
-                        if batch_array.dtype == np.uint8:
-                            if torch.cuda.is_available() and self.device.type == 'cuda':
-                                pinned_tensor = torch.empty(batch_array.shape, dtype=torch.uint8, pin_memory=True)
-                                pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
-                                processed_batch = pinned_tensor.to(self.device, dtype=torch.float32, non_blocking=True)
-                            else:
-                                tensor = torch.from_numpy(batch_array)
-                                processed_batch = tensor.to(self.device, dtype=torch.float32, non_blocking=False)
-                            processed_batch = _normalize_clip_gpu(processed_batch, self.device)
-                        else:
-                            if torch.cuda.is_available() and self.device.type == 'cuda':
-                                pinned_tensor = torch.empty(batch_array.shape, dtype=torch.float32, pin_memory=True)
-                                pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
-                                processed_batch = pinned_tensor.to(self.device, non_blocking=True)
-                            else:
-                                tensor = torch.from_numpy(batch_array)
-                                processed_batch = tensor.to(self.device, non_blocking=False)
+                    # Batch is already a tensor from collate function
+                    # - If using GPU preprocessing: already on GPU and normalized
+                    # - If using CPU processor: needs to be moved to GPU
+                    if use_gpu_preprocess:
+                        # Already on GPU from GPU preprocessing
+                        processed_batch = batch
                     else:
-                        # Fallback: if not processed, process now (shouldn't happen)
-                        batch_array = np.ascontiguousarray(np.stack([np.array(b) for b in batch], axis=0))
-                        if batch_array.dtype == np.uint8:
-                            if torch.cuda.is_available() and self.device.type == 'cuda':
-                                pinned_tensor = torch.empty(batch_array.shape, dtype=torch.uint8, pin_memory=True)
-                                pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
-                                processed_batch = pinned_tensor.to(self.device, dtype=torch.float32, non_blocking=True)
-                            else:
-                                tensor = torch.from_numpy(batch_array)
-                                processed_batch = tensor.to(self.device, dtype=torch.float32, non_blocking=False)
-                            processed_batch = _normalize_clip_gpu(processed_batch, self.device)
-                        else:
-                            if torch.cuda.is_available() and self.device.type == 'cuda':
-                                pinned_tensor = torch.empty(batch_array.shape, dtype=torch.float32, pin_memory=True)
-                                pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
-                                processed_batch = pinned_tensor.to(self.device, non_blocking=True)
-                            else:
-                                tensor = torch.from_numpy(batch_array)
-                                processed_batch = tensor.to(self.device, non_blocking=False)
+                        # Move to GPU if using CPU processor
+                        processed_batch = batch.to(self.device)
                     
                     perf_stats['preprocessing_time'] += time.time() - preprocess_start
                     
@@ -2383,38 +2488,26 @@ class NucleiEmbedding:
                     # 3. Minimize synchronization points
                     postprocess_start = time.time()
                     if torch.is_tensor(batch_embeddings):
-                        # Convert to float16 on GPU first (no CPU transfer yet)
-                        batch_embeddings = batch_embeddings.to(dtype=torch.float16)
-                        # OPTIMIZATION: Use CUDA events to track only the operations we need, not all GPU work
-                        if torch.cuda.is_available():
-                            # Record an event after dtype conversion to track its completion
-                            # This is more efficient than synchronizing the entire device
-                            event = torch.cuda.Event()
-                            event.record()
-                            # Wait only for our specific operations to complete
-                            event.wait()
-                            # Create pinned tensor for faster transfer
-                            pinned_tensor = torch.empty(
-                                batch_embeddings.shape, 
-                                dtype=torch.float16, 
-                                pin_memory=True
-                            )
-                            # Use async copy (non_blocking=True) - the event ensures dtype conversion is done
-                            pinned_tensor.copy_(batch_embeddings, non_blocking=True)
-                            # Record another event to track copy completion
-                            copy_event = torch.cuda.Event()
-                            copy_event.record()
-                            copy_event.wait()  # Wait only for copy to complete
-                            batch_embeddings = pinned_tensor.numpy()
-                        else:
-                            # CPU fallback
-                            batch_embeddings = batch_embeddings.cpu().numpy()
-                    elif isinstance(batch_embeddings, np.ndarray) and batch_embeddings.dtype != np.float16:
-                        batch_embeddings = batch_embeddings.astype(np.float16, copy=False)
+                        # Keep as float32 for numerical consistency with original implementation
+                        batch_embeddings = batch_embeddings.to(dtype=torch.float32)
+                        
+                        # L2 normalization: embeddings / ||embeddings|| (matches server version)
+                        batch_embeddings = batch_embeddings / torch.norm(batch_embeddings, dim=1, keepdim=True)
+                        batch_embeddings = batch_embeddings.detach().cpu().numpy()
+                    elif isinstance(batch_embeddings, np.ndarray):
+                        # Ensure float32 dtype
+                        if batch_embeddings.dtype != np.float32:
+                            batch_embeddings = batch_embeddings.astype(np.float32, copy=False)
+                        
+                        # L2 normalization: embeddings / ||embeddings|| (matches server version)
+                        batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
                     perf_stats['postprocessing_time'] += time.time() - postprocess_start
                     
                     # I/O operations
                     io_start = time.time()
+                    # Convert to float16 before saving (matches server version)
+                    if isinstance(batch_embeddings, np.ndarray):
+                        batch_embeddings = batch_embeddings.astype(np.float16, copy=False)
                     current_size = embeddings_dset.shape[0]
                     new_size = current_size + batch_embeddings.shape[0]
                     embeddings_dset.resize((new_size, 768))
@@ -2423,8 +2516,10 @@ class NucleiEmbedding:
                     
                     # Update statistics
                     perf_stats['total_batches'] += 1
-                    # Get batch size (handle both numpy array and list)
-                    if isinstance(batch, np.ndarray):
+                    # Get batch size (handle tensor, numpy array, and list)
+                    if isinstance(batch, torch.Tensor):
+                        batch_size = batch.shape[0]
+                    elif isinstance(batch, np.ndarray):
                         batch_size = batch.shape[0]
                     else:
                         batch_size = len(batch)
