@@ -123,6 +123,7 @@ class NucleiPatchDataset(Dataset):
         # Detect if this is a z-stack image
         self.is_zstack = False
         self.num_z_layers = 1
+        self.pyramidHeight = 1  # Default: no pyramid structure
         self._detect_zstack()  # Enable z-stack detection
         
         # For z-stack images, open a persistent TiffFile handle for efficient layer access
@@ -214,17 +215,21 @@ class NucleiPatchDataset(Dataset):
                 from ndpi_utils import analyze_ndpi_structure
                 meta = analyze_ndpi_structure(self.slide_path)
                 sizeZ = meta["sizeZ"]
+                pyramidHeight = meta["pyramidHeight"]
                 
                 if sizeZ > 1:
                     self.is_zstack = True
                     self.num_z_layers = sizeZ
+                    self.pyramidHeight = pyramidHeight  # Store for page index calculation
                     print(f"Detected z-stack image with {sizeZ} layers (via ndpi_utils)")
+                    print(f"Pyramid structure: {pyramidHeight} resolution levels per z-layer")
                     return
                 else:
                     # Single layer detected
                     print(f"Single-layer image detected (sizeZ={sizeZ})")
                     self.is_zstack = False
                     self.num_z_layers = 1
+                    self.pyramidHeight = pyramidHeight
                     return
             except Exception as e:
                 print(f"ndpi_utils detection failed: {e}, falling back to legacy detection")
@@ -534,17 +539,34 @@ class NucleiPatchDataset(Dataset):
                     close_after = True
                 
                 try:
+                    # Calculate correct page index for z-stack with pyramid structure
+                    # For NDPI z-stack: each z-layer has multiple pyramid levels
+                    # We want pyramid level 0 (full resolution) of the specified z-layer
+                    if hasattr(self, 'pyramidHeight') and self.pyramidHeight > 1:
+                        from ndpi_utils import get_ifd_index
+                        page_idx = get_ifd_index(
+                            series_index=0,  # Pyramid level 0 (full resolution)
+                            z_index=z_layer,
+                            pyramid_height=self.pyramidHeight,
+                            sizeZ=self.num_z_layers
+                        )
+                    else:
+                        # Simple z-stack (no pyramid structure)
+                        page_idx = z_layer
+                    
                     # Access the specific z-layer page
-                    page = tif.pages[z_layer]
+                    page = tif.pages[page_idx]
                     
                     # Calculate bounds
                     y2 = min(y1 + height, page.shape[0])
                     x2 = min(x1 + width, page.shape[1])
                     
                     # Use cached zarr array if available (avoids repeated aszarr() calls)
-                    if z_layer not in self._zarr_cache:
-                        self._zarr_cache[z_layer] = zarr_lib.open(page.aszarr(), mode='r')
-                    zarr_array = self._zarr_cache[z_layer]
+                    # Cache key includes page_idx to handle pyramid structure correctly
+                    cache_key = (z_layer, page_idx)
+                    if cache_key not in self._zarr_cache:
+                        self._zarr_cache[cache_key] = zarr_lib.open(page.aszarr(), mode='r')
+                    zarr_array = self._zarr_cache[cache_key]
                     
                     # Read only the required region (efficient - no full layer load!)
                     patch_array = np.asarray(zarr_array[y1:y2, x1:x2])
@@ -2148,7 +2170,9 @@ class NucleiEmbedding:
                         batch_embeddings = self.embed_batch(processed_batch, is_zstack=False)
                         
                         # Normalize and convert to float16
-                        batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
+                        norms = np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
+                        norms = np.where(norms > 0, norms, 1)  # Avoid division by zero
+                        batch_embeddings = batch_embeddings / norms
                         batch_embeddings = batch_embeddings.astype(np.float16)
                         
                         # Write to temporary layer dataset
