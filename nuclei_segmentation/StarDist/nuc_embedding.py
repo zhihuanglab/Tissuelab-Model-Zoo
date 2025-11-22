@@ -429,10 +429,32 @@ class NucleiPatchDataset(Dataset):
             # else:
             result = self._extract_single_patch(x1, y1, width, height, idx, x, y, z_layer=0)
             
+            # Ensure we never return None to maintain embedding order
+            # If extraction failed, return an empty patch instead
+            if result is None:
+                import numpy as np
+                from PIL import Image
+                # Return empty patch to maintain order (will be processed but produce zero embedding)
+                if isinstance(self.patch_size, (int, float)):
+                    patch_size = int(self.patch_size)
+                else:
+                    patch_size = 224  # Default fallback
+                # Return as numpy array to match expected format
+                empty_patch = np.zeros((patch_size, patch_size, 3), dtype=np.uint8)
+                return empty_patch
+            
             return result
         except Exception as e:
             print(f"Error processing centroid {self.centroids[idx]}: {str(e)}")
-            return None
+            # Return empty patch instead of None to maintain embedding order
+            import numpy as np
+            if isinstance(self.patch_size, (int, float)):
+                patch_size = int(self.patch_size)
+            else:
+                patch_size = 224  # Default fallback
+            # Return as numpy array to match expected format
+            empty_patch = np.zeros((patch_size, patch_size, 3), dtype=np.uint8)
+            return empty_patch
 
     def _extract_single_patch(self, x1, y1, width, height, idx, x, y, z_layer=0):
         """Extract a single patch from one z-layer"""
