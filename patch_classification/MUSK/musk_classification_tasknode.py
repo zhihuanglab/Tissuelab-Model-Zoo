@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import colorsys
 import asyncio
+import gc
 from sse_starlette.sse import EventSourceResponse
 import xgboost as xgb
 import io
@@ -405,7 +406,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     print("Classifier updated and saved")
                 
                 # predict in chunks to avoid GPU memory issues
-                batch_size = 10000  # Process 10k samples at a time
+                # Optimize batch_size: use larger batches for better performance
+                batch_size = 50000  # Increased from 10k for better performance
                 n_samples = len(cell_embeddings)
                 predictions = np.zeros(n_samples, dtype=int)
                 
@@ -413,25 +415,42 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 n_classes = clf.n_classes_
                 prediction_probs = np.zeros((n_samples, n_classes), dtype=np.float32)
                 
-                print(f"Predicting {n_samples} samples in batches of {batch_size}")
-                for i in range(0, n_samples, batch_size):
+                n_batches = (n_samples + batch_size - 1) // batch_size
+                print(f"Predicting {n_samples} samples in {n_batches} batches (batch_size={batch_size})")
+                
+                for batch_idx, i in enumerate(range(0, n_samples, batch_size)):
                     end_idx = min(i + batch_size, n_samples)
                     batch_embeddings = cell_embeddings[i:end_idx]
                     
-                    # Clear GPU memory before each batch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    
-                    batch_predictions = clf.predict(batch_embeddings)
+                    # OPTIMIZATION: Only call predict_proba once, then extract predictions from probabilities
+                    # This avoids duplicate forward passes through the model
                     batch_probs = clf.predict_proba(batch_embeddings)
-                    
-                    print(f"Debug: batch_probs shape: {batch_probs.shape}, prediction_probs slice shape: {prediction_probs[i:end_idx].shape}")
-                    print(f"Debug: n_classes: {n_classes}, batch_size: {batch_size}")
+                    batch_predictions = np.argmax(batch_probs, axis=1).astype(int)
                     
                     predictions[i:end_idx] = batch_predictions
                     prediction_probs[i:end_idx] = batch_probs
                     
-                    print(f"Processed batch {i//batch_size + 1}/{(n_samples + batch_size - 1)//batch_size}")
+                    # Clear batch data from memory
+                    del batch_embeddings, batch_predictions, batch_probs
+                    
+                    # Only clear GPU cache if using GPU (XGBoost on GPU)
+                    # For CPU-based XGBoost, skip this to save time
+                    if torch.cuda.is_available():
+                        # Only clear cache if we're actually using GPU (XGBoost with device='cuda')
+                        # For CPU XGBoost, this is unnecessary and wastes time
+                        try:
+                            if hasattr(clf, 'get_booster') and clf.get_booster().attributes().get('device', 'cpu') == 'cuda':
+                                torch.cuda.empty_cache()
+                        except:
+                            # If we can't determine device, conservatively clear cache
+                            torch.cuda.empty_cache()
+                    
+                    # Force garbage collection every 5 batches (more frequent for large batches)
+                    if (batch_idx + 1) % 5 == 0:
+                        gc.collect()
+                    
+                    if (batch_idx + 1) % max(1, n_batches // 10) == 0 or (batch_idx + 1) == n_batches:
+                        print(f"Processed batch {batch_idx + 1}/{n_batches} ({end_idx}/{n_samples} samples)")
                 
                 print("Prediction completed")
                 
@@ -523,7 +542,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     clf.fit(X_train, y_train)
 
     # predict in chunks to avoid GPU memory issues
-    batch_size = 10000  # Process 10k samples at a time
+    # Optimize batch_size: use larger batches for better performance
+    batch_size = 50000  # Increased from 10k for better performance
     n_samples = len(cell_embeddings)
     predictions = np.zeros(n_samples, dtype=int)
     
@@ -531,25 +551,42 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     n_classes = clf.n_classes_
     prediction_probs = np.zeros((n_samples, n_classes), dtype=np.float32)
     
-    print(f"Predicting {n_samples} samples in batches of {batch_size}")
-    for i in range(0, n_samples, batch_size):
+    n_batches = (n_samples + batch_size - 1) // batch_size
+    print(f"Predicting {n_samples} samples in {n_batches} batches (batch_size={batch_size})")
+    
+    for batch_idx, i in enumerate(range(0, n_samples, batch_size)):
         end_idx = min(i + batch_size, n_samples)
         batch_embeddings = cell_embeddings[i:end_idx]
         
-        # Clear GPU memory before each batch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        batch_predictions = clf.predict(batch_embeddings)
+        # OPTIMIZATION: Only call predict_proba once, then extract predictions from probabilities
+        # This avoids duplicate forward passes through the model
         batch_probs = clf.predict_proba(batch_embeddings)
-        
-        print(f"Debug: batch_probs shape: {batch_probs.shape}, prediction_probs slice shape: {prediction_probs[i:end_idx].shape}")
-        print(f"Debug: n_classes: {n_classes}, batch_size: {batch_size}")
+        batch_predictions = np.argmax(batch_probs, axis=1).astype(int)
         
         predictions[i:end_idx] = batch_predictions
         prediction_probs[i:end_idx] = batch_probs
         
-        print(f"Processed batch {i//batch_size + 1}/{(n_samples + batch_size - 1)//batch_size}")
+        # Clear batch data from memory
+        del batch_embeddings, batch_predictions, batch_probs
+        
+        # Only clear GPU cache if using GPU (XGBoost on GPU)
+        # For CPU-based XGBoost, skip this to save time
+        if torch.cuda.is_available():
+            # Only clear cache if we're actually using GPU (XGBoost with device='cuda')
+            # For CPU XGBoost, this is unnecessary and wastes time
+            try:
+                if hasattr(clf, 'get_booster') and clf.get_booster().attributes().get('device', 'cpu') == 'cuda':
+                    torch.cuda.empty_cache()
+            except:
+                # If we can't determine device, conservatively clear cache
+                torch.cuda.empty_cache()
+        
+        # Force garbage collection every 5 batches (more frequent for large batches)
+        if (batch_idx + 1) % 5 == 0:
+            gc.collect()
+        
+        if (batch_idx + 1) % max(1, n_batches // 10) == 0 or (batch_idx + 1) == n_batches:
+            print(f"Processed batch {batch_idx + 1}/{n_batches} ({end_idx}/{n_samples} samples)")
     
     print("Prediction completed")
 
