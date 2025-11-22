@@ -421,7 +421,7 @@ def load_classifier_params(zarr_path):
 
         
 def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
-    global CLASSIFIER_PATH
+    global CLASSIFIER_PATH, progress_value
     
     # update XGBoost parameter settings
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -441,10 +441,14 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     # try to load existing classifier parameters
     if CLASSIFIER_PATH is not None:
         try:
+            print("Loading classifier parameters...")
             loaded_params = load_classifier_params(CLASSIFIER_PATH)
             if loaded_params is not None:
                 clf, class_names, class_colors, prev_embeddings, prev_labels = loaded_params
                 print(f"Loaded existing classifier parameters, classes: {class_names}")
+                # Update progress after loading classifier
+                progress_value = 40
+                print(f"Progress: 40% (Classifier loaded)")
                 
                 if not annotations.empty:
                     existing_classes = set(class_names)
@@ -563,7 +567,10 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 predictions = np.zeros(n_cells, dtype=np.int32)
                 prediction_probs = np.zeros((n_cells, len(class_names)), dtype=np.float32)
                 
-                for i in range(0, n_cells, batch_size):
+                n_batches = (n_cells + batch_size - 1) // batch_size
+                print(f"Starting prediction for {n_cells} cells in {n_batches} batches...")
+                
+                for batch_idx, i in enumerate(range(0, n_cells, batch_size)):
                     end_idx = min(i + batch_size, n_cells)
                     batch_embeddings = cell_embeddings[i:end_idx]
                     
@@ -582,11 +589,17 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     # Clear batch data from memory
                     del batch_embeddings, batch_predictions, batch_probs
                     
+                    # Update progress: 40% -> 90% during prediction
+                    progress_value = 40 + int(50 * (batch_idx + 1) / n_batches)
+                    if (batch_idx + 1) % max(1, n_batches // 10) == 0 or (batch_idx + 1) == n_batches:
+                        print(f"Progress: {progress_value}% (Predicted {end_idx}/{n_cells} cells)")
+                    
                     # Force garbage collection every 10 batches to prevent memory accumulation
                     if (i // batch_size) % 10 == 0:
                         gc.collect()
                 
-                print(f"Completed prediction for {n_cells} cells")
+                progress_value = 90
+                print(f"Progress: 90% (Completed prediction for {n_cells} cells)")
                 
                 return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
         except Exception as e:
@@ -663,7 +676,10 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
             print("Proceeding without negative control vectors as they could not be loaded.")
 
     clf = xgb.XGBClassifier(**xgb_params)
+    print("Training new classifier...")
     clf.fit(X_train, y_train)
+    progress_value = 50
+    print(f"Progress: 50% (Classifier trained)")
 
     # predict in batches to avoid memory issues
     batch_size = 50000  # Process 50k cells at a time
@@ -672,7 +688,10 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     predictions = np.zeros(n_cells, dtype=np.int32)
     prediction_probs = np.zeros((n_cells, len(class_names)), dtype=np.float32)
     
-    for i in range(0, n_cells, batch_size):
+    n_batches = (n_cells + batch_size - 1) // batch_size
+    print(f"Starting prediction for {n_cells} cells in {n_batches} batches...")
+    
+    for batch_idx, i in enumerate(range(0, n_cells, batch_size)):
         end_idx = min(i + batch_size, n_cells)
         batch_embeddings = cell_embeddings[i:end_idx]
         
@@ -691,11 +710,17 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         # Clear batch data from memory
         del batch_embeddings, batch_predictions, batch_probs
         
+        # Update progress: 50% -> 90% during prediction
+        progress_value = 50 + int(40 * (batch_idx + 1) / n_batches)
+        if (batch_idx + 1) % max(1, n_batches // 10) == 0 or (batch_idx + 1) == n_batches:
+            print(f"Progress: {progress_value}% (Predicted {end_idx}/{n_cells} cells)")
+        
         # Force garbage collection every 10 batches to prevent memory accumulation
         if (i // batch_size) % 10 == 0:
             gc.collect()
     
-    print(f"Completed prediction for {n_cells} cells")
+    progress_value = 90
+    print(f"Progress: 90% (Completed prediction for {n_cells} cells)")
 
     # save classifier parameters
     train_data = {
@@ -746,7 +771,10 @@ def run_classification(args) -> Dict[str, Any]:
         seg_grp = zf['SegmentationNode']
         if 'embedding' not in seg_grp:
             raise ValueError("embedding dataset not found in h5 file => no cell_embeddings")
+        print("Loading embeddings from zarr...")
         cell_embeddings = seg_grp['embedding'][()]
+        progress_value = 35
+        print(f"Progress: 35% (Embeddings loaded, shape: {cell_embeddings.shape})")
     
         # C) supervised or zero-shot
         organ = getattr(args, "organ", None)
@@ -925,6 +953,9 @@ def run_classification(args) -> Dict[str, Any]:
             final_class_names = nuclei_classes
 
         # D) result => cell_classification (common for both supervised and zero-shot)
+        progress_value = 95
+        print(f"Progress: 95% (Saving results to zarr...)")
+        
         if NODE_NAME in zf:
             del zf[NODE_NAME]
         grp_cls = zf.require_group(NODE_NAME)
@@ -979,6 +1010,9 @@ def run_classification(args) -> Dict[str, Any]:
         end_time = time.time()
         result["classification_count"] = len(predictions)
         result["message"] = f"Classification completed using {classification_method} in {end_time - start_time:.2f}s"
+
+        progress_value = 100
+        print(f"Progress: 100% (Classification completed)")
 
         # print H5 structure
         print("H5 structure after classification:")
