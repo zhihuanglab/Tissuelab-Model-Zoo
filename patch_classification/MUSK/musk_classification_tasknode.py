@@ -646,18 +646,78 @@ def run_classification(args) -> Dict[str, Any]:
             classification_method = "supervised"
             print(f"Supervised classification completed using {classification_method}")
             
-            # When CLASSIFIER_PATH is set, directly use classifier's class_names and class_colors
-            # to override user params, preventing issues with incomplete user input
-            # Note: class_names here already includes all classes:
-            # - Original classes from the saved classifier
-            # - New classes from user annotations (if any, added in train_linear_classifier)
-            # This ensures we always use the complete, up-to-date class list
-            if CLASSIFIER_PATH is not None:
-                # Use classifier's class_names and class_colors directly
+            # When CLASSIFIER_PATH is set, check if user provided tissue_classes
+            # If user provided classes, merge user order with classifier classes:
+            # - Use user order for classes that user specified
+            # - Append classifier classes not in user list (in classifier order) to ensure all classes are shown
+            if CLASSIFIER_PATH is not None and tissue_classes and len(tissue_classes) > 0:
+                # Merge user order with classifier classes to ensure all classes are displayed
+                print(f"[{NODE_NAME}] CLASSIFIER_PATH is set, user provided tissue_classes: {tissue_classes}")
+                print(f"[{NODE_NAME}] Classifier internal order: {class_names}")
+                
+                # Build final class list: user order first, then classifier classes not in user list
+                user_classes_set = set(tissue_classes)
+                classifier_classes_not_in_user = [cn for cn in class_names if cn not in user_classes_set]
+                
+                # Final order: user specified classes (in user order) + remaining classifier classes (in classifier order)
+                final_class_names = list(tissue_classes) + classifier_classes_not_in_user
+                
+                print(f"[{NODE_NAME}] Merged class order (user order + classifier remaining): {final_class_names}")
+                
+                # Build color mapping: prioritize user colors, then classifier colors
+                classifier_color_map = {name: color for name, color in zip(class_names, class_colors)}
+                final_class_colors = []
+                
+                # Use user colors if provided, otherwise use classifier colors
+                if tissue_colors and len(tissue_colors) == len(tissue_classes):
+                    user_color_map = dict(zip(tissue_classes, tissue_colors))
+                else:
+                    user_color_map = {}
+                
+                for cls_name in final_class_names:
+                    if cls_name in user_color_map:
+                        final_class_colors.append(user_color_map[cls_name])
+                    elif cls_name in classifier_color_map:
+                        final_class_colors.append(classifier_color_map[cls_name])
+                    else:
+                        final_class_colors.append("#aaaaaa")
+                
+                # Create mapping from classifier internal indices to final output indices
+                classifier_name_to_idx = {name: idx for idx, name in enumerate(class_names)}
+                final_name_to_idx = {name: idx for idx, name in enumerate(final_class_names)}
+                
+                # Build remap array: classifier_idx -> final_idx
+                remap = np.zeros(len(class_names), dtype=np.int32)
+                for classifier_idx, cls_name in enumerate(class_names):
+                    if cls_name in final_name_to_idx:
+                        remap[classifier_idx] = final_name_to_idx[cls_name]
+                    else:
+                        # Should not happen, but set to 0 as fallback
+                        remap[classifier_idx] = 0
+                
+                # Remap predictions to final output order
+                remapped_predictions = remap[predictions]
+                predictions = remapped_predictions
+                
+                # Remap prediction_probs columns to final output order
+                if prediction_probs is not None:
+                    remapped_probs = np.zeros((prediction_probs.shape[0], len(final_class_names)), dtype=np.float32)
+                    for final_idx, cls_name in enumerate(final_class_names):
+                        if cls_name in classifier_name_to_idx:
+                            classifier_idx = classifier_name_to_idx[cls_name]
+                            remapped_probs[:, final_idx] = prediction_probs[:, classifier_idx]
+                        else:
+                            # Set probability to 0 for classes not in classifier (shouldn't happen)
+                            remapped_probs[:, final_idx] = 0.0
+                    prediction_probs = remapped_probs
+                
+                print(f"[{NODE_NAME}] Mapped predictions to merged order. Final class names: {final_class_names}")
+            elif CLASSIFIER_PATH is not None:
+                # CLASSIFIER_PATH is set but no user input, use classifier's class_names and class_colors directly
                 # These are already updated with new classes if user annotations had new classes
                 final_class_names = class_names
                 final_class_colors = class_colors
-                print(f"Using classifier's classes and colors (CLASSIFIER_PATH is set): {final_class_names}")
+                print(f"[{NODE_NAME}] Using classifier's classes and colors (CLASSIFIER_PATH is set, no user input): {final_class_names}")
             else:
                 # No classifier path, use classifier output as-is (from annotations)
                 final_class_names = class_names
