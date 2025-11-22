@@ -201,6 +201,8 @@ class NucleiPatchDataset(Dataset):
                                         self.is_zstack = True
                                         self.num_z_layers = num_z
                                         print(f"Detected z-stack image with {num_z} layers (via ZYXS format - legacy)")
+                                        # Preload all z-layers to memory for fast access
+                                        self._preload_zstack_layers()
                                         return
                         
                 except Exception as e:
@@ -226,6 +228,8 @@ class NucleiPatchDataset(Dataset):
                             self.is_zstack = True
                             self.num_z_layers = n_frames
                             print(f"Detected z-stack image with {n_frames} layers (via PIL multi-page)")
+                            # Preload all z-layers to memory for fast access
+                            self._preload_zstack_layers()
                             return
                     except EOFError:
                         pass
@@ -277,7 +281,7 @@ class NucleiPatchDataset(Dataset):
             total_size_gb = sum(layer.nbytes for layer in self._zstack_layers) / (1024**3)
             
             print(f"{'='*80}")
-            print(f"✓ Preloading complete!")
+            print(f"[OK] Preloading complete!")
             print(f"  Total time: {total_time:.2f}s")
             print(f"  Total memory: {total_size_gb:.2f} GB")
             print(f"  Now all patch extraction will be instant from RAM")
@@ -286,7 +290,7 @@ class NucleiPatchDataset(Dataset):
             self._zstack_preloaded = True
             
         except Exception as e:
-            print(f"\n✗ Failed to preload z-stack: {e}")
+            print(f"\n[ERROR] Failed to preload z-stack: {e}")
             print("Falling back to on-demand loading...")
             self._zstack_layers = None
             self._zstack_preloaded = False
@@ -1345,21 +1349,40 @@ class NucleiEmbedding:
                 )
         else:
             # Windows/Mac can use more aggressive settings
-            if dataset.is_zstack:
+            # BUT: If z-stack is preloaded, we MUST use workers=0 because:
+            # - Windows uses 'spawn' (not fork), which requires pickling the entire Dataset
+            # - Preloaded data (_zstack_layers) can be 5+ GB → MemoryError during pickle
+            if dataset.is_zstack and dataset._zstack_preloaded:
+                print(f"[WARNING] Z-stack preloaded on Windows: MUST use 0 workers (spawn cannot pickle 4+ GB data)")
+                print(f"          Data is in RAM, so single-process is still fast!")
+                max_workers = 0
+            elif dataset.is_zstack:
                 print(f"Z-stack detected on {platform.system()}: using {num_workers} workers (no deadlock issues on non-Linux)")
+                max_workers = num_workers
             else:
                 print(f"Single-layer image on {platform.system()}: using {num_workers} workers")
+                max_workers = num_workers
             
-            dataloader = DataLoader(
-                dataset,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                shuffle=False,
-                collate_fn=collate_patches,
-                prefetch_factor=1,
-                persistent_workers=True,
-                pin_memory=True
-            )
+            if max_workers > 0:
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    num_workers=max_workers,
+                    shuffle=False,
+                    collate_fn=collate_patches,
+                    prefetch_factor=1,
+                    persistent_workers=True,
+                    pin_memory=True
+                )
+            else:
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    num_workers=0,
+                    shuffle=False,
+                    collate_fn=collate_patches,
+                    pin_memory=False
+                )
         
         if zarr_path is None:
             raise ValueError("zarr_path must be provided to write embeddings directly")
@@ -1452,7 +1475,7 @@ class NucleiEmbedding:
                 
                 pbar.close()
                 temp_layer_embeddings.append(f'_temp_layer_{layer_idx}')
-                print(f"✓ Layer {layer_idx + 1} complete: {num_cells} embeddings saved")
+                print(f"[OK] Layer {layer_idx + 1} complete: {num_cells} embeddings saved")
                 
                 # Reset dataset for next layer
                 dataset.z_layer = None
@@ -1499,7 +1522,7 @@ class NucleiEmbedding:
             for temp_name in temp_layer_embeddings:
                 del parent[temp_name]
             
-            print(f"✓ Fusion complete: {num_cells} final embeddings saved")
+            print(f"[OK] Fusion complete: {num_cells} final embeddings saved")
             
         else:
             # Single layer case: original logic
