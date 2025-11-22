@@ -23,7 +23,7 @@ from nuc_stat import SlideProperty
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--slidepath', default='E:\\projects\\Tissuelab-Model-Zoo\\nuclei_segmentation\\StarDist\\CMU-1.svs', type=str)
+    parser.add_argument('--slidepath', default='E:\experiments\TCGA-COAD\patch_demo\TCGA-AD-6548-01Z-00-DX1.4e047481-8926-48e6-9eba-46597c4cc396.svs', type=str)
     parser.add_argument('--read_image_method', default='tiffslide', type=str, choices=['openslide','tiffslide','PIL','numpy'])
     parser.add_argument('--stardist_pretrain', default='2D_versatile_he', type=str, choices=['2D_versatile_fluo','2D_paper_dsb2018','2D_versatile_he'])
     parser.add_argument('--isIHC', default=False, type=bool)
