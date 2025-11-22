@@ -561,26 +561,24 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     print("Classifier updated and saved")
                 
                 # predict in batches to avoid memory issues
-                batch_size = 50000  # Process 50k cells at a time
+                # Optimize batch_size: use larger batches if memory allows (100k for embeddings)
+                batch_size = 100000  # Increased from 50k for better performance
                 n_cells = cell_embeddings.shape[0]
                 
                 predictions = np.zeros(n_cells, dtype=np.int32)
                 prediction_probs = np.zeros((n_cells, len(class_names)), dtype=np.float32)
                 
                 n_batches = (n_cells + batch_size - 1) // batch_size
-                print(f"Starting prediction for {n_cells} cells in {n_batches} batches...")
+                print(f"Starting prediction for {n_cells} cells in {n_batches} batches (batch_size={batch_size})...")
                 
                 for batch_idx, i in enumerate(range(0, n_cells, batch_size)):
                     end_idx = min(i + batch_size, n_cells)
                     batch_embeddings = cell_embeddings[i:end_idx]
                     
-                    # Clear GPU cache before each batch to prevent accumulation
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    
-                    # Predict batch
-                    batch_predictions = clf.predict(batch_embeddings)
+                    # OPTIMIZATION: Only call predict_proba once, then extract predictions from probabilities
+                    # This avoids duplicate forward passes through the model
                     batch_probs = clf.predict_proba(batch_embeddings)
+                    batch_predictions = np.argmax(batch_probs, axis=1).astype(np.int32)
                     
                     # Store results
                     predictions[i:end_idx] = batch_predictions
@@ -594,8 +592,20 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     if (batch_idx + 1) % max(1, n_batches // 10) == 0 or (batch_idx + 1) == n_batches:
                         print(f"Progress: {progress_value}% (Predicted {end_idx}/{n_cells} cells)")
                     
-                    # Force garbage collection every 10 batches to prevent memory accumulation
-                    if (i // batch_size) % 10 == 0:
+                    # Only clear GPU cache if using GPU (XGBoost on GPU)
+                    # For CPU-based XGBoost, skip this to save time
+                    if torch.cuda.is_available():
+                        # Only clear cache if we're actually using GPU (XGBoost with device='cuda')
+                        # For CPU XGBoost, this is unnecessary and wastes time
+                        try:
+                            if hasattr(clf, 'get_booster') and clf.get_booster().attributes().get('device', 'cpu') == 'cuda':
+                                torch.cuda.empty_cache()
+                        except:
+                            # If we can't determine device, conservatively clear cache
+                            torch.cuda.empty_cache()
+                    
+                    # Force garbage collection every 5 batches (more frequent for large batches)
+                    if (batch_idx + 1) % 5 == 0:
                         gc.collect()
                 
                 progress_value = 90
@@ -682,26 +692,24 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     print(f"Progress: 50% (Classifier trained)")
 
     # predict in batches to avoid memory issues
-    batch_size = 50000  # Process 50k cells at a time
+    # Optimize batch_size: use larger batches if memory allows (100k for embeddings)
+    batch_size = 100000  # Increased from 50k for better performance
     n_cells = cell_embeddings.shape[0]
     
     predictions = np.zeros(n_cells, dtype=np.int32)
     prediction_probs = np.zeros((n_cells, len(class_names)), dtype=np.float32)
     
     n_batches = (n_cells + batch_size - 1) // batch_size
-    print(f"Starting prediction for {n_cells} cells in {n_batches} batches...")
+    print(f"Starting prediction for {n_cells} cells in {n_batches} batches (batch_size={batch_size})...")
     
     for batch_idx, i in enumerate(range(0, n_cells, batch_size)):
         end_idx = min(i + batch_size, n_cells)
         batch_embeddings = cell_embeddings[i:end_idx]
         
-        # Clear GPU cache before each batch to prevent accumulation
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        # Predict batch
-        batch_predictions = clf.predict(batch_embeddings)
+        # OPTIMIZATION: Only call predict_proba once, then extract predictions from probabilities
+        # This avoids duplicate forward passes through the model
         batch_probs = clf.predict_proba(batch_embeddings)
+        batch_predictions = np.argmax(batch_probs, axis=1).astype(np.int32)
         
         # Store results
         predictions[i:end_idx] = batch_predictions
@@ -715,8 +723,20 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         if (batch_idx + 1) % max(1, n_batches // 10) == 0 or (batch_idx + 1) == n_batches:
             print(f"Progress: {progress_value}% (Predicted {end_idx}/{n_cells} cells)")
         
-        # Force garbage collection every 10 batches to prevent memory accumulation
-        if (i // batch_size) % 10 == 0:
+        # Only clear GPU cache if using GPU (XGBoost on GPU)
+        # For CPU-based XGBoost, skip this to save time
+        if torch.cuda.is_available():
+            # Only clear cache if we're actually using GPU (XGBoost with device='cuda')
+            # For CPU XGBoost, this is unnecessary and wastes time
+            try:
+                if hasattr(clf, 'get_booster') and clf.get_booster().attributes().get('device', 'cpu') == 'cuda':
+                    torch.cuda.empty_cache()
+            except:
+                # If we can't determine device, conservatively clear cache
+                torch.cuda.empty_cache()
+        
+        # Force garbage collection every 5 batches (more frequent for large batches)
+        if (batch_idx + 1) % 5 == 0:
             gc.collect()
     
     progress_value = 90
