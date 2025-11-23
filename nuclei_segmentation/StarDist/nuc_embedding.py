@@ -1976,6 +1976,10 @@ class NucleiEmbedding:
                                 vision_outputs = self.model.vision_model(cell_tensor)
                                 image_embeds = vision_outputs.last_hidden_state.mean(dim=1)
                                 embeddings = self.image_projection(image_embeds)
+
+                                # OPTIMIZATION: Record event after inference to enable async processing
+                                inference_event = torch.cuda.Event()
+                                inference_event.record()
                         else:
                             # CPU fallback
                             vision_outputs = self.model.vision_model(cell_tensor)
@@ -2017,34 +2021,10 @@ class NucleiEmbedding:
             # Concatenate all cell embeddings
             final_embeddings = torch.cat(all_cell_embeddings, dim=0)
             
-            # OPTIMIZATION: Normalize on GPU before moving to CPU (faster)
-            # Use more efficient normalization: torch.nn.functional.normalize is optimized
-            final_embeddings = torch.nn.functional.normalize(final_embeddings, p=2, dim=1)
-            # Convert to float16 while still on device to avoid extra CPU copies
-            final_embeddings = final_embeddings.to(dtype=torch.float16)
-            # OPTIMIZATION: Use CUDA events to track only the operations we need, not all GPU work
-            if torch.cuda.is_available():
-                # Record an event after normalize/to operations to track their completion
-                # This is more efficient than synchronizing the entire device
-                event = torch.cuda.Event()
-                event.record()
-                # Wait only for our specific operations to complete
-                event.wait()
-                # Create pinned tensor for faster transfer
-                pinned_tensor = torch.empty(
-                    final_embeddings.shape, 
-                    dtype=torch.float16, 
-                    pin_memory=True
-                )
-                # Use async copy (non_blocking=True) - the event ensures normalize is done
-                pinned_tensor.copy_(final_embeddings, non_blocking=True)
-                # Record another event to track copy completion
-                copy_event = torch.cuda.Event()
-                copy_event.record()
-                copy_event.wait()  # Wait only for copy to complete
-                final_embeddings = pinned_tensor.numpy()
-            else:
-                final_embeddings = final_embeddings.cpu().numpy()
+            # Keep as float32 for numerical consistency with original implementation
+            # L2 normalization will be done in generate_embeddings postprocessing
+            final_embeddings = final_embeddings.to(dtype=torch.float32)
+            final_embeddings = final_embeddings.detach().cpu().numpy()
             
             # Final verification log
             print(f"[Z-STACK FUSION] Processed {len(all_cell_embeddings)} cells, final shape: {final_embeddings.shape}")
@@ -2067,6 +2047,10 @@ class NucleiEmbedding:
                         image_embeds = vision_outputs.last_hidden_state.mean(dim=1)  # Mean pooling
                         # Use trained projection layer
                         embeddings = self.image_projection(image_embeds)
+
+                        # OPTIMIZATION: Record event after inference to enable async processing
+                        inference_event = torch.cuda.Event()
+                        inference_event.record()
                 else:
                     # CPU fallback
                     vision_outputs = self.model.vision_model(processed_batch)
@@ -2075,6 +2059,7 @@ class NucleiEmbedding:
                 # Keep as float32 for numerical consistency with original implementation
                 # L2 normalization will be done in generate_embeddings postprocessing
                 embeddings = embeddings.to(dtype=torch.float32)
+
                 embeddings = embeddings.detach().cpu().numpy()
 
             return embeddings
@@ -2334,15 +2319,28 @@ class NucleiEmbedding:
             
             temp_layer_embeddings = []
             
+            # OPTIMIZATION: Pre-allocate GPU memory for batch processing to avoid repeated allocations
+            if torch.cuda.is_available() and not use_gpu_preprocess:
+                # Only pre-allocate if not using GPU preprocessing (which already has data on GPU)
+                gpu_batch_buffer = torch.empty(
+                    (batch_size, 3, dataset.patch_size, dataset.patch_size),
+                    dtype=torch.float32,
+                    device=self.device,
+                    pin_memory=False  # Regular GPU memory, not pinned
+                )
+                print(f"[PERF] Pre-allocated GPU batch buffer: {gpu_batch_buffer.shape} ({gpu_batch_buffer.numel() * 4 / 1024**2:.1f} MB)")
+            else:
+                gpu_batch_buffer = None
+
             # Process each layer independently
             for layer_idx in range(num_layers):
                 print(f"\n{'='*80}")
                 print(f"Processing Layer {layer_idx + 1}/{num_layers}")
                 print(f"{'='*80}")
-                
+
                 # Set dataset to extract only this specific layer
                 dataset.z_layer = layer_idx
-                
+
                 # Create temporary dataset for this layer
                 layer_dset = parent.create_dataset(
                     f'_temp_layer_{layer_idx}',
@@ -2350,22 +2348,36 @@ class NucleiEmbedding:
                     chunks=(min(1000, batch_size), 768),
                     dtype=np.float16
                 )
-                
+
                 # Process this layer
                 cell_idx = 0
                 pbar = tqdm(total=num_cells, desc=f"Layer {layer_idx + 1}/{num_layers}")
-                
+
                 for batch in dataloader:
                     if batch is not None and (isinstance(batch, np.ndarray) and batch.size > 0 or isinstance(batch, list) and len(batch) > 0):
-                        # Process batch (already preprocessed by collate function)
-                        if isinstance(batch, np.ndarray):
-                            if not batch.flags['C_CONTIGUOUS']:
-                                batch = np.ascontiguousarray(batch)
-                            processed_batch = torch.from_numpy(batch).to(self.device, dtype=torch.float32)
+                        # OPTIMIZATION: Handle GPU vs CPU preprocessing differently
+                        if use_gpu_preprocess:
+                            # Data is already on GPU from GPU preprocessing
+                            processed_batch = batch  # Already torch.Tensor on GPU
                         else:
-                            batch_array = np.ascontiguousarray(np.stack(batch, axis=0))
-                            processed_batch = torch.from_numpy(batch_array).to(self.device, dtype=torch.float32)
-                        
+                            # CPU preprocessing: use pre-allocated GPU buffer for efficiency
+                            if isinstance(batch, np.ndarray):
+                                if not batch.flags['C_CONTIGUOUS']:
+                                    batch = np.ascontiguousarray(batch)
+                                batch_tensor = torch.from_numpy(batch)
+                            else:
+                                batch_array = np.ascontiguousarray(np.stack(batch, axis=0))
+                                batch_tensor = torch.from_numpy(batch_array)
+
+                            # Use pre-allocated buffer or direct copy to GPU
+                            if gpu_batch_buffer is not None and batch_tensor.shape[0] <= gpu_batch_buffer.shape[0]:
+                                # Copy to pre-allocated buffer (avoids new allocations)
+                                gpu_batch_buffer[:batch_tensor.shape[0]].copy_(batch_tensor)
+                                processed_batch = gpu_batch_buffer[:batch_tensor.shape[0]]
+                            else:
+                                # Fallback to direct GPU transfer for edge cases
+                                processed_batch = batch_tensor.to(self.device, dtype=torch.float32)
+
                         # Get embeddings
                         batch_embeddings = self.embed_batch(processed_batch, is_zstack=False)
                         
@@ -2393,7 +2405,13 @@ class NucleiEmbedding:
                 # Reset dataset for next layer
                 dataset.z_layer = None
                 gc.collect()
-            
+
+            # Clean up pre-allocated GPU buffer after all layers
+            if gpu_batch_buffer is not None:
+                del gpu_batch_buffer
+                torch.cuda.empty_cache()
+                print("[PERF] Cleaned up GPU batch buffer")
+
             # Fuse embeddings across layers
             print(f"\n{'='*80}")
             print(f"FUSING EMBEDDINGS ACROSS {num_layers} LAYERS")
