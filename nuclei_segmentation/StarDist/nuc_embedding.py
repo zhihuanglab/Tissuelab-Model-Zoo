@@ -17,7 +17,7 @@ import torch
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
 import torchvision.transforms as transforms
 
-from PIL import Image
+from PIL import Image, ImageDraw
 import multiprocess as mp
 from tqdm import tqdm
 import zarr
@@ -26,6 +26,12 @@ from torch.utils.data import Dataset, DataLoader
 import time
 from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
 import pathlib
+import cv2
+from scipy.ndimage import zoom
+import gc
+import sys
+import platform
+import traceback
 
 VIPS_AVAILABLE = importlib.util.find_spec("pyvips") is not None
 
@@ -294,7 +300,6 @@ class NucleiPatchDataset(Dataset):
             
             # Method 2: Try PIL for multi-page TIFF
             try:
-                from PIL import Image
                 with Image.open(self.slide_path) as img:
                     # Check if it's a multi-page TIFF
                     try:
@@ -330,7 +335,6 @@ class NucleiPatchDataset(Dataset):
 
     def _open_slide(self):
         """Open slide object once and reuse it for all patch extractions"""
-        import time
         slide_open_start = time.time()
         
         if self.slide is not None:
@@ -396,7 +400,6 @@ class NucleiPatchDataset(Dataset):
         Contours shape: (n_nuclei, n_points, 2) where each contour is (x, y) points
         This is O(n) per nucleus - just min/max operations, very fast!
         """
-        import numpy as np
         
         self.bounding_boxes = []
         for i in range(len(self.centroids)):
@@ -541,8 +544,6 @@ class NucleiPatchDataset(Dataset):
 
     def _extract_single_patch(self, x1, y1, width, height, idx, x, y, z_layer=0):
         """Extract a single patch from one z-layer"""
-        import time
-        from PIL import Image  # Import at the beginning for all branches
         
         # FOR Z-STACK: Use tifffile + zarr for efficient region reading (avoids loading entire 3.56GB layer!)
         # OPTIMIZATION: Use persistent TiffFile handle to avoid repeated file opening (100x faster!)
@@ -550,7 +551,6 @@ class NucleiPatchDataset(Dataset):
         is_tiff_file = self.slide_path.lower().endswith(('.tif', '.tiff', '.ndpi'))
         if self.is_zstack and is_tiff_file:
             try:
-                import zarr as zarr_lib
                 
                 # Use persistent TiffFile handle if available (much faster!)
                 if self._tiff_handle is not None:
@@ -589,7 +589,7 @@ class NucleiPatchDataset(Dataset):
                     # Cache key includes page_idx to handle pyramid structure correctly
                     cache_key = (z_layer, page_idx)
                     if cache_key not in self._zarr_cache:
-                        self._zarr_cache[cache_key] = zarr_lib.open(page.aszarr(), mode='r')
+                        self._zarr_cache[cache_key] = zarr.open(page.aszarr(), mode='r')
                     zarr_array = self._zarr_cache[cache_key]
                     
                     # Read only the required region (efficient - no full layer load!)
@@ -606,7 +606,6 @@ class NucleiPatchDataset(Dataset):
                     
                     # Resize to model input size
                     if patch_array.shape[0] != self.patch_size or patch_array.shape[1] != self.patch_size:
-                        import cv2
                         patch_array = cv2.resize(patch_array, (self.patch_size, self.patch_size), interpolation=cv2.INTER_LINEAR)
                     
                     # Return numpy array (processor can handle it)
@@ -616,7 +615,6 @@ class NucleiPatchDataset(Dataset):
                         tif.close()
                         
             except Exception as e:
-                import traceback
                 error_msg = f"Error reading z-stack layer {z_layer} for cell {idx}: {type(e).__name__}: {e}"
                 # Only print detailed error for first few cells to avoid spam
                 if idx < 10:
@@ -730,7 +728,6 @@ class NucleiPatchDataset(Dataset):
             if needs_resize:
                 # Use cv2 for faster resize (if available) or scipy.ndimage
                 try:
-                    import cv2
                     # Choose interpolation method based on scale factor
                     scale_factor = min(self.patch_size / patch_w, self.patch_size / patch_h)
                     if scale_factor < 0.5:
@@ -742,7 +739,6 @@ class NucleiPatchDataset(Dataset):
                     patch = cv2.resize(patch, (self.patch_size, self.patch_size), interpolation=interpolation)
                 except ImportError:
                     # Fallback to scipy.ndimage.zoom
-                    from scipy.ndimage import zoom
                     scale_h = self.patch_size / patch_h
                     scale_w = self.patch_size / patch_w
                     patch = zoom(patch, (scale_h, scale_w, 1), order=1).astype(np.uint8)
@@ -800,7 +796,6 @@ class NucleiPatchDataset(Dataset):
 
     def _extract_zstack_patches(self, x1, y1, width, height, idx):
         """Extract patches from all z-layers for embedding fusion"""
-        from PIL import Image
         
         x, y = self.centroids[idx]
         
@@ -841,8 +836,7 @@ class NucleiPatchDataset(Dataset):
                                     
                                     # Use aszarr() for efficient region reading
                                     # This avoids loading the entire 4GB+ page into memory
-                                    import zarr as zarr_lib
-                                    zarr_array = zarr_lib.open(page.aszarr(), mode='r')
+                                    zarr_array = zarr.open(page.aszarr(), mode='r')
                                     # Read only the required region
                                     patch_array = np.asarray(zarr_array[y1:y2, x1:x2])
                                     
@@ -924,8 +918,7 @@ class NucleiPatchDataset(Dataset):
                                     
                                     # Read only the required region using zarr for efficiency
                                     # This avoids loading the entire page into memory
-                                    import zarr as zarr_lib
-                                    zarr_array = zarr_lib.open(page.aszarr(), mode='r')
+                                    zarr_array = zarr.open(page.aszarr(), mode='r')
                                     patch_array = np.asarray(zarr_array[y1:y2, x1:x2])
                                     
                                     # Check and pad undersized patches (boundary cells)
@@ -1055,7 +1048,6 @@ class NucleiPatchDataset(Dataset):
         if not self.debug_save_patches:
             return
         try:
-            from PIL import ImageDraw
             
             debug_patch = patch_img.copy()
             draw = ImageDraw.Draw(debug_patch)
@@ -1089,8 +1081,6 @@ class NucleiPatchDataset(Dataset):
         if not self.debug_save_patches:
             return
         try:
-            from PIL import Image, ImageDraw
-            import numpy as np
             
             # Convert processed_patch to numpy array if needed
             if not isinstance(processed_patch, np.ndarray):
@@ -1154,7 +1144,6 @@ class NucleiPatchDataset(Dataset):
                 print(f"[DEBUG] Saved PROCESSED patch {self.debug_patch_counter}: {filename}")
         except Exception as e:
             print(f"[DEBUG] Failed to save processed patch {idx}: {str(e)}")
-            import traceback
             traceback.print_exc()
 
 # Pre-compute CLIP normalization constants (module-level for reuse)
@@ -1211,9 +1200,6 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
     Returns:
         torch.Tensor of shape (N, C, H, W) with normalized float32 values
     """
-    import time
-    import numpy as np
-    from PIL import Image
     
     if len(images) == 0:
         return torch.zeros((0, 3, target_size, target_size), device=device, dtype=torch.float32)
@@ -1330,7 +1316,6 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
         - If return_uint8=True: uint8 values [0, 255] (not normalized)
         - If return_uint8=False: float32 normalized values (ready for model)
     """
-    import time
     
     if use_torchvision:
         num_images = len(images)
@@ -1675,8 +1660,6 @@ def collate_patches(batch, processor=None, perf_stats=None, use_fast_preprocess=
         For z-stack: batch is [cell1_patches, cell2_patches, ...]
         where cell_patches = [z1_patch, z2_patch, ...]
     """
-    import time
-    import numpy as np
     
     valid_items = [item for item in batch if item is not None]
     
@@ -1854,7 +1837,6 @@ class NucleiEmbedding:
         # This can provide 20-30% speedup on modern GPUs
         # NOTE: Per project policy, only enable torch.compile on Windows machines
         try:
-            import platform
             is_windows = platform.system() == 'Windows'
 
             if not is_windows:
@@ -2148,7 +2130,6 @@ class NucleiEmbedding:
             print(f"This ensures sequential I/O and avoids multi-process file handle conflicts")
         
         # Detect if running on Linux (server), adjust DataLoader strategy
-        import platform
         is_linux = platform.system() == 'Linux'
         
         # Adjust num_workers based on platform and z-stack status
@@ -2293,7 +2274,6 @@ class NucleiEmbedding:
         ds_name = parts[-1]
         
         total_start_time = time.time()
-        import gc
         
         # Z-stack layer-wise processing
         if is_zstack:
@@ -2604,7 +2584,6 @@ class NucleiEmbedding:
                         print(f"  Model: {perf_stats['model_time']:.1f}s ({perf_stats['model_time']/elapsed_time*100:.1f}%)", flush=True)
         except Exception as e:
             print(f"\n[PERF] Error during embedding generation: {e}", flush=True)
-            import traceback
             traceback.print_exc()
             raise
         finally:
@@ -2618,7 +2597,6 @@ class NucleiEmbedding:
             total_time = time.time() - total_start_time
             
             # Print performance statistics (force flush to ensure output)
-            import sys
             sys.stdout.flush()
             
             print("\n" + "="*60, flush=True)
