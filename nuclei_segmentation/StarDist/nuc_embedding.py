@@ -63,13 +63,15 @@ class NucleiPatchDataset(Dataset):
             'processor_transpose_in_convert_time': 0.0,  # Time for transpose during convert (HWC->CHW)
             'processor_convert_normalize_time': 0.0,  # Total time for type conversion and normalization
             'processor_transpose_time': 0.0,  # Time for final transpose check (should be minimal now)
-            'processor_imagenet_norm_time': 0.0,  # Time for CLIP normalization
+            'processor_clip_norm_time': 0.0,  # Time for CLIP normalization
             'processor_total_time': 0.0,  # Total processor time
             'total_calls': 0,
             'slide_open_time': 0.0  # Time spent opening slide objects
         }
         
         # Pre-compute bounding boxes from contours if available (very efficient - just numpy operations)
+        # NOTE: Bounding box functionality is temporarily disabled for now (set to False).
+        #       Re-enable by setting to True once contour-based patch extraction is validated and ready for production.
         self.use_bounding_boxes = False
         if self.use_bounding_boxes:
             print(f"Using contour-based bounding boxes for patch extraction (padding: {padding_ratio*100}%)")
@@ -1635,7 +1637,7 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
         # No separate CLIP normalization step needed - already applied directly from uint8
         if perf_stats is not None:
             # CLIP norm time is now included in normalize_time
-            perf_stats['processor_imagenet_norm_time'] += 0.0
+            perf_stats['processor_clip_norm_time'] += 0.0
         
         return batch_array
     else:
@@ -1959,9 +1961,7 @@ class NucleiEmbedding:
                                 image_embeds = vision_outputs.last_hidden_state.mean(dim=1)
                                 embeddings = self.image_projection(image_embeds)
 
-                                # OPTIMIZATION: Record event after inference to enable async processing
-                                inference_event = torch.cuda.Event()
-                                inference_event.record()
+                                # (Removed unused CUDA event creation and recording)
                         else:
                             # CPU fallback
                             vision_outputs = self.model.vision_model(cell_tensor)
@@ -2031,8 +2031,6 @@ class NucleiEmbedding:
                         embeddings = self.image_projection(image_embeds)
 
                         # OPTIMIZATION: Record event after inference to enable async processing
-                        inference_event = torch.cuda.Event()
-                        inference_event.record()
                 else:
                     # CPU fallback
                     vision_outputs = self.model.vision_model(processed_batch)
@@ -2334,7 +2332,11 @@ class NucleiEmbedding:
                 pbar = tqdm(total=num_cells, desc=f"Layer {layer_idx + 1}/{num_layers}")
 
                 for batch in dataloader:
-                    if batch is not None and (isinstance(batch, np.ndarray) and batch.size > 0 or isinstance(batch, list) and len(batch) > 0):
+                    if batch is not None and (
+                        (isinstance(batch, np.ndarray) and batch.size > 0) or
+                        (isinstance(batch, list) and len(batch) > 0) or
+                        (torch.is_tensor(batch) and batch.size(0) > 0)
+                    ):
                         # OPTIMIZATION: Handle GPU vs CPU preprocessing differently
                         if use_gpu_preprocess:
                             # Data is already on GPU from GPU preprocessing
