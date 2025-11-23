@@ -1263,8 +1263,8 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
         
         # Calculate scale factor based on shortest edge (always resize, even if scale=1.0)
         scale = target_size / shortest_edge
-        new_h = int(round(h * scale))
-        new_w = int(round(w * scale))
+        new_h = int(np.floor(h * scale))
+        new_w = int(np.floor(w * scale))
         
         # Ensure at least target_size for both dimensions (for center crop)
         if new_h < target_size:
