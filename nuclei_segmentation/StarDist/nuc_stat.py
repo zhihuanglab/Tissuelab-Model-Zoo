@@ -137,7 +137,7 @@ class VipsSlide():
         
         print('Reading slide with libvips...')
         st = time.time()
-        self.wsi = pyvips.Image.new_from_file(filepath, access="random")
+        self.wsi = pyvips.Image.new_from_file(filepath, access="sequential")
         self.region = pyvips.Region.new(self.wsi)
         et = time.time()
         print(f'Done. Time elapsed: {et-st} seconds.')
