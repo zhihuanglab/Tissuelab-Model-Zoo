@@ -430,6 +430,11 @@ def process_inferred_batch(
         if batch_results_local.dim() == 3:
             batch_results_local = batch_results_local.unsqueeze(0)
 
+        centroids_accum: list[torch.Tensor] = []
+        areas_accum: list[torch.Tensor] = []
+        contours_accum: list[np.ndarray] = []
+        stardist_accum: list[np.ndarray] = []
+
         for tile_idx, (counter, i, window_i, j, window_j) in enumerate(batch_metadata):
             tile_label = batch_results_local[tile_idx]
 
@@ -546,12 +551,11 @@ def process_inferred_batch(
                                 f"degenerate={frac_zero:.2f}%"
                             )
                         coords_gpu_np = coords_gpu.detach().cpu().numpy()
-                        emitter.emit(
-                            global_centroids,
-                            areas_tile,
-                            list(coords_gpu_np),
-                            coords_gpu_np,
-                        )
+                        centroids_accum.append(global_centroids.clone())
+                        areas_accum.append(areas_tile.to(torch.float32))
+                        for obj_coords in coords_gpu_np:
+                            contours_accum.append(obj_coords.astype(np.int32))
+                        stardist_accum.append(coords_gpu_np.astype(np.float32))
                         continue
                     except Exception as exc:  # pragma: no cover - GPU optional
                         gpu_sampling_enabled = False
@@ -659,17 +663,26 @@ def process_inferred_batch(
                 contour_block_elapsed = time.time() - contour_block_start
                 contour_time_batch += contour_block_elapsed
 
-                stardist_coords_np = (
-                    np.stack(stardist_coords_tile, axis=0).astype(np.float32)
-                    if stardist_coords_tile
-                    else None
-                )
-                emitter.emit(
-                    global_centroids,
-                    areas_tile,
-                    contours_tile,
-                    stardist_coords_np,
-                )
+                centroids_accum.append(global_centroids)
+                areas_accum.append(areas_tile.to(torch.float32))
+                contours_accum.extend(contours_tile)
+                if len(stardist_coords_tile) > 0:
+                    stardist_coords_np = np.stack(stardist_coords_tile, axis=0).astype(np.float32)
+                    stardist_accum.append(stardist_coords_np)
+
+        if centroids_accum:
+            batch_centroids = torch.cat(centroids_accum, dim=0)
+            batch_areas = torch.cat(areas_accum, dim=0)
+            stardist_array = (
+                np.concatenate(stardist_accum, axis=0) if len(stardist_accum) > 0 else None
+            )
+            contours_payload = contours_accum if len(contours_accum) > 0 else None
+            emitter.emit(
+                batch_centroids,
+                batch_areas,
+                contours_payload,
+                stardist_array,
+            )
 
     centroid_extraction_elapsed = time.time() - centroid_extraction_start
     centroid_only_time = max(centroid_extraction_elapsed - contour_time_batch, 0.0)
