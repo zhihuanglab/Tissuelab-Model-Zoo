@@ -29,13 +29,14 @@ import multiprocess
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 from pathlib import Path
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from instanseg.inference_class import InstanSeg
+from instanseg.pipeline import run_wsi
 
 app = FastAPI()
 
@@ -105,6 +106,28 @@ def _load_prediction_from_zarr(image_path: str, prediction_tag: str, channel: in
 
     return label_array, float(scale_y), float(scale_x)
 
+
+def _read_streamed_vectors_from_zarr(
+    zarr_path: Optional[str],
+    node_name: str,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    """Utility to fetch centroids/contours/probability written by the streaming runner."""
+    if not zarr_path or not os.path.exists(zarr_path):
+        return None, None, None
+
+    try:
+        zf = zarr.open_group(zarr_path, mode="r")
+        if node_name not in zf:
+            return None, None, None
+        grp = zf[node_name]
+        centroids = grp["centroids"][()] if "centroids" in grp else None
+        contours = grp["contours"][()] if "contours" in grp else None
+        probability = grp["probability"][()] if "probability" in grp else None
+        return centroids, contours, probability
+    except Exception as exc:
+        print(f"[SEG LOG] Error reading streamed vectors from {zarr_path}: {exc}")
+        return None, None, None
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8006, help='port')
@@ -136,6 +159,12 @@ def parse_args():
                         help='Normalize input images')
     parser.add_argument('--use_otsu', default=False, type=bool,
                         help='Use Otsu thresholding for WSI tissue detection')
+    parser.add_argument('--min_area_pixels', default=50, type=int,
+                        help='Minimum nucleus area (pixels) kept after filtering')
+    parser.add_argument('--detection_size', default=20, type=int,
+                        help='Expected half-size for detections (core region margin)')
+    parser.add_argument('--stardist_rays', default=32, type=int,
+                        help='Number of rays for StarDist-style contour export')
 
     # ROI parameters
     parser.add_argument('--target_mpp', default=None, type=float,
@@ -427,33 +456,17 @@ def run_segmentation(args):
         probability = None
 
         if os.path.exists(ZARR_PATH):
-            try:
-                zf = zarr.open_group(ZARR_PATH, mode='r')
-                if NODE_NAME in zf:
-                    if f"{NODE_NAME}/centroids" in zf:
-                        centroids = zf[f"{NODE_NAME}/centroids"][()]
-                    if f"{NODE_NAME}/contours" in zf:
-                        contours = zf[f"{NODE_NAME}/contours"][()]
-                    if f"{NODE_NAME}/probability" in zf:
-                        probability = zf[f"{NODE_NAME}/probability"][()]
-
-                    if centroids is not None and centroids.size > 0:
-                        ALREADY_HAVE_SEG = True
-                        result["message"] = "Using existing nuclei segmentation"
-                        result["nuclei_count"] = len(centroids)
-                        print(f"[SEG LOG] Using existing segmentation with {len(centroids)} nuclei")
-                    else:
-                        print("[SEG LOG] Existing centroids empty or invalid, will re-run InstanSeg.")
-                        centroids = None
-                        contours = None
-                        probability = None
-                else:
-                    print(f"[SEG LOG] Group '{NODE_NAME}' not found in Zarr store. Will run InstanSeg.")
-            except Exception as e:
-                print(f"[SEG LOG] Error reading existing data: {e}. Will re-run InstanSeg.")
+            centroids, contours, probability = _read_streamed_vectors_from_zarr(ZARR_PATH, NODE_NAME)
+            if centroids is not None and centroids.size > 0:
+                ALREADY_HAVE_SEG = True
+                result["message"] = "Using existing nuclei segmentation"
+                result["nuclei_count"] = len(centroids)
+                print(f"[SEG LOG] Using existing segmentation with {len(centroids)} nuclei")
+            else:
                 centroids = None
                 contours = None
                 probability = None
+                print(f"[SEG LOG] No existing streamed vectors for '{NODE_NAME}', will re-run InstanSeg.")
 
         # ------------------------------------------------------------------
         # Step B: run InstanSeg if needed to obtain a label image
@@ -472,120 +485,46 @@ def run_segmentation(args):
             update_progress(5, "initialization")
 
             inference_start = time.time()
-            label_image = MODEL.eval(
+            run_wsi(
+                model=MODEL,
                 image=args.slidepath,
                 pixel_size=args.pixel_size,
-                save_output=False,
-                save_overlay=False,
-                save_geojson=False,
-                processing_method=args.processing_method,
-                tile_size=args.tile_size,
-                batch_size=args.batch_size,
-                overlap=args.overlap,
                 normalise=args.normalise,
+                normalisation_subsampling_factor=1,
+                tile_size=args.tile_size,
+                overlap=args.overlap,
+                detection_size=getattr(args, "detection_size", 20),
+                save_geojson=False,
                 use_otsu_threshold=args.use_otsu,
-                use_tissue_mask=args.use_otsu is False  # if not Otsu, allow color-based mask
+                batch_size=args.batch_size,
+                use_tissue_mask=args.use_otsu is False,
+                debug_tissue_mask=False,
+                min_area=getattr(args, "min_area_pixels", 50),
+                stardist_rays=getattr(args, "stardist_rays", 32),
             )
             inference_time = time.time() - inference_start
-            print(f"[SEG LOG] Inference completed in {inference_time:.2f}s")
+            print(f"[SEG LOG] Streaming inference completed in {inference_time:.2f}s")
+            update_progress(65, "streaming_complete")
 
-            update_progress(50, "inference_complete")
-
-            extraction_start = time.time()
-
-            if label_image is None:
-                print("[SEG LOG] InstanSeg returned None, loading prediction from zarr on disk")
-                update_progress(52, "loading_zarr_prediction")
-                label_image, scale_y, scale_x = _load_prediction_from_zarr(args.slidepath, MODEL.prediction_tag)
-
-            # At this point we must have a label_image
-            if label_image is None:
-                raise RuntimeError("InstanSeg produced no label image and no on-disk prediction could be loaded.")
-
-            update_progress(55, "extracting_contours")
-            centroids_label, contours_list, probability = extract_contours_and_centroids_from_labels(label_image)
-
-            # Scale centroids / contours into slide coordinate space if needed
-            if centroids_label.size > 0 and (scale_x != 1.0 or scale_y != 1.0):
-                update_progress(58, "scaling_coordinates")
-                centroids_float = centroids_label.astype(np.float64)
-                centroids_float[:, 0] = np.round(centroids_float[:, 0] * scale_y)
-                centroids_float[:, 1] = np.round(centroids_float[:, 1] * scale_x)
-                centroids = centroids_float.astype(np.int32)
-
-                if contours_list:
-                    scaled_contours = []
-                    for i, contour in enumerate(contours_list):
-                        if i % 50 == 0:
-                            progress = 58 + int((i / len(contours_list)) * 7)
-                            update_progress(progress, "scaling_contours")
-                        if contour.size > 0:
-                            c = contour.astype(np.float64)
-                            c[:, 0] = np.round(c[:, 0] * scale_x)
-                            c[:, 1] = np.round(c[:, 1] * scale_y)
-                            scaled_contours.append(c.astype(np.int32))
-                        else:
-                            scaled_contours.append(contour)
-                    contours = scaled_contours
-                else:
-                    contours = []
-            else:
-                # No scaling required; slide space == label space
-                centroids = centroids_label.astype(np.int32)
-                contours = contours_list
-
-            extraction_time = time.time() - extraction_start
-            print(f"[SEG LOG] Detected {len(centroids)} nuclei in {extraction_time:.2f}s")
-            update_progress(65, "extraction_complete")
-
-            result["nuclei_count"] = len(centroids)
+            centroids, contours, probability = _read_streamed_vectors_from_zarr(ZARR_PATH, NODE_NAME)
+            if centroids is None or centroids.size == 0:
+                raise RuntimeError("Streaming pipeline completed but no centroids were written to Zarr.")
             result["message"] = "Segmentation completed successfully"
+            result["nuclei_count"] = len(centroids)
 
         # ------------------------------------------------------------------
-        # Step C: (Re-)write core segmentation data to Zarr
-        #         This mirrors the StarDist node behaviour and is safe even
-        #         when we reused existing segmentation.
+        # Step C: ensure streamed data exists (writer already handled Zarr IO)
         # ------------------------------------------------------------------
-        if centroids is not None:
-            zarr_write_start = time.time()
-            zf = zarr.open_group(ZARR_PATH, mode='a')
-            node_grp = zf.require_group(NODE_NAME)
-
-            # Clear existing datasets if any, but keep other fields (e.g. embedding)
-            for key in ['centroids', 'probability', 'contours']:
-                if key in node_grp:
-                    del node_grp[key]
-
-            update_progress(67, "writing_centroids")
-            node_grp.create_dataset('centroids', data=centroids.astype(np.int32))
-
-            if probability is not None:
-                update_progress(69, "writing_probability")
-                node_grp.create_dataset('probability', data=probability.astype(np.float32))
-            else:
-                print("[SEG LOG] Probability is None, skipping probability write.")
-
-            if contours is not None and len(contours) > 0:
-                update_progress(71, "formatting_contours")
-                # If contours already in fixed-length format, this is cheap
-                contours_array = format_contours_for_h5(contours)
-                update_progress(73, "writing_contours")
-                node_grp.create_dataset('contours', data=contours_array)
-                print(f"[SEG LOG] Saved {len(contours)} contours in shape {contours_array.shape}")
-            else:
-                print("[SEG LOG] No contours to write.")
-
-            zarr_write_time = time.time() - zarr_write_start
-            print(f"[SEG LOG] Saved core data to {ZARR_PATH} in {zarr_write_time:.2f}s")
-            update_progress(75, "core_data_saved")
-        else:
-            print("[SEG LOG] No centroids available after segmentation check/run. Skipping write and embedding.")
+        if centroids is None or centroids.size == 0:
+            print("[SEG LOG] No centroids available after segmentation check/run. Aborting.")
             result["message"] = "No nuclei detected"
             progress_complete = True
             update_progress(100, "segmentation")
             end_time = time.time()
             print(f"Time taken: {end_time - start_time:.2f}s")
             return result
+        else:
+            update_progress(75, "core_data_saved")
 
         # ------------------------------------------------------------------
         # Step D: generate / reuse embeddings (aligned with StarDist node)
@@ -606,10 +545,14 @@ def run_segmentation(args):
             if not have_cached_embedding:
                 print("[EMBED LOG] No cached embeddings or size mismatch => generate new embeddings.")
 
-                # Ensure we have a label_image and label-space centroids for embedding
-                if label_image is None:
+                label_for_embedding = label_image
+                centroids_label = None
+
+                if label_for_embedding is None:
                     try:
-                        label_image, scale_y, scale_x = _load_prediction_from_zarr(args.slidepath, MODEL.prediction_tag)
+                        label_for_embedding, scale_y, scale_x = _load_prediction_from_zarr(
+                            args.slidepath, MODEL.prediction_tag
+                        )
                         if scale_x != 0 and scale_y != 0:
                             inv_scale_y = 1.0 / scale_y
                             inv_scale_x = 1.0 / scale_x
@@ -625,24 +568,26 @@ def run_segmentation(args):
                         centroids_label = None
 
                 if centroids_label is None:
-                    # Fall back to slide-space centroids if we could not obtain label-space coords
                     centroids_label = centroids.astype(np.int32)
 
-                embedding_start = time.time()
-                update_progress(76, "generating_embeddings")
+                if label_for_embedding is None:
+                    print("[EMBED LOG] No label image available; skipping embedding generation.")
+                else:
+                    embedding_start = time.time()
+                    update_progress(76, "generating_embeddings")
 
-                ne = NucleiEmbedding(args, centroids_label)
-                ne.generate_embeddings(
-                    label_image,
-                    zarr_path=ZARR_PATH,
-                    dataset_path=f"{NODE_NAME}/embedding",
-                    progress_callback=update_progress,
-                )
+                    ne = NucleiEmbedding(args, centroids_label)
+                    ne.generate_embeddings(
+                        label_for_embedding,
+                        zarr_path=ZARR_PATH,
+                        dataset_path=f"{NODE_NAME}/embedding",
+                        progress_callback=update_progress,
+                    )
 
-                embedding_time = time.time() - embedding_start
-                print(f"[SEG LOG] Generated embeddings in {embedding_time:.2f}s")
+                    embedding_time = time.time() - embedding_start
+                    print(f"[SEG LOG] Generated embeddings in {embedding_time:.2f}s")
 
-                update_progress(92, "embeddings_saved")
+                    update_progress(92, "embeddings_saved")
             else:
                 print("[EMBED LOG] Reusing cached embeddings from Zarr.")
 
@@ -706,6 +651,9 @@ def init_node():
                     overlap=80,
                     normalise=True,
                     use_otsu=False,
+                    min_area_pixels=50,
+                    detection_size=20,
+                    stardist_rays=32,
                     target_mpp=None,
                     bbox=None,
                     polygon_points=None
@@ -757,6 +705,9 @@ def read_node(data: Dict[str, Any]):
             overlap=80,
             normalise=True,
             use_otsu=False,
+            min_area_pixels=50,
+            detection_size=20,
+            stardist_rays=32,
             target_mpp=None,
             bbox=None,
             polygon_points=None,
@@ -767,6 +718,12 @@ def read_node(data: Dict[str, Any]):
         ARGS.bbox = None
         ARGS.polygon_points = None
         ARGS.pixel_size = None
+        if not hasattr(ARGS, "min_area_pixels"):
+            ARGS.min_area_pixels = 50
+        if not hasattr(ARGS, "detection_size"):
+            ARGS.detection_size = 20
+        if not hasattr(ARGS, "stardist_rays"):
+            ARGS.stardist_rays = 32
 
     # Read user data from Zarr
     zf = zarr.open_group(ZARR_PATH, mode='r')

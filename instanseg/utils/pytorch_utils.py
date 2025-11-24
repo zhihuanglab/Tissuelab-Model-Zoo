@@ -494,6 +494,7 @@ def _to_tensor_float32(image: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
     If the input is a NumPy array, it will be converted to a PyTorch tensor.
     The tensor will be squeezed to remove any singleton dimensions.
     The channel dimension will be moved to the first position if it is not already there.
+    Supports both single images (2D/3D) and batched images (4D).
     
     Args:
         image (Union[np.ndarray, torch.Tensor]): The input image, which can be either a NumPy array or a PyTorch tensor.
@@ -505,11 +506,26 @@ def _to_tensor_float32(image: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
     if isinstance(image, np.ndarray):      
         if image.dtype == np.uint16:
             image = image.astype(np.int32)
-        image = torch.from_numpy(image.astype(np.float32)).float()
+        # Optimized: Avoid astype(float32) which creates a copy. 
+        # from_numpy creates a tensor sharing memory (or copy if strides mismatch), 
+        # then float() casts to float32 on tensor side which is often faster or avoids double copy.
+        image = torch.from_numpy(image).float()
     
+    # Handle batched inputs (4D: batch, channels, height, width)
+    if image.dim() == 4:
+        # For batched inputs, ensure channel dimension is first
+        # If shape is (B, H, W, C) or (B, C, H, W), we need to check
+        # Most common case: (B, C, H, W) - already correct, just ensure it's float32
+        if image.dtype != torch.float32:
+            image = image.float()
+        # If channels are last (B, H, W, C), move them to second position
+        if image.shape[1] > image.shape[-1] and image.shape[-1] <= 4:  # Likely channels are last
+            image = image.movedim(-1, 1)  # Move channels from last to second position
+        return image
+    
+    # Handle single image inputs (2D/3D)
     image = image.squeeze()
-
-    assert image.dim() <= 3 and image.dim() >= 2, f"Input image shape {image.shape()} is not supported."
+    assert image.dim() <= 3 and image.dim() >= 2, f"Input image shape {image.shape} is not supported."
 
     image = torch.atleast_3d(image)
     channel_index = np.argmin(image.shape) #Note, this could break for small, highly multiplexed images.
