@@ -17,7 +17,7 @@ import torch
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
 import torchvision.transforms as transforms
 
-from PIL import Image
+from PIL import Image, ImageDraw
 import multiprocess as mp
 from tqdm import tqdm
 import zarr
@@ -26,6 +26,12 @@ from torch.utils.data import Dataset, DataLoader
 import time
 from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
 import pathlib
+import cv2
+from scipy.ndimage import zoom
+import gc
+import sys
+import platform
+import traceback
 
 VIPS_AVAILABLE = importlib.util.find_spec("pyvips") is not None
 
@@ -53,18 +59,20 @@ class NucleiPatchDataset(Dataset):
             'processor_pil_to_numpy_time': 0.0,  # Time for PIL to numpy conversion
             'processor_stack_time': 0.0,  # Time for stacking arrays (vectorized path)
             'processor_astype_time': 0.0,  # Time for type conversion (uint8 to float32)
-            'processor_normalize_time': 0.0,  # Time for ImageNet normalization (direct from uint8)
+            'processor_normalize_time': 0.0,  # Time for CLIP normalization (direct from uint8)
             'processor_transpose_in_convert_time': 0.0,  # Time for transpose during convert (HWC->CHW)
             'processor_convert_normalize_time': 0.0,  # Total time for type conversion and normalization
             'processor_transpose_time': 0.0,  # Time for final transpose check (should be minimal now)
-            'processor_imagenet_norm_time': 0.0,  # Time for ImageNet normalization
+            'processor_clip_norm_time': 0.0,  # Time for CLIP normalization
             'processor_total_time': 0.0,  # Total processor time
             'total_calls': 0,
             'slide_open_time': 0.0  # Time spent opening slide objects
         }
         
         # Pre-compute bounding boxes from contours if available (very efficient - just numpy operations)
-        self.use_bounding_boxes = (contours is not None and len(contours) == len(centroids))
+        # NOTE: Bounding box functionality is temporarily disabled for now (set to False).
+        #       Re-enable by setting to True once contour-based patch extraction is validated and ready for production.
+        self.use_bounding_boxes = False
         if self.use_bounding_boxes:
             print(f"Using contour-based bounding boxes for patch extraction (padding: {padding_ratio*100}%)")
             self._compute_bounding_boxes()
@@ -153,32 +161,69 @@ class NucleiPatchDataset(Dataset):
         # Note: _open_slide() will be called after magnification is determined to reuse the slide
         
         # Get magnification and MPP from slide
+        # FIXED: Prioritize tiffslide/openslide for accurate MPP reading (same as old code)
         # Open slide once and reuse it for both MPP reading and patch extraction
         self.mpp = None
+        self.magnification = None
+        
+        # FIXED: Try tiffslide/openslide first to get accurate MPP (same as old code)
+        # This ensures magnification is calculated correctly even when using vips
+        if read_image_method in ['vips', 'PIL', 'numpy', 'dicom']:
+            # For methods that can't read MPP directly, try tiffslide/openslide first
+            try:
+                import tiffslide
+                temp_slide = tiffslide.TiffSlide(slide_path)
+                self.mpp = float(temp_slide.properties['tiffslide.mpp-x'])
+                reference_mpp_1x = 10  # objective magnification
+                self.magnification = reference_mpp_1x / self.mpp
+                temp_slide.close()
+                print(f"[FIXED] Read MPP using tiffslide: {self.mpp:.4f}, magnification: {self.magnification:.2f}x")
+            except Exception:
+                try:
+                    import openslide
+                    temp_slide = openslide.OpenSlide(slide_path)
+                    self.mpp = float(temp_slide.properties['openslide.mpp-x'])
+                    reference_mpp_1x = 10
+                    self.magnification = reference_mpp_1x / self.mpp
+                    temp_slide.close()
+                    print(f"[FIXED] Read MPP using openslide: {self.mpp:.4f}, magnification: {self.magnification:.2f}x")
+                except Exception:
+                    # Fallback to provided magnification
+                    self.magnification = magnification
+                    if magnification is not None:
+                        self.mpp = 10.0 / magnification
+                    else:
+                        self.mpp = 0.25  # Default 40x equivalent
+                    print(f"[WARNING] Could not read MPP, using provided magnification: {self.magnification}x")
+        
         if read_image_method == 'openslide':
             import openslide
             self.slide = openslide.OpenSlide(slide_path)
             self.slide_dimensions = self.slide.dimensions
-            self.mpp = float(self.slide.properties['openslide.mpp-x'])
-            reference_mpp_1x = 10  # objective magnification
-            self.magnification = reference_mpp_1x / self.mpp
+            if self.mpp is None:
+                self.mpp = float(self.slide.properties['openslide.mpp-x'])
+                reference_mpp_1x = 10  # objective magnification
+                self.magnification = reference_mpp_1x / self.mpp
         elif read_image_method == 'tiffslide':
             import tiffslide
             self.slide = tiffslide.TiffSlide(slide_path)
             self.slide_dimensions = self.slide.dimensions
-            self.mpp = float(self.slide.properties['tiffslide.mpp-x'])
-            reference_mpp_1x = 10  # objective magnification
-            self.magnification = reference_mpp_1x / self.mpp
+            if self.mpp is None:
+                self.mpp = float(self.slide.properties['tiffslide.mpp-x'])
+                reference_mpp_1x = 10  # objective magnification
+                self.magnification = reference_mpp_1x / self.mpp
         else:
             # Default to provided magnification for PIL and numpy
-            self.magnification = magnification
+            if self.magnification is None:
+                self.magnification = magnification
             # Estimate MPP from magnification (if not provided)
             # Note: slide will be opened later in _open_slide() and dimensions will be set there
             self.slide_dimensions = None
-            if magnification is not None:
-                self.mpp = 10.0 / magnification
-            else:
-                self.mpp = 0.25  # Default 40x equivalent
+            if self.mpp is None:
+                if self.magnification is not None:
+                    self.mpp = 10.0 / self.magnification
+                else:
+                    self.mpp = 0.25  # Default 40x equivalent
             # Open slide for PIL/numpy/dicom methods
             self._open_slide()
         
@@ -186,26 +231,13 @@ class NucleiPatchDataset(Dataset):
         if self.slide is not None:
             print(f"[PERF] Opened slide object for reuse (will save ~21% DataLoader overhead)")
         
-        # If not using bounding boxes, calculate extraction_size for fixed-size patches
-        if not self.use_bounding_boxes:
-            # Extract a fixed physical size (e.g., 10-15 microns) regardless of magnification
-            # This ensures we get a consistent cell-sized patch, not a huge tissue region
-            target_physical_size_microns = 12.0  # ~12 microns - good for most nuclei with some context
-            
-            # Calculate extraction_size in pixels based on physical size
-            if self.mpp is not None:
-                self.extraction_size = int(target_physical_size_microns / self.mpp)
-                # Ensure minimum size for model input (will upsample if needed)
-                self.extraction_size = max(self.extraction_size, patch_size // 2)
-                print(f"Magnification: {self.magnification}x, MPP: {self.mpp:.4f}")
-                print(f"Target physical size: {target_physical_size_microns} microns")
-                print(f"Extraction size: {self.extraction_size} pixels (physical: {self.extraction_size * self.mpp:.2f} microns)")
-            else:
-                # Fallback: use conservative scale factor
-                self.scale_factor = 1.5  # Much smaller than before (was 40/magnification)
-                self.extraction_size = int(self.patch_size * self.scale_factor)
-                print(f"Magnification: {self.magnification}x (MPP unknown, using fallback)")
-                print(f"Scale factor: {self.scale_factor}, Extraction size: {self.extraction_size} pixels")
+        # FIXED: Use the same calculation method as old code (centroid-based fixed-size extraction)
+        # Calculate extraction_size using the same formula as old code
+        self.scale_factor = 40 / self.magnification
+        self.extraction_size = int(self.patch_size * self.scale_factor)
+        print("Magnification:", self.magnification)
+        print("Scale factor:", self.scale_factor)
+        print(f"Extraction size: {self.extraction_size} pixels")
 
     def _detect_zstack(self):
         """Detect if the image is a z-stack (multi-layer) image"""
@@ -270,7 +302,6 @@ class NucleiPatchDataset(Dataset):
             
             # Method 2: Try PIL for multi-page TIFF
             try:
-                from PIL import Image
                 with Image.open(self.slide_path) as img:
                     # Check if it's a multi-page TIFF
                     try:
@@ -306,7 +337,6 @@ class NucleiPatchDataset(Dataset):
 
     def _open_slide(self):
         """Open slide object once and reuse it for all patch extractions"""
-        import time
         slide_open_start = time.time()
         
         if self.slide is not None:
@@ -372,7 +402,6 @@ class NucleiPatchDataset(Dataset):
         Contours shape: (n_nuclei, n_points, 2) where each contour is (x, y) points
         This is O(n) per nucleus - just min/max operations, very fast!
         """
-        import numpy as np
         
         self.bounding_boxes = []
         for i in range(len(self.centroids)):
@@ -517,8 +546,6 @@ class NucleiPatchDataset(Dataset):
 
     def _extract_single_patch(self, x1, y1, width, height, idx, x, y, z_layer=0):
         """Extract a single patch from one z-layer"""
-        import time
-        from PIL import Image  # Import at the beginning for all branches
         
         # FOR Z-STACK: Use tifffile + zarr for efficient region reading (avoids loading entire 3.56GB layer!)
         # OPTIMIZATION: Use persistent TiffFile handle to avoid repeated file opening (100x faster!)
@@ -526,7 +553,6 @@ class NucleiPatchDataset(Dataset):
         is_tiff_file = self.slide_path.lower().endswith(('.tif', '.tiff', '.ndpi'))
         if self.is_zstack and is_tiff_file:
             try:
-                import zarr as zarr_lib
                 
                 # Use persistent TiffFile handle if available (much faster!)
                 if self._tiff_handle is not None:
@@ -565,7 +591,7 @@ class NucleiPatchDataset(Dataset):
                     # Cache key includes page_idx to handle pyramid structure correctly
                     cache_key = (z_layer, page_idx)
                     if cache_key not in self._zarr_cache:
-                        self._zarr_cache[cache_key] = zarr_lib.open(page.aszarr(), mode='r')
+                        self._zarr_cache[cache_key] = zarr.open(page.aszarr(), mode='r')
                     zarr_array = self._zarr_cache[cache_key]
                     
                     # Read only the required region (efficient - no full layer load!)
@@ -582,7 +608,6 @@ class NucleiPatchDataset(Dataset):
                     
                     # Resize to model input size
                     if patch_array.shape[0] != self.patch_size or patch_array.shape[1] != self.patch_size:
-                        import cv2
                         patch_array = cv2.resize(patch_array, (self.patch_size, self.patch_size), interpolation=cv2.INTER_LINEAR)
                     
                     # Return numpy array (processor can handle it)
@@ -592,7 +617,6 @@ class NucleiPatchDataset(Dataset):
                         tif.close()
                         
             except Exception as e:
-                import traceback
                 error_msg = f"Error reading z-stack layer {z_layer} for cell {idx}: {type(e).__name__}: {e}"
                 # Only print detailed error for first few cells to avoid spam
                 if idx < 10:
@@ -706,7 +730,6 @@ class NucleiPatchDataset(Dataset):
             if needs_resize:
                 # Use cv2 for faster resize (if available) or scipy.ndimage
                 try:
-                    import cv2
                     # Choose interpolation method based on scale factor
                     scale_factor = min(self.patch_size / patch_w, self.patch_size / patch_h)
                     if scale_factor < 0.5:
@@ -718,7 +741,6 @@ class NucleiPatchDataset(Dataset):
                     patch = cv2.resize(patch, (self.patch_size, self.patch_size), interpolation=interpolation)
                 except ImportError:
                     # Fallback to scipy.ndimage.zoom
-                    from scipy.ndimage import zoom
                     scale_h = self.patch_size / patch_h
                     scale_w = self.patch_size / patch_w
                     patch = zoom(patch, (scale_h, scale_w, 1), order=1).astype(np.uint8)
@@ -776,7 +798,6 @@ class NucleiPatchDataset(Dataset):
 
     def _extract_zstack_patches(self, x1, y1, width, height, idx):
         """Extract patches from all z-layers for embedding fusion"""
-        from PIL import Image
         
         x, y = self.centroids[idx]
         
@@ -817,8 +838,7 @@ class NucleiPatchDataset(Dataset):
                                     
                                     # Use aszarr() for efficient region reading
                                     # This avoids loading the entire 4GB+ page into memory
-                                    import zarr as zarr_lib
-                                    zarr_array = zarr_lib.open(page.aszarr(), mode='r')
+                                    zarr_array = zarr.open(page.aszarr(), mode='r')
                                     # Read only the required region
                                     patch_array = np.asarray(zarr_array[y1:y2, x1:x2])
                                     
@@ -900,8 +920,7 @@ class NucleiPatchDataset(Dataset):
                                     
                                     # Read only the required region using zarr for efficiency
                                     # This avoids loading the entire page into memory
-                                    import zarr as zarr_lib
-                                    zarr_array = zarr_lib.open(page.aszarr(), mode='r')
+                                    zarr_array = zarr.open(page.aszarr(), mode='r')
                                     patch_array = np.asarray(zarr_array[y1:y2, x1:x2])
                                     
                                     # Check and pad undersized patches (boundary cells)
@@ -1031,7 +1050,6 @@ class NucleiPatchDataset(Dataset):
         if not self.debug_save_patches:
             return
         try:
-            from PIL import ImageDraw
             
             debug_patch = patch_img.copy()
             draw = ImageDraw.Draw(debug_patch)
@@ -1065,8 +1083,6 @@ class NucleiPatchDataset(Dataset):
         if not self.debug_save_patches:
             return
         try:
-            from PIL import Image, ImageDraw
-            import numpy as np
             
             # Convert processed_patch to numpy array if needed
             if not isinstance(processed_patch, np.ndarray):
@@ -1081,15 +1097,15 @@ class NucleiPatchDataset(Dataset):
                 # (C, H, W) -> (H, W, C)
                 processed_patch = np.transpose(processed_patch, (1, 2, 0))
             
-            # Denormalize: PLIP typically normalizes to [0, 1] or uses ImageNet stats
+            # Denormalize: PLIP typically normalizes to [0, 1] or uses CLIP stats
             # Try to detect normalization and denormalize
             if processed_patch.max() <= 1.0:
                 # Likely normalized to [0, 1]
                 processed_patch = (processed_patch * 255).astype(np.uint8)
             elif processed_patch.min() < 0:
-                # Likely standardized (mean/std normalization) - use ImageNet stats
-                mean = np.array([0.485, 0.456, 0.406])
-                std = np.array([0.229, 0.224, 0.225])
+                # Likely standardized (mean/std normalization) - use CLIP stats
+                mean = np.array([0.48145466, 0.4578275, 0.40821073])
+                std = np.array([0.26862954, 0.26130258, 0.27577711])
                 processed_patch = processed_patch * std + mean
                 processed_patch = np.clip(processed_patch, 0, 1)
                 processed_patch = (processed_patch * 255).astype(np.uint8)
@@ -1130,26 +1146,25 @@ class NucleiPatchDataset(Dataset):
                 print(f"[DEBUG] Saved PROCESSED patch {self.debug_patch_counter}: {filename}")
         except Exception as e:
             print(f"[DEBUG] Failed to save processed patch {idx}: {str(e)}")
-            import traceback
             traceback.print_exc()
 
-# Pre-compute ImageNet normalization constants (module-level for reuse)
-# For uint8 input [0, 255], directly apply ImageNet norm: (x - mean*255) / (std*255)
+# Pre-compute CLIP normalization constants (module-level for reuse)
+# For uint8 input [0, 255], directly apply CLIP norm: (x - mean*255) / (std*255)
 # This avoids the intermediate step of normalizing to [0, 1] first
-_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+_CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
+_CLIP_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
 # Pre-compute constants for uint8 input (no need for /255 step)
-_IMAGENET_MEAN_UINT8 = _IMAGENET_MEAN * 255.0  # [123.675, 116.28, 103.53]
-_IMAGENET_STD_UINT8 = _IMAGENET_STD * 255.0    # [58.395, 57.12, 57.375]
-_IMAGENET_INV_STD_UINT8 = 1.0 / _IMAGENET_STD_UINT8  # Pre-compute division constant
-_IMAGENET_MEAN_TIMES_INV_STD_UINT8 = _IMAGENET_MEAN_UINT8 * _IMAGENET_INV_STD_UINT8
+_CLIP_MEAN_UINT8 = _CLIP_MEAN * 255.0  # CLIP mean scaled to uint8 range
+_CLIP_STD_UINT8 = _CLIP_STD * 255.0    # CLIP std scaled to uint8 range
+_CLIP_INV_STD_UINT8 = 1.0 / _CLIP_STD_UINT8  # Pre-compute division constant
+_CLIP_MEAN_TIMES_INV_STD_UINT8 = _CLIP_MEAN_UINT8 * _CLIP_INV_STD_UINT8
 
 # PyTorch tensor constants for GPU normalization (faster than numpy)
-_IMAGENET_MEAN_TENSOR = None  # Will be initialized on first use
-_IMAGENET_STD_TENSOR = None   # Will be initialized on first use
+_CLIP_MEAN_TENSOR = None  # Will be initialized on first use
+_CLIP_STD_TENSOR = None   # Will be initialized on first use
 
-def _normalize_imagenet_gpu(tensor, device):
-    """Normalize ImageNet on GPU using PyTorch (faster than CPU numpy).
+def _normalize_clip_gpu(tensor, device):
+    """Normalize CLIP on GPU using PyTorch (faster than CPU numpy).
     
     Args:
         tensor: torch.Tensor of shape (N, C, H, W) with float32 values [0, 255] (already converted from uint8)
@@ -1158,19 +1173,133 @@ def _normalize_imagenet_gpu(tensor, device):
     Returns:
         Normalized tensor of shape (N, C, H, W) with float32 values
     """
-    global _IMAGENET_MEAN_TENSOR, _IMAGENET_STD_TENSOR
+    global _CLIP_MEAN_TENSOR, _CLIP_STD_TENSOR
     
     # Initialize constants on first use (lazy initialization)
-    if _IMAGENET_MEAN_TENSOR is None or _IMAGENET_MEAN_TENSOR.device != device:
-        _IMAGENET_MEAN_TENSOR = torch.tensor(_IMAGENET_MEAN_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
-        _IMAGENET_STD_TENSOR = torch.tensor(_IMAGENET_STD_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+    if _CLIP_MEAN_TENSOR is None or _CLIP_MEAN_TENSOR.device != device:
+        _CLIP_MEAN_TENSOR = torch.tensor(_CLIP_MEAN_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+        _CLIP_STD_TENSOR = torch.tensor(_CLIP_STD_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
     
     # OPTIMIZATION: Tensor is already float32 on GPU, so just normalize directly
-    # Standard ImageNet normalization: (x - mean) / std
+    # CLIP normalization: (x - mean) / std
     # PyTorch will fuse these operations automatically on GPU
     # Using in-place operations where possible for better memory efficiency
-    normalized = (tensor - _IMAGENET_MEAN_TENSOR) / _IMAGENET_STD_TENSOR
+    normalized = (tensor - _CLIP_MEAN_TENSOR) / _CLIP_STD_TENSOR
     return normalized
+
+def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
+    """GPU-accelerated preprocessing matching processor's behavior:
+    1. Resize shortest edge to target_size (maintain aspect ratio, BICUBIC)
+    2. Center crop to target_size x target_size
+    3. Normalize with CLIP statistics
+    
+    Args:
+        images: List of PIL Images or numpy arrays (H, W, C) with uint8 values [0, 255]
+        device: torch device to use
+        target_size: Target size for resize and crop (default: 224)
+        perf_stats: Optional dict to track preprocessing timing
+        
+    Returns:
+        torch.Tensor of shape (N, C, H, W) with normalized float32 values
+    """
+    
+    if len(images) == 0:
+        return torch.zeros((0, 3, target_size, target_size), device=device, dtype=torch.float32)
+    
+    preprocess_start = time.time()
+    
+    # Convert PIL Images to numpy arrays and ensure uint8 format
+    numpy_images = []
+    for img in images:
+        if isinstance(img, Image.Image):
+            # Convert PIL to numpy (H, W, C)
+            arr = np.array(img, dtype=np.uint8)
+            if len(arr.shape) == 2:
+                arr = np.repeat(arr[:, :, np.newaxis], 3, axis=2)
+            elif arr.shape[2] == 1:
+                arr = np.repeat(arr, 3, axis=2)
+            elif arr.shape[2] > 3:
+                arr = arr[:, :, :3]
+        elif isinstance(img, np.ndarray):
+            arr = img.astype(np.uint8) if img.dtype != np.uint8 else img
+            if len(arr.shape) == 2:
+                arr = np.repeat(arr[:, :, np.newaxis], 3, axis=2)
+            elif arr.shape[2] == 1:
+                arr = np.repeat(arr, 3, axis=2)
+            elif arr.shape[2] > 3:
+                arr = arr[:, :, :3]
+        else:
+            raise ValueError(f"Unsupported image type: {type(img)}")
+        numpy_images.append(arr)
+    
+    # Stack into batch (N, H, W, C) - handle variable sizes
+    # We'll process each image individually for resize/crop, then stack
+    processed_tensors = []
+    
+    for arr in numpy_images:
+        h, w = arr.shape[:2]
+        
+        # Convert to tensor and move to GPU (H, W, C) -> (1, C, H, W)
+        img_tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().to(device)
+        
+        # Step 1: Resize shortest edge to target_size (maintain aspect ratio)
+        # Processor uses BICUBIC (resample=3), which corresponds to mode='bicubic' in F.interpolate
+        # CRITICAL: Processor ALWAYS resizes shortest edge to target_size, even if already target_size
+        # This means processor will resize 224x224 images to 224x224 (identity resize with BICUBIC)
+        # We must match this behavior exactly!
+        shortest_edge = min(h, w)
+        
+        # Calculate scale factor based on shortest edge (always resize, even if scale=1.0)
+        scale = target_size / shortest_edge
+        new_h = int(np.floor(h * scale))
+        new_w = int(np.floor(w * scale))
+        
+        # Ensure at least target_size for both dimensions (for center crop)
+        if new_h < target_size:
+            new_h = target_size
+        if new_w < target_size:
+            new_w = target_size
+        
+        # ALWAYS resize using BICUBIC interpolation (matches processor's resample=3)
+        # This includes identity resize (224x224 -> 224x224) to match processor behavior
+        img_tensor = torch.nn.functional.interpolate(
+            img_tensor, 
+            size=(new_h, new_w), 
+            mode='bicubic', 
+            align_corners=False,
+            antialias=True  # Better quality for downscaling
+        )
+        
+        # Step 2: Center crop to target_size x target_size
+        if new_h != target_size or new_w != target_size:
+            # Calculate crop coordinates (center crop)
+            top = (new_h - target_size) // 2
+            left = (new_w - target_size) // 2
+            img_tensor = img_tensor[:, :, top:top+target_size, left:left+target_size]
+        
+        # Ensure final size is exactly target_size x target_size
+        if img_tensor.shape[2] != target_size or img_tensor.shape[3] != target_size:
+            # Final resize if crop didn't work (shouldn't happen, but safety check)
+            img_tensor = torch.nn.functional.interpolate(
+                img_tensor,
+                size=(target_size, target_size),
+                mode='bicubic',
+                align_corners=False,
+                antialias=True
+            )
+        
+        processed_tensors.append(img_tensor.squeeze(0))  # Remove batch dim: (C, H, W)
+    
+    # Stack all processed images: (N, C, H, W)
+    batch_tensor = torch.stack(processed_tensors, dim=0)
+    
+    # Step 3: Normalize with CLIP statistics (GPU-accelerated)
+    normalized_batch = _normalize_clip_gpu(batch_tensor, device)
+    
+    if perf_stats is not None:
+        perf_stats['gpu_preprocessing_time'] = perf_stats.get('gpu_preprocessing_time', 0) + (time.time() - preprocess_start)
+    
+    return normalized_batch
 
 def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return_uint8=False):
     """Ultra-fast batch preprocessing using optimized numpy operations with minimal overhead.
@@ -1189,7 +1318,6 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
         - If return_uint8=True: uint8 values [0, 255] (not normalized)
         - If return_uint8=False: float32 normalized values (ready for model)
     """
-    import time
     
     if use_torchvision:
         num_images = len(images)
@@ -1212,8 +1340,8 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
         # If return_uint8, use uint8 dtype (faster, less memory), else use float32 for normalized data
         batch_array = np.empty((num_images, 3, h, w), dtype=np.uint8 if return_uint8 else np.float32, order='C')
         
-        # OPTIMIZATION 2: Direct ImageNet normalization from uint8 (no intermediate /255 step)
-        # We skip the * inv_255 normalization since ImageNet norm will handle it
+        # OPTIMIZATION 2: Direct CLIP normalization from uint8 (no intermediate /255 step)
+        # We skip the * inv_255 normalization since CLIP norm will handle it
         
         # OPTIMIZATION: Vectorized batch processing when possible
         # Check if all images are numpy arrays (can be fully vectorized)
@@ -1287,18 +1415,18 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                             transposed = stacked.transpose(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
                             batch_array[:] = transposed  # Copy into pre-allocated array
                         else:
-                            # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
+                            # OPTIMIZATION: Merge astype and CLIP normalization - single batch conversion
                             # Convert entire batch once, then process all channels (more efficient than per-channel conversion)
                             normalize_start = time.time()
                             # Single astype for entire batch (more efficient than per-channel)
                             float_batch = stacked.astype(np.float32)
-                            # Vectorized ImageNet normalization for all channels
-                            np.multiply(float_batch[:, :, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
-                            batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                            np.multiply(float_batch[:, :, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
-                            batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                            np.multiply(float_batch[:, :, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
-                            batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                            # Vectorized CLIP normalization for all channels
+                            np.multiply(float_batch[:, :, :, 0], _CLIP_INV_STD_UINT8[0], out=batch_array[:, 0])
+                            batch_array[:, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                            np.multiply(float_batch[:, :, :, 1], _CLIP_INV_STD_UINT8[1], out=batch_array[:, 1])
+                            batch_array[:, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                            np.multiply(float_batch[:, :, :, 2], _CLIP_INV_STD_UINT8[2], out=batch_array[:, 2])
+                            batch_array[:, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                             normalize_time = time.time() - normalize_start
                             if perf_stats is not None:
                                 # Astype is now merged into normalize_time (single batch conversion is faster)
@@ -1313,15 +1441,15 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                             transposed = stacked[:, :, :, :3].transpose(0, 3, 1, 2)  # (N, H, W, 3) -> (N, 3, H, W)
                             batch_array[:] = transposed  # Copy into pre-allocated array
                         else:
-                            # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
+                            # OPTIMIZATION: Merge astype and CLIP normalization - single batch conversion
                             normalize_start = time.time()
                             float_batch = stacked[:, :, :, :3].astype(np.float32)
-                            np.multiply(float_batch[:, :, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
-                            batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                            np.multiply(float_batch[:, :, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
-                            batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                            np.multiply(float_batch[:, :, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
-                            batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                            np.multiply(float_batch[:, :, :, 0], _CLIP_INV_STD_UINT8[0], out=batch_array[:, 0])
+                            batch_array[:, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                            np.multiply(float_batch[:, :, :, 1], _CLIP_INV_STD_UINT8[1], out=batch_array[:, 1])
+                            batch_array[:, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                            np.multiply(float_batch[:, :, :, 2], _CLIP_INV_STD_UINT8[2], out=batch_array[:, 2])
+                            batch_array[:, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                             normalize_time = time.time() - normalize_start
                             if perf_stats is not None:
                                 perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
@@ -1330,15 +1458,15 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                     elif len(stacked.shape) == 3 and stacked.shape[1:] == (h, w):
                         # Grayscale 2D - direct write using out parameter (zero-copy)
                         convert_start = time.time()
-                        # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
+                        # OPTIMIZATION: Merge astype and CLIP normalization - single batch conversion
                         normalize_start = time.time()
                         float_batch = stacked.astype(np.float32)
-                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
-                        batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
-                        batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
-                        batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                        np.multiply(float_batch, _CLIP_INV_STD_UINT8[0], out=batch_array[:, 0])
+                        batch_array[:, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                        np.multiply(float_batch, _CLIP_INV_STD_UINT8[1], out=batch_array[:, 1])
+                        batch_array[:, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                        np.multiply(float_batch, _CLIP_INV_STD_UINT8[2], out=batch_array[:, 2])
+                        batch_array[:, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
@@ -1347,15 +1475,15 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                     elif stacked.shape[1:] == (h, w, 1):
                         # Grayscale 3D - direct write using out parameter (zero-copy)
                         convert_start = time.time()
-                        # OPTIMIZATION: Merge astype and ImageNet normalization - single batch conversion
+                        # OPTIMIZATION: Merge astype and CLIP normalization - single batch conversion
                         normalize_start = time.time()
                         float_batch = stacked[:, :, :, 0].astype(np.float32)
-                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[0], out=batch_array[:, 0])
-                        batch_array[:, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[1], out=batch_array[:, 1])
-                        batch_array[:, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                        np.multiply(float_batch, _IMAGENET_INV_STD_UINT8[2], out=batch_array[:, 2])
-                        batch_array[:, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                        np.multiply(float_batch, _CLIP_INV_STD_UINT8[0], out=batch_array[:, 0])
+                        batch_array[:, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                        np.multiply(float_batch, _CLIP_INV_STD_UINT8[1], out=batch_array[:, 1])
+                        batch_array[:, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                        np.multiply(float_batch, _CLIP_INV_STD_UINT8[2], out=batch_array[:, 2])
+                        batch_array[:, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
@@ -1385,75 +1513,75 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                         pil_conversion_time += time.time() - conv_start
                     
                     # Fast path: Standard RGB image (most common case - optimize this path)
-                    # OPTIMIZATION: Merge astype and ImageNet normalization
+                    # OPTIMIZATION: Merge astype and CLIP normalization
                     if arr_uint8.shape == (h, w, 3):
                         normalize_start = time.time()
                         float_img = arr_uint8.astype(np.float32)
-                        np.multiply(float_img[:, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[i, 0])
-                        batch_array[i, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                        np.multiply(float_img[:, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[i, 1])
-                        batch_array[i, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                        np.multiply(float_img[:, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[i, 2])
-                        batch_array[i, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                        np.multiply(float_img[:, :, 0], _CLIP_INV_STD_UINT8[0], out=batch_array[i, 0])
+                        batch_array[i, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                        np.multiply(float_img[:, :, 1], _CLIP_INV_STD_UINT8[1], out=batch_array[i, 1])
+                        batch_array[i, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                        np.multiply(float_img[:, :, 2], _CLIP_INV_STD_UINT8[2], out=batch_array[i, 2])
+                        batch_array[i, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     elif arr_uint8.ndim == 2:
-                        # Grayscale - merge astype and ImageNet normalization
+                        # Grayscale - merge astype and CLIP normalization
                         normalize_start = time.time()
                         float_img = arr_uint8.astype(np.float32)
-                        np.multiply(float_img, _IMAGENET_INV_STD_UINT8[0], out=batch_array[i, 0])
-                        batch_array[i, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                        np.multiply(float_img, _IMAGENET_INV_STD_UINT8[1], out=batch_array[i, 1])
-                        batch_array[i, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                        np.multiply(float_img, _IMAGENET_INV_STD_UINT8[2], out=batch_array[i, 2])
-                        batch_array[i, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                        np.multiply(float_img, _CLIP_INV_STD_UINT8[0], out=batch_array[i, 0])
+                        batch_array[i, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                        np.multiply(float_img, _CLIP_INV_STD_UINT8[1], out=batch_array[i, 1])
+                        batch_array[i, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                        np.multiply(float_img, _CLIP_INV_STD_UINT8[2], out=batch_array[i, 2])
+                        batch_array[i, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     elif arr_uint8.shape[2] == 4:
-                        # RGBA - merge astype and ImageNet normalization
+                        # RGBA - merge astype and CLIP normalization
                         normalize_start = time.time()
                         float_img = arr_uint8[:, :, :3].astype(np.float32)
-                        np.multiply(float_img[:, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[i, 0])
-                        batch_array[i, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                        np.multiply(float_img[:, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[i, 1])
-                        batch_array[i, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                        np.multiply(float_img[:, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[i, 2])
-                        batch_array[i, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                        np.multiply(float_img[:, :, 0], _CLIP_INV_STD_UINT8[0], out=batch_array[i, 0])
+                        batch_array[i, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                        np.multiply(float_img[:, :, 1], _CLIP_INV_STD_UINT8[1], out=batch_array[i, 1])
+                        batch_array[i, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                        np.multiply(float_img[:, :, 2], _CLIP_INV_STD_UINT8[2], out=batch_array[i, 2])
+                        batch_array[i, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     elif arr_uint8.shape[0] == h and arr_uint8.shape[1] == w and arr_uint8.shape[2] >= 3:
-                        # Multi-channel (>=3) - merge astype and ImageNet normalization
+                        # Multi-channel (>=3) - merge astype and CLIP normalization
                         normalize_start = time.time()
                         float_img = arr_uint8[:, :, :3].astype(np.float32)
-                        np.multiply(float_img[:, :, 0], _IMAGENET_INV_STD_UINT8[0], out=batch_array[i, 0])
-                        batch_array[i, 0] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[0]
-                        np.multiply(float_img[:, :, 1], _IMAGENET_INV_STD_UINT8[1], out=batch_array[i, 1])
-                        batch_array[i, 1] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[1]
-                        np.multiply(float_img[:, :, 2], _IMAGENET_INV_STD_UINT8[2], out=batch_array[i, 2])
-                        batch_array[i, 2] -= _IMAGENET_MEAN_TIMES_INV_STD_UINT8[2]
+                        np.multiply(float_img[:, :, 0], _CLIP_INV_STD_UINT8[0], out=batch_array[i, 0])
+                        batch_array[i, 0] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[0]
+                        np.multiply(float_img[:, :, 1], _CLIP_INV_STD_UINT8[1], out=batch_array[i, 1])
+                        batch_array[i, 1] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[1]
+                        np.multiply(float_img[:, :, 2], _CLIP_INV_STD_UINT8[2], out=batch_array[i, 2])
+                        batch_array[i, 2] -= _CLIP_MEAN_TIMES_INV_STD_UINT8[2]
                         normalize_time = time.time() - normalize_start
                         if perf_stats is not None:
                             perf_stats['processor_astype_time'] += 0.0  # Merged into normalize_time
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     else:
-                        # Edge case: fallback to standard conversion with ImageNet normalization
+                        # Edge case: fallback to standard conversion with CLIP normalization
                         arr_float = np.array(img, dtype=np.float32)
-                        # Apply ImageNet normalization directly (no /255 step)
+                        # Apply CLIP normalization directly (no /255 step)
                         if arr_float.max() > 1.0:
-                            # uint8 input - apply ImageNet norm directly
-                            arr_float[:, :, 0] = (arr_float[:, :, 0] - _IMAGENET_MEAN_UINT8[0]) / _IMAGENET_STD_UINT8[0]
-                            arr_float[:, :, 1] = (arr_float[:, :, 1] - _IMAGENET_MEAN_UINT8[1]) / _IMAGENET_STD_UINT8[1]
-                            arr_float[:, :, 2] = (arr_float[:, :, 2] - _IMAGENET_MEAN_UINT8[2]) / _IMAGENET_STD_UINT8[2]
+                            # uint8 input - apply CLIP norm directly
+                            arr_float[:, :, 0] = (arr_float[:, :, 0] - _CLIP_MEAN_UINT8[0]) / _CLIP_STD_UINT8[0]
+                            arr_float[:, :, 1] = (arr_float[:, :, 1] - _CLIP_MEAN_UINT8[1]) / _CLIP_STD_UINT8[1]
+                            arr_float[:, :, 2] = (arr_float[:, :, 2] - _CLIP_MEAN_UINT8[2]) / _CLIP_STD_UINT8[2]
                         # Ensure correct shape and transpose to (C, H, W)
                         if arr_float.ndim == 2:
                             # Grayscale: (H, W) -> (H, W, 3) -> (3, H, W)
@@ -1465,15 +1593,15 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                             # Fallback: try to reshape
                             batch_array[i] = arr_float.reshape(3, h, w) if arr_float.size == 3*h*w else arr_float[:3].reshape(3, h, w)
                 except Exception:
-                    # Ultimate fallback: standard conversion with ImageNet normalization
+                    # Ultimate fallback: standard conversion with CLIP normalization
                     arr_float = np.array(img, dtype=np.float32)
-                    # Apply ImageNet normalization directly (no /255 step)
+                    # Apply CLIP normalization directly (no /255 step)
                     if arr_float.max() > 1.0:
-                        # uint8 input - apply ImageNet norm directly
+                        # uint8 input - apply CLIP norm directly
                         if arr_float.ndim == 3 and arr_float.shape[2] >= 3:
-                            arr_float[:, :, 0] = (arr_float[:, :, 0] - _IMAGENET_MEAN_UINT8[0]) / _IMAGENET_STD_UINT8[0]
-                            arr_float[:, :, 1] = (arr_float[:, :, 1] - _IMAGENET_MEAN_UINT8[1]) / _IMAGENET_STD_UINT8[1]
-                            arr_float[:, :, 2] = (arr_float[:, :, 2] - _IMAGENET_MEAN_UINT8[2]) / _IMAGENET_STD_UINT8[2]
+                            arr_float[:, :, 0] = (arr_float[:, :, 0] - _CLIP_MEAN_UINT8[0]) / _CLIP_STD_UINT8[0]
+                            arr_float[:, :, 1] = (arr_float[:, :, 1] - _CLIP_MEAN_UINT8[1]) / _CLIP_STD_UINT8[1]
+                            arr_float[:, :, 2] = (arr_float[:, :, 2] - _CLIP_MEAN_UINT8[2]) / _CLIP_STD_UINT8[2]
                     # Ensure correct shape and transpose to (C, H, W)
                     if arr_float.ndim == 2:
                         arr_float = np.repeat(arr_float[:, :, np.newaxis], 3, axis=2)
@@ -1505,11 +1633,11 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
         if perf_stats is not None:
             perf_stats['processor_transpose_time'] += transpose_end - transpose_start
         
-        # OPTIMIZATION: ImageNet normalization is already done during conversion above
-        # No separate ImageNet normalization step needed - already applied directly from uint8
+        # OPTIMIZATION: CLIP normalization is already done during conversion above
+        # No separate CLIP normalization step needed - already applied directly from uint8
         if perf_stats is not None:
-            # ImageNet norm time is now included in normalize_time
-            perf_stats['processor_imagenet_norm_time'] += 0.0
+            # CLIP norm time is now included in normalize_time
+            perf_stats['processor_clip_norm_time'] += 0.0
         
         return batch_array
     else:
@@ -1534,8 +1662,6 @@ def collate_patches(batch, processor=None, perf_stats=None, use_fast_preprocess=
         For z-stack: batch is [cell1_patches, cell2_patches, ...]
         where cell_patches = [z1_patch, z2_patch, ...]
     """
-    import time
-    import numpy as np
     
     valid_items = [item for item in batch if item is not None]
     
@@ -1713,7 +1839,6 @@ class NucleiEmbedding:
         # This can provide 20-30% speedup on modern GPUs
         # NOTE: Per project policy, only enable torch.compile on Windows machines
         try:
-            import platform
             is_windows = platform.system() == 'Windows'
 
             if not is_windows:
@@ -1835,6 +1960,8 @@ class NucleiEmbedding:
                                 vision_outputs = self.model.vision_model(cell_tensor)
                                 image_embeds = vision_outputs.last_hidden_state.mean(dim=1)
                                 embeddings = self.image_projection(image_embeds)
+
+                                # (Removed unused CUDA event creation and recording)
                         else:
                             # CPU fallback
                             vision_outputs = self.model.vision_model(cell_tensor)
@@ -1876,34 +2003,10 @@ class NucleiEmbedding:
             # Concatenate all cell embeddings
             final_embeddings = torch.cat(all_cell_embeddings, dim=0)
             
-            # OPTIMIZATION: Normalize on GPU before moving to CPU (faster)
-            # Use more efficient normalization: torch.nn.functional.normalize is optimized
-            final_embeddings = torch.nn.functional.normalize(final_embeddings, p=2, dim=1)
-            # Convert to float16 while still on device to avoid extra CPU copies
-            final_embeddings = final_embeddings.to(dtype=torch.float16)
-            # OPTIMIZATION: Use CUDA events to track only the operations we need, not all GPU work
-            if torch.cuda.is_available():
-                # Record an event after normalize/to operations to track their completion
-                # This is more efficient than synchronizing the entire device
-                event = torch.cuda.Event()
-                event.record()
-                # Wait only for our specific operations to complete
-                event.wait()
-                # Create pinned tensor for faster transfer
-                pinned_tensor = torch.empty(
-                    final_embeddings.shape, 
-                    dtype=torch.float16, 
-                    pin_memory=True
-                )
-                # Use async copy (non_blocking=True) - the event ensures normalize is done
-                pinned_tensor.copy_(final_embeddings, non_blocking=True)
-                # Record another event to track copy completion
-                copy_event = torch.cuda.Event()
-                copy_event.record()
-                copy_event.wait()  # Wait only for copy to complete
-                final_embeddings = pinned_tensor.numpy()
-            else:
-                final_embeddings = final_embeddings.cpu().numpy()
+            # Keep as float32 for numerical consistency with original implementation
+            # L2 normalization will be done in generate_embeddings postprocessing
+            final_embeddings = final_embeddings.to(dtype=torch.float32)
+            final_embeddings = final_embeddings.detach().cpu().numpy()
             
             # Final verification log
             print(f"[Z-STACK FUSION] Processed {len(all_cell_embeddings)} cells, final shape: {final_embeddings.shape}")
@@ -1926,41 +2029,18 @@ class NucleiEmbedding:
                         image_embeds = vision_outputs.last_hidden_state.mean(dim=1)  # Mean pooling
                         # Use trained projection layer
                         embeddings = self.image_projection(image_embeds)
+
+                        # OPTIMIZATION: Record event after inference to enable async processing
                 else:
                     # CPU fallback
                     vision_outputs = self.model.vision_model(processed_batch)
                     image_embeds = vision_outputs.last_hidden_state.mean(dim=1)  # Mean pooling
                     embeddings = self.image_projection(image_embeds)
-                # OPTIMIZATION: Normalize on GPU before moving to CPU (faster)
-                # L2 normalization: embeddings / ||embeddings||
-                # Use more efficient normalization: torch.nn.functional.normalize is optimized
-                embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-                # Convert to float16 on device to avoid numpy-side copies
-                embeddings = embeddings.to(dtype=torch.float16)
-                # OPTIMIZATION: Use CUDA events to track only the operations we need, not all GPU work
-                if torch.cuda.is_available():
-                    # Record an event after normalize/to operations to track their completion
-                    # This is more efficient than synchronizing the entire device
-                    event = torch.cuda.Event()
-                    event.record()
-                    # Wait only for our specific operations to complete
-                    event.wait()
-                    # Create pinned tensor for faster transfer
-                    pinned_tensor = torch.empty(
-                        embeddings.shape, 
-                        dtype=torch.float16, 
-                        pin_memory=True
-                    )
-                    # Use async copy (non_blocking=True) - the event ensures normalize is done
-                    pinned_tensor.copy_(embeddings, non_blocking=True)
-                    # Record another event to track copy completion
-                    copy_event = torch.cuda.Event()
-                    copy_event.record()
-                    copy_event.wait()  # Wait only for copy to complete
-                    embeddings = pinned_tensor.numpy()
-                else:
-                    # CPU fallback
-                    embeddings = embeddings.cpu().numpy()
+                # Keep as float32 for numerical consistency with original implementation
+                # L2 normalization will be done in generate_embeddings postprocessing
+                embeddings = embeddings.to(dtype=torch.float32)
+
+                embeddings = embeddings.detach().cpu().numpy()
 
             return embeddings
 
@@ -1975,7 +2055,8 @@ class NucleiEmbedding:
         """
         # Set num_workers
         # Note: On Windows, multiprocessing has issues with pickling file handles (slide objects)
-        # So we default to 0 workers to avoid serialization errors
+        # So we default to 0 workers to avoid serialization errors unless the caller explicitly opts in.
+        user_specified_num_workers = num_workers
         if num_workers is None:
             # Default to 0 workers to avoid pickling issues with slide file handles
             # The slide object contains file handles that cannot be pickled for multiprocessing
@@ -2048,7 +2129,6 @@ class NucleiEmbedding:
             print(f"This ensures sequential I/O and avoids multi-process file handle conflicts")
         
         # Detect if running on Linux (server), adjust DataLoader strategy
-        import platform
         is_linux = platform.system() == 'Linux'
         
         # Adjust num_workers based on platform and z-stack status
@@ -2059,9 +2139,14 @@ class NucleiEmbedding:
                 num_workers = 0
                 print(f"Z-stack detected: using single-process mode for layer-wise processing (avoids file conflicts)")
             else:
-                # Single-layer on Linux: can use multiple workers
-                num_workers = min(num_workers if num_workers > 0 else 2, 4)
-                print(f"Single-layer image: using {num_workers} workers")
+                if user_specified_num_workers is not None and user_specified_num_workers > 0:
+                    # Respect explicit user request but keep an upper bound to avoid oversubscription
+                    num_workers = min(user_specified_num_workers, 4)
+                    print(f"Single-layer image: respecting user num_workers={num_workers}")
+                else:
+                    # Default to 0 on Linux when not explicitly requested
+                    num_workers = 0
+                    print("Single-layer image: keeping default num_workers=0 (no implicit override)")
         else:
             # Windows/Mac
             if dataset.is_zstack:
@@ -2069,15 +2154,104 @@ class NucleiEmbedding:
                 num_workers = 0
                 print(f"Z-stack detected on Windows: using single-process mode for stability")
             else:
-                # Single-layer on Windows: can use workers
-                print(f"Single-layer image on Windows: using {num_workers} workers")
+                if user_specified_num_workers is not None and user_specified_num_workers > 0:
+                    num_workers = user_specified_num_workers
+                    print(f"Single-layer image on {platform.system()}: respecting user num_workers={num_workers}")
+                else:
+                    num_workers = 0
+                    print(f"Single-layer image on {platform.system()}: keeping default num_workers=0")
+        
+        # Performance profiling variables (needed for GPU preprocessing)
+        perf_stats = {
+            'dataloader_time': 0.0,
+            'preprocessing_time': 0.0,
+            'model_time': 0.0,
+            'postprocessing_time': 0.0,
+            'io_time': 0.0,
+            'total_batches': 0,
+            'total_samples': 0,
+            'gpu_preprocessing_time': 0.0  # Track GPU preprocessing time separately
+        }
         
         # Disable persistent_workers when num_workers=0
         # Create collate function with processor for batch processing
-        # Use fast numpy-based preprocessing instead of slow transformers processor
-        from functools import partial
-        collate_fn_with_processor = partial(collate_patches, processor=self.processor, perf_stats=dataset.perf_stats, use_fast_preprocess=True)
-        print("[PERF] Using optimized fast preprocessing (numpy-based) instead of transformers processor")
+        # Use GPU-accelerated preprocessing for better performance while matching processor behavior
+        use_gpu_preprocess = torch.cuda.is_available()
+        
+        # Debug flag to log first image only
+        _debug_first_image_logged = {'value': False}
+        
+        if use_gpu_preprocess:
+            def collate_with_gpu_preprocess(batch):
+                """GPU-accelerated preprocessing matching processor's behavior:
+                1. Resize shortest edge to 224 (maintain aspect ratio, BICUBIC)
+                2. Center crop to 224x224
+                3. Normalize with CLIP statistics
+                """
+                if len(batch) == 0:
+                    return torch.zeros((0, 3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
+                
+                # Process all items, handling None values
+                processed_batch = []
+                for item in batch:
+                    if item is None:
+                        # Create empty normalized patch (will be normalized to zeros)
+                        empty_patch = torch.zeros((3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
+                        processed_batch.append(empty_patch)
+                    else:
+                        # Process single item with GPU preprocessing
+                        # Debug: Check input image size (only log first image)
+                        if not _debug_first_image_logged['value']:
+                            if isinstance(item, np.ndarray):
+                                item_h, item_w = item.shape[:2]
+                                print(f"[DEBUG] GPU preprocessing: input image size = {item_w}x{item_h}, target_size = {dataset.patch_size}")
+                                _debug_first_image_logged['value'] = True
+                            elif hasattr(item, 'size'):
+                                item_w, item_h = item.size
+                                print(f"[DEBUG] GPU preprocessing: input image size = {item_w}x{item_h}, target_size = {dataset.patch_size}")
+                                _debug_first_image_logged['value'] = True
+                        
+                        processed_tensor = _preprocess_clip_gpu([item], self.device, target_size=dataset.patch_size, perf_stats=perf_stats)
+                        processed_batch.append(processed_tensor.squeeze(0))  # Remove batch dimension: (C, H, W)
+                
+                return torch.stack(processed_batch, dim=0)  # Stack to (N, C, H, W)
+            
+            collate_fn = collate_with_gpu_preprocess
+            print("[PERF] Using GPU-accelerated preprocessing (resize + center crop + normalize) matching processor behavior")
+            print(f"[DEBUG] GPU preprocessing enabled: CUDA available={torch.cuda.is_available()}, device={self.device}")
+        else:
+            def collate_with_original_processor(batch):
+                """Use original transformers processor for consistency"""
+                if len(batch) == 0:
+                    return torch.zeros((0, 3, dataset.patch_size, dataset.patch_size), dtype=torch.float32)
+
+                processed_batch = []
+                for item in batch:
+                    if item is None:
+                        # Handle None values by creating empty patch
+                        empty_patch = torch.zeros((3, dataset.patch_size, dataset.patch_size), dtype=torch.float32)
+                        processed_batch.append(empty_patch)
+                    else:
+                        # Use original processor
+                        # Debug: Check input image size (only log first image)
+                        if not _debug_first_image_logged['value']:
+                            if isinstance(item, np.ndarray):
+                                item_h, item_w = item.shape[:2]
+                                print(f"[DEBUG] CPU processor: input image size = {item_w}x{item_h}, target_size = {dataset.patch_size}")
+                                _debug_first_image_logged['value'] = True
+                            elif hasattr(item, 'size'):
+                                item_w, item_h = item.size
+                                print(f"[DEBUG] CPU processor: input image size = {item_w}x{item_h}, target_size = {dataset.patch_size}")
+                                _debug_first_image_logged['value'] = True
+                        
+                        processed = self.processor(item, return_tensors="pt")['pixel_values']
+                        processed_batch.append(processed.squeeze(0))  # Remove batch dimension
+
+                return torch.stack(processed_batch, dim=0)
+
+            collate_fn = collate_with_original_processor
+            print("[PERF] Using original transformers processor (CPU mode - GPU not available)")
+            print(f"[DEBUG] CPU processor mode: CUDA available={torch.cuda.is_available()}, device={self.device}")
         
         # Enable pin_memory even with num_workers=0 to speed up CPU->GPU transfer
         # This uses pinned (page-locked) memory which allows faster async transfers
@@ -2088,10 +2262,10 @@ class NucleiEmbedding:
             batch_size=batch_size,
             num_workers=num_workers,
             shuffle=False,
-            collate_fn=collate_fn_with_processor,
+            collate_fn=collate_fn,
             prefetch_factor=4 if num_workers > 0 else None,  # Increased from 2 to 4 for better GPU utilization
             persistent_workers=True if num_workers > 0 else False,
-            pin_memory=use_pin_memory,  # Enable pin_memory for faster CPU->GPU transfer even with num_workers=0
+            pin_memory=use_pin_memory and not use_gpu_preprocess,  # Only use pin_memory if not using GPU preprocessing (already on GPU)
             drop_last=False  # Keep all samples
         )
         
@@ -2108,7 +2282,6 @@ class NucleiEmbedding:
         ds_name = parts[-1]
         
         total_start_time = time.time()
-        import gc
         
         # Z-stack layer-wise processing
         if is_zstack:
@@ -2134,15 +2307,28 @@ class NucleiEmbedding:
             
             temp_layer_embeddings = []
             
+            # OPTIMIZATION: Pre-allocate GPU memory for batch processing to avoid repeated allocations
+            if torch.cuda.is_available() and not use_gpu_preprocess:
+                # Only pre-allocate if not using GPU preprocessing (which already has data on GPU)
+                gpu_batch_buffer = torch.empty(
+                    (batch_size, 3, dataset.patch_size, dataset.patch_size),
+                    dtype=torch.float32,
+                    device=self.device,
+                    pin_memory=False  # Regular GPU memory, not pinned
+                )
+                print(f"[PERF] Pre-allocated GPU batch buffer: {gpu_batch_buffer.shape} ({gpu_batch_buffer.numel() * 4 / 1024**2:.1f} MB)")
+            else:
+                gpu_batch_buffer = None
+
             # Process each layer independently
             for layer_idx in range(num_layers):
                 print(f"\n{'='*80}")
                 print(f"Processing Layer {layer_idx + 1}/{num_layers}")
                 print(f"{'='*80}")
-                
+
                 # Set dataset to extract only this specific layer
                 dataset.z_layer = layer_idx
-                
+
                 # Create temporary dataset for this layer
                 layer_dset = parent.create_dataset(
                     f'_temp_layer_{layer_idx}',
@@ -2150,22 +2336,40 @@ class NucleiEmbedding:
                     chunks=(min(1000, batch_size), 768),
                     dtype=np.float16
                 )
-                
+
                 # Process this layer
                 cell_idx = 0
                 pbar = tqdm(total=num_cells, desc=f"Layer {layer_idx + 1}/{num_layers}")
-                
+
                 for batch in dataloader:
-                    if batch is not None and (isinstance(batch, np.ndarray) and batch.size > 0 or isinstance(batch, list) and len(batch) > 0):
-                        # Process batch (already preprocessed by collate function)
-                        if isinstance(batch, np.ndarray):
-                            if not batch.flags['C_CONTIGUOUS']:
-                                batch = np.ascontiguousarray(batch)
-                            processed_batch = torch.from_numpy(batch).to(self.device, dtype=torch.float32)
+                    if batch is not None and (
+                        (isinstance(batch, np.ndarray) and batch.size > 0) or
+                        (isinstance(batch, list) and len(batch) > 0) or
+                        (torch.is_tensor(batch) and batch.size(0) > 0)
+                    ):
+                        # OPTIMIZATION: Handle GPU vs CPU preprocessing differently
+                        if use_gpu_preprocess:
+                            # Data is already on GPU from GPU preprocessing
+                            processed_batch = batch  # Already torch.Tensor on GPU
                         else:
-                            batch_array = np.ascontiguousarray(np.stack(batch, axis=0))
-                            processed_batch = torch.from_numpy(batch_array).to(self.device, dtype=torch.float32)
-                        
+                            # CPU preprocessing: use pre-allocated GPU buffer for efficiency
+                            if isinstance(batch, np.ndarray):
+                                if not batch.flags['C_CONTIGUOUS']:
+                                    batch = np.ascontiguousarray(batch)
+                                batch_tensor = torch.from_numpy(batch)
+                            else:
+                                batch_array = np.ascontiguousarray(np.stack(batch, axis=0))
+                                batch_tensor = torch.from_numpy(batch_array)
+
+                            # Use pre-allocated buffer or direct copy to GPU
+                            if gpu_batch_buffer is not None and batch_tensor.shape[0] <= gpu_batch_buffer.shape[0]:
+                                # Copy to pre-allocated buffer (avoids new allocations)
+                                gpu_batch_buffer[:batch_tensor.shape[0]].copy_(batch_tensor)
+                                processed_batch = gpu_batch_buffer[:batch_tensor.shape[0]]
+                            else:
+                                # Fallback to direct GPU transfer for edge cases
+                                processed_batch = batch_tensor.to(self.device, dtype=torch.float32)
+
                         # Get embeddings
                         batch_embeddings = self.embed_batch(processed_batch, is_zstack=False)
                         
@@ -2193,7 +2397,13 @@ class NucleiEmbedding:
                 # Reset dataset for next layer
                 dataset.z_layer = None
                 gc.collect()
-            
+
+            # Clean up pre-allocated GPU buffer after all layers
+            if gpu_batch_buffer is not None:
+                del gpu_batch_buffer
+                torch.cuda.empty_cache()
+                print("[PERF] Cleaned up GPU batch buffer")
+
             # Fuse embeddings across layers
             print(f"\n{'='*80}")
             print(f"FUSING EMBEDDINGS ACROSS {num_layers} LAYERS")
@@ -2255,16 +2465,8 @@ class NucleiEmbedding:
         )
         pbar = tqdm(total=len(dataset), desc="Generating embeddings")
         
-        # Performance profiling variables
-        perf_stats = {
-            'dataloader_time': 0.0,  # Time spent waiting for dataloader
-            'preprocessing_time': 0.0,  # Time for data preprocessing (concatenate, to device)
-            'model_time': 0.0,  # Time for model inference
-            'postprocessing_time': 0.0,  # Time for normalization and type conversion
-            'io_time': 0.0,  # Time for writing to zarr
-            'total_batches': 0,
-            'total_samples': 0
-        }
+        # Performance profiling variables (already defined above for collate function)
+        # perf_stats is already defined before collate function creation
         
         batch_idx = 0
         prev_batch_end_time = time.time()
@@ -2277,9 +2479,11 @@ class NucleiEmbedding:
                 if batch_idx > 0:
                     perf_stats['dataloader_time'] += dataloader_start_time - prev_batch_end_time
                 
-                # Check if batch is valid (handle both numpy array and list)
+                # Check if batch is valid (handle tensor, numpy array, and list)
                 batch_valid = False
-                if isinstance(batch, np.ndarray):
+                if isinstance(batch, torch.Tensor):
+                    batch_valid = batch.numel() > 0
+                elif isinstance(batch, np.ndarray):
                     batch_valid = batch.size > 0
                 elif isinstance(batch, list):
                     batch_valid = len(batch) > 0
@@ -2292,82 +2496,17 @@ class NucleiEmbedding:
                     #     # Z-stack case: batch is list of lists
                     #     batch_embeddings = self.embed_batch(batch, is_zstack=True, num_z_layers=dataset.num_layers)
                     # else:
-                    # Single layer case: batch is already processed by collate function
+                    # Use processor output (tensor already in correct format)
                     preprocess_start = time.time()
-                    # Batch is already processed by collate_patches (fast preprocessing applied)
-                    # Fast preprocessing returns a single array (N, C, H, W) - no stack needed!
-                    # OPTIMIZATION: Streamlined preprocessing with minimal operations
-                    if isinstance(batch, np.ndarray):
-                        # Already a single stacked array from fast preprocessing
-                        # OPTIMIZATION: Ensure contiguous memory layout for faster transfer
-                        if not batch.flags['C_CONTIGUOUS']:
-                            batch = np.ascontiguousarray(batch)
-                        
-                        if batch.dtype == np.uint8:
-                            # OPTIMIZATION: Use pinned memory tensor for faster CPU->GPU transfer
-                            if torch.cuda.is_available() and self.device.type == 'cuda':
-                                # Create pinned tensor (page-locked memory) for faster GPU transfer
-                                pinned_tensor = torch.empty(batch.shape, dtype=torch.uint8, pin_memory=True)
-                                # Copy numpy array to pinned tensor (this is fast, just memory copy)
-                                pinned_tensor.copy_(torch.from_numpy(batch), non_blocking=False)
-                                # Transfer pinned tensor to GPU and convert to float32 in one step
-                                processed_batch = pinned_tensor.to(self.device, dtype=torch.float32, non_blocking=True)
-                            else:
-                                # CPU mode: use regular tensor
-                                tensor = torch.from_numpy(batch)
-                                processed_batch = tensor.to(self.device, dtype=torch.float32, non_blocking=False)
-                            # Normalize on GPU (fused operations)
-                            processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
-                        else:
-                            # Data is already normalized (float32) - transfer directly using pinned memory
-                            if torch.cuda.is_available() and self.device.type == 'cuda':
-                                pinned_tensor = torch.empty(batch.shape, dtype=torch.float32, pin_memory=True)
-                                pinned_tensor.copy_(torch.from_numpy(batch), non_blocking=False)
-                                processed_batch = pinned_tensor.to(self.device, non_blocking=True)
-                            else:
-                                # CPU mode: use regular tensor
-                                tensor = torch.from_numpy(batch)
-                                processed_batch = tensor.to(self.device, non_blocking=False)
-                    elif isinstance(batch, list) and len(batch) > 0 and isinstance(batch[0], np.ndarray):
-                        # Fallback: list of arrays (shouldn't happen with fast preprocessing)
-                        batch_array = np.ascontiguousarray(np.stack(batch, axis=0))
-                        if batch_array.dtype == np.uint8:
-                            if torch.cuda.is_available() and self.device.type == 'cuda':
-                                pinned_tensor = torch.empty(batch_array.shape, dtype=torch.uint8, pin_memory=True)
-                                pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
-                                processed_batch = pinned_tensor.to(self.device, dtype=torch.float32, non_blocking=True)
-                            else:
-                                tensor = torch.from_numpy(batch_array)
-                                processed_batch = tensor.to(self.device, dtype=torch.float32, non_blocking=False)
-                            processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
-                        else:
-                            if torch.cuda.is_available() and self.device.type == 'cuda':
-                                pinned_tensor = torch.empty(batch_array.shape, dtype=torch.float32, pin_memory=True)
-                                pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
-                                processed_batch = pinned_tensor.to(self.device, non_blocking=True)
-                            else:
-                                tensor = torch.from_numpy(batch_array)
-                                processed_batch = tensor.to(self.device, non_blocking=False)
+                    # Batch is already a tensor from collate function
+                    # - If using GPU preprocessing: already on GPU and normalized
+                    # - If using CPU processor: needs to be moved to GPU
+                    if use_gpu_preprocess:
+                        # Already on GPU from GPU preprocessing
+                        processed_batch = batch
                     else:
-                        # Fallback: if not processed, process now (shouldn't happen)
-                        batch_array = np.ascontiguousarray(np.stack([np.array(b) for b in batch], axis=0))
-                        if batch_array.dtype == np.uint8:
-                            if torch.cuda.is_available() and self.device.type == 'cuda':
-                                pinned_tensor = torch.empty(batch_array.shape, dtype=torch.uint8, pin_memory=True)
-                                pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
-                                processed_batch = pinned_tensor.to(self.device, dtype=torch.float32, non_blocking=True)
-                            else:
-                                tensor = torch.from_numpy(batch_array)
-                                processed_batch = tensor.to(self.device, dtype=torch.float32, non_blocking=False)
-                            processed_batch = _normalize_imagenet_gpu(processed_batch, self.device)
-                        else:
-                            if torch.cuda.is_available() and self.device.type == 'cuda':
-                                pinned_tensor = torch.empty(batch_array.shape, dtype=torch.float32, pin_memory=True)
-                                pinned_tensor.copy_(torch.from_numpy(batch_array), non_blocking=False)
-                                processed_batch = pinned_tensor.to(self.device, non_blocking=True)
-                            else:
-                                tensor = torch.from_numpy(batch_array)
-                                processed_batch = tensor.to(self.device, non_blocking=False)
+                        # Move to GPU if using CPU processor
+                        processed_batch = batch.to(self.device)
                     
                     perf_stats['preprocessing_time'] += time.time() - preprocess_start
                     
@@ -2383,38 +2522,26 @@ class NucleiEmbedding:
                     # 3. Minimize synchronization points
                     postprocess_start = time.time()
                     if torch.is_tensor(batch_embeddings):
-                        # Convert to float16 on GPU first (no CPU transfer yet)
-                        batch_embeddings = batch_embeddings.to(dtype=torch.float16)
-                        # OPTIMIZATION: Use CUDA events to track only the operations we need, not all GPU work
-                        if torch.cuda.is_available():
-                            # Record an event after dtype conversion to track its completion
-                            # This is more efficient than synchronizing the entire device
-                            event = torch.cuda.Event()
-                            event.record()
-                            # Wait only for our specific operations to complete
-                            event.wait()
-                            # Create pinned tensor for faster transfer
-                            pinned_tensor = torch.empty(
-                                batch_embeddings.shape, 
-                                dtype=torch.float16, 
-                                pin_memory=True
-                            )
-                            # Use async copy (non_blocking=True) - the event ensures dtype conversion is done
-                            pinned_tensor.copy_(batch_embeddings, non_blocking=True)
-                            # Record another event to track copy completion
-                            copy_event = torch.cuda.Event()
-                            copy_event.record()
-                            copy_event.wait()  # Wait only for copy to complete
-                            batch_embeddings = pinned_tensor.numpy()
-                        else:
-                            # CPU fallback
-                            batch_embeddings = batch_embeddings.cpu().numpy()
-                    elif isinstance(batch_embeddings, np.ndarray) and batch_embeddings.dtype != np.float16:
-                        batch_embeddings = batch_embeddings.astype(np.float16, copy=False)
+                        # Keep as float32 for numerical consistency with original implementation
+                        batch_embeddings = batch_embeddings.to(dtype=torch.float32)
+                        
+                        # L2 normalization: embeddings / ||embeddings|| (matches server version)
+                        batch_embeddings = batch_embeddings / torch.norm(batch_embeddings, dim=1, keepdim=True)
+                        batch_embeddings = batch_embeddings.detach().cpu().numpy()
+                    elif isinstance(batch_embeddings, np.ndarray):
+                        # Ensure float32 dtype
+                        if batch_embeddings.dtype != np.float32:
+                            batch_embeddings = batch_embeddings.astype(np.float32, copy=False)
+                        
+                        # L2 normalization: embeddings / ||embeddings|| (matches server version)
+                        batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
                     perf_stats['postprocessing_time'] += time.time() - postprocess_start
                     
                     # I/O operations
                     io_start = time.time()
+                    # Convert to float16 before saving (matches server version)
+                    if isinstance(batch_embeddings, np.ndarray):
+                        batch_embeddings = batch_embeddings.astype(np.float16, copy=False)
                     current_size = embeddings_dset.shape[0]
                     new_size = current_size + batch_embeddings.shape[0]
                     embeddings_dset.resize((new_size, 768))
@@ -2423,8 +2550,10 @@ class NucleiEmbedding:
                     
                     # Update statistics
                     perf_stats['total_batches'] += 1
-                    # Get batch size (handle both numpy array and list)
-                    if isinstance(batch, np.ndarray):
+                    # Get batch size (handle tensor, numpy array, and list)
+                    if isinstance(batch, torch.Tensor):
+                        batch_size = batch.shape[0]
+                    elif isinstance(batch, np.ndarray):
                         batch_size = batch.shape[0]
                     else:
                         batch_size = len(batch)
@@ -2467,7 +2596,6 @@ class NucleiEmbedding:
                         print(f"  Model: {perf_stats['model_time']:.1f}s ({perf_stats['model_time']/elapsed_time*100:.1f}%)", flush=True)
         except Exception as e:
             print(f"\n[PERF] Error during embedding generation: {e}", flush=True)
-            import traceback
             traceback.print_exc()
             raise
         finally:
@@ -2481,7 +2609,6 @@ class NucleiEmbedding:
             total_time = time.time() - total_start_time
             
             # Print performance statistics (force flush to ensure output)
-            import sys
             sys.stdout.flush()
             
             print("\n" + "="*60, flush=True)
