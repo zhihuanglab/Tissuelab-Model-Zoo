@@ -1,14 +1,24 @@
 from typing import Union, List, Optional, Tuple
+import math
 import numpy as np
 import torch
 from torch import nn
 from torch.nn.functional import interpolate
+from torch.utils import dlpack as torch_dlpack
 from pathlib import Path, PosixPath
 from tiffslide import TiffSlide
 import zarr
 import os
 import time
-from instanseg.utils.pytorch_utils import _to_tensor_float32, centroids_from_lab, torch_fastremap
+from collections import Counter
+from contextlib import nullcontext
+from instanseg.utils.pytorch_utils import _to_tensor_float32, torch_fastremap
+from skimage.measure import regionprops
+
+try:
+    import cupy as cp
+except ImportError:
+    cp = None
 pixel_size_precision = 0.01
 def _to_ndim(x, *args, **kwargs):
     from instanseg.utils.pytorch_utils import _to_ndim as _to_ndim_pytorch
@@ -17,6 +27,443 @@ def _to_ndim(x, *args, **kwargs):
         return _to_ndim_pytorch(x, *args, **kwargs)
     elif isinstance(x, np.ndarray):
         return _to_ndim_numpy(x, *args, **kwargs)
+
+
+_GPU_RAYCAST_KERNEL = None
+
+
+def _gpu_contour_support_available() -> bool:
+    return cp is not None
+
+
+def _tensor_device_index(tensor: torch.Tensor) -> int:
+    if not tensor.is_cuda:
+        raise ValueError("Expected CUDA tensor for GPU utilities.")
+    return 0 if tensor.device.index is None else tensor.device.index
+
+
+def _torch_to_cupy(tensor: torch.Tensor, device_index: Optional[int] = None):
+    if cp is None:
+        raise RuntimeError("CuPy is not available for GPU contour sampling.")
+    if not tensor.is_cuda:
+        raise ValueError("Tensor must be on CUDA device for CuPy conversion.")
+    device_idx = _tensor_device_index(tensor) if device_index is None else device_index
+    with cp.cuda.Device(device_idx):
+        return cp.asarray(tensor)
+
+
+def _cupy_to_torch(array: "cp.ndarray", device_index: Optional[int] = None) -> torch.Tensor:
+    target_device = 0 if device_index is None else device_index
+    if array.size == 0:
+        return torch.empty(0, device=torch.device(f"cuda:{target_device}"), dtype=torch.float32)
+    with torch.cuda.device(target_device):
+        return torch_dlpack.from_dlpack(array.toDlpack())
+
+
+def _prepare_ray_unit_vectors_gpu(ray_unit_vectors: Optional[np.ndarray]):
+    if ray_unit_vectors is None or not _gpu_contour_support_available():
+        return None
+    return cp.asarray(ray_unit_vectors.astype(np.float32))
+
+
+def _get_gpu_raycast_kernel():
+    global _GPU_RAYCAST_KERNEL
+    if _GPU_RAYCAST_KERNEL is not None:
+        return _GPU_RAYCAST_KERNEL
+    if not _gpu_contour_support_available():
+        raise RuntimeError("CuPy backend unavailable for GPU ray casting.")
+    kernel_code = r"""
+    typedef signed int int32_t;
+    typedef unsigned int uint32_t;
+    extern "C" __global__
+    void stardist_raycast(
+        const int32_t* __restrict__ label_map,
+        const float* __restrict__ centroids_y,
+        const float* __restrict__ centroids_x,
+        const int32_t* __restrict__ label_ids,
+        const float* __restrict__ ray_dirs_x,
+        const float* __restrict__ ray_dirs_y,
+        const float* __restrict__ max_radii,
+        const float step_size,
+        const int height,
+        const int width,
+        const int n_rays,
+        float* __restrict__ out_coords,
+        float* __restrict__ out_dists)
+    {
+        const int obj_idx = blockIdx.x;
+        const int ray_idx = threadIdx.x;
+        if (ray_idx >= n_rays) {
+            return;
+        }
+
+        const int label_value = label_ids[obj_idx];
+        const float cx = centroids_x[obj_idx];
+        const float cy = centroids_y[obj_idx];
+        const float dir_x = ray_dirs_x[ray_idx];
+        const float dir_y = ray_dirs_y[ray_idx];
+        const float max_r = max_radii[obj_idx];
+
+        float r = 0.0f;
+        float last_x = cx;
+        float last_y = cy;
+        bool hit = false;
+
+        while (r <= max_r) {
+            const float sample_x = cx + dir_x * r;
+            const float sample_y = cy + dir_y * r;
+            const int xi = (int)floorf(sample_x);
+            const int yi = (int)floorf(sample_y);
+
+            if (xi < 0 || xi >= width || yi < 0 || yi >= height) {
+                break;
+            }
+
+            const int idx = yi * width + xi;
+            if (label_map[idx] != label_value) {
+                break;
+            }
+
+            last_x = sample_x;
+            last_y = sample_y;
+            hit = true;
+            r += step_size;
+        }
+
+        const int coord_base = (obj_idx * n_rays + ray_idx) * 2;
+        out_coords[coord_base + 0] = last_x;
+        out_coords[coord_base + 1] = last_y;
+
+        const int dist_idx = obj_idx * n_rays + ray_idx;
+        if (hit) {
+            const float dx = last_x - cx;
+            const float dy = last_y - cy;
+            out_dists[dist_idx] = sqrtf(dx * dx + dy * dy);
+        } else {
+            out_dists[dist_idx] = 0.0f;
+        }
+    }
+    """
+    _GPU_RAYCAST_KERNEL = cp.RawKernel(kernel_code, "stardist_raycast")
+    return _GPU_RAYCAST_KERNEL
+
+
+def _snap_centroids_to_labels(
+    label_tile: torch.Tensor,
+    centroids_tile: torch.Tensor,
+    label_ids_tile: torch.Tensor,
+    max_radius: int = 2,
+) -> torch.Tensor:
+    if centroids_tile.numel() == 0:
+        return centroids_tile
+
+    height, width = label_tile.shape[-2:]
+    label_flat = label_tile.view(-1)
+    snapped = centroids_tile.clone()
+
+    y_int = torch.clamp(torch.round(centroids_tile[:, 0]), 0, height - 1).long()
+    x_int = torch.clamp(torch.round(centroids_tile[:, 1]), 0, width - 1).long()
+    flat_idx = y_int * width + x_int
+    label_ids_long = label_ids_tile.long()
+    matched = label_flat[flat_idx] == label_ids_long
+
+    if matched.all():
+        snapped[:, 0] = y_int.float() + 0.5
+        snapped[:, 1] = x_int.float() + 0.5
+        return snapped
+
+    offsets_by_radius = []
+    for radius in range(1, max_radius + 1):
+        offsets = []
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if max(abs(dy), abs(dx)) != radius:
+                    continue
+                offsets.append((dy, dx))
+        offsets_by_radius.append(offsets)
+
+    for offsets in offsets_by_radius:
+        if matched.all():
+            break
+        for dy, dx in offsets:
+            if matched.all():
+                break
+            y_cand = torch.clamp(y_int + dy, 0, height - 1)
+            x_cand = torch.clamp(x_int + dx, 0, width - 1)
+            flat_cand = y_cand * width + x_cand
+            cand_match = (label_flat[flat_cand] == label_ids_long) & (~matched)
+            if cand_match.any():
+                y_int[cand_match] = y_cand[cand_match]
+                x_int[cand_match] = x_cand[cand_match]
+                matched |= cand_match
+
+    snapped[:, 0] = y_int.float() + 0.5
+    snapped[:, 1] = x_int.float() + 0.5
+    return snapped
+
+
+def _label_seed_pixels(
+    label_tile: torch.Tensor,
+    label_ids_tile: torch.Tensor,
+    centroids_tile: torch.Tensor,
+) -> torch.Tensor:
+    if label_ids_tile.numel() == 0:
+        return label_ids_tile.new_empty((0, 2), dtype=torch.float32)
+
+    height, width = label_tile.shape[-2:]
+    label_flat = label_tile.view(-1)
+    num_labels = int(label_flat.max().item()) + 1
+    total_pixels = label_flat.numel()
+    idx = torch.arange(total_pixels, device=label_tile.device, dtype=torch.int64)
+    first_idx = torch.full((num_labels,), total_pixels, device=label_tile.device, dtype=torch.int64)
+    label_flat_long = label_flat.long()
+    first_idx.scatter_reduce_(0, label_flat_long, idx, reduce="amin", include_self=True)
+
+    seed_y = torch.div(first_idx, width, rounding_mode="floor").float() + 0.5
+    seed_x = (first_idx % width).float() + 0.5
+    seeds = torch.stack([seed_y, seed_x], dim=1)
+    y_int = torch.clamp(torch.round(centroids_tile[:, 0]).long(), 0, height - 1)
+    x_int = torch.clamp(torch.round(centroids_tile[:, 1]).long(), 0, width - 1)
+    label_values = label_tile[y_int, x_int].long().clamp(min=0, max=num_labels - 1)
+    seeds = seeds[label_values]
+    return seeds
+
+
+def _centroids_and_areas(label_tile: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = label_tile.device
+    height, width = label_tile.shape[-2:]
+    flat = label_tile.view(-1)
+    mask = flat > 0
+    if not mask.any():
+        empty = torch.empty((0,), device=device, dtype=torch.float32)
+        return (
+            torch.empty((0, 2), device=device, dtype=torch.float32),
+            torch.empty((0,), device=device, dtype=torch.long),
+            empty,
+        )
+
+    labels = flat[mask].long()
+    coords = torch.arange(flat.numel(), device=device, dtype=torch.long)[mask]
+    ys = (coords // width).to(torch.float32)
+    xs = (coords % width).to(torch.float32)
+
+    max_label = int(labels.max().item())
+    minlength = max_label + 1
+    counts = torch.bincount(labels, minlength=minlength).to(torch.float32)
+    sum_y = torch.bincount(labels, weights=ys, minlength=minlength)
+    sum_x = torch.bincount(labels, weights=xs, minlength=minlength)
+
+    label_ids = torch.nonzero(counts > 0, as_tuple=False).squeeze(1)
+    if label_ids.numel() == 0:
+        empty = torch.empty((0,), device=device, dtype=torch.float32)
+        return (
+            torch.empty((0, 2), device=device, dtype=torch.float32),
+            torch.empty((0,), device=device, dtype=torch.long),
+            empty,
+        )
+    areas = counts[label_ids]
+    centroids_y = sum_y[label_ids] / areas
+    centroids_x = sum_x[label_ids] / areas
+    centroids = torch.stack([centroids_y, centroids_x], dim=1)
+    return centroids, label_ids.long(), areas
+
+
+def _apply_core_and_area_filters(
+    centroids_tile: torch.Tensor,
+    areas_tile: torch.Tensor,
+    label_ids_tile: torch.Tensor,
+    core_bounds: Tuple[int, int, int, int],
+    min_area: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if centroids_tile.numel() == 0:
+        return centroids_tile, areas_tile, label_ids_tile
+
+    core_i_start, core_i_end, core_j_start, core_j_end = core_bounds
+    mask = areas_tile >= min_area
+    mask &= centroids_tile[:, 0] >= core_i_start
+    mask &= centroids_tile[:, 0] < core_i_end
+    mask &= centroids_tile[:, 1] >= core_j_start
+    mask &= centroids_tile[:, 1] < core_j_end
+
+    if mask.all():
+        return centroids_tile, areas_tile, label_ids_tile
+
+    keep_idx = mask.nonzero(as_tuple=False).squeeze(1)
+    if keep_idx.numel() == 0:
+        empty = centroids_tile.new_empty((0, 2))
+        empty_area = areas_tile.new_empty((0,))
+        empty_labels = label_ids_tile.new_empty((0,), dtype=label_ids_tile.dtype)
+        return empty, empty_area, empty_labels
+    return (
+        centroids_tile.index_select(0, keep_idx),
+        areas_tile.index_select(0, keep_idx),
+        label_ids_tile.index_select(0, keep_idx),
+    )
+
+
+class _StreamingSegmentationWriter:
+    def __init__(
+        self,
+        zarr_path: Union[str, Path],
+        node_name: str = "SegmentationNode",
+        enable_stardist: bool = True,
+        verbose: bool = False,
+    ):
+        self.zarr_path = Path(zarr_path)
+        self.node_name = node_name
+        self.enable_stardist = enable_stardist
+        self.verbose = verbose
+        self._group = zarr.open_group(str(self.zarr_path), mode="a").require_group(node_name)
+        for key in ["centroids", "probability", "contours", "stardist_coords", "stardist_distances"]:
+            if key in self._group:
+                del self._group[key]
+        self.centroids_ds = self._group.create_dataset(
+            "centroids",
+            shape=(0, 2),
+            chunks=(8192, 2),
+            maxshape=(None, 2),
+            dtype="i4",
+        )
+        self.contours_ds = None
+        self.stardist_coords_ds = None
+        self.stardist_dist_ds = None
+        self.count = 0
+
+    def _append_dataset(self, attr_name: str, name: str, data: np.ndarray):
+        if data is None or data.size == 0:
+            return
+        ds = getattr(self, attr_name)
+        if ds is None:
+            chunks = (min(8192, max(1, data.shape[0])),) + data.shape[1:]
+            maxshape = (None,) + data.shape[1:]
+            ds = self._group.create_dataset(
+                name,
+                shape=(0,) + data.shape[1:],
+                chunks=chunks,
+                maxshape=maxshape,
+                dtype=data.dtype,
+            )
+            setattr(self, attr_name, ds)
+        start = ds.shape[0]
+        new_shape = list(ds.shape)
+        new_shape[0] = start + data.shape[0]
+        ds.resize(tuple(new_shape))
+        ds[start : start + data.shape[0]] = data
+
+    def append(
+        self,
+        centroids: np.ndarray,
+        contours: Optional[np.ndarray],
+        stardist_coords: Optional[np.ndarray],
+        stardist_distances: Optional[np.ndarray],
+    ):
+        if centroids.size == 0:
+            return
+        start = self.centroids_ds.shape[0]
+        new_shape = list(self.centroids_ds.shape)
+        new_shape[0] = start + centroids.shape[0]
+        self.centroids_ds.resize(tuple(new_shape))
+        self.centroids_ds[start : start + centroids.shape[0]] = centroids.astype(np.int32)
+        self.count += centroids.shape[0]
+
+        if contours is not None:
+            self._append_dataset("contours_ds", "contours", contours.astype(np.int32))
+        if self.enable_stardist and stardist_coords is not None:
+            self._append_dataset("stardist_coords_ds", "stardist_coords", stardist_coords.astype(np.float32))
+        if self.enable_stardist and stardist_distances is not None:
+            self._append_dataset("stardist_dist_ds", "stardist_distances", stardist_distances.astype(np.float32))
+
+    def write_probabilities(self, probabilities: np.ndarray):
+        if "probability" in self._group:
+            del self._group["probability"]
+        self._group.create_dataset("probability", data=probabilities.astype(np.float32))
+
+
+
+def _gpu_sample_star_polygon_from_tile(
+    label_tile: torch.Tensor,
+    centroids_tile: torch.Tensor,
+    label_ids_tile: torch.Tensor,
+    ray_unit_vectors: Optional[np.ndarray],
+    n_rays: int,
+    bbox_tensor: Optional[torch.Tensor] = None,
+    centroid_overrides: Optional[torch.Tensor] = None,
+    step: float = 0.5,
+    ray_unit_vectors_gpu=None,
+):
+    if n_rays <= 0 or centroids_tile.numel() == 0:
+        device = label_tile.device
+        empty_coords = torch.empty((0, 0, 2), device=device, dtype=torch.float32)
+        empty_dists = torch.empty((0, 0), device=device, dtype=torch.float32)
+        return empty_coords, empty_dists
+    if not _gpu_contour_support_available():
+        raise RuntimeError("GPU contour sampling requested but CuPy/cuCIM not available.")
+
+    device_idx = _tensor_device_index(label_tile)
+    with cp.cuda.Device(device_idx):
+        ray_dirs_cu = ray_unit_vectors_gpu
+        if ray_dirs_cu is None:
+            ray_dirs_cu = _prepare_ray_unit_vectors_gpu(ray_unit_vectors)
+
+        centroid_source = (
+            centroid_overrides if centroid_overrides is not None else centroids_tile
+        )
+        centroids_float = centroid_source.to(torch.float32).contiguous()
+        centroids_y = _torch_to_cupy(centroids_float[:, 0].contiguous(), device_idx)
+        centroids_x = _torch_to_cupy(centroids_float[:, 1].contiguous(), device_idx)
+        label_ids_int = label_ids_tile.to(torch.int32).contiguous()
+        label_ids_cu = _torch_to_cupy(label_ids_int, device_idx)
+        label_map_cu = _torch_to_cupy(label_tile.contiguous(), device_idx)
+        label_map_flat = cp.ascontiguousarray(label_map_cu.ravel())
+
+        num_objects = centroids_tile.shape[0]
+        if bbox_tensor is not None:
+            bbox_tensor = bbox_tensor.to(torch.float32).contiguous()
+            bbox_cu = _torch_to_cupy(bbox_tensor, device_idx)
+            heights = bbox_cu[:, 2] - bbox_cu[:, 0]
+            widths = bbox_cu[:, 3] - bbox_cu[:, 1]
+            max_radii_cu = cp.sqrt(heights * heights + widths * widths) * 0.5 + 1.0
+        else:
+            diag = math.hypot(label_tile.shape[-2], label_tile.shape[-1]) + 1.0
+            max_radii_cu = cp.full((num_objects,), diag, dtype=cp.float32)
+
+        ray_dirs_x = cp.ascontiguousarray(ray_dirs_cu[:, 0])
+        ray_dirs_y = cp.ascontiguousarray(ray_dirs_cu[:, 1])
+
+        coords_cu = cp.zeros((num_objects, n_rays, 2), dtype=cp.float32)
+        dists_cu = cp.zeros((num_objects, n_rays), dtype=cp.float32)
+
+        kernel = _get_gpu_raycast_kernel()
+        threads = 1
+        while threads < n_rays:
+            threads *= 2
+        threads = min(threads, 1024)
+
+        kernel(
+            (num_objects,),
+            (threads,),
+            (
+                label_map_flat,
+                centroids_y,
+                centroids_x,
+                label_ids_cu,
+                ray_dirs_x,
+                ray_dirs_y,
+                max_radii_cu,
+                np.float32(step),
+                np.int32(label_tile.shape[-2]),
+                np.int32(label_tile.shape[-1]),
+                np.int32(n_rays),
+                coords_cu.ravel(),
+                dists_cu.ravel(),
+            ),
+        )
+
+    coords_torch = _cupy_to_torch(coords_cu, device_idx)
+    dists_torch = _cupy_to_torch(dists_cu, device_idx)
+    coords_torch = coords_torch.view(num_objects, n_rays, 2)
+    dists_torch = dists_torch.view(num_objects, n_rays)
+    return coords_torch, dists_torch
 
 
 class InstanSeg():
@@ -180,6 +627,7 @@ class InstanSeg():
             print(e)
             pass
         try:
+            import slideio
             import slideio
             slide = slideio.open_slide(image_str, driver = "AUTO")
             scene  = slide.get_scene(0)
@@ -596,12 +1044,14 @@ class InstanSeg():
             :param overlap: The overlap (in pixels) betwene tiles.
             :param detection_size: The expected maximum size of detection objects.
             :param batch_size: The number of tiles to be run simultaneously (default: 8). Higher values use more GPU memory but are faster.
+            :param batch_size: The number of tiles to be run simultaneously (default: 8). Higher values use more GPU memory but are faster.
             :param normalisation_subsampling_factor: The subsampling or downsample factor at which to calculate normalisation parameters.
             :param use_otsu_threshold: bool = False. Whether to use an otsu threshold on the image thumbnail to find the tissue region.
             :param kwargs: Passed to pytorch.
             :return: Returns a zarr file with the segmentation. The zarr file is saved in the same directory as the image with the same name but with the extension .zarr.
             """
 
+            memory_block_size = tile_size, tile_size
             memory_block_size = tile_size, tile_size
 
             from itertools import product
@@ -636,10 +1086,18 @@ class InstanSeg():
                     raise ValueError("The image pixel size {} is not in microns.".format(img_pixel_size))
             
             scale_factor = model_pixel_size / img_pixel_size
+            scale_factor = model_pixel_size / img_pixel_size
 
             dims = slide.dimensions
             dims = (round(dims[1]/ scale_factor), round(dims[0]/scale_factor))
 
+            # Core margin: exclude this many pixels from each edge to avoid edge artifacts
+            # and ensure nuclei are only counted once (by the tile whose core region contains their centroid)
+            core_margin = max(overlap // 2, detection_size)
+            
+            # Ensure overlap is at least 2 * core_margin so neighboring tiles cover each other's core regions
+            # This prevents nuclei from being dropped when core_margin > overlap // 2
+            effective_overlap = max(overlap, 2 * core_margin)
             # Core margin: exclude this many pixels from each edge to avoid edge artifacts
             # and ensure nuclei are only counted once (by the tile whose core region contains their centroid)
             core_margin = max(overlap // 2, detection_size)
@@ -666,6 +1124,7 @@ class InstanSeg():
             use_tissue_mask = kwargs.pop("use_tissue_mask", False)
             debug_tissue_mask = kwargs.pop("debug_tissue_mask", False)
             min_area = kwargs.pop("min_area", 50)
+            stardist_rays = kwargs.pop("stardist_rays", 32)
 
             # Tissue mask filtering
             thumbnail_for_debug = None
@@ -675,6 +1134,17 @@ class InstanSeg():
                     print("[PERF] Using color-based tissue mask...")
                 mask, mask_downsample, thumbnail_for_debug = _generate_tissue_mask(slide, max_dim=2048)
                 valid_positions = _find_non_empty_positions(mask, chop_list, shape[0], dims)
+                valid_tile_count = np.sum(valid_positions)
+                if self.verbose:
+                    print(f"[PERF] Tissue mask: {valid_tile_count}/{total_possible_tiles} tiles contain tissue ({100*valid_tile_count/total_possible_tiles:.1f}%)")
+            elif use_otsu_threshold:
+                if self.verbose:
+                    print("[PERF] Using Otsu thresholding to skip empty tiles...")
+                mask, mask_downsample, thumbnail_for_debug = _threshold_thumbnail(slide)
+                valid_positions = _find_non_empty_positions(mask, chop_list, shape[0], dims)
+                valid_tile_count = np.sum(valid_positions)
+                if self.verbose:
+                    print(f"[PERF] Otsu filtering: {valid_tile_count}/{total_possible_tiles} tiles contain tissue ({100*valid_tile_count/total_possible_tiles:.1f}%)")
                 valid_tile_count = np.sum(valid_positions)
                 if self.verbose:
                     print(f"[PERF] Tissue mask: {valid_tile_count}/{total_possible_tiles} tiles contain tissue ({100*valid_tile_count/total_possible_tiles:.1f}%)")
@@ -773,17 +1243,394 @@ class InstanSeg():
                 'tensor_conversion_time': 0.0,
                 'inference_time': 0.0,
                 'centroid_extraction_time': 0.0,
+                'contour_extraction_time': 0.0,
                 'total_tiles': 0,
                 'total_batches': 0
             }
             
-            # Vector-first: accumulate centroids, areas, and contours directly
-            # Probabilities computed later using global max_area for consistency
-            aggregated_centroids = []
-            aggregated_areas = []
-            aggregated_contours = []
+            # Vector-first streaming writer: write centroids/contours per batch, track areas for probability pass
+            contour_fallback_stats = Counter()
+            areas_chunks = []
+            writer = _StreamingSegmentationWriter(
+                file_with_zarr_extension,
+                enable_stardist=stardist_rays > 0,
+                verbose=self.verbose,
+            )
+            slide_width, slide_height = slide.dimensions
+            dims_y, dims_x = dims
+            scale_x = slide_width / dims_x if dims_x > 0 else 1.0
+            scale_y = slide_height / dims_y if dims_y > 0 else 1.0
             
             total_start_time = time.time()
+            ray_unit_vectors = None
+            ray_unit_vectors_gpu = None
+            gpu_sampling_enabled = False
+            gpu_device_index = None
+            stream_main = torch.cuda.Stream(device=self.inference_device) if isinstance(self.inference_device, torch.device) and self.inference_device.type == "cuda" else None
+            stream_post = torch.cuda.Stream(device=self.inference_device) if stream_main is not None else None
+            if stream_post is not None:
+                torch.cuda.set_stream(stream_main)
+            if stardist_rays > 0:
+                angles = np.linspace(0, 2 * np.pi, stardist_rays, endpoint=False, dtype=np.float32)
+                ray_unit_vectors = np.stack([np.cos(angles), np.sin(angles)], axis=1)
+                device_obj = (
+                    self.inference_device
+                    if isinstance(self.inference_device, torch.device)
+                    else torch.device(self.inference_device)
+                )
+                if (
+                    _gpu_contour_support_available()
+                    and device_obj.type == "cuda"
+                ):
+                    gpu_device_index = 0 if device_obj.index is None else device_obj.index
+                    try:
+                        with cp.cuda.Device(gpu_device_index):
+                            ray_unit_vectors_gpu = _prepare_ray_unit_vectors_gpu(ray_unit_vectors)
+                        gpu_sampling_enabled = ray_unit_vectors_gpu is not None
+                    except Exception as exc:
+                        gpu_sampling_enabled = False
+                        if self.verbose:
+                            print(f"[WARN] Failed to initialize GPU contour sampling: {exc}")
+            
+            format_contours_cached = None
+
+            def _process_inferred_batch(
+                batch_results,
+                batch_metadata,
+                batch_event,
+                batch_start_time,
+                actual_batch_size,
+                batch_idx,
+            ):
+                nonlocal gpu_sampling_enabled
+                if batch_results is None or actual_batch_size == 0:
+                    return
+                contour_time_batch = 0.0
+
+                def _emit_chunk(
+                    global_centroids_tensor: torch.Tensor,
+                    areas_tensor: torch.Tensor,
+                    contours_seq: Optional[Union[List[np.ndarray], np.ndarray]],
+                    stardist_coords_array: Optional[np.ndarray],
+                ):
+                    nonlocal format_contours_cached
+                    if global_centroids_tensor is None or global_centroids_tensor.numel() == 0:
+                        return
+                    centroids_np = global_centroids_tensor.detach().cpu().numpy().astype(np.float32)
+                    areas_np = areas_tensor.detach().cpu().numpy().astype(np.float32)
+                    if areas_np.size == 0:
+                        return
+                    areas_chunks.append(areas_np)
+
+                    centroids_scaled = centroids_np.astype(np.float64, copy=True)
+                    centroids_scaled[:, 0] = np.round(centroids_scaled[:, 0] * scale_x)
+                    centroids_scaled[:, 1] = np.round(centroids_scaled[:, 1] * scale_y)
+                    centroids_scaled = centroids_scaled.astype(np.int32)
+
+                    contours_array = None
+                    if contours_seq is not None:
+                        contours_scaled = []
+                        for contour in contours_seq:
+                            contour_arr = np.asarray(contour)
+                            if contour_arr.size == 0:
+                                contours_scaled.append(contour_arr)
+                                continue
+                            contour_copy = contour_arr.astype(np.float64, copy=True)
+                            contour_copy[:, 0] = np.round(contour_copy[:, 0] * scale_x)
+                            contour_copy[:, 1] = np.round(contour_copy[:, 1] * scale_y)
+                            contours_scaled.append(contour_copy.astype(np.int32))
+                        if contours_scaled:
+                            if format_contours_cached is None:
+                                from instanseg.segmentation_taskNode import format_contours_for_h5 as _fmt
+                                format_contours_cached = _fmt
+                            contours_array = format_contours_cached(contours_scaled)
+
+                    stardist_coords_scaled = None
+                    stardist_dist_scaled = None
+                    if stardist_rays > 0 and stardist_coords_array is not None and stardist_coords_array.size > 0:
+                        coords_scaled = stardist_coords_array.astype(np.float64, copy=True)
+                        coords_scaled[:, :, 0] *= scale_x
+                        coords_scaled[:, :, 1] *= scale_y
+                        centroid_x = centroids_scaled[:, 0][:, None].astype(np.float32)
+                        centroid_y = centroids_scaled[:, 1][:, None].astype(np.float32)
+                        stardist_dist_scaled = np.sqrt(
+                            (coords_scaled[:, :, 0].astype(np.float32) - centroid_x) ** 2
+                            + (coords_scaled[:, :, 1].astype(np.float32) - centroid_y) ** 2
+                        ).astype(np.float32)
+                        stardist_coords_scaled = coords_scaled.astype(np.float32)
+
+                    writer.append(
+                        centroids_scaled,
+                        contours_array,
+                        stardist_coords_scaled,
+                        stardist_dist_scaled,
+                    )
+                centroid_extraction_start = time.time()
+                processing_stream = stream_post if stream_post is not None else None
+                if processing_stream is not None and batch_event is not None:
+                    processing_stream.wait_event(batch_event)
+                elif batch_event is not None:
+                    batch_event.synchronize()
+                stream_ctx = (
+                    torch.cuda.stream(processing_stream)
+                    if processing_stream is not None
+                    else nullcontext()
+                )
+                with stream_ctx:
+                    batch_results_local = batch_results
+                    if batch_results_local.dim() == 3:
+                        batch_results_local = batch_results_local.unsqueeze(0)
+                    
+                    for tile_idx, (counter, i, window_i, j, window_j) in enumerate(batch_metadata):
+                        tile_label = batch_results_local[tile_idx]
+                        
+                        if tile_label.shape[-2:] != shape:
+                            tile_label = interpolate(tile_label.unsqueeze(0), size=shape[-2:], mode="nearest").int()[0]
+
+                        tile_label = _to_ndim(tile_label, 3)
+                        
+                        for n in range(tile_label.shape[0]):
+                            label_tile = tile_label[n]
+                            
+                            ignore_list = []
+                            if i == 0:
+                                ignore_list.append("top")
+                            if j == 0:
+                                ignore_list.append("left")
+                            if i == len(chop_list[0]) - 1:
+                                ignore_list.append("bottom")
+                            if j == len(chop_list[1]) - 1:
+                                ignore_list.append("right")
+                            
+                            label_tile = _remove_edge_labels(label_tile, ignore=ignore_list)
+
+                            if isinstance(label_tile, torch.Tensor):
+                                label_tile = label_tile.to(self.inference_device)
+                            else:
+                                label_tile = torch.tensor(label_tile, device=self.inference_device, dtype=torch.int32)
+                            
+                            label_tile = torch_fastremap(label_tile)
+                            
+                            if label_tile.max() > 0:
+                                centroids_tile, label_ids_kernel, areas_tile = _centroids_and_areas(label_tile)
+
+                                N = min(
+                                    centroids_tile.shape[0],
+                                    label_ids_kernel.shape[0],
+                                    areas_tile.shape[0],
+                                )
+                                if N == 0:
+                                    continue
+                                centroids_tile = centroids_tile[:N]
+                                label_ids_kernel = label_ids_kernel[:N]
+                                areas_tile = areas_tile[:N]
+
+                                core_i_start = core_margin
+                                core_i_end = shape[0] - core_margin
+                                core_j_start = core_margin
+                                core_j_end = shape[1] - core_margin
+                                if i == 0:
+                                    core_i_start = 0
+                                if j == 0:
+                                    core_j_start = 0
+                                if i == len(chop_list[0]) - 1:
+                                    core_i_end = shape[0]
+                                if j == len(chop_list[1]) - 1:
+                                    core_j_end = shape[1]
+
+                                centroids_tile, areas_tile, label_ids_kernel = _apply_core_and_area_filters(
+                                    centroids_tile,
+                                    areas_tile,
+                                    label_ids_kernel,
+                                    (core_i_start, core_i_end, core_j_start, core_j_end),
+                                    min_area,
+                                )
+                                
+                                if len(centroids_tile) > 0:
+                                    sampling_centroids = _label_seed_pixels(
+                                        label_tile,
+                                        label_ids_kernel,
+                                        centroids_tile,
+                                    )
+                                    global_centroids = torch.zeros_like(centroids_tile, dtype=torch.float32)
+                                    global_centroids[:, 0] = centroids_tile[:, 1] + window_j
+                                    global_centroids[:, 1] = centroids_tile[:, 0] + window_i
+
+                                    gpu_tile_sampling = (
+                                        gpu_sampling_enabled
+                                        and ray_unit_vectors_gpu is not None
+                                        and label_tile.is_cuda
+                                    )
+                                    if gpu_tile_sampling:
+                                        try:
+                                            contour_block_start = time.time()
+                                            coords_gpu, dists_gpu = _gpu_sample_star_polygon_from_tile(
+                                                label_tile,
+                                                centroids_tile,
+                                                label_ids_kernel,
+                                                ray_unit_vectors,
+                                                stardist_rays,
+                                                bbox_tensor=None,
+                                                centroid_overrides=sampling_centroids,
+                                                step=0.5,
+                                                ray_unit_vectors_gpu=ray_unit_vectors_gpu,
+                                            )
+                                            coords_gpu = coords_gpu.contiguous()
+                                            diff_x = coords_gpu[:, :, 0] - centroids_tile[:, 1].unsqueeze(1)
+                                            diff_y = coords_gpu[:, :, 1] - centroids_tile[:, 0].unsqueeze(1)
+                                            dists_gpu = torch.sqrt(diff_x ** 2 + diff_y ** 2)
+                                            coords_gpu[:, :, 0] += window_j
+                                            coords_gpu[:, :, 1] += window_i
+                                            torch.cuda.synchronize(device=label_tile.device)
+                                            contour_time_batch += time.time() - contour_block_start
+                                            if self.verbose and batch_idx < 2:
+                                                zero_mask = (dists_gpu < 1e-3).all(dim=1)
+                                                mean_radius_gpu = dists_gpu.mean().item()
+                                                frac_zero = zero_mask.float().mean().item() * 100.0
+                                                print(
+                                                    f"    [DEBUG] GPU contours (tile {batch_idx}, labels={len(label_ids_kernel)}): "
+                                                    f"mean_radius={mean_radius_gpu:.2f}px, "
+                                                    f"degenerate={frac_zero:.2f}%"
+                                                )
+                                            coords_gpu_np = coords_gpu.detach().cpu().numpy()
+                                            _emit_chunk(
+                                                global_centroids,
+                                                areas_tile,
+                                                list(coords_gpu_np),
+                                                coords_gpu_np,
+                                            )
+                                            continue
+                                        except Exception as exc:
+                                            gpu_sampling_enabled = False
+                                            if self.verbose:
+                                                print(f"[WARN] GPU contour sampling failed, falling back to CPU: {exc}")
+                                    
+                                    contours_tile = []
+                                    stardist_coords_tile = []
+                                    stardist_dist_tile = []
+                                    tile_fallbacks = Counter()
+                                    contour_block_start = time.time()
+                                    label_tile_cpu = label_tile.cpu().numpy().astype(np.int32)
+                                    props = regionprops(label_tile_cpu)
+                                    prop_lookup = {prop.label: prop for prop in props}
+
+                                    for idx, label_id in enumerate(label_ids_kernel):
+                                        centroid_xy = global_centroids[idx].cpu().numpy().astype(np.int32)
+                                        if label_id <= 0:
+                                            contours_tile.append(
+                                                np.array([[centroid_xy[0], centroid_xy[1]]], dtype=np.int32)
+                                            )
+                                            stardist_dist_tile.append(np.zeros(stardist_rays, dtype=np.float32))
+                                            stardist_coords_tile.append(
+                                                np.repeat([[centroid_xy[0], centroid_xy[1]]], stardist_rays, axis=0).astype(np.float32)
+                                            )
+                                            tile_fallbacks['invalid_label'] += 1
+                                            continue
+
+                                        prop = prop_lookup.get(int(label_id))
+                                        if prop is None:
+                                            contours_tile.append(
+                                                np.array([[centroid_xy[0], centroid_xy[1]]], dtype=np.int32)
+                                            )
+                                            stardist_dist_tile.append(np.zeros(stardist_rays, dtype=np.float32))
+                                            stardist_coords_tile.append(
+                                                np.repeat([[centroid_xy[0], centroid_xy[1]]], stardist_rays, axis=0).astype(np.float32)
+                                            )
+                                            tile_fallbacks['missing_prop'] += 1
+                                            continue
+
+                                        min_row, min_col, max_row, max_col = prop.bbox
+                                        submask = prop.image.astype(np.uint8)
+                                        prop_centroid = np.array(prop.centroid, dtype=np.float32)
+                                        centroid_local = np.array([
+                                            prop_centroid[0] - min_row,
+                                            prop_centroid[1] - min_col,
+                                        ], dtype=np.float32)
+
+                                        coords_tile_local, dists_tile = _sample_star_polygon(
+                                            submask,
+                                            centroid_local,
+                                            ray_unit_vectors,
+                                            stardist_rays,
+                                        )
+
+                                        contour_global = np.zeros_like(coords_tile_local, dtype=np.int32)
+                                        contour_global[:, 0] = np.round(coords_tile_local[:, 0] + min_col + window_j).astype(np.int32)
+                                        contour_global[:, 1] = np.round(coords_tile_local[:, 1] + min_row + window_i).astype(np.int32)
+
+                                        contours_tile.append(contour_global)
+                                        stardist_coords_tile.append(
+                                            np.stack([
+                                                coords_tile_local[:, 0] + min_col + window_j,
+                                                coords_tile_local[:, 1] + min_row + window_i,
+                                            ], axis=1).astype(np.float32)
+                                        )
+                                        stardist_dist_tile.append(dists_tile.astype(np.float32))
+                                    
+                                    if tile_fallbacks:
+                                        contour_fallback_stats.update(tile_fallbacks)
+                                        if self.verbose and (batch_idx < 5 or batch_idx % 50 == 0):
+                                            msg = ", ".join(f"{k}={v}" for k, v in tile_fallbacks.items())
+                                            print(f"    [PERF] Contour fallbacks: {msg}")
+                                    
+                                    global_centroids_np = global_centroids.cpu().numpy().astype(np.int32)
+                                    if len(contours_tile) != len(global_centroids_np):
+                                        mismatch = abs(len(contours_tile) - len(global_centroids_np))
+                                        contour_fallback_stats['length_mismatch'] += mismatch
+                                        if self.verbose:
+                                            print(f"    [WARN] Contour count mismatch ({len(contours_tile)} vs {len(global_centroids_np)}). Replacing with centroid fallbacks.")
+                                        contours_tile = [
+                                            np.array([[pt[0], pt[1]]], dtype=np.int32)
+                                            for pt in global_centroids_np
+                                        ]
+                                        stardist_coords_tile = [
+                                            np.repeat([[pt[0], pt[1]]], stardist_rays, axis=0).astype(np.float32)
+                                            for pt in global_centroids_np
+                                        ]
+                                        stardist_dist_tile = [
+                                            np.zeros(stardist_rays, dtype=np.float32)
+                                            for _ in global_centroids_np
+                                        ]
+                                    
+                                    contour_block_elapsed = time.time() - contour_block_start
+                                    contour_time_batch += contour_block_elapsed
+                                    
+                                    stardist_coords_np = (
+                                        np.stack(stardist_coords_tile, axis=0).astype(np.float32)
+                                        if stardist_coords_tile
+                                        else None
+                                    )
+                                    _emit_chunk(
+                                        global_centroids,
+                                        areas_tile,
+                                        contours_tile,
+                                        stardist_coords_np,
+                                    )
+                
+                centroid_extraction_elapsed = time.time() - centroid_extraction_start
+                centroid_only_time = max(centroid_extraction_elapsed - contour_time_batch, 0.0)
+                perf_stats['centroid_extraction_time'] += centroid_only_time
+                perf_stats['contour_extraction_time'] += contour_time_batch
+                perf_stats['total_batches'] += 1
+                
+                if self.verbose and (batch_idx < 5 or batch_idx % 50 == 0):
+                    print(
+                        f"  [PERF] Batch {batch_idx+1}: "
+                        f"Centroids {centroid_only_time:.3f}s | "
+                        f"Contours {contour_time_batch:.3f}s | "
+                        f"Total {centroid_extraction_elapsed:.3f}s"
+                    )
+                
+                batch_time = time.time() - batch_start_time
+                avg_time_per_tile = batch_time / max(actual_batch_size, 1)
+                remaining_batches = num_batches - (batch_idx + 1)
+                est_remaining = avg_time_per_tile * actual_batch_size * remaining_batches
+                elapsed = time.time() - total_start_time
+                
+                if self.verbose and (batch_idx < 10 or (batch_idx + 1) % 10 == 0):
+                    print(f"[PERF] Batch {batch_idx+1}/{num_batches} ({100*(batch_idx+1)/num_batches:.1f}%): "
+                          f"{batch_time:.2f}s total ({avg_time_per_tile:.3f}s/tile), "
+                          f"Elapsed: {elapsed:.1f}s, Est. remaining: {est_remaining:.1f}s")
             
             # Collect all valid tile positions first
             tile_positions = []
@@ -794,9 +1641,9 @@ class InstanSeg():
                 if valid_positions[counter] == 0:
                     continue
                 tile_positions.append((counter, i, window_i, j, window_j))
-            
+
             perf_stats['total_tiles'] = len(tile_positions)
-            
+
             # Process tiles in batches - calculate intermediate shape first
             best_level = slide.get_best_level_for_downsample(scale_factor)
             downsample_factor = slide.level_downsamples[best_level]
@@ -805,12 +1652,11 @@ class InstanSeg():
             final_pixel_size = model_pixel_size
             intermediate_to_final = intermediate_pixel_size / final_pixel_size
             intermediate_shape = (round(shape[0] / intermediate_to_final), round(shape[1] / intermediate_to_final))
-            
+
             # Auto-detect optimal batch size based on tile size and GPU memory
             if batch_size is None:
                 if str(self.inference_device).startswith('cuda'):
                     try:
-                        import torch
                         # Get GPU memory info
                         total_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
                         allocated_memory_gb = torch.cuda.memory_allocated(0) / (1024**3)
@@ -876,7 +1722,6 @@ class InstanSeg():
                 if self.verbose:
                     print("[OPT] Pre-warming GPU memory and CUDA kernels...")
                 try:
-                    import torch
                     # Pre-allocate a dummy tensor to warm up CUDA
                     dummy_tensor = torch.zeros((batch_size, 3, intermediate_shape[0], intermediate_shape[1]), 
                                              dtype=torch.float32, device=self.inference_device)
@@ -895,8 +1740,16 @@ class InstanSeg():
             next_batch_tensors = None
             next_batch_metadata = None
             
+            pending_results = None
+            pending_metadata = None
+            pending_event = None
+            pending_start_time = None
+            pending_batch_size = None
+            pending_batch_idx = None
+            
             for batch_idx in tqdm(range(num_batches), desc="Processing batches", colour="green"):
                 batch_start_time = time.time()
+                contour_time_batch = 0.0
                 batch_start = batch_idx * batch_size
                 batch_end = min(batch_start + batch_size, len(tile_positions))
                 batch_tiles = tile_positions[batch_start:batch_end]
@@ -945,14 +1798,25 @@ class InstanSeg():
                 
                 # Run inference on batch
                 inference_start = time.time()
-                batch_results = self.eval_small_image(
-                    batch_tensor,
-                    pixel_size=intermediate_pixel_size,
-                    return_image_tensor=False,
-                    rescale_output=False,
-                    normalise=normalise,
-                    **kwargs
-                )
+                if stream_main is not None:
+                    with torch.cuda.stream(stream_main):
+                        batch_results = self.eval_small_image(
+                            batch_tensor,
+                            pixel_size=intermediate_pixel_size,
+                            return_image_tensor=False,
+                            rescale_output=False,
+                            normalise=normalise,
+                            **kwargs
+                        )
+                else:
+                    batch_results = self.eval_small_image(
+                        batch_tensor,
+                        pixel_size=intermediate_pixel_size,
+                        return_image_tensor=False,
+                        rescale_output=False,
+                        normalise=normalise,
+                        **kwargs
+                    )
                 inference_elapsed = time.time() - inference_start
                 perf_stats['inference_time'] += inference_elapsed
                 
@@ -961,161 +1825,32 @@ class InstanSeg():
                           f"({inference_elapsed/actual_batch_size:.3f}s per tile)")
                     print(f"[PERF] Batch results shape: {batch_results.shape}")
                 
-                # Process each tile result - VECTOR-FIRST PIPELINE
-                if batch_results.dim() == 3:
-                    batch_results = batch_results.unsqueeze(0)
-                
-                centroid_extraction_start = time.time()
-                
-                for tile_idx, (counter, i, window_i, j, window_j) in enumerate(batch_metadata):
-                    tile_label = batch_results[tile_idx]
-                    
-                    if tile_label.shape[-2:] != shape:
-                        from torch.nn.functional import interpolate
-                        tile_label = interpolate(tile_label.unsqueeze(0), size=shape[-2:], mode="nearest").int()[0]
-                    
-                    tile_label = _to_ndim(tile_label, 3)
-                    
-                    # Process each channel (usually n_dim=1 for nuclei)
-                    for n in range(tile_label.shape[0]):
-                        label_tile = tile_label[n]
-                        
-                        # Remove edge labels (unreliable due to padding)
-                        ignore_list = []
-                        if i == 0:
-                            ignore_list.append("top")
-                        if j == 0:
-                            ignore_list.append("left")
-                        if i == len(chop_list[0])-1:
-                            ignore_list.append("bottom")
-                        if j == len(chop_list[1])-1:
-                            ignore_list.append("right")
-                        
-                        label_tile = _remove_edge_labels(label_tile, ignore=ignore_list)
-                        
-                        # Convert to GPU tensor and remap to contiguous IDs
-                        if isinstance(label_tile, torch.Tensor):
-                            label_tile = label_tile.to(self.inference_device)
-                        else:
-                            label_tile = torch.tensor(label_tile, device=self.inference_device, dtype=torch.int32)
-                        
-                        label_tile = torch_fastremap(label_tile)
-                        
-                        # Compute centroids and areas immediately (vector-first)
-                        if label_tile.max() > 0:
-                            centroids_tile, label_ids_tile = centroids_from_lab(label_tile.unsqueeze(0))
-                            
-                            # Compute areas using bincount
-                            flat_labels = label_tile.flatten()
-                            counts = torch.bincount(flat_labels)
-                            areas_tile = counts[label_ids_tile].float()
+                inference_event = torch.cuda.Event(enable_timing=False) if stream_main is not None else None
+                if inference_event is not None:
+                    inference_event.record(stream_main)
 
-                            # SAFETY: ensure centroids, areas, and label_ids have consistent length
-                            # In rare edge cases centroids_from_lab / torch_sparse_onehot can return
-                            # a centroids array that is shorter than label_ids. We trim everything
-                            # to the minimum common length before further masking/indexing.
-                            N = min(
-                                centroids_tile.shape[0],
-                                label_ids_tile.shape[0],
-                                areas_tile.shape[0],
-                            )
-                            if N == 0:
-                                continue
-                            centroids_tile = centroids_tile[:N]
-                            label_ids_tile = label_ids_tile[:N]
-                            areas_tile = areas_tile[:N]
-                            
-                            # CORE-REGION OWNERSHIP: Only keep nuclei whose centroids are in this tile's core region
-                            # Core region = tile minus overlap margins
-                            core_i_start = core_margin
-                            core_i_end = shape[0] - core_margin
-                            core_j_start = core_margin
-                            core_j_end = shape[1] - core_margin
-                            
-                            # Handle edge tiles
-                            if i == 0:
-                                core_i_start = 0
-                            if j == 0:
-                                core_j_start = 0
-                            if i == len(chop_list[0]) - 1:
-                                core_i_end = shape[0]
-                            if j == len(chop_list[1]) - 1:
-                                core_j_end = shape[1]
-                            
-                            # Filter centroids to core region (centroids are in (y, x) format from centroids_from_lab)
-                            in_core = (
-                                (centroids_tile[:, 0] >= core_i_start) & 
-                                (centroids_tile[:, 0] < core_i_end) &
-                                (centroids_tile[:, 1] >= core_j_start) & 
-                                (centroids_tile[:, 1] < core_j_end)
-                            )
-                            
-                            centroids_tile = centroids_tile[in_core]
-                            areas_tile = areas_tile[in_core]
-                            label_ids_tile = label_ids_tile[in_core]
-                            
-                            # EARLY FILTERING: Remove tiny detections
-                            valid_mask = areas_tile >= min_area
-                            centroids_tile = centroids_tile[valid_mask]
-                            areas_tile = areas_tile[valid_mask]
-                            label_ids_tile = label_ids_tile[valid_mask]
-                            
-                            if len(centroids_tile) > 0:
-                                # Convert centroids to global slide coordinates
-                                # centroids_from_lab returns (y, x), convert to (x, y) and add tile offset
-                                global_centroids = torch.zeros_like(centroids_tile)
-                                global_centroids[:, 0] = centroids_tile[:, 1] + window_j  # x = j + tile_offset_j
-                                global_centroids[:, 1] = centroids_tile[:, 0] + window_i  # y = i + tile_offset_i
-                                
-                                # Extract simplified contours (or use centroids as fallback)
-                                contours_tile = []
-                                for idx, label_id in enumerate(label_ids_tile):
-                                    # For speed, use simplified contours (centroid repeated)
-                                    # For detailed contours, uncomment the cv2.findContours code below
-                                    centroid_xy = global_centroids[idx].cpu().numpy().astype(np.int32)
-                                    contours_tile.append(np.array([[centroid_xy[0], centroid_xy[1]]], dtype=np.int32))
-                                    
-                                    # Detailed contour extraction (slower but more accurate):
-                                    # mask = (label_tile == label_id).cpu().numpy().astype(np.uint8)
-                                    # if mask.sum() > 0:
-                                    #     import cv2
-                                    #     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                                    #     if contours:
-                                    #         contour = max(contours, key=cv2.contourArea).squeeze()
-                                    #         if contour.ndim == 1:
-                                    #             contour = contour.reshape(1, -1)
-                                    #         # Convert to global coordinates
-                                    #         contour = contour.astype(np.int32)
-                                    #         contour[:, 0] += window_j
-                                    #         contour[:, 1] += window_i
-                                    #         contours_tile.append(contour)
-                                    #     else:
-                                    #         contours_tile.append(np.array([[centroid_xy[0], centroid_xy[1]]], dtype=np.int32))
-                                
-                                # Accumulate results (probabilities computed later using global max_area)
-                                aggregated_centroids.append(global_centroids.cpu().numpy().astype(np.int32))
-                                aggregated_areas.append(areas_tile.cpu().numpy().astype(np.float32))
-                                aggregated_contours.extend(contours_tile)
-                
-                centroid_extraction_elapsed = time.time() - centroid_extraction_start
-                perf_stats['centroid_extraction_time'] += centroid_extraction_elapsed
-                perf_stats['total_batches'] += 1
-                
-                if self.verbose and (batch_idx < 5 or batch_idx % 50 == 0):
-                    print(f"  [PERF] Batch {batch_idx+1}: Centroid extraction took {centroid_extraction_elapsed:.3f}s")
-                
-                batch_time = time.time() - batch_start_time
-                
-                # Log progress
-                if self.verbose and (batch_idx < 10 or (batch_idx + 1) % 10 == 0):
-                    avg_time_per_tile = batch_time / actual_batch_size
-                    remaining_batches = num_batches - (batch_idx + 1)
-                    est_remaining = avg_time_per_tile * actual_batch_size * remaining_batches
-                    elapsed = time.time() - total_start_time
-                    
-                    print(f"[PERF] Batch {batch_idx+1}/{num_batches} ({100*(batch_idx+1)/num_batches:.1f}%): "
-                          f"{batch_time:.2f}s total ({avg_time_per_tile:.3f}s/tile), "
-                          f"Elapsed: {elapsed:.1f}s, Est. remaining: {est_remaining:.1f}s")
+                if pending_results is not None:
+                    _process_inferred_batch(
+                        pending_results,
+                        pending_metadata,
+                        pending_event,
+                        pending_start_time,
+                        pending_batch_size,
+                        pending_batch_idx,
+                    )
+                    pending_results = None
+                    pending_metadata = None
+                    pending_event = None
+                    pending_start_time = None
+                    pending_batch_size = None
+                    pending_batch_idx = None
+
+                pending_results = batch_results
+                pending_metadata = batch_metadata
+                pending_event = inference_event
+                pending_start_time = batch_start_time
+                pending_batch_size = actual_batch_size
+                pending_batch_idx = batch_idx
                 
                 # Prefetch next batch AFTER processing current batch (ensures each batch read exactly once)
                 if batch_idx < num_batches - 1:
@@ -1136,6 +1871,16 @@ class InstanSeg():
                         next_batch_tensors.append(input_data)
                         next_batch_metadata.append((counter, i, window_i, j, window_j))
             
+            if pending_results is not None:
+                _process_inferred_batch(
+                    pending_results,
+                    pending_metadata,
+                    pending_event,
+                    pending_start_time,
+                    pending_batch_size,
+                    pending_batch_idx,
+                )
+
             perf_stats['total_time'] = time.time() - total_start_time
             
             # Print performance summary
@@ -1153,101 +1898,54 @@ class InstanSeg():
                 print(f"  - Tensor conversion: {perf_stats['tensor_conversion_time']:.2f}s ({100*perf_stats['tensor_conversion_time']/perf_stats['total_time']:.1f}%)")
                 print(f"  - Inference: {perf_stats['inference_time']:.2f}s ({100*perf_stats['inference_time']/perf_stats['total_time']:.1f}%)")
                 print(f"  - Centroid extraction: {perf_stats['centroid_extraction_time']:.2f}s ({100*perf_stats['centroid_extraction_time']/perf_stats['total_time']:.1f}%)")
-                print(f"  - Other overhead: {perf_stats['total_time'] - perf_stats['tile_reading_time'] - perf_stats['tensor_conversion_time'] - perf_stats['inference_time'] - perf_stats['centroid_extraction_time']:.2f}s")
+                print(f"  - Contour extraction: {perf_stats['contour_extraction_time']:.2f}s ({100*perf_stats['contour_extraction_time']/perf_stats['total_time']:.1f}%)")
+                other_overhead = (
+                    perf_stats['total_time']
+                    - perf_stats['tile_reading_time']
+                    - perf_stats['tensor_conversion_time']
+                    - perf_stats['inference_time']
+                    - perf_stats['centroid_extraction_time']
+                    - perf_stats['contour_extraction_time']
+                )
+                print(f"  - Other overhead: {other_overhead:.2f}s")
+                if contour_fallback_stats:
+                    print("  - Contour fallbacks:")
+                    for reason, count in contour_fallback_stats.items():
+                        print(f"      * {reason}: {count}")
                 print("="*60)
 
-            # VECTOR-FIRST: Concatenate accumulated results and write to zarr
+            # Finalize streamed output (probability normalization)
             if self.verbose:
-                print("\n[OUTPUT] Concatenating accumulated centroids, contours, and probabilities...")
+                print("\n[OUTPUT] Finalizing streamed centroids/contours and writing probabilities...")
             
             write_start = time.time()
-            
             try:
-                from instanseg.segmentation_taskNode import format_contours_for_h5
-                
-                # Concatenate all accumulated results
-                if len(aggregated_centroids) > 0:
-                    centroids = np.concatenate(aggregated_centroids, axis=0)
-                    areas = np.concatenate(aggregated_areas, axis=0)
-                    contours_list = aggregated_contours
-                    
-                    # Map centroids from internal processing grid (dims) to level-0 slide pixels
-                    slide_width, slide_height = slide.dimensions  # (width, height) in level-0 pixels
-                    dims_y, dims_x = dims                          # (height, width) of processing grid
-                    if dims_x > 0 and dims_y > 0:
-                        scale_x = slide_width / dims_x
-                        scale_y = slide_height / dims_y
-                        centroids_float = centroids.astype(np.float64)
-                        centroids_float[:, 0] = np.round(centroids_float[:, 0] * scale_x)  # X
-                        centroids_float[:, 1] = np.round(centroids_float[:, 1] * scale_y)  # Y
-                        centroids = centroids_float.astype(np.int32)
-                    
-                    # Compute probabilities using global max_area (consistent across entire slide)
-                    max_area_global = float(areas.max()) if len(areas) > 0 else 1.0
-                    if max_area_global > 0:
-                        probabilities = (areas / max_area_global).astype(np.float32)
-                    else:
-                        probabilities = np.ones(len(areas), dtype=np.float32)
-                    
-                    if self.verbose:
-                        print(f"[OUTPUT] Total nuclei detected: {len(centroids)}")
-                        print(f"[OUTPUT] Total contours: {len(contours_list)}")
-                        print(f"[OUTPUT] Global max area: {max_area_global:.1f} pixels")
-                        print(f"[OUTPUT] Probability range: [{probabilities.min():.3f}, {probabilities.max():.3f}]")
+                if areas_chunks:
+                    areas_concat = np.concatenate(areas_chunks, axis=0)
+                    max_area_global = float(areas_concat.max()) if areas_concat.size > 0 else 1.0
+                    denom = max(max_area_global, 1.0)
+                    probabilities = (areas_concat / denom).astype(np.float32)
                 else:
-                    centroids = np.array([]).reshape(0, 2).astype(np.int32)
                     probabilities = np.zeros((0,), dtype=np.float32)
-                    contours_list = []
-                    if self.verbose:
-                        print("[OUTPUT] No nuclei detected")
-                
-                # Create proper zarr group structure: CMU-1.svs.zarr > SegmentationNode > centroids/contours/probability
-                zf = zarr.open_group(file_with_zarr_extension, mode='a')
-                node_name = "SegmentationNode"
-                node_grp = zf.require_group(node_name)
-                
-                # Clear existing datasets if any (but keep embedding if it exists)
-                for key in ['centroids', 'probability', 'contours']:
-                    if key in node_grp:
-                        del node_grp[key]
-                
-                # Write centroids
-                if len(centroids) > 0:
-                    node_grp.create_dataset('centroids', data=centroids.astype(np.int32))
-                    if self.verbose:
-                        print(f"[OUTPUT] Wrote centroids: shape {centroids.shape}")
-                
-                # Write probabilities
-                if probabilities is not None and len(probabilities) > 0:
-                    node_grp.create_dataset('probability', data=probabilities.astype(np.float32))
-                    if self.verbose:
-                        print(f"[OUTPUT] Wrote probability: shape {probabilities.shape}")
-                
-                # Write contours
-                if contours_list is not None and len(contours_list) > 0:
-                    if self.verbose:
-                        print("[OUTPUT] Formatting contours...")
-                    max_points = 32
-                    if len(contours_list) > 0 and len(contours_list[0]) == 1:
-                        contours_array = np.array(contours_list, dtype=np.int32)
-                        contours_array = np.tile(contours_array, (1, max_points, 1))
-                    else:
-                        contours_array = format_contours_for_h5(contours_list)
-                    node_grp.create_dataset('contours', data=contours_array)
-                    if self.verbose:
-                        print(f"[OUTPUT] Wrote contours: shape {contours_array.shape}")
-                
+
+                if probabilities.shape[0] != writer.count:
+                    if probabilities.shape[0] > writer.count:
+                        probabilities = probabilities[: writer.count]
+                    elif probabilities.shape[0] < writer.count:
+                        pad = writer.count - probabilities.shape[0]
+                        probabilities = np.pad(probabilities, (0, pad), mode="constant", constant_values=0.0)
+
+                writer.write_probabilities(probabilities)
                 write_time = time.time() - write_start
                 if self.verbose:
                     print(f"[OUTPUT] Writing completed in {write_time:.2f}s")
-                    print(f"[OUTPUT] Zarr structure: {file_with_zarr_extension} > {node_name} > [centroids, contours, probability]")
-                
+                    print(f"[OUTPUT] Zarr structure: {file_with_zarr_extension} > {writer.node_name} > [centroids, contours, probability]")
             except Exception as e:
                 if self.verbose:
-                    print(f"[WARN] Could not write centroids/contours: {e}")
+                    print(f"[WARN] Could not finalize streamed outputs: {e}")
                     import traceback
                     traceback.print_exc()
-            
+
             if save_geojson:
                 print("Exporting to geojson")
                 _zarr_to_json_export(file_with_zarr_extension, 
@@ -1405,6 +2103,48 @@ def _generate_tissue_mask(slide, max_dim=2048, level=None):
     return tissue_mask.astype(bool), downsample_factor, img_thumbnail
 
 
+def _generate_tissue_mask(slide, max_dim=2048, level=None):
+    """
+    Generate a color-based tissue mask from slide thumbnail.
+    Uses HSV color space to identify tissue regions (non-white areas).
+    
+    Args:
+        slide: TiffSlide object
+        max_dim: Maximum dimension for thumbnail (for speed)
+        level: Pyramid level to use (None = auto-select)
+    
+    Returns:
+        binary_mask: Boolean array where True indicates tissue
+        downsample_factor: Factor to scale mask coordinates back to full resolution
+    """
+    from skimage.color import rgb2hsv
+    import numpy as np
+    
+    if level is None:
+        level = slide.level_count - 1
+    
+    # Read thumbnail
+    thumb_size = min(max_dim, slide.level_dimensions[level][0], slide.level_dimensions[level][1])
+    img_thumbnail = slide.read_region((0, 0), level, size=(thumb_size, thumb_size), as_array=True, padding=False)
+    downsample_factor = slide.level_downsamples[level]
+    
+    # Convert to HSV
+    img_hsv = rgb2hsv(img_thumbnail)
+    
+    # Tissue detection: exclude very bright/white regions (high value, low saturation)
+    # Typical H&E tissue has saturation > 0.1 and value < 0.9
+    saturation = img_hsv[:, :, 1]
+    value = img_hsv[:, :, 2]
+    
+    # Tissue mask: not too bright and has some color
+    tissue_mask = (value < 0.9) & (saturation > 0.1)
+    
+    # Also exclude very dark regions (likely artifacts)
+    tissue_mask = tissue_mask & (value > 0.05)
+    
+    return tissue_mask.astype(bool), downsample_factor, img_thumbnail
+
+
 def _threshold_thumbnail(slide, level=None, sigma = 3):
     from skimage.color import rgb2gray
     from skimage import filters
@@ -1421,6 +2161,7 @@ def _threshold_thumbnail(slide, level=None, sigma = 3):
     gray_image = filters.gaussian(gray_image,sigma = sigma)>threshold_value
     binary_image = ~(gray_image > threshold_value)  # Apply the threshold to create a binary image
 
+    return binary_image, downsample_factor_thumbnail, img_thumbnail
     return binary_image, downsample_factor_thumbnail, img_thumbnail
 
 
@@ -1482,3 +2223,54 @@ def _display_colourized(mIF, normalise = True):
     colour_render = torch.clamp_(colour_render, 0, 1)
     colour_render = _move_channel_axis(colour_render,to_back = True).detach().numpy()*255
     return colour_render.astype(np.uint8)
+
+
+def _sample_star_polygon(submask: np.ndarray,
+                         centroid_local: np.ndarray,
+                         ray_unit_vectors: Optional[np.ndarray],
+                         n_rays: int,
+                         step: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Approximate StarDist-style ray intersections directly from a binary mask.
+    """
+    if ray_unit_vectors is None or n_rays <= 0:
+        repeats = max(int(n_rays), 1)
+        centroid_xy = np.array([centroid_local[1], centroid_local[0]], dtype=np.float32)
+        coords = np.repeat(centroid_xy[None, :], repeats, axis=0)
+        dists = np.zeros(repeats, dtype=np.float32)
+        return coords, dists
+
+    coords = np.zeros((n_rays, 2), dtype=np.float32)
+    dists = np.zeros(n_rays, dtype=np.float32)
+    max_radius = float(np.hypot(submask.shape[0], submask.shape[1]) + 1.0)
+    cy, cx = float(centroid_local[0]), float(centroid_local[1])
+
+    for idx in range(n_rays):
+        dir_x = float(ray_unit_vectors[idx, 0])
+        dir_y = float(ray_unit_vectors[idx, 1])
+        r = 0.0
+        last_x, last_y = cx, cy
+        hit = False
+
+        while r <= max_radius:
+            sample_x = cx + dir_x * r
+            sample_y = cy + dir_y * r
+            xi = int(math.floor(sample_x))
+            yi = int(math.floor(sample_y))
+            if (
+                yi < 0
+                or yi >= submask.shape[0]
+                or xi < 0
+                or xi >= submask.shape[1]
+                or submask[yi, xi] == 0
+            ):
+                break
+            last_x, last_y = sample_x, sample_y
+            hit = True
+            r += step
+
+        coords[idx, 0] = last_x
+        coords[idx, 1] = last_y
+        dists[idx] = math.hypot(last_x - cx, last_y - cy) if hit else 0.0
+
+    return coords, dists
