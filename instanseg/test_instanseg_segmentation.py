@@ -16,12 +16,11 @@ from pathlib import Path
 import numpy as np
 import zarr
 
-from instanseg.inference_class import (
-    InstanSeg,
+from instanseg.inference_class import InstanSeg
+from instanseg.pipeline import (
     _sample_star_polygon,
     _gpu_contour_support_available,
     _gpu_sample_star_polygon_from_tile,
-    _label_seed_pixels,
     _centroids_and_areas,
     _apply_core_and_area_filters,
 )
@@ -464,7 +463,6 @@ def run_roi_only(args, model, image_path):
         raise RuntimeError("ROI-only mode requires OpenCV and scikit-image.") from exc
 
     from instanseg.utils.pytorch_utils import _to_tensor_float32
-    from instanseg.inference_class import _sample_star_polygon
 
     x0 = int(args.debug_centroid_x)
     y0 = int(args.debug_centroid_y)
@@ -601,7 +599,7 @@ def run_roi_wsi_pass(args, model, image_path):
 
     _maybe_sync()
     t_centroids = time.time()
-    centroids_tile, label_ids_kernel, areas_tile = _centroids_and_areas(label_map)
+    centroids_tile, label_ids_kernel, areas_tile, seed_pixels = _centroids_and_areas(label_map)
     timing["centroid_stage"] = time.time() - t_centroids
     timing["bincount"] = 0.0
 
@@ -612,8 +610,8 @@ def run_roi_wsi_pass(args, model, image_path):
     )
     centroids_tile = centroids_tile[:N]
     label_ids_kernel = label_ids_kernel[:N]
-    label_ids_kernel = label_ids_kernel[:N]
     areas_tile = areas_tile[:N]
+    seed_pixels = seed_pixels[:N]
 
     t_filter = time.time()
     core_margin = max(args.overlap // 2, args.detection_size)
@@ -626,12 +624,13 @@ def run_roi_wsi_pass(args, model, image_path):
     )
 
     t_filter = time.time()
-    centroids_tile, areas_tile, label_ids_kernel = _apply_core_and_area_filters(
+    centroids_tile, areas_tile, label_ids_kernel, seed_pixels = _apply_core_and_area_filters(
         centroids_tile,
         areas_tile,
         label_ids_kernel,
         core_bounds,
         args.min_area_pixels,
+        seeds_tile=seed_pixels,
     )
     timing["filter_stage"] = time.time() - t_filter
 
@@ -639,7 +638,7 @@ def run_roi_wsi_pass(args, model, image_path):
         print("[ROI-WSI] No detections after core-region and min-area filtering.")
         return
 
-    sampling_centroids = _label_seed_pixels(label_map, label_ids_kernel, centroids_tile)
+    sampling_centroids = seed_pixels
     global_centroids = torch.zeros_like(centroids_tile)
     global_centroids[:, 0] = centroids_tile[:, 1] + x0
     global_centroids[:, 1] = centroids_tile[:, 0] + y0
