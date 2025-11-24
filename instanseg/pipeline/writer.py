@@ -27,11 +27,11 @@ class _StreamingSegmentationWriter:
 
         root_group = zarr.open_group(str(self.zarr_path), mode="a")
         if node_name in root_group:
-            del root_group[node_name]
+            try:
+                del root_group[node_name]
+            except FileNotFoundError:
+                shutil.rmtree(node_dir, ignore_errors=True)
         self._group = root_group.require_group(node_name)
-        for key in ["centroids", "probability", "contours", "stardist_coords", "stardist_distances"]:
-            if key in self._group:
-                del self._group[key]
         self.centroids_ds = self._group.create_dataset(
             "centroids",
             shape=(0, 2),

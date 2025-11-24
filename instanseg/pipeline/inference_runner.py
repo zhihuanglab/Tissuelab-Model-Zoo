@@ -7,6 +7,7 @@ from collections import Counter
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from concurrent.futures import ThreadPoolExecutor, Future
 
 import numpy as np
 import torch
@@ -31,6 +32,30 @@ try:
     import cupy as cp
 except ImportError:  # pragma: no cover - optional dependency
     cp = None
+
+
+def _read_tile_batch(
+    slide,
+    batch_tiles: Sequence[Tuple[int, int, int, int, int]],
+    *,
+    scale_factor: float,
+    best_level: int,
+    intermediate_shape: Tuple[int, int],
+) -> Tuple[list, list, float]:
+    """Read a batch of tiles from the slide (runs inside thread pool)."""
+    start = time.time()
+    batch_tensors = []
+    batch_metadata = []
+    for counter, i, window_i, j, window_j in batch_tiles:
+        input_data = slide.read_region(
+            (round(window_j * scale_factor), round(window_i * scale_factor)),
+            best_level,
+            (round(intermediate_shape[0]), round(intermediate_shape[1])),
+            as_array=True,
+        )
+        batch_tensors.append(input_data)
+        batch_metadata.append((counter, i, window_i, j, window_j))
+    return batch_tensors, batch_metadata, time.time() - start
 
 
 def run_wsi(
@@ -190,6 +215,24 @@ def run_wsi(
     pending_start_time = None
 
     num_batches = (len(tile_positions) + batch_size - 1) // batch_size
+    executor = ThreadPoolExecutor(max_workers=1) if tile_positions else None
+
+    def _submit_prefetch(start_index: int) -> Optional[Future]:
+        if executor is None or start_index >= len(tile_positions):
+            return None
+        batch_start = start_index
+        batch_end = min(batch_start + batch_size, len(tile_positions))
+        batch_tiles = tile_positions[batch_start:batch_end]
+        return executor.submit(
+            _read_tile_batch,
+            slide,
+            batch_tiles,
+            scale_factor=scale_factor,
+            best_level=best_level,
+            intermediate_shape=intermediate_shape,
+        )
+
+    prefetch_future = _submit_prefetch(0)
 
     for batch_idx in tqdm(range(num_batches), desc="Processing batches", colour="green"):
         batch_start_time = time.time()
@@ -198,20 +241,15 @@ def run_wsi(
         batch_tiles = tile_positions[batch_start:batch_end]
         actual_batch_size = len(batch_tiles)
 
-        read_start = time.time()
-        batch_tensors = []
-        batch_metadata = []
-        for counter, i, window_i, j, window_j in batch_tiles:
-            input_data = slide.read_region(
-                (round(window_j * scale_factor), round(window_i * scale_factor)),
-                best_level,
-                (round(intermediate_shape[0]), round(intermediate_shape[1])),
-                as_array=True,
-            )
-            batch_tensors.append(input_data)
-            batch_metadata.append((counter, i, window_i, j, window_j))
-        read_elapsed = time.time() - read_start
+        if prefetch_future is None:
+            batch_tensors = []
+            batch_metadata = []
+            read_elapsed = 0.0
+        else:
+            batch_tensors, batch_metadata, read_elapsed = prefetch_future.result()
         perf_stats["tile_reading_time"] += read_elapsed
+
+        next_prefetch = _submit_prefetch(batch_end)
 
         tensor_start = time.time()
         tensor_list = [_to_tensor_float32(t) for t in batch_tensors]
@@ -284,6 +322,7 @@ def run_wsi(
         pending_metadata = batch_metadata
         pending_event = inference_event
         pending_start_time = batch_start_time
+        prefetch_future = next_prefetch
 
     if pending_results is not None:
         process_inferred_batch(
@@ -342,6 +381,9 @@ def run_wsi(
             scale=scale_factor,
             n_dim=n_dim,
         )
+
+    if executor is not None:
+        executor.shutdown(wait=True)
 
 
 def process_inferred_batch(
