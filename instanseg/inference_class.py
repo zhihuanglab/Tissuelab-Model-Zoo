@@ -1,4 +1,5 @@
 from typing import Union, List, Optional, Tuple
+import math
 import numpy as np
 import torch
 from torch import nn
@@ -8,7 +9,28 @@ from tiffslide import TiffSlide
 import zarr
 import os
 import time
-from instanseg.utils.pytorch_utils import _to_tensor_float32, centroids_from_lab, torch_fastremap
+from collections import Counter
+from contextlib import nullcontext
+from instanseg.utils.pytorch_utils import _to_tensor_float32, torch_fastremap
+from skimage.measure import regionprops
+from instanseg.pipeline import (
+    _StreamingSegmentationWriter,
+    _apply_core_and_area_filters,
+    _centroids_and_areas,
+    BatchEmitter,
+    process_inferred_batch,
+    run_wsi,
+    _gpu_contour_support_available,
+    _gpu_sample_star_polygon_from_tile,
+    _prepare_ray_unit_vectors_gpu,
+    _sample_star_polygon,
+    TilePlan,
+    prepare_tile_plan,
+)
+try:
+    import cupy as cp
+except ImportError:
+    cp = None
 pixel_size_precision = 0.01
 def _to_ndim(x, *args, **kwargs):
     from instanseg.utils.pytorch_utils import _to_ndim as _to_ndim_pytorch
@@ -17,8 +39,6 @@ def _to_ndim(x, *args, **kwargs):
         return _to_ndim_pytorch(x, *args, **kwargs)
     elif isinstance(x, np.ndarray):
         return _to_ndim_numpy(x, *args, **kwargs)
-
-
 class InstanSeg():
     """
     Main class for running InstanSeg.
@@ -180,6 +200,7 @@ class InstanSeg():
             print(e)
             pass
         try:
+            import slideio
             import slideio
             slide = slideio.open_slide(image_str, driver = "AUTO")
             scene  = slide.get_scene(0)
@@ -574,685 +595,37 @@ class InstanSeg():
             return instances.cpu()
 
         
-    def eval_whole_slide_image(self,
-                               image: str,
-                               pixel_size: Optional[float] = None, 
-                               normalise: bool = True,
-                               normalisation_subsampling_factor: int = 1,
-                               tile_size: int = 1024,
-                               overlap: int = 50,
-                               detection_size: int = 20, 
-                               save_geojson: bool = False,
-                               use_otsu_threshold: bool = False,
-                               batch_size: Optional[int] = None,
-                               **kwargs):
-            """
-            Evaluate a whole slide input image using the InstanSeg model. This function uses slideio to read an image and then segments it using the instanseg model. The segmentation is done in a tiled manner to avoid memory issues. 
-            
-            :param image: The input image to be evaluated.
-            :param pixel_size: The pixel size of the image, in microns. If not provided, it will be read from the image metadata.
-            :param normalise: Controls whether the image is normalised.
-            :param tile_size: The width/height of the tiles that the image will be split into.
-            :param overlap: The overlap (in pixels) betwene tiles.
-            :param detection_size: The expected maximum size of detection objects.
-            :param batch_size: The number of tiles to be run simultaneously (default: 8). Higher values use more GPU memory but are faster.
-            :param normalisation_subsampling_factor: The subsampling or downsample factor at which to calculate normalisation parameters.
-            :param use_otsu_threshold: bool = False. Whether to use an otsu threshold on the image thumbnail to find the tissue region.
-            :param kwargs: Passed to pytorch.
-            :return: Returns a zarr file with the segmentation. The zarr file is saved in the same directory as the image with the same name but with the extension .zarr.
-            """
+    def eval_whole_slide_image(
+        self,
+        image: str,
+        pixel_size: Optional[float] = None,
+        normalise: bool = True,
+        normalisation_subsampling_factor: int = 1,
+        tile_size: int = 1024,
+        overlap: int = 50,
+        detection_size: int = 20,
+        save_geojson: bool = False,
+        use_otsu_threshold: bool = False,
+        batch_size: Optional[int] = None,
+        **kwargs,
+    ):
+        """Run the shared WSI pipeline and write streaming outputs."""
+        run_wsi(
+            model=self,
+            image=image,
+            pixel_size=pixel_size,
+            normalise=normalise,
+            normalisation_subsampling_factor=normalisation_subsampling_factor,
+            tile_size=tile_size,
+            overlap=overlap,
+            detection_size=detection_size,
+            save_geojson=save_geojson,
+            use_otsu_threshold=use_otsu_threshold,
+            batch_size=batch_size,
+            to_ndim_fn=_to_ndim,
+            **kwargs,
+        )
 
-            memory_block_size = tile_size, tile_size
-
-            from itertools import product
-            from pathlib import Path
-            from tqdm import tqdm
-            from instanseg.utils.tiling import _chops, _remove_edge_labels, _zarr_to_json_export
-    
-            instanseg = self.instanseg
-
-            image, img_pixel_size = self.read_image(image, processing_method= "wsi")
-
-            if pixel_size is not None and img_pixel_size is not None:
-                if img_pixel_size != pixel_size:
-                    import warnings
-                    warnings.warn(f"Pixel size {img_pixel_size} from image metadata does not match pixel size {pixel_size} provided. Using {pixel_size}.")
-                    img_pixel_size = pixel_size
-
-            slide = self.read_slide(image)
-
-            n_dim = 2 if instanseg.cells_and_nuclei else 1
-            model_pixel_size = instanseg.pixel_size
-
-            new_stem = Path(image).stem + self.prediction_tag
-            file_with_zarr_extension = Path(image).parent / (new_stem + ".zarr")
-
-            if img_pixel_size is None or img_pixel_size > 1 or img_pixel_size < 0.1:
-                import warnings
-                warnings.warn("The image pixel size {} is not in microns.".format(img_pixel_size))
-                if pixel_size is not None:
-                    img_pixel_size = pixel_size
-                else:
-                    raise ValueError("The image pixel size {} is not in microns.".format(img_pixel_size))
-            
-            scale_factor = model_pixel_size / img_pixel_size
-
-            dims = slide.dimensions
-            dims = (round(dims[1]/ scale_factor), round(dims[0]/scale_factor))
-
-            # Core margin: exclude this many pixels from each edge to avoid edge artifacts
-            # and ensure nuclei are only counted once (by the tile whose core region contains their centroid)
-            core_margin = max(overlap // 2, detection_size)
-            
-            # Ensure overlap is at least 2 * core_margin so neighboring tiles cover each other's core regions
-            # This prevents nuclei from being dropped when core_margin > overlap // 2
-            effective_overlap = max(overlap, 2 * core_margin)
-
-            shape = memory_block_size
-            # Use effective_overlap for tiling to ensure core regions are fully covered
-            chop_list = _chops(dims, shape, overlap=effective_overlap)
-            
-            total_possible_tiles = len(chop_list[0]) * len(chop_list[1])
-            
-            if self.verbose:
-                print(f"[PERF] Image dimensions (after scaling): {dims}")
-                print(f"[PERF] Tile size: {tile_size}x{tile_size} pixels")
-                print(f"[PERF] Requested overlap: {overlap} pixels")
-                print(f"[PERF] Core margin: {core_margin} pixels (excludes {core_margin}px from each edge)")
-                print(f"[PERF] Effective overlap: {effective_overlap} pixels (ensures core regions are covered)")
-                print(f"[PERF] Total possible tiles: {total_possible_tiles} ({len(chop_list[0])} rows x {len(chop_list[1])} cols)")
-
-            # Optional flags for advanced behavior
-            use_tissue_mask = kwargs.pop("use_tissue_mask", False)
-            debug_tissue_mask = kwargs.pop("debug_tissue_mask", False)
-            min_area = kwargs.pop("min_area", 50)
-
-            # Tissue mask filtering
-            thumbnail_for_debug = None
-
-            if use_tissue_mask:
-                if self.verbose:
-                    print("[PERF] Using color-based tissue mask...")
-                mask, mask_downsample, thumbnail_for_debug = _generate_tissue_mask(slide, max_dim=2048)
-                valid_positions = _find_non_empty_positions(mask, chop_list, shape[0], dims)
-                valid_tile_count = np.sum(valid_positions)
-                if self.verbose:
-                    print(f"[PERF] Tissue mask: {valid_tile_count}/{total_possible_tiles} tiles contain tissue ({100*valid_tile_count/total_possible_tiles:.1f}%)")
-            elif use_otsu_threshold:
-                if self.verbose:
-                    print("[PERF] Using Otsu thresholding to skip empty tiles...")
-                mask, mask_downsample, thumbnail_for_debug = _threshold_thumbnail(slide)
-                valid_positions = _find_non_empty_positions(mask, chop_list, shape[0], dims)
-                valid_tile_count = np.sum(valid_positions)
-                if self.verbose:
-                    print(f"[PERF] Otsu filtering: {valid_tile_count}/{total_possible_tiles} tiles contain tissue ({100*valid_tile_count/total_possible_tiles:.1f}%)")
-            else:
-                valid_positions = np.ones((len(chop_list[0])* len(chop_list[1])), dtype=np.int32)
-                if self.verbose:
-                    print(f"[PERF] Processing all tiles (no tissue filtering)")
-
-            # Optionally save a debug visualization of the tissue mask and processed tiles over the thumbnail
-            if thumbnail_for_debug is not None and debug_tissue_mask:
-                try:
-                    import matplotlib.pyplot as plt
-                    from itertools import product
-
-                    thumb_rgb = thumbnail_for_debug
-                    if thumb_rgb.shape[-1] == 4:
-                        thumb_rgb = thumb_rgb[..., :3]
-                    thumb_rgb = thumb_rgb.astype(np.uint8)
-
-                    h_thumb, w_thumb = thumb_rgb.shape[:2]
-
-                    # Resize mask to thumbnail shape if needed
-                    if mask.shape[:2] != thumb_rgb.shape[:2]:
-                        from skimage.transform import resize
-                        mask_resized = resize(
-                            mask.astype(float),
-                            (h_thumb, w_thumb),
-                            order=0,
-                            preserve_range=True,
-                        ) > 0.5
-                    else:
-                        mask_resized = mask
-
-                    overlay = thumb_rgb.copy()
-
-                    # Highlight tissue regions in red (mask)
-                    overlay[mask_resized] = [255, 0, 0]
-
-                    # Overlay blue rectangle borders for each processed tile
-                    # Compute mapping from full-resolution coordinates to thumbnail
-                    downsample_factor_mask = dims[0] / mask.shape[0]  # dims[0] ~ image height
-                    scaled_tile_size = int(round(round(shape[0] / downsample_factor_mask, 0)))
-                    thickness = max(1, scaled_tile_size // 64)
-
-                    counter_debug = -1
-                    # Iterate over all tile positions in the same order as _find_non_empty_positions
-                    for _, ((i, window_i), (j, window_j)) in enumerate(
-                        product(enumerate(chop_list[0]), enumerate(chop_list[1]))
-                    ):
-                        counter_debug += 1
-                        # Only draw tiles that were actually processed (valid_positions == 1)
-                        if valid_positions[counter_debug] == 0:
-                            continue
-
-                        # Map tile origin to thumbnail coordinates
-                        y_thumb = int(round(round(window_i / downsample_factor_mask, 0)))
-                        x_thumb = int(round(round(window_j / downsample_factor_mask, 0)))
-
-                        y0 = max(0, y_thumb)
-                        x0 = max(0, x_thumb)
-                        y1 = min(h_thumb, y0 + scaled_tile_size)
-                        x1 = min(w_thumb, x0 + scaled_tile_size)
-
-                        if y1 <= y0 or x1 <= x0:
-                            continue
-
-                        # Draw neon-blue (pure blue) rectangle border
-                        # Top border
-                        overlay[y0 : min(y0 + thickness, y1), x0:x1] = [0, 0, 255]
-                        # Bottom border
-                        overlay[max(y1 - thickness, y0) : y1, x0:x1] = [0, 0, 255]
-                        # Left border
-                        overlay[y0:y1, x0 : min(x0 + thickness, x1)] = [0, 0, 255]
-                        # Right border
-                        overlay[y0:y1, max(x1 - thickness, x0) : x1] = [0, 0, 255]
-
-                    debug_path = Path(image).parent / (Path(image).stem + "_tissue_mask_debug.png")
-                    plt.imsave(debug_path, overlay)
-                    if self.verbose:
-                        print(f"[DEBUG] Tissue mask visualization saved to {debug_path}")
-                except Exception as e:
-                    if self.verbose:
-                        print(f"[WARN] Could not save tissue mask debug image: {e}")
-
-            perf_stats = {
-                'total_time': 0.0,
-                'tile_reading_time': 0.0,
-                'tensor_conversion_time': 0.0,
-                'inference_time': 0.0,
-                'centroid_extraction_time': 0.0,
-                'total_tiles': 0,
-                'total_batches': 0
-            }
-            
-            # Vector-first: accumulate centroids, areas, and contours directly
-            # Probabilities computed later using global max_area for consistency
-            aggregated_centroids = []
-            aggregated_areas = []
-            aggregated_contours = []
-            
-            total_start_time = time.time()
-            
-            # Collect all valid tile positions first
-            tile_positions = []
-            total = len(chop_list[0]) * len(chop_list[1])
-            counter = -1
-            for _, ((i, window_i), (j, window_j)) in enumerate(product(enumerate(chop_list[0]), enumerate(chop_list[1]))):
-                counter += 1
-                if valid_positions[counter] == 0:
-                    continue
-                tile_positions.append((counter, i, window_i, j, window_j))
-            
-            perf_stats['total_tiles'] = len(tile_positions)
-            
-            # Process tiles in batches - calculate intermediate shape first
-            best_level = slide.get_best_level_for_downsample(scale_factor)
-            downsample_factor = slide.level_downsamples[best_level]
-            initial_pixel_size = img_pixel_size
-            intermediate_pixel_size = initial_pixel_size * downsample_factor
-            final_pixel_size = model_pixel_size
-            intermediate_to_final = intermediate_pixel_size / final_pixel_size
-            intermediate_shape = (round(shape[0] / intermediate_to_final), round(shape[1] / intermediate_to_final))
-            
-            # Auto-detect optimal batch size based on tile size and GPU memory
-            if batch_size is None:
-                if str(self.inference_device).startswith('cuda'):
-                    try:
-                        import torch
-                        # Get GPU memory info
-                        total_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                        allocated_memory_gb = torch.cuda.memory_allocated(0) / (1024**3)
-                        reserved_memory_gb = torch.cuda.memory_reserved(0) / (1024**3)
-                        free_memory_gb = total_memory_gb - reserved_memory_gb
-                        
-                        # U-Net memory scales roughly as: batch_size × tile_size² × 10 (for feature maps)
-                        # Estimate: each tile needs ~10x its input size in memory for U-Net processing
-                        # Input: tile_size² × 3 channels × 4 bytes = 12 × tile_size² bytes
-                        # Total per tile: ~120 × tile_size² bytes = ~0.12 × tile_size² MB
-                        tile_area = intermediate_shape[0] * intermediate_shape[1]
-                        memory_per_tile_mb = 0.12 * tile_area / (1024**2)
-                        
-                        # Use 60% of free memory for safety
-                        available_memory_mb = free_memory_gb * 1024 * 0.6
-                        max_batch_size = int(available_memory_mb / memory_per_tile_mb)
-                        
-                        # Set reasonable bounds: min 4, max based on tile size
-                        if tile_size >= 1024:
-                            max_batch_size = min(max_batch_size, 32)  # Smaller batches for large tiles
-                        elif tile_size >= 512:
-                            max_batch_size = min(max_batch_size, 64)
-                        else:
-                            max_batch_size = min(max_batch_size, 128)
-                        
-                        batch_size = max(4, max_batch_size)
-                        
-                        if self.verbose:
-                            print(f"[PERF] GPU Memory: {total_memory_gb:.1f} GB total, {free_memory_gb:.1f} GB free")
-                            print(f"[PERF] Estimated memory per tile: {memory_per_tile_mb:.1f} MB")
-                            print(f"[PERF] Auto-detected optimal batch_size: {batch_size}")
-                    except Exception as e:
-                        if self.verbose:
-                            print(f"[WARN] Could not auto-detect batch size: {e}")
-                        # Fallback: conservative defaults based on tile size
-                        if tile_size >= 1024:
-                            batch_size = 16
-                        elif tile_size >= 512:
-                            batch_size = 32
-                        else:
-                            batch_size = 64
-                else:
-                    # CPU: use smaller batches
-                    batch_size = 8
-            
-            num_batches = (len(tile_positions) + batch_size - 1) // batch_size
-            
-            if self.verbose:
-                print(f"[PERF] Total tiles to process: {perf_stats['total_tiles']}")
-                print(f"[PERF] Batch size: {batch_size}")
-                print(f"[PERF] Estimated batches: {num_batches}")
-            
-            if self.verbose:
-                print(f"[PERF] Model pixel size: {model_pixel_size:.3f} um/pixel")
-                print(f"[PERF] Image pixel size: {img_pixel_size:.3f} um/pixel")
-                print(f"[PERF] Scale factor: {scale_factor:.3f}x")
-                print(f"[PERF] Using pyramid level {best_level} (downsample: {downsample_factor:.2f}x)")
-                print(f"[PERF] Intermediate pixel size: {intermediate_pixel_size:.3f} um/pixel")
-                print(f"[PERF] Reading tiles at {intermediate_shape[0]}x{intermediate_shape[1]} pixels")
-            
-            # OPTIMIZATION: Pre-warm GPU to avoid slow first batches
-            if str(self.inference_device).startswith('cuda'):
-                if self.verbose:
-                    print("[OPT] Pre-warming GPU memory and CUDA kernels...")
-                try:
-                    import torch
-                    # Pre-allocate a dummy tensor to warm up CUDA
-                    dummy_tensor = torch.zeros((batch_size, 3, intermediate_shape[0], intermediate_shape[1]), 
-                                             dtype=torch.float32, device=self.inference_device)
-                    # Pre-compile tensor operations
-                    _ = torch.stack([dummy_tensor[0], dummy_tensor[0]])
-                    # Clear the dummy tensor
-                    del dummy_tensor
-                    torch.cuda.empty_cache()
-                    if self.verbose:
-                        print("[OPT] GPU warmup complete")
-                except Exception as e:
-                    if self.verbose:
-                        print(f"[WARN] GPU warmup failed: {e}")
-            
-            # Prefetch buffer for next batch (for I/O overlap)
-            next_batch_tensors = None
-            next_batch_metadata = None
-            
-            for batch_idx in tqdm(range(num_batches), desc="Processing batches", colour="green"):
-                batch_start_time = time.time()
-                batch_start = batch_idx * batch_size
-                batch_end = min(batch_start + batch_size, len(tile_positions))
-                batch_tiles = tile_positions[batch_start:batch_end]
-                actual_batch_size = len(batch_tiles)
-                
-                # Read current batch tiles (use prefetched data if available, otherwise read now)
-                read_start = time.time()
-                if batch_idx == 0:
-                    # First batch: read now (no prefetch available yet)
-                    batch_tensors = []
-                    batch_metadata = []
-                    for counter, i, window_i, j, window_j in batch_tiles:
-                        input_data = slide.read_region(
-                            (round(window_j*scale_factor), round(window_i*scale_factor)), 
-                            best_level, 
-                            (round(intermediate_shape[0]), round(intermediate_shape[1])), 
-                            as_array=True
-                        )
-                        batch_tensors.append(input_data)
-                        batch_metadata.append((counter, i, window_i, j, window_j))
-                else:
-                    # Use prefetched data from previous iteration
-                    batch_tensors = next_batch_tensors
-                    batch_metadata = next_batch_metadata
-                
-                read_elapsed = time.time() - read_start
-                perf_stats['tile_reading_time'] += read_elapsed
-                
-                if self.verbose and (batch_idx < 5 or batch_idx % 50 == 0):
-                    print(f"  [PERF] Batch {batch_idx+1}: Read {actual_batch_size} tiles in {read_elapsed:.3f}s ({read_elapsed/actual_batch_size:.3f}s/tile)")
-                
-                # Convert to tensor batch
-                tensor_start = time.time()
-                tensor_list = [self._to_tensor(t) for t in batch_tensors]
-                batch_tensor = torch.stack(tensor_list) if len(tensor_list) > 1 else tensor_list[0]
-                if len(tensor_list) == 1:
-                    batch_tensor = batch_tensor.unsqueeze(0)
-                tensor_elapsed = time.time() - tensor_start
-                perf_stats['tensor_conversion_time'] += tensor_elapsed
-                
-                if self.verbose and (batch_idx < 5 or batch_idx % 50 == 0):
-                    print(f"  [PERF] Batch {batch_idx+1}: Tensor conversion took {tensor_elapsed:.3f}s")
-                
-                if self.verbose and batch_idx == 0:
-                    print(f"[PERF] Batch tensor shape: {batch_tensor.shape}, dtype: {batch_tensor.dtype}")
-                
-                # Run inference on batch
-                inference_start = time.time()
-                batch_results = self.eval_small_image(
-                    batch_tensor,
-                    pixel_size=intermediate_pixel_size,
-                    return_image_tensor=False,
-                    rescale_output=False,
-                    normalise=normalise,
-                    **kwargs
-                )
-                inference_elapsed = time.time() - inference_start
-                perf_stats['inference_time'] += inference_elapsed
-                
-                if self.verbose and batch_idx == 0:
-                    print(f"[PERF] Inference took {inference_elapsed:.3f}s for batch of {actual_batch_size} tiles "
-                          f"({inference_elapsed/actual_batch_size:.3f}s per tile)")
-                    print(f"[PERF] Batch results shape: {batch_results.shape}")
-                
-                # Process each tile result - VECTOR-FIRST PIPELINE
-                if batch_results.dim() == 3:
-                    batch_results = batch_results.unsqueeze(0)
-                
-                centroid_extraction_start = time.time()
-                
-                for tile_idx, (counter, i, window_i, j, window_j) in enumerate(batch_metadata):
-                    tile_label = batch_results[tile_idx]
-                    
-                    if tile_label.shape[-2:] != shape:
-                        from torch.nn.functional import interpolate
-                        tile_label = interpolate(tile_label.unsqueeze(0), size=shape[-2:], mode="nearest").int()[0]
-                    
-                    tile_label = _to_ndim(tile_label, 3)
-                    
-                    # Process each channel (usually n_dim=1 for nuclei)
-                    for n in range(tile_label.shape[0]):
-                        label_tile = tile_label[n]
-                        
-                        # Remove edge labels (unreliable due to padding)
-                        ignore_list = []
-                        if i == 0:
-                            ignore_list.append("top")
-                        if j == 0:
-                            ignore_list.append("left")
-                        if i == len(chop_list[0])-1:
-                            ignore_list.append("bottom")
-                        if j == len(chop_list[1])-1:
-                            ignore_list.append("right")
-                        
-                        label_tile = _remove_edge_labels(label_tile, ignore=ignore_list)
-                        
-                        # Convert to GPU tensor and remap to contiguous IDs
-                        if isinstance(label_tile, torch.Tensor):
-                            label_tile = label_tile.to(self.inference_device)
-                        else:
-                            label_tile = torch.tensor(label_tile, device=self.inference_device, dtype=torch.int32)
-                        
-                        label_tile = torch_fastremap(label_tile)
-                        
-                        # Compute centroids and areas immediately (vector-first)
-                        if label_tile.max() > 0:
-                            centroids_tile, label_ids_tile = centroids_from_lab(label_tile.unsqueeze(0))
-                            
-                            # Compute areas using bincount
-                            flat_labels = label_tile.flatten()
-                            counts = torch.bincount(flat_labels)
-                            areas_tile = counts[label_ids_tile].float()
-
-                            # SAFETY: ensure centroids, areas, and label_ids have consistent length
-                            # In rare edge cases centroids_from_lab / torch_sparse_onehot can return
-                            # a centroids array that is shorter than label_ids. We trim everything
-                            # to the minimum common length before further masking/indexing.
-                            N = min(
-                                centroids_tile.shape[0],
-                                label_ids_tile.shape[0],
-                                areas_tile.shape[0],
-                            )
-                            if N == 0:
-                                continue
-                            centroids_tile = centroids_tile[:N]
-                            label_ids_tile = label_ids_tile[:N]
-                            areas_tile = areas_tile[:N]
-                            
-                            # CORE-REGION OWNERSHIP: Only keep nuclei whose centroids are in this tile's core region
-                            # Core region = tile minus overlap margins
-                            core_i_start = core_margin
-                            core_i_end = shape[0] - core_margin
-                            core_j_start = core_margin
-                            core_j_end = shape[1] - core_margin
-                            
-                            # Handle edge tiles
-                            if i == 0:
-                                core_i_start = 0
-                            if j == 0:
-                                core_j_start = 0
-                            if i == len(chop_list[0]) - 1:
-                                core_i_end = shape[0]
-                            if j == len(chop_list[1]) - 1:
-                                core_j_end = shape[1]
-                            
-                            # Filter centroids to core region (centroids are in (y, x) format from centroids_from_lab)
-                            in_core = (
-                                (centroids_tile[:, 0] >= core_i_start) & 
-                                (centroids_tile[:, 0] < core_i_end) &
-                                (centroids_tile[:, 1] >= core_j_start) & 
-                                (centroids_tile[:, 1] < core_j_end)
-                            )
-                            
-                            centroids_tile = centroids_tile[in_core]
-                            areas_tile = areas_tile[in_core]
-                            label_ids_tile = label_ids_tile[in_core]
-                            
-                            # EARLY FILTERING: Remove tiny detections
-                            valid_mask = areas_tile >= min_area
-                            centroids_tile = centroids_tile[valid_mask]
-                            areas_tile = areas_tile[valid_mask]
-                            label_ids_tile = label_ids_tile[valid_mask]
-                            
-                            if len(centroids_tile) > 0:
-                                # Convert centroids to global slide coordinates
-                                # centroids_from_lab returns (y, x), convert to (x, y) and add tile offset
-                                global_centroids = torch.zeros_like(centroids_tile)
-                                global_centroids[:, 0] = centroids_tile[:, 1] + window_j  # x = j + tile_offset_j
-                                global_centroids[:, 1] = centroids_tile[:, 0] + window_i  # y = i + tile_offset_i
-                                
-                                # Extract simplified contours (or use centroids as fallback)
-                                contours_tile = []
-                                for idx, label_id in enumerate(label_ids_tile):
-                                    # For speed, use simplified contours (centroid repeated)
-                                    # For detailed contours, uncomment the cv2.findContours code below
-                                    centroid_xy = global_centroids[idx].cpu().numpy().astype(np.int32)
-                                    contours_tile.append(np.array([[centroid_xy[0], centroid_xy[1]]], dtype=np.int32))
-                                    
-                                    # Detailed contour extraction (slower but more accurate):
-                                    # mask = (label_tile == label_id).cpu().numpy().astype(np.uint8)
-                                    # if mask.sum() > 0:
-                                    #     import cv2
-                                    #     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                                    #     if contours:
-                                    #         contour = max(contours, key=cv2.contourArea).squeeze()
-                                    #         if contour.ndim == 1:
-                                    #             contour = contour.reshape(1, -1)
-                                    #         # Convert to global coordinates
-                                    #         contour = contour.astype(np.int32)
-                                    #         contour[:, 0] += window_j
-                                    #         contour[:, 1] += window_i
-                                    #         contours_tile.append(contour)
-                                    #     else:
-                                    #         contours_tile.append(np.array([[centroid_xy[0], centroid_xy[1]]], dtype=np.int32))
-                                
-                                # Accumulate results (probabilities computed later using global max_area)
-                                aggregated_centroids.append(global_centroids.cpu().numpy().astype(np.int32))
-                                aggregated_areas.append(areas_tile.cpu().numpy().astype(np.float32))
-                                aggregated_contours.extend(contours_tile)
-                
-                centroid_extraction_elapsed = time.time() - centroid_extraction_start
-                perf_stats['centroid_extraction_time'] += centroid_extraction_elapsed
-                perf_stats['total_batches'] += 1
-                
-                if self.verbose and (batch_idx < 5 or batch_idx % 50 == 0):
-                    print(f"  [PERF] Batch {batch_idx+1}: Centroid extraction took {centroid_extraction_elapsed:.3f}s")
-                
-                batch_time = time.time() - batch_start_time
-                
-                # Log progress
-                if self.verbose and (batch_idx < 10 or (batch_idx + 1) % 10 == 0):
-                    avg_time_per_tile = batch_time / actual_batch_size
-                    remaining_batches = num_batches - (batch_idx + 1)
-                    est_remaining = avg_time_per_tile * actual_batch_size * remaining_batches
-                    elapsed = time.time() - total_start_time
-                    
-                    print(f"[PERF] Batch {batch_idx+1}/{num_batches} ({100*(batch_idx+1)/num_batches:.1f}%): "
-                          f"{batch_time:.2f}s total ({avg_time_per_tile:.3f}s/tile), "
-                          f"Elapsed: {elapsed:.1f}s, Est. remaining: {est_remaining:.1f}s")
-                
-                # Prefetch next batch AFTER processing current batch (ensures each batch read exactly once)
-                if batch_idx < num_batches - 1:
-                    next_batch_start = batch_end
-                    next_batch_end = min(next_batch_start + batch_size, len(tile_positions))
-                    next_batch_tiles = tile_positions[next_batch_start:next_batch_end]
-                    
-                    # Read next batch tiles (will be used in next iteration)
-                    next_batch_tensors = []
-                    next_batch_metadata = []
-                    for counter, i, window_i, j, window_j in next_batch_tiles:
-                        input_data = slide.read_region(
-                            (round(window_j*scale_factor), round(window_i*scale_factor)), 
-                            best_level, 
-                            (round(intermediate_shape[0]), round(intermediate_shape[1])), 
-                            as_array=True
-                        )
-                        next_batch_tensors.append(input_data)
-                        next_batch_metadata.append((counter, i, window_i, j, window_j))
-            
-            perf_stats['total_time'] = time.time() - total_start_time
-            
-            # Print performance summary
-            if self.verbose:
-                print("\n" + "="*60)
-                print("[PERF] PERFORMANCE SUMMARY")
-                print("="*60)
-                print(f"[PERF] Total time: {perf_stats['total_time']:.2f}s ({perf_stats['total_time']/60:.2f} minutes)")
-                print(f"[PERF] Total tiles processed: {perf_stats['total_tiles']}")
-                print(f"[PERF] Total batches: {perf_stats['total_batches']}")
-                print(f"[PERF] Average time per tile: {perf_stats['total_time']/perf_stats['total_tiles']:.3f}s")
-                print(f"[PERF] Average time per batch: {perf_stats['total_time']/perf_stats['total_batches']:.2f}s")
-                print("\n[PERF] Time breakdown:")
-                print(f"  - Tile reading: {perf_stats['tile_reading_time']:.2f}s ({100*perf_stats['tile_reading_time']/perf_stats['total_time']:.1f}%)")
-                print(f"  - Tensor conversion: {perf_stats['tensor_conversion_time']:.2f}s ({100*perf_stats['tensor_conversion_time']/perf_stats['total_time']:.1f}%)")
-                print(f"  - Inference: {perf_stats['inference_time']:.2f}s ({100*perf_stats['inference_time']/perf_stats['total_time']:.1f}%)")
-                print(f"  - Centroid extraction: {perf_stats['centroid_extraction_time']:.2f}s ({100*perf_stats['centroid_extraction_time']/perf_stats['total_time']:.1f}%)")
-                print(f"  - Other overhead: {perf_stats['total_time'] - perf_stats['tile_reading_time'] - perf_stats['tensor_conversion_time'] - perf_stats['inference_time'] - perf_stats['centroid_extraction_time']:.2f}s")
-                print("="*60)
-
-            # VECTOR-FIRST: Concatenate accumulated results and write to zarr
-            if self.verbose:
-                print("\n[OUTPUT] Concatenating accumulated centroids, contours, and probabilities...")
-            
-            write_start = time.time()
-            
-            try:
-                from instanseg.segmentation_taskNode import format_contours_for_h5
-                
-                # Concatenate all accumulated results
-                if len(aggregated_centroids) > 0:
-                    centroids = np.concatenate(aggregated_centroids, axis=0)
-                    areas = np.concatenate(aggregated_areas, axis=0)
-                    contours_list = aggregated_contours
-                    
-                    # Map centroids from internal processing grid (dims) to level-0 slide pixels
-                    slide_width, slide_height = slide.dimensions  # (width, height) in level-0 pixels
-                    dims_y, dims_x = dims                          # (height, width) of processing grid
-                    if dims_x > 0 and dims_y > 0:
-                        scale_x = slide_width / dims_x
-                        scale_y = slide_height / dims_y
-                        centroids_float = centroids.astype(np.float64)
-                        centroids_float[:, 0] = np.round(centroids_float[:, 0] * scale_x)  # X
-                        centroids_float[:, 1] = np.round(centroids_float[:, 1] * scale_y)  # Y
-                        centroids = centroids_float.astype(np.int32)
-                    
-                    # Compute probabilities using global max_area (consistent across entire slide)
-                    max_area_global = float(areas.max()) if len(areas) > 0 else 1.0
-                    if max_area_global > 0:
-                        probabilities = (areas / max_area_global).astype(np.float32)
-                    else:
-                        probabilities = np.ones(len(areas), dtype=np.float32)
-                    
-                    if self.verbose:
-                        print(f"[OUTPUT] Total nuclei detected: {len(centroids)}")
-                        print(f"[OUTPUT] Total contours: {len(contours_list)}")
-                        print(f"[OUTPUT] Global max area: {max_area_global:.1f} pixels")
-                        print(f"[OUTPUT] Probability range: [{probabilities.min():.3f}, {probabilities.max():.3f}]")
-                else:
-                    centroids = np.array([]).reshape(0, 2).astype(np.int32)
-                    probabilities = np.zeros((0,), dtype=np.float32)
-                    contours_list = []
-                    if self.verbose:
-                        print("[OUTPUT] No nuclei detected")
-                
-                # Create proper zarr group structure: CMU-1.svs.zarr > SegmentationNode > centroids/contours/probability
-                zf = zarr.open_group(file_with_zarr_extension, mode='a')
-                node_name = "SegmentationNode"
-                node_grp = zf.require_group(node_name)
-                
-                # Clear existing datasets if any (but keep embedding if it exists)
-                for key in ['centroids', 'probability', 'contours']:
-                    if key in node_grp:
-                        del node_grp[key]
-                
-                # Write centroids
-                if len(centroids) > 0:
-                    node_grp.create_dataset('centroids', data=centroids.astype(np.int32))
-                    if self.verbose:
-                        print(f"[OUTPUT] Wrote centroids: shape {centroids.shape}")
-                
-                # Write probabilities
-                if probabilities is not None and len(probabilities) > 0:
-                    node_grp.create_dataset('probability', data=probabilities.astype(np.float32))
-                    if self.verbose:
-                        print(f"[OUTPUT] Wrote probability: shape {probabilities.shape}")
-                
-                # Write contours
-                if contours_list is not None and len(contours_list) > 0:
-                    if self.verbose:
-                        print("[OUTPUT] Formatting contours...")
-                    max_points = 32
-                    if len(contours_list) > 0 and len(contours_list[0]) == 1:
-                        contours_array = np.array(contours_list, dtype=np.int32)
-                        contours_array = np.tile(contours_array, (1, max_points, 1))
-                    else:
-                        contours_array = format_contours_for_h5(contours_list)
-                    node_grp.create_dataset('contours', data=contours_array)
-                    if self.verbose:
-                        print(f"[OUTPUT] Wrote contours: shape {contours_array.shape}")
-                
-                write_time = time.time() - write_start
-                if self.verbose:
-                    print(f"[OUTPUT] Writing completed in {write_time:.2f}s")
-                    print(f"[OUTPUT] Zarr structure: {file_with_zarr_extension} > {node_name} > [centroids, contours, probability]")
-                
-            except Exception as e:
-                if self.verbose:
-                    print(f"[WARN] Could not write centroids/contours: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            if save_geojson:
-                print("Exporting to geojson")
-                _zarr_to_json_export(file_with_zarr_extension, 
-                                     detection_size = detection_size, size = shape[0], scale = scale_factor, n_dim = n_dim)
-                    
     def display(self,
                 image: torch.tensor,
                 instances: torch.Tensor,
@@ -1361,94 +734,6 @@ class InstanSeg():
 
         return adata
 
-
-
-def _generate_tissue_mask(slide, max_dim=2048, level=None):
-    """
-    Generate a color-based tissue mask from slide thumbnail.
-    Uses HSV color space to identify tissue regions (non-white areas).
-    
-    Args:
-        slide: TiffSlide object
-        max_dim: Maximum dimension for thumbnail (for speed)
-        level: Pyramid level to use (None = auto-select)
-    
-    Returns:
-        binary_mask: Boolean array where True indicates tissue
-        downsample_factor: Factor to scale mask coordinates back to full resolution
-    """
-    from skimage.color import rgb2hsv
-    import numpy as np
-    
-    if level is None:
-        level = slide.level_count - 1
-    
-    # Read thumbnail
-    thumb_size = min(max_dim, slide.level_dimensions[level][0], slide.level_dimensions[level][1])
-    img_thumbnail = slide.read_region((0, 0), level, size=(thumb_size, thumb_size), as_array=True, padding=False)
-    downsample_factor = slide.level_downsamples[level]
-    
-    # Convert to HSV
-    img_hsv = rgb2hsv(img_thumbnail)
-    
-    # Tissue detection: exclude very bright/white regions (high value, low saturation)
-    # Typical H&E tissue has saturation > 0.1 and value < 0.9
-    saturation = img_hsv[:, :, 1]
-    value = img_hsv[:, :, 2]
-    
-    # Tissue mask: not too bright and has some color
-    tissue_mask = (value < 0.9) & (saturation > 0.1)
-    
-    # Also exclude very dark regions (likely artifacts)
-    tissue_mask = tissue_mask & (value > 0.05)
-    
-    return tissue_mask.astype(bool), downsample_factor, img_thumbnail
-
-
-def _threshold_thumbnail(slide, level=None, sigma = 3):
-    from skimage.color import rgb2gray
-    from skimage import filters
-    import numpy as np
-
-    if level is None:
-        level = slide.level_count - 1
-
-    img_thumbnail = slide.read_region((0, 0), level, size=(10000, 10000), as_array=True, padding=False)
-    downsample_factor_thumbnail = slide.level_downsamples[level]
-
-    gray_image = rgb2gray(np.array(img_thumbnail))
-    threshold_value = filters.threshold_otsu(gray_image)
-    gray_image = filters.gaussian(gray_image,sigma = sigma)>threshold_value
-    binary_image = ~(gray_image > threshold_value)  # Apply the threshold to create a binary image
-
-    return binary_image, downsample_factor_thumbnail, img_thumbnail
-
-
-
-def _find_non_empty_positions(mask, chop_list, tile_size, chopped_image_size, emptiness_threshold = 0.1):
-    """
-    Precompute all valid positions within the mask where tiles can be placed.
-    """
-    from itertools import product
-    from instanseg.utils.utils import show_images
-    valid_positions = []
-
-    downsample_factor_mask = chopped_image_size[0] / mask.shape[0]
-    scaled_tile_size = round(round(tile_size / downsample_factor_mask,0))
-
-    for y,x in product((chop_list[0]),(chop_list[1])):
-
-        y = round(round(y / downsample_factor_mask,0))
-        x = round(round(x / downsample_factor_mask,0))
-
-        if mask[y:y + scaled_tile_size, x:x + scaled_tile_size].max() > emptiness_threshold:
-            valid_positions.append(1)
-        else:
-            valid_positions.append(0)
-
-    return valid_positions
-
-
 def _rescale_to_pixel_size(image: torch.Tensor, 
                            requested_pixel_size: float, 
                            model_pixel_size: float,
@@ -1482,3 +767,4 @@ def _display_colourized(mIF, normalise = True):
     colour_render = torch.clamp_(colour_render, 0, 1)
     colour_render = _move_channel_axis(colour_render,to_back = True).detach().numpy()*255
     return colour_render.astype(np.uint8)
+
