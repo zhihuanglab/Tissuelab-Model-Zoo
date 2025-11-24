@@ -4,8 +4,17 @@ from typing import Optional, Tuple
 
 import torch
 
+try:
+    from .centroids_cuda import centroids_and_areas_cuda as _centroids_and_areas_cuda
+except Exception:  # pragma: no cover - CUDA optional
+    _centroids_and_areas_cuda = None
+
 
 def _centroids_and_areas(label_tile: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if label_tile.is_cuda and _centroids_and_areas_cuda is not None:
+        result = _centroids_and_areas_cuda(label_tile)
+        if result is not None:
+            return result
     device = label_tile.device
     height, width = label_tile.shape[-2:]
     flat = label_tile.view(-1)
