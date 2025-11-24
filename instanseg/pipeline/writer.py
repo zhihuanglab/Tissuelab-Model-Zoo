@@ -40,8 +40,6 @@ class _StreamingSegmentationWriter:
             dtype="i4",
         )
         self.contours_ds = None
-        self.stardist_coords_ds = None
-        self.stardist_dist_ds = None
         self.count = 0
 
     def _append_dataset(self, attr_name: str, name: str, data: np.ndarray):
@@ -83,10 +81,6 @@ class _StreamingSegmentationWriter:
 
         if contours is not None:
             self._append_dataset("contours_ds", "contours", contours.astype(np.int32))
-        if self.enable_stardist and stardist_coords is not None:
-            self._append_dataset("stardist_coords_ds", "stardist_coords", stardist_coords.astype(np.float32))
-        if self.enable_stardist and stardist_distances is not None:
-            self._append_dataset("stardist_dist_ds", "stardist_distances", stardist_distances.astype(np.float32))
 
     def write_probabilities(self, probabilities: np.ndarray):
         if "probability" in self._group:

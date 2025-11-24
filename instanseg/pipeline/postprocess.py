@@ -48,7 +48,7 @@ class BatchEmitter:
     writer: object
     scale_x: float
     scale_y: float
-    stardist_rays: int
+    stardist_rays: int = 0
     verbose: bool = False
 
     def __post_init__(self):
