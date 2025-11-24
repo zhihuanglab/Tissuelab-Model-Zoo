@@ -2055,7 +2055,8 @@ class NucleiEmbedding:
         """
         # Set num_workers
         # Note: On Windows, multiprocessing has issues with pickling file handles (slide objects)
-        # So we default to 0 workers to avoid serialization errors
+        # So we default to 0 workers to avoid serialization errors unless the caller explicitly opts in.
+        user_specified_num_workers = num_workers
         if num_workers is None:
             # Default to 0 workers to avoid pickling issues with slide file handles
             # The slide object contains file handles that cannot be pickled for multiprocessing
@@ -2138,9 +2139,14 @@ class NucleiEmbedding:
                 num_workers = 0
                 print(f"Z-stack detected: using single-process mode for layer-wise processing (avoids file conflicts)")
             else:
-                # Single-layer on Linux: can use multiple workers
-                num_workers = min(num_workers if num_workers > 0 else 2, 4)
-                print(f"Single-layer image: using {num_workers} workers")
+                if user_specified_num_workers is not None and user_specified_num_workers > 0:
+                    # Respect explicit user request but keep an upper bound to avoid oversubscription
+                    num_workers = min(user_specified_num_workers, 4)
+                    print(f"Single-layer image: respecting user num_workers={num_workers}")
+                else:
+                    # Default to 0 on Linux when not explicitly requested
+                    num_workers = 0
+                    print("Single-layer image: keeping default num_workers=0 (no implicit override)")
         else:
             # Windows/Mac
             if dataset.is_zstack:
@@ -2148,8 +2154,12 @@ class NucleiEmbedding:
                 num_workers = 0
                 print(f"Z-stack detected on Windows: using single-process mode for stability")
             else:
-                # Single-layer on Windows: can use workers
-                print(f"Single-layer image on Windows: using {num_workers} workers")
+                if user_specified_num_workers is not None and user_specified_num_workers > 0:
+                    num_workers = user_specified_num_workers
+                    print(f"Single-layer image on {platform.system()}: respecting user num_workers={num_workers}")
+                else:
+                    num_workers = 0
+                    print(f"Single-layer image on {platform.system()}: keeping default num_workers=0")
         
         # Performance profiling variables (needed for GPU preprocessing)
         perf_stats = {
