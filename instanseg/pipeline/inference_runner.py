@@ -215,9 +215,9 @@ def run_wsi(
     pending_start_time = None
 
     num_batches = (len(tile_positions) + batch_size - 1) // batch_size
-    executor = ThreadPoolExecutor(max_workers=1) if tile_positions else None
+    executor = ThreadPoolExecutor(max_workers=2) if tile_positions else None
 
-    def _submit_prefetch(start_index: int) -> Optional[Future]:
+    def _submit_read(start_index: int) -> Optional[Future]:
         if executor is None or start_index >= len(tile_positions):
             return None
         batch_start = start_index
@@ -232,7 +232,22 @@ def run_wsi(
             intermediate_shape=intermediate_shape,
         )
 
-    prefetch_future = _submit_prefetch(0)
+    def _submit_convert(read_future: Optional[Future]) -> Optional[Future]:
+        if read_future is None:
+            return None
+        def _convert():
+            batch_tensors, batch_metadata, read_elapsed = read_future.result()
+            tensor_start = time.time()
+            tensor_list = [_to_tensor_float32(t) for t in batch_tensors]
+            batch_tensor = torch.stack(tensor_list) if len(tensor_list) > 1 else tensor_list[0].unsqueeze(0)
+            if stream_main is not None and not batch_tensor.is_pinned():
+                batch_tensor = batch_tensor.pin_memory()
+            tensor_elapsed = time.time() - tensor_start
+            return batch_tensor, batch_metadata, read_elapsed, tensor_elapsed
+        return executor.submit(_convert)
+
+    read_future = _submit_read(0)
+    convert_future = _submit_convert(read_future)
 
     for batch_idx in tqdm(range(num_batches), desc="Processing batches", colour="green"):
         batch_start_time = time.time()
@@ -241,28 +256,24 @@ def run_wsi(
         batch_tiles = tile_positions[batch_start:batch_end]
         actual_batch_size = len(batch_tiles)
 
-        if prefetch_future is None:
-            batch_tensors = []
+        if convert_future is None:
             batch_metadata = []
+            batch_tensor = torch.empty((0,), dtype=torch.float32)
             read_elapsed = 0.0
+            tensor_elapsed = 0.0
         else:
-            batch_tensors, batch_metadata, read_elapsed = prefetch_future.result()
+            batch_tensor, batch_metadata, read_elapsed, tensor_elapsed = convert_future.result()
         perf_stats["tile_reading_time"] += read_elapsed
+        perf_stats["tensor_conversion_time"] += tensor_elapsed
 
-        next_prefetch = _submit_prefetch(batch_end)
+        next_read = _submit_read(batch_end)
+        next_convert = _submit_convert(next_read)
 
-        tensor_start = time.time()
-        tensor_list = [_to_tensor_float32(t) for t in batch_tensors]
-        batch_tensor = torch.stack(tensor_list) if len(tensor_list) > 1 else tensor_list[0].unsqueeze(0)
         if stream_main is not None:
-            if not batch_tensor.is_pinned():
-                batch_tensor = batch_tensor.pin_memory()
             with torch.cuda.stream(stream_copy):
                 batch_tensor_device = batch_tensor.to(model.inference_device, non_blocking=True)
         else:
             batch_tensor_device = batch_tensor.to(model.inference_device)
-        tensor_elapsed = time.time() - tensor_start
-        perf_stats["tensor_conversion_time"] += tensor_elapsed
 
         inference_start = time.time()
         if stream_main is not None:
@@ -322,7 +333,8 @@ def run_wsi(
         pending_metadata = batch_metadata
         pending_event = inference_event
         pending_start_time = batch_start_time
-        prefetch_future = next_prefetch
+        read_future = next_read
+        convert_future = next_convert
 
     if pending_results is not None:
         process_inferred_batch(
