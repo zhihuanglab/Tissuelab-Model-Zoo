@@ -15,10 +15,6 @@ import platform
 import numpy as np
 import cv2
 import torch
-try:
-    from scipy.ndimage import distance_transform_edt, binary_erosion
-except ImportError:
-    from skimage.morphology import distance_transform_edt, binary_erosion
 from sse_starlette.sse import EventSourceResponse
 import asyncio
 import tempfile
@@ -37,6 +33,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from instanseg.inference_class import InstanSeg
 from instanseg.pipeline import run_wsi
+
+# Add StarDist to path for PLIP embedding imports
+stardist_path = Path(__file__).parent.parent / "StarDist"
+if str(stardist_path) not in sys.path:
+    sys.path.insert(0, str(stardist_path))
+
+# Import StarDist's PLIP-based embedding generator
+from nuc_embedding import NucleiEmbedding as StarDistNucleiEmbedding
 
 app = FastAPI()
 
@@ -59,7 +63,6 @@ DEPENDENCIES = []
 progress_value = 0  # Global variable to track progress
 progress_complete = False  # New flag to indicate completion
 
-EMBED_PATCH_SIZE = 16
 MAX_CONTOUR_POINTS = 32
 
 
@@ -317,117 +320,6 @@ def format_contours_for_h5(contours_list, max_points: int = MAX_CONTOUR_POINTS):
     return contours_array
 
 
-class NucleiEmbedding:
-    """Generate embeddings for nuclei using patch-based approach."""
-
-    def __init__(self, args, centroids):
-        self.args = args
-        self.centroids = centroids
-        self.patch_size = EMBED_PATCH_SIZE
-
-    def _compute_instance_embedding(self, mask: np.ndarray, centroid: np.ndarray) -> np.ndarray:
-        """
-        Generate a compact embedding for an instance mask by extracting a centered patch and stacking
-        mask, distance transform, and boundary maps.
-        """
-        h, w = mask.shape
-        cy, cx = int(centroid[0]), int(centroid[1])
-
-        half = self.patch_size // 2
-        y0 = cy - half
-        x0 = cx - half
-        y1 = y0 + self.patch_size
-        x1 = x0 + self.patch_size
-
-        patch = np.zeros((self.patch_size, self.patch_size), dtype=np.float32)
-        sy0 = max(0, y0)
-        sx0 = max(0, x0)
-        sy1 = min(h, y1)
-        sx1 = min(w, x1)
-
-        if sy1 > sy0 and sx1 > sx0:
-            py0 = sy0 - y0
-            px0 = sx0 - x0
-            py1 = py0 + (sy1 - sy0)
-            px1 = px0 + (sx1 - sx0)
-            patch[py0:py1, px0:px1] = mask[sy0:sy1, sx0:sx1]
-
-        patch_bool = patch > 0.5
-
-        if np.any(patch_bool):
-            dist = distance_transform_edt(patch_bool)
-            max_dist = dist.max()
-            if max_dist > 0:
-                dist = dist / max_dist
-        else:
-            dist = np.zeros_like(patch, dtype=np.float32)
-
-        eroded = binary_erosion(patch_bool, structure=np.ones((3, 3), dtype=bool))
-        eroded = eroded.astype(np.float32)
-        boundary = patch_bool.astype(np.float32) - eroded
-        boundary[boundary < 0] = 0.0
-
-        stacked = np.stack(
-            [
-                patch_bool.astype(np.float32),
-                dist.astype(np.float32),
-                boundary.astype(np.float32),
-            ],
-            axis=0,
-        )
-
-        return stacked.reshape(-1)
-
-    def generate_embeddings(self, label_image, zarr_path: str, dataset_path: str = "embedding", progress_callback=None) -> str:
-        """
-        Generate embeddings for all nuclei and save to Zarr.
-
-        Args:
-            label_image: Label image with unique IDs for each nucleus
-            zarr_path: Path to Zarr group/store
-            dataset_path: Path within Zarr store to save embeddings
-            progress_callback: Optional callback function(progress, message) for progress updates
-
-        Returns:
-            Path to Zarr dataset containing embeddings
-        """
-        if isinstance(label_image, torch.Tensor):
-            label_image = label_image.cpu().numpy()
-
-        if label_image.ndim > 2:
-            label_image = label_image.squeeze()
-
-        label_image = label_image.astype(np.int32)
-
-        unique_labels = np.unique(label_image)
-        unique_labels = unique_labels[unique_labels > 0]
-
-        embeddings_list = []
-        total = len(unique_labels)
-
-        for i, label_id in enumerate(unique_labels):
-            if i < len(self.centroids):
-                if progress_callback and i % max(1, total // 20) == 0:
-                    progress = 76 + int((i / total) * 10)
-                    progress_callback(progress, f"embedding_{i}/{total}")
-
-                mask = (label_image == label_id).astype(np.uint8)
-                centroid = self.centroids[i]
-                embedding = self._compute_instance_embedding(mask, centroid)
-                embeddings_list.append(embedding)
-
-        embeddings = np.stack(embeddings_list, axis=0).astype(np.float16) if embeddings_list else np.zeros((0, self.patch_size * self.patch_size * 3), dtype=np.float16)
-
-        # Open Zarr and write embeddings
-        store = zarr.open_group(zarr_path, mode='a')
-        if dataset_path in store:
-            del store[dataset_path]
-        store.create_dataset(dataset_path, data=embeddings)
-
-        print(f"[SEG LOG] Generated {len(embeddings)} embeddings")
-        return dataset_path
-
-
 def run_segmentation(args):
     """
     Run InstanSeg segmentation following StarDist pattern.
@@ -543,51 +435,37 @@ def run_segmentation(args):
                     have_cached_embedding = False
 
             if not have_cached_embedding:
-                print("[EMBED LOG] No cached embeddings or size mismatch => generate new embeddings.")
+                print("[EMBED LOG] No cached embeddings or size mismatch => generate new embeddings using StarDist PLIP model.")
 
-                label_for_embedding = label_image
-                centroids_label = None
-
-                if label_for_embedding is None:
+                # Load contours for bounding box extraction (optional, improves patch quality)
+                contours_for_embedding = None
+                if NODE_NAME in zf and 'contours' in zf[NODE_NAME]:
                     try:
-                        label_for_embedding, scale_y, scale_x = _load_prediction_from_zarr(
-                            args.slidepath, MODEL.prediction_tag
-                        )
-                        if scale_x != 0 and scale_y != 0:
-                            inv_scale_y = 1.0 / scale_y
-                            inv_scale_x = 1.0 / scale_x
-                            centroids_float = centroids.astype(np.float64)
-                            centroids_float[:, 0] = np.round(centroids_float[:, 0] * inv_scale_y)
-                            centroids_float[:, 1] = np.round(centroids_float[:, 1] * inv_scale_x)
-                            centroids_label = centroids_float.astype(np.int32)
-                        else:
-                            print("[EMBED LOG] Invalid scale factors, using slide-space centroids for embeddings.")
-                            centroids_label = centroids.astype(np.int32)
+                        contours_for_embedding = zf[f"{NODE_NAME}/contours"][()]
+                        print(f"[EMBED LOG] Loaded contours for embedding: shape {contours_for_embedding.shape}")
                     except Exception as e:
-                        print(f"[EMBED LOG] Could not load prediction zarr for embeddings: {e}")
-                        centroids_label = None
+                        print(f"[EMBED LOG] Warning: Could not load contours for embedding: {e}")
 
-                if centroids_label is None:
-                    centroids_label = centroids.astype(np.int32)
+                embedding_start = time.time()
+                update_progress(76, "generating_embeddings")
 
-                if label_for_embedding is None:
-                    print("[EMBED LOG] No label image available; skipping embedding generation.")
-                else:
-                    embedding_start = time.time()
-                    update_progress(76, "generating_embeddings")
+                # Use StarDist's PLIP-based embedding generator
+                # Note: centroids are already in slide-space coordinates (from streaming pipeline)
+                ne = StarDistNucleiEmbedding(
+                    args,
+                    centroids=centroids,
+                    contours=contours_for_embedding,
+                    progress_callback=lambda x: update_progress(76 + int(x * 0.16), "embedding")
+                )
+                ne.generate_embeddings(
+                    zarr_path=ZARR_PATH,
+                    dataset_path=f"{NODE_NAME}/embedding"
+                )
 
-                    ne = NucleiEmbedding(args, centroids_label)
-                    ne.generate_embeddings(
-                        label_for_embedding,
-                        zarr_path=ZARR_PATH,
-                        dataset_path=f"{NODE_NAME}/embedding",
-                        progress_callback=update_progress,
-                    )
+                embedding_time = time.time() - embedding_start
+                print(f"[SEG LOG] Generated PLIP embeddings in {embedding_time:.2f}s")
 
-                    embedding_time = time.time() - embedding_start
-                    print(f"[SEG LOG] Generated embeddings in {embedding_time:.2f}s")
-
-                    update_progress(92, "embeddings_saved")
+                update_progress(92, "embeddings_saved")
             else:
                 print("[EMBED LOG] Reusing cached embeddings from Zarr.")
 
