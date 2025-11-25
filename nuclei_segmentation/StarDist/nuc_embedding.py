@@ -2321,6 +2321,10 @@ class NucleiEmbedding:
                 gpu_batch_buffer = None
 
             # Process each layer independently
+            # Total progress: layer processing (90%) + fusion (10%)
+            total_layer_work = num_layers * num_cells
+            last_reported_progress = -1  # Throttle SSE updates
+            
             for layer_idx in range(num_layers):
                 print(f"\n{'='*80}")
                 print(f"Processing Layer {layer_idx + 1}/{num_layers}")
@@ -2386,6 +2390,15 @@ class NucleiEmbedding:
                         
                         pbar.update(batch_size_actual)
                         
+                        # Update SSE progress callback (layer processing phase: 0-90%)
+                        if self.progress_callback:
+                            # Calculate overall progress: (layer_idx * num_cells + cell_idx) / total_layer_work * 90
+                            layer_progress = int(((layer_idx * num_cells + cell_idx) / total_layer_work) * 90)
+                            # Throttle updates: only update when progress changes by at least 1%
+                            if layer_progress != last_reported_progress:
+                                self.progress_callback(layer_progress)
+                                last_reported_progress = layer_progress
+                        
                         # Clean memory
                         del batch_embeddings
                         torch.cuda.empty_cache()
@@ -2408,6 +2421,8 @@ class NucleiEmbedding:
             print(f"\n{'='*80}")
             print(f"FUSING EMBEDDINGS ACROSS {num_layers} LAYERS")
             print(f"{'='*80}")
+            
+            fusion_start_time = time.time()
             
             # Create final dataset
             final_dset = parent.create_dataset(
@@ -2436,8 +2451,27 @@ class NucleiEmbedding:
                 final_dset[start_idx:end_idx] = fused_embs
                 
                 pbar.update(end_idx - start_idx)
+                
+                # Update SSE progress callback (fusion phase: 90-100%)
+                if self.progress_callback:
+                    # Fusion progress: 90 + (processed_cells / total_cells) * 10
+                    fusion_progress = int(90 + ((end_idx / num_cells) * 10))
+                    # Throttle updates: only update when progress changes by at least 1%
+                    if fusion_progress != last_reported_progress:
+                        self.progress_callback(fusion_progress)
+                        last_reported_progress = fusion_progress
+            
+            fusion_time = time.time() - fusion_start_time
+            pbar.close()
+            
+            print(f"[FUSION] Completed in {fusion_time:.2f} seconds ({fusion_time/60:.2f} minutes)")
+            print(f"[FUSION] Average speed: {num_cells/fusion_time:.1f} cells/second")
             
             pbar.close()
+            
+            # Ensure progress reaches 100% after fusion completes
+            if self.progress_callback:
+                self.progress_callback(100)
             
             # Clean up temporary datasets
             print(f"\nCleaning up temporary layer datasets...")
