@@ -21,26 +21,34 @@ class _StreamingSegmentationWriter:
         self.enable_stardist = enable_stardist
         self.verbose = verbose
 
-        node_dir = self.zarr_path / node_name
-        if node_dir.exists():
-            shutil.rmtree(node_dir, ignore_errors=True)
-
         root_group = zarr.open_group(str(self.zarr_path), mode="a")
-        if node_name in root_group:
-            try:
-                del root_group[node_name]
-            except FileNotFoundError:
-                shutil.rmtree(node_dir, ignore_errors=True)
         self._group = root_group.require_group(node_name)
-        self.centroids_ds = self._group.create_dataset(
-            "centroids",
-            shape=(0, 2),
-            chunks=(8192, 2),
-            maxshape=(None, 2),
-            dtype="i4",
-        )
-        self.contours_ds = None
-        self.count = 0
+        
+        # Check if datasets already exist - if so, reuse them instead of deleting
+        # This allows incremental writes and preserves existing data if segmentation is skipped
+        # Note: Writer is only created when running NEW segmentation (ALREADY_HAVE_SEG=False),
+        # so this handles the case where we want to append/continue processing
+        if "centroids" in self._group:
+            self.centroids_ds = self._group["centroids"]
+            self.count = self.centroids_ds.shape[0]
+            if self.verbose:
+                print(f"[WRITER] Reusing existing centroids dataset: {self.count} nuclei")
+        else:
+            self.centroids_ds = self._group.create_dataset(
+                "centroids",
+                shape=(0, 2),
+                chunks=(8192, 2),
+                maxshape=(None, 2),
+                dtype="i4",
+            )
+            self.count = 0
+        
+        if "contours" in self._group:
+            self.contours_ds = self._group["contours"]
+            if self.verbose:
+                print(f"[WRITER] Reusing existing contours dataset")
+        else:
+            self.contours_ds = None
 
     def _append_dataset(self, attr_name: str, name: str, data: np.ndarray):
         if data is None or data.size == 0:
