@@ -225,14 +225,21 @@ def run_segmentation(args):
 
             if not have_cached_embedding:
                 print("no cached embeddings => generate new embeddings directly into Zarr")
-                # Load contours for bounding box extraction
+                # Use contours from segmentation if available (in memory), otherwise try loading from Zarr
                 contours_for_embedding = None
-                if NODE_NAME in zf and 'contours' in zf[NODE_NAME]:
+                if contours is not None and len(contours) > 0:
+                    # Use contours from current segmentation run (already in memory)
+                    contours_for_embedding = contours
+                    print(f"Using contours from segmentation: shape {contours_for_embedding.shape}")
+                elif NODE_NAME in zf and 'contours' in zf[NODE_NAME]:
+                    # Fallback: load from Zarr (for cases where segmentation was cached)
                     try:
                         contours_for_embedding = zf[f"{NODE_NAME}/contours"][()]
-                        print(f"Loaded contours for embedding: shape {contours_for_embedding.shape}")
+                        print(f"Loaded contours from Zarr for embedding: shape {contours_for_embedding.shape}")
                     except Exception as e:
                         print(f"Warning: Could not load contours for embedding: {e}")
+                else:
+                    print("No contours available for embedding (will use centroid-based extraction)")
                 ne = NucleiEmbedding(args, centroids, contours=contours_for_embedding, progress_callback=lambda x: update_progress(x, "embedding"))
                 ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{NODE_NAME}/embedding")
         elif centroids is not None and len(centroids) == 0:

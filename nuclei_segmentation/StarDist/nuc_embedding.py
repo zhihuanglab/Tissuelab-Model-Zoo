@@ -70,14 +70,25 @@ class NucleiPatchDataset(Dataset):
         }
         
         # Pre-compute bounding boxes from contours if available (very efficient - just numpy operations)
-        # NOTE: Bounding box functionality is temporarily disabled for now (set to False).
-        #       Re-enable by setting to True once contour-based patch extraction is validated and ready for production.
-        self.use_bounding_boxes = False
+        # Enable bounding box extraction only if contours are available and valid
+        self.use_bounding_boxes = (
+            self.contours is not None 
+            and len(self.contours) > 0 
+            and len(self.contours) == len(self.centroids)
+        )
+        
         if self.use_bounding_boxes:
-            print(f"Using contour-based bounding boxes for patch extraction (padding: {padding_ratio*100}%)")
+            print(f"Using contour-based bounding boxes for patch extraction (padding: 40% small cells, 20% large cells)")
             self._compute_bounding_boxes()
         else:
-            print("Using centroid-based fixed-size patch extraction (contours not available)")
+            if self.contours is None:
+                print("Using centroid-based fixed-size patch extraction (contours not provided)")
+            elif len(self.contours) == 0:
+                print("Using centroid-based fixed-size patch extraction (contours array is empty)")
+            elif len(self.contours) != len(self.centroids):
+                print(f"Using centroid-based fixed-size patch extraction (contours/centroids mismatch: {len(self.contours)} vs {len(self.centroids)})")
+            else:
+                print("Using centroid-based fixed-size patch extraction")
         
         # DEBUG: Save patches (enabled by default for final check, will disable before PR)
         self.debug_save_patches = False
@@ -397,15 +408,29 @@ class NucleiPatchDataset(Dataset):
         return len(self.centroids)
 
     def _compute_bounding_boxes(self):
-        """Pre-compute bounding boxes from contours - very efficient numpy operations
+        """Pre-compute SQUARE bounding boxes from contours centered on cell centroids.
+        
+        This approach:
+        1. Computes bounding box from contour points
+        2. Makes the box SQUARE (using larger dimension) to avoid aspect ratio distortion
+        3. Centers the square on the cell centroid (not contour center) for consistency
+        4. Enforces minimum extraction size to avoid excessive upscaling for tiny cells
+        5. Adds adaptive padding based on cell size
         
         Contours shape: (n_nuclei, n_points, 2) where each contour is (x, y) points
         This is O(n) per nucleus - just min/max operations, very fast!
         """
         
+        # Minimum extraction size to avoid excessive upscaling (56px → 224px is 4x, acceptable)
+        # This ensures tiny cells have enough context and don't become too blurry
+        MIN_EXTRACTION_SIZE = 112
+        
         self.bounding_boxes = []
         for i in range(len(self.centroids)):
             try:
+                # Get centroid for this cell (use as center of square patch)
+                center_x, center_y = self.centroids[i]
+                
                 # Contours are already numpy arrays with shape (n_points, 2)
                 contour_points = self.contours[i]
                 
@@ -430,55 +455,45 @@ class NucleiPatchDataset(Dataset):
                     else:
                         raise ValueError(f"Unexpected contour format: {type(contour_points)}")
                 
-                # Calculate bounding box dimensions
-                width = max_x - min_x
-                height = max_y - min_y
+                # Calculate bounding box dimensions from contour
+                cell_width = max(1, max_x - min_x)  # Ensure at least 1px
+                cell_height = max(1, max_y - min_y)
                 
-                # Handle edge case: zero-width or zero-height contours
-                if width <= 0 or height <= 0:
-                    # Fallback to small fixed size
-                    width = max(1, width)
-                    height = max(1, height)
+                # Use the LARGER dimension to make a square (avoids aspect ratio distortion)
+                cell_size = max(cell_width, cell_height)
                 
-                # Add padding (adaptive based on nucleus size)
-                # For small nuclei, use fixed pixel padding instead of percentage
-                if width < 30 or height < 30:
-                    # Small nuclei: use 30% padding, minimum 5px
-                    pad_x = max(5, int(width * 0.3))
-                    pad_y = max(5, int(height * 0.3))
+                # Add adaptive padding based on cell size
+                # For small cells: more generous padding (40%, min 8px) for context
+                # For larger cells: percentage-based padding (default 20% for better margin)
+                if cell_size < 30:
+                    padding = max(8, int(cell_size * 0.6))
                 else:
-                    # Larger nuclei: use percentage-based padding (default 10%)
-                    pad_x = max(1, int(width * self.padding_ratio))
-                    pad_y = max(1, int(height * self.padding_ratio))
+                    padding = max(5, int(cell_size * 0.4))  # 20% padding, min 5px
                 
-                # Don't enforce a large minimum size - let small nuclei stay small
-                # The model will resize to 224x224 anyway, so we don't need to upsample here
-                # Only ensure we have at least a few pixels for very tiny nuclei
-                min_size = 30  # Very small minimum - just enough to avoid single-pixel issues
+                # Calculate final square size with padding
+                final_size = cell_size + 2 * padding
                 
-                # Only enforce minimum for extremely tiny nuclei (< 10px)
-                if width < 10:
-                    min_width = min_size
-                    if width + 2 * pad_x < min_width:
-                        pad_x = (min_width - width) // 2
-                if height < 10:
-                    min_height = min_size
-                    if height + 2 * pad_y < min_height:
-                        pad_y = (min_height - height) // 2
+                # Enforce minimum extraction size to avoid excessive upscaling
+                # (e.g., a 10px cell upscaled to 224px would be very blurry)
+                final_size = max(final_size, MIN_EXTRACTION_SIZE)
                 
-                # Calculate final dimensions after all padding adjustments
-                final_width = width + 2 * pad_x
-                final_height = height + 2 * pad_y
+                # Calculate top-left corner, centered on centroid
+                half_size = final_size // 2
+                x1 = int(center_x - half_size)
+                y1 = int(center_y - half_size)
                 
-                # Calculate top-left corner with boundary checking
-                x1 = max(0, int(min_x - pad_x))
-                y1 = max(0, int(min_y - pad_y))
+                # Boundary checking: ensure patch doesn't go negative
+                # (upper bounds checked during extraction in _extract_single_patch)
+                x1 = max(0, x1)
+                y1 = max(0, y1)
                 
-                self.bounding_boxes.append((x1, y1, final_width, final_height))
+                self.bounding_boxes.append((x1, y1, final_size, final_size))
                 
                 # Debug: Log first few bounding boxes to verify sizes
                 if i < 5:
-                    print(f"[DEBUG] Nucleus {i}: contour bbox=({width}x{height}), padded=({final_width}x{final_height}), padding=({pad_x}, {pad_y})")
+                    print(f"[DEBUG] Nucleus {i}: cell=({cell_width:.0f}x{cell_height:.0f}), "
+                          f"square patch={final_size}x{final_size}, padding={padding}px, "
+                          f"centered at ({center_x:.0f}, {center_y:.0f})")
                 
             except Exception as e:
                 # Fallback to centroid-based extraction if contour processing fails
@@ -486,18 +501,19 @@ class NucleiPatchDataset(Dataset):
                 if hasattr(self, 'extraction_size'):
                     size = self.extraction_size
                 else:
-                    size = self.patch_size
-                self.bounding_boxes.append((x - size // 2, y - size // 2, size, size))
+                    size = max(self.patch_size, MIN_EXTRACTION_SIZE)
+                x1 = max(0, int(x - size // 2))
+                y1 = max(0, int(y - size // 2))
+                self.bounding_boxes.append((x1, y1, size, size))
                 if i < 5:  # Only log first few errors
                     print(f"Warning: Failed to compute bounding box for nucleus {i}: {e}, using centroid-based extraction")
         
-        # Debug: Print statistics about bounding box sizes
+        # Debug: Print statistics about square bounding box sizes
         if len(self.bounding_boxes) > 0:
-            widths = [bb[2] for bb in self.bounding_boxes]
-            heights = [bb[3] for bb in self.bounding_boxes]
-            print(f"[DEBUG] Bounding box stats: width={min(widths)}-{max(widths)}px (avg={np.mean(widths):.1f}), height={min(heights)}-{max(heights)}px (avg={np.mean(heights):.1f})")
+            sizes = [bb[2] for bb in self.bounding_boxes]  # width == height for square boxes
+            print(f"[DEBUG] Square patch sizes: min={min(sizes)}px, max={max(sizes)}px, avg={np.mean(sizes):.1f}px")
         
-        print(f"Computed {len(self.bounding_boxes)} bounding boxes from contours")
+        print(f"Computed {len(self.bounding_boxes)} square bounding boxes from contours (centered on centroids)")
     
     def __getitem__(self, idx):
         if self.use_bounding_boxes:
@@ -723,27 +739,26 @@ class NucleiPatchDataset(Dataset):
         patch_w, patch_h = width, height
         
         # Handle numpy array vs PIL Image differently
+        # NOTE: When using bounding boxes, patches are always SQUARE (width == height)
+        # so resizing to patch_size x patch_size preserves aspect ratio
         if isinstance(patch, np.ndarray):
             # Numpy array path - use numpy/cv2 operations (faster than PIL)
             needs_resize = patch_w != self.patch_size or patch_h != self.patch_size
             
             if needs_resize:
-                # Use cv2 for faster resize (if available) or scipy.ndimage
-                try:
-                    # Choose interpolation method based on scale factor
-                    scale_factor = min(self.patch_size / patch_w, self.patch_size / patch_h)
-                    if scale_factor < 0.5:
-                        # Large downscaling - use AREA for better quality
-                        interpolation = cv2.INTER_AREA
-                    else:
-                        # Small scaling - use LINEAR
-                        interpolation = cv2.INTER_LINEAR
-                    patch = cv2.resize(patch, (self.patch_size, self.patch_size), interpolation=interpolation)
-                except ImportError:
-                    # Fallback to scipy.ndimage.zoom
-                    scale_h = self.patch_size / patch_h
-                    scale_w = self.patch_size / patch_w
-                    patch = zoom(patch, (scale_h, scale_w, 1), order=1).astype(np.uint8)
+                # Use cv2 for faster resize
+                # Choose interpolation method based on whether upscaling or downscaling
+                scale_factor = self.patch_size / max(patch_w, patch_h)
+                if scale_factor < 1.0:
+                    # Downscaling - use AREA for best quality (anti-aliased)
+                    interpolation = cv2.INTER_AREA
+                elif scale_factor > 2.0:
+                    # Large upscaling (tiny cells) - use CUBIC for smoother results
+                    interpolation = cv2.INTER_CUBIC
+                else:
+                    # Small upscaling or near 1:1 - use LINEAR (fast, good quality)
+                    interpolation = cv2.INTER_LINEAR
+                patch = cv2.resize(patch, (self.patch_size, self.patch_size), interpolation=interpolation)
             
             # Ensure RGB format (3 channels)
             if len(patch.shape) == 2:
@@ -761,7 +776,6 @@ class NucleiPatchDataset(Dataset):
             
             # OPTIMIZATION: Keep as numpy array - processor can handle it directly
             # This avoids numpy -> PIL -> numpy conversion overhead
-            # No need to convert to PIL since processor supports numpy arrays
         else:
             # PIL Image path (for non-tiffslide/openslide methods)
             needs_convert = patch.mode != 'RGB'
@@ -771,10 +785,17 @@ class NucleiPatchDataset(Dataset):
             if not needs_convert and not needs_resize:
                 pass  # Skip all processing
             elif needs_resize:
-                # Calculate scale factor to choose optimal resize method
-                scale_factor = min(self.patch_size / patch_w, self.patch_size / patch_h)
-                # Use NEAREST for large downscaling (>2x), BILINEAR for smaller scaling
-                resize_method = Image.Resampling.NEAREST if scale_factor < 0.5 else Image.Resampling.BILINEAR
+                # Choose optimal resize method based on scale direction
+                scale_factor = self.patch_size / max(patch_w, patch_h)
+                if scale_factor < 1.0:
+                    # Downscaling - use LANCZOS for best quality
+                    resize_method = Image.Resampling.LANCZOS
+                elif scale_factor > 2.0:
+                    # Large upscaling (tiny cells) - use BICUBIC for smoother results
+                    resize_method = Image.Resampling.BICUBIC
+                else:
+                    # Small upscaling or near 1:1 - use BILINEAR
+                    resize_method = Image.Resampling.BILINEAR
                 
                 if needs_convert:
                     # Both needed: convert first, then resize with optimal method
@@ -788,6 +809,30 @@ class NucleiPatchDataset(Dataset):
                 patch = patch.convert('RGB')
         
         self.perf_stats['image_process_time'] += time.time() - image_process_start
+        
+        # DEBUG: Save patch before returning (for single-layer images)
+        if self.debug_save_patches and self.debug_output_dir is not None:
+            try:
+                # Calculate centroid position within the patch
+                centroid_x_in_patch = int((x - x1) * (self.patch_size / width)) if width > 0 else self.patch_size // 2
+                centroid_y_in_patch = int((y - y1) * (self.patch_size / height)) if height > 0 else self.patch_size // 2
+                
+                # Clamp to valid range
+                centroid_x_in_patch = max(0, min(self.patch_size - 1, centroid_x_in_patch))
+                centroid_y_in_patch = max(0, min(self.patch_size - 1, centroid_y_in_patch))
+                
+                # Save the patch (convert numpy to PIL if needed)
+                # Pass extraction coordinates for contour transformation
+                if isinstance(patch, np.ndarray):
+                    patch_pil = Image.fromarray(patch)
+                    self._debug_save_patch(patch_pil, idx, centroid_x_in_patch, centroid_y_in_patch, x, y,
+                                          patch_x1=x1, patch_y1=y1, patch_width=width, patch_height=height)
+                else:
+                    self._debug_save_patch(patch, idx, centroid_x_in_patch, centroid_y_in_patch, x, y,
+                                          patch_x1=x1, patch_y1=y1, patch_width=width, patch_height=height)
+            except Exception as e:
+                if idx < 5:  # Only log first few errors
+                    print(f"[DEBUG] Failed to save debug patch {idx}: {e}")
         
         # Return patch (PIL Image or numpy array depending on read method)
         # - For TiffSlide/OpenSlide with as_array=True: returns numpy array
@@ -1045,14 +1090,54 @@ class NucleiPatchDataset(Dataset):
         else:
             return None
     
-    def _debug_save_patch(self, patch_img, idx, centroid_x, centroid_y, orig_x, orig_y):
-        """DEBUG: Save patch image with centroid marked"""
+    def _debug_save_patch(self, patch_img, idx, centroid_x, centroid_y, orig_x, orig_y, 
+                          patch_x1=None, patch_y1=None, patch_width=None, patch_height=None):
+        """DEBUG: Save patch image with centroid and contour marked
+        
+        Args:
+            patch_img: PIL Image of the patch
+            idx: Cell index
+            centroid_x, centroid_y: Centroid position in patch coordinates
+            orig_x, orig_y: Original centroid position in image coordinates
+            patch_x1, patch_y1: Top-left corner of patch in image coordinates
+            patch_width, patch_height: Original extraction size before resize
+        """
         if not self.debug_save_patches:
             return
         try:
-            
             debug_patch = patch_img.copy()
             draw = ImageDraw.Draw(debug_patch)
+            
+            # Get patch dimensions
+            patch_w, patch_h = debug_patch.size
+            
+            # Draw contour if available (green outline)
+            if self.contours is not None and idx < len(self.contours) and patch_x1 is not None:
+                try:
+                    contour_points = self.contours[idx]
+                    if isinstance(contour_points, np.ndarray) and contour_points.ndim == 2:
+                        # Transform contour points from image space to patch space
+                        # 1. Subtract patch origin (x1, y1)
+                        # 2. Scale by resize factor (patch_size / extraction_size)
+                        scale_x = patch_w / patch_width if patch_width and patch_width > 0 else 1.0
+                        scale_y = patch_h / patch_height if patch_height and patch_height > 0 else 1.0
+                        
+                        transformed_points = []
+                        for point in contour_points:
+                            px = (point[0] - patch_x1) * scale_x
+                            py = (point[1] - patch_y1) * scale_y
+                            # Clamp to patch bounds
+                            px = max(0, min(patch_w - 1, px))
+                            py = max(0, min(patch_h - 1, py))
+                            transformed_points.append((px, py))
+                        
+                        # Draw contour as connected lines (green)
+                        if len(transformed_points) > 2:
+                            # Close the contour by connecting last point to first
+                            contour_polygon = transformed_points + [transformed_points[0]]
+                            draw.line(contour_polygon, fill='lime', width=2)
+                except Exception as e:
+                    pass  # Skip contour drawing if it fails
             
             # Red dot at centroid
             dot_radius = 5
@@ -2244,7 +2329,7 @@ class NucleiEmbedding:
                                 print(f"[DEBUG] CPU processor: input image size = {item_w}x{item_h}, target_size = {dataset.patch_size}")
                                 _debug_first_image_logged['value'] = True
                         
-                        processed = self.processor(item, return_tensors="pt")['pixel_values']
+                        processed = self.processor(images=item, return_tensors="pt")['pixel_values']
                         processed_batch.append(processed.squeeze(0))  # Remove batch dimension
 
                 return torch.stack(processed_batch, dim=0)
