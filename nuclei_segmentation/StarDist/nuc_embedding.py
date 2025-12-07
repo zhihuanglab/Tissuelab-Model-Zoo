@@ -306,7 +306,11 @@ class NucleiPatchDataset(Dataset):
         local_x_all = x1_all - region_x_all
         local_y_all = y1_all - region_y_all
         
-        # 构建映射（使用字典，但批量处理）
+        # 构建映射（优化：使用numpy数组存储，索引访问比字典更快）
+        # 存储格式：region_keys[i] = (region_x, region_y), local_coords[i] = (local_x, local_y)
+        self.region_keys_array = np.zeros((len(self.centroids), 2), dtype=np.int32)
+        self.local_coords_array = np.zeros((len(self.centroids), 2), dtype=np.int32)
+        
         for cell_idx in range(len(self.centroids)):
             region_key = (int(region_x_all[cell_idx]), int(region_y_all[cell_idx]))
             
@@ -314,7 +318,10 @@ class NucleiPatchDataset(Dataset):
                 self.region_plan[region_key] = []
             self.region_plan[region_key].append(cell_idx)
             
+            # 同时保存到字典（兼容性）和数组（性能）
             self.cell_to_region[cell_idx] = (region_key, int(local_x_all[cell_idx]), int(local_y_all[cell_idx]))
+            self.region_keys_array[cell_idx] = [region_key[0], region_key[1]]
+            self.local_coords_array[cell_idx] = [int(local_x_all[cell_idx]), int(local_y_all[cell_idx])]
     
     def _load_region_fast(self, region_key):
         """
@@ -679,17 +686,25 @@ class NucleiPatchDataset(Dataset):
     
     def __getitem__(self, idx):
         # 如果启用区域共享优化，从缓存的大区域中裁剪
-        if self.use_region_sharing and self.region_plan and idx in self.cell_to_region:
+        if self.use_region_sharing and self.region_plan and idx < len(self.centroids):
             try:
-                region_key, local_x, local_y = self.cell_to_region[idx]
+                # 优化：使用数组索引而不是字典查找（更快）
+                if hasattr(self, 'region_keys_array') and hasattr(self, 'local_coords_array'):
+                    # 使用数组索引（O(1)，比字典查找稍快）
+                    region_x, region_y = self.region_keys_array[idx]
+                    local_x, local_y = self.local_coords_array[idx]
+                    region_key = (int(region_x), int(region_y))
+                else:
+                    # 回退到字典查找（兼容性）
+                    region_key, local_x, local_y = self.cell_to_region[idx]
                 
                 # 从缓存中获取大区域，如果不存在则读取
-                if region_key not in self.region_cache:
+                region_image = self.region_cache.get(region_key)
+                if region_image is None:
                     self._load_region_fast(region_key)
+                    region_image = self.region_cache[region_key]
                 
                 # 从大区域中裁剪出需要的patch（使用numpy view，无需复制）
-                region_image = self.region_cache[region_key]
-                
                 # 直接裁剪（返回view，不是copy，性能更好）
                 # region_image已经是region_size x region_size，local_x/y已经在规划时确保在范围内
                 patch = region_image[local_y:local_y+self.extraction_size, local_x:local_x+self.extraction_size]
@@ -1440,66 +1455,102 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
             raise ValueError(f"Unsupported image type: {type(img)}")
         numpy_images.append(arr)
     
-    # Stack into batch (N, H, W, C) - handle variable sizes
-    # We'll process each image individually for resize/crop, then stack
-    processed_tensors = []
+    # 优化：批量处理相同尺寸的图像（所有patch都是447x447）
+    # 检查是否所有图像尺寸相同，如果是，可以真正批量处理
+    first_shape = numpy_images[0].shape[:2] if len(numpy_images) > 0 else None
+    all_same_size = all(arr.shape[:2] == first_shape for arr in numpy_images)
     
-    for arr in numpy_images:
-        h, w = arr.shape[:2]
+    if all_same_size and len(numpy_images) > 1:
+        # 批量处理：一次性处理整个batch，大幅提升性能
+        # Stack all images into batch: (N, H, W, C)
+        batch_array = np.stack(numpy_images, axis=0)
         
-        # Convert to tensor and move to GPU (H, W, C) -> (1, C, H, W)
-        img_tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().to(device)
+        # Convert to tensor and move to GPU: (N, H, W, C) -> (N, C, H, W)
+        batch_tensor = torch.from_numpy(batch_array).permute(0, 3, 1, 2).float().to(device)
         
-        # Step 1: Resize shortest edge to target_size (maintain aspect ratio)
-        # Processor uses BICUBIC (resample=3), which corresponds to mode='bicubic' in F.interpolate
-        # CRITICAL: Processor ALWAYS resizes shortest edge to target_size, even if already target_size
-        # This means processor will resize 224x224 images to 224x224 (identity resize with BICUBIC)
-        # We must match this behavior exactly!
+        h, w = first_shape
         shortest_edge = min(h, w)
         
-        # Calculate scale factor based on shortest edge (always resize, even if scale=1.0)
+        # Calculate scale factor based on shortest edge
         scale = target_size / shortest_edge
         new_h = int(np.floor(h * scale))
         new_w = int(np.floor(w * scale))
         
-        # Ensure at least target_size for both dimensions (for center crop)
+        # Ensure at least target_size for both dimensions
         if new_h < target_size:
             new_h = target_size
         if new_w < target_size:
             new_w = target_size
         
-        # ALWAYS resize using BICUBIC interpolation (matches processor's resample=3)
-        # This includes identity resize (224x224 -> 224x224) to match processor behavior
-        img_tensor = torch.nn.functional.interpolate(
-            img_tensor, 
-            size=(new_h, new_w), 
-            mode='bicubic', 
+        # Batch resize: 一次性resize整个batch
+        batch_tensor = torch.nn.functional.interpolate(
+            batch_tensor,
+            size=(new_h, new_w),
+            mode='bicubic',
             align_corners=False,
-            antialias=True  # Better quality for downscaling
+            antialias=True
         )
         
-        # Step 2: Center crop to target_size x target_size
+        # Batch center crop
         if new_h != target_size or new_w != target_size:
-            # Calculate crop coordinates (center crop)
             top = (new_h - target_size) // 2
             left = (new_w - target_size) // 2
-            img_tensor = img_tensor[:, :, top:top+target_size, left:left+target_size]
+            batch_tensor = batch_tensor[:, :, top:top+target_size, left:left+target_size]
         
-        # Ensure final size is exactly target_size x target_size
-        if img_tensor.shape[2] != target_size or img_tensor.shape[3] != target_size:
-            # Final resize if crop didn't work (shouldn't happen, but safety check)
-            img_tensor = torch.nn.functional.interpolate(
-                img_tensor,
+        # Final check
+        if batch_tensor.shape[2] != target_size or batch_tensor.shape[3] != target_size:
+            batch_tensor = torch.nn.functional.interpolate(
+                batch_tensor,
                 size=(target_size, target_size),
                 mode='bicubic',
                 align_corners=False,
                 antialias=True
             )
+    else:
+        # 逐个处理（兼容不同尺寸的情况）
+        processed_tensors = []
         
-        processed_tensors.append(img_tensor.squeeze(0))  # Remove batch dim: (C, H, W)
-    
-    # Stack all processed images: (N, C, H, W)
-    batch_tensor = torch.stack(processed_tensors, dim=0)
+        for arr in numpy_images:
+            h, w = arr.shape[:2]
+            
+            # Convert to tensor and move to GPU (H, W, C) -> (1, C, H, W)
+            img_tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().to(device)
+            
+            shortest_edge = min(h, w)
+            scale = target_size / shortest_edge
+            new_h = int(np.floor(h * scale))
+            new_w = int(np.floor(w * scale))
+            
+            if new_h < target_size:
+                new_h = target_size
+            if new_w < target_size:
+                new_w = target_size
+            
+            img_tensor = torch.nn.functional.interpolate(
+                img_tensor, 
+                size=(new_h, new_w), 
+                mode='bicubic', 
+                align_corners=False,
+                antialias=True
+            )
+            
+            if new_h != target_size or new_w != target_size:
+                top = (new_h - target_size) // 2
+                left = (new_w - target_size) // 2
+                img_tensor = img_tensor[:, :, top:top+target_size, left:left+target_size]
+            
+            if img_tensor.shape[2] != target_size or img_tensor.shape[3] != target_size:
+                img_tensor = torch.nn.functional.interpolate(
+                    img_tensor,
+                    size=(target_size, target_size),
+                    mode='bicubic',
+                    align_corners=False,
+                    antialias=True
+                )
+            
+            processed_tensors.append(img_tensor.squeeze(0))
+        
+        batch_tensor = torch.stack(processed_tensors, dim=0)
     
     # Step 3: Normalize with CLIP statistics (GPU-accelerated)
     normalized_batch = _normalize_clip_gpu(batch_tensor, device)
@@ -2405,34 +2456,55 @@ class NucleiEmbedding:
                 1. Resize shortest edge to 224 (maintain aspect ratio, BICUBIC)
                 2. Center crop to 224x224
                 3. Normalize with CLIP statistics
+                
+                优化：批量处理所有items，而不是逐个处理，大幅提升性能
                 """
                 if len(batch) == 0:
                     return torch.zeros((0, 3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
                 
-                # Process all items, handling None values
-                processed_batch = []
-                for item in batch:
-                    if item is None:
-                        # Create empty normalized patch (will be normalized to zeros)
-                        empty_patch = torch.zeros((3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
-                        processed_batch.append(empty_patch)
-                    else:
-                        # Process single item with GPU preprocessing
-                        # Debug: Check input image size (only log first image)
-                        if not _debug_first_image_logged['value']:
-                            if isinstance(item, np.ndarray):
-                                item_h, item_w = item.shape[:2]
-                                print(f"[DEBUG] GPU preprocessing: input image size = {item_w}x{item_h}, target_size = {dataset.patch_size}")
-                                _debug_first_image_logged['value'] = True
-                            elif hasattr(item, 'size'):
-                                item_w, item_h = item.size
-                                print(f"[DEBUG] GPU preprocessing: input image size = {item_w}x{item_h}, target_size = {dataset.patch_size}")
-                                _debug_first_image_logged['value'] = True
-                        
-                        processed_tensor = _preprocess_clip_gpu([item], self.device, target_size=dataset.patch_size, perf_stats=perf_stats)
-                        processed_batch.append(processed_tensor.squeeze(0))  # Remove batch dimension: (C, H, W)
+                # 过滤None值，收集有效items
+                valid_items = []
+                valid_indices = []
+                for i, item in enumerate(batch):
+                    if item is not None:
+                        valid_items.append(item)
+                        valid_indices.append(i)
                 
-                return torch.stack(processed_batch, dim=0)  # Stack to (N, C, H, W)
+                # Debug: Check input image size (only log first image)
+                if len(valid_items) > 0 and not _debug_first_image_logged['value']:
+                    if isinstance(valid_items[0], np.ndarray):
+                        item_h, item_w = valid_items[0].shape[:2]
+                        print(f"[DEBUG] GPU preprocessing: input image size = {item_w}x{item_h}, target_size = {dataset.patch_size}")
+                        _debug_first_image_logged['value'] = True
+                    elif hasattr(valid_items[0], 'size'):
+                        item_w, item_h = valid_items[0].size
+                        print(f"[DEBUG] GPU preprocessing: input image size = {item_w}x{item_h}, target_size = {dataset.patch_size}")
+                        _debug_first_image_logged['value'] = True
+                
+                # 批量处理所有有效items（关键优化：一次性处理整个batch）
+                if len(valid_items) > 0:
+                    processed_tensors = _preprocess_clip_gpu(valid_items, self.device, target_size=dataset.patch_size, perf_stats=perf_stats)
+                    # processed_tensors shape: (N, C, H, W)
+                else:
+                    processed_tensors = torch.zeros((0, 3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
+                
+                # 处理None值：创建空patch
+                if len(valid_indices) < len(batch):
+                    # 有None值，需要填充
+                    final_batch = []
+                    valid_idx = 0
+                    for i in range(len(batch)):
+                        if i in valid_indices:
+                            final_batch.append(processed_tensors[valid_idx])
+                            valid_idx += 1
+                        else:
+                            # None值：创建空normalized patch
+                            empty_patch = torch.zeros((3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
+                            final_batch.append(empty_patch)
+                    return torch.stack(final_batch, dim=0)
+                else:
+                    # 没有None值，直接返回
+                    return processed_tensors
             
             collate_fn = collate_with_gpu_preprocess
             print("[PERF] Using GPU-accelerated preprocessing (resize + center crop + normalize) matching processor behavior")
