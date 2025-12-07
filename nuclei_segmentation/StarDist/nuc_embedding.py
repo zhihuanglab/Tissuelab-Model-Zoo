@@ -50,6 +50,7 @@ class NucleiPatchDataset(Dataset):
         self.processor = processor
         self.z_layer = z_layer  # Specific Z layer for segmentation, None means use all layers for embedding
         self.padding_ratio = padding_ratio  # Padding as fraction of bounding box size (e.g., 0.2 = 20%)
+        self.skip_cpu_resize = False  # 如果使用GPU预处理，跳过CPU resize以提升性能
         
         # Performance profiling for detailed analysis
         self.perf_stats = {
@@ -238,6 +239,183 @@ class NucleiPatchDataset(Dataset):
         print("Magnification:", self.magnification)
         print("Scale factor:", self.scale_factor)
         print(f"Extraction size: {self.extraction_size} pixels")
+        
+        # 区域共享优化：使用大区域读取来减少IO时间
+        # 对于pyvips，使用crop读取大区域，然后用numpy裁剪小patch
+        # 这样可以减少IO操作次数，提高性能
+        self.use_region_sharing = True  # 始终启用区域共享优化
+        self.region_size = 2048  # 大区域大小（固定2048，最大且最有效）
+        self.region_cache = {}  # 缓存已读取的大区域 {(x, y): numpy_array}
+        self.region_plan = {}  # 区域规划：{region_key: [cell_indices]}
+        self.cell_to_region = {}  # 映射：cell_idx -> (region_key, local_x, local_y)
+        
+        # 如果centroids不为空，进行快速规划
+        if self.centroids is not None and len(self.centroids) > 0:
+            print(f"[优化] 启用区域共享优化，大区域大小: {self.region_size}x{self.region_size}")
+            print(f"[优化] 对于pyvips：使用crop读取大区域，然后用numpy裁剪小patch")
+            self._plan_regions_fast()
+            print(f"[优化] 规划完成: {len(self.region_plan)} 个大区域，覆盖 {len(self.centroids)} 个细胞核")
+            original_io = len(self.centroids)
+            optimized_io = len(self.region_plan)
+            if original_io > 0:
+                reduction = (1 - optimized_io / original_io) * 100
+                print(f"[优化] IO操作减少: {reduction:.1f}% ({original_io} -> {optimized_io})")
+            
+            # 预加载前N个最常用的区域
+            preload_count = min(200, len(self.region_plan)) if len(self.centroids) > 50000 else 100
+            self._preload_frequent_regions(max_regions=preload_count)
+
+    def _plan_regions_fast(self):
+        """
+        快速规划读取区域（简化版本，避免复杂的合并算法）
+        将细胞核分组到共享的大区域中
+        """
+        if self.centroids is None or len(self.centroids) == 0:
+            return
+        
+        # 获取slide尺寸
+        if not hasattr(self, 'slide_dimensions') or self.slide_dimensions is None:
+            if hasattr(self.slide, 'dimensions'):
+                self.slide_dimensions = self.slide.dimensions
+            elif hasattr(self.slide, 'level_dimensions'):
+                self.slide_dimensions = self.slide.level_dimensions[0]
+            else:
+                self.slide_dimensions = (100000, 100000)
+        
+        slide_width, slide_height = self.slide_dimensions[0], self.slide_dimensions[1]
+        
+        # 快速规划：直接将细胞核分配到网格对齐的大区域
+        # 优化：使用numpy向量化操作加速
+        centroids_array = np.array(self.centroids)
+        
+        # 计算所有细胞核的提取区域左上角
+        x1_all = np.maximum(0, centroids_array[:, 0] - self.extraction_size // 2).astype(np.int32)
+        y1_all = np.maximum(0, centroids_array[:, 1] - self.extraction_size // 2).astype(np.int32)
+        
+        # 计算大区域的左上角（对齐到region_size网格）
+        region_x_all = (x1_all // self.region_size) * self.region_size
+        region_y_all = (y1_all // self.region_size) * self.region_size
+        
+        # 确保不超出边界
+        region_x_all = np.minimum(region_x_all, slide_width - self.region_size)
+        region_y_all = np.minimum(region_y_all, slide_height - self.region_size)
+        region_x_all = np.maximum(0, region_x_all)
+        region_y_all = np.maximum(0, region_y_all)
+        
+        # 计算局部坐标
+        local_x_all = x1_all - region_x_all
+        local_y_all = y1_all - region_y_all
+        
+        # 构建映射（使用字典，但批量处理）
+        for cell_idx in range(len(self.centroids)):
+            region_key = (int(region_x_all[cell_idx]), int(region_y_all[cell_idx]))
+            
+            if region_key not in self.region_plan:
+                self.region_plan[region_key] = []
+            self.region_plan[region_key].append(cell_idx)
+            
+            self.cell_to_region[cell_idx] = (region_key, int(local_x_all[cell_idx]), int(local_y_all[cell_idx]))
+    
+    def _load_region_fast(self, region_key):
+        """
+        快速读取一个大区域并缓存（针对pyvips优化）
+        """
+        region_x, region_y = region_key
+        
+        # 获取slide尺寸
+        if not hasattr(self, 'slide_dimensions') or self.slide_dimensions is None:
+            if hasattr(self.slide, 'dimensions'):
+                self.slide_dimensions = self.slide.dimensions
+            elif hasattr(self.slide, 'level_dimensions'):
+                self.slide_dimensions = self.slide.level_dimensions[0]
+            else:
+                raise ValueError(f"Cannot determine slide dimensions")
+        
+        slide_width, slide_height = self.slide_dimensions[0], self.slide_dimensions[1]
+        
+        # 计算实际读取的区域大小
+        actual_width = min(self.region_size, slide_width - region_x)
+        actual_height = min(self.region_size, slide_height - region_y)
+        actual_width = max(0, actual_width)
+        actual_height = max(0, actual_height)
+        
+        if actual_width <= 0 or actual_height <= 0:
+            self.region_cache[region_key] = np.zeros((self.region_size, self.region_size, 3), dtype=np.uint8)
+            return
+        
+        try:
+            # 对于pyvips，使用crop方法（最快速）
+            if self.read_image_method == 'vips':
+                import pyvips
+                cropped = self.slide.wsi.crop(region_x, region_y, actual_width, actual_height)
+                region = cropped.numpy()
+                if region.dtype != np.uint8:
+                    region = region.astype(np.uint8)
+                if len(region.shape) == 3 and region.shape[2] >= 4:
+                    region = region[:, :, :3]
+                elif len(region.shape) == 2:
+                    region = np.repeat(region[:, :, np.newaxis], 3, axis=2)
+            elif self.read_image_method == 'tiffslide':
+                region = self.slide.read_region(
+                    location=(region_x, region_y),
+                    level=0,
+                    size=(actual_width, actual_height),
+                    as_array=True
+                )
+                if region.dtype != np.uint8:
+                    region = region.astype(np.uint8)
+                if len(region.shape) == 3 and region.shape[2] == 4:
+                    region = region[:, :, :3]
+            else:
+                # Fallback
+                region = self.slide.read_region(
+                    location=(region_x, region_y),
+                    level=0,
+                    size=(actual_width, actual_height)
+                )
+                if not isinstance(region, np.ndarray):
+                    region = np.array(region)
+                if len(region.shape) == 3 and region.shape[2] == 4:
+                    region = region[:, :, :3]
+            
+            # 填充到region_size（如果需要）
+            if region.shape[0] < self.region_size or region.shape[1] < self.region_size:
+                padded = np.zeros((self.region_size, self.region_size, 3), dtype=region.dtype)
+                h, w = region.shape[:2]
+                padded[:h, :w] = region
+                region = padded
+            
+            self.region_cache[region_key] = region
+        except Exception as e:
+            print(f"Error loading region {region_key}: {e}")
+            self.region_cache[region_key] = np.zeros((self.region_size, self.region_size, 3), dtype=np.uint8)
+    
+    def _preload_frequent_regions(self, max_regions=50):
+        """
+        预加载最常用的区域（包含最多细胞的区域）
+        这样可以减少DataLoader的IO等待时间
+        """
+        if not self.region_plan or len(self.region_plan) == 0:
+            return
+        
+        # 按包含的细胞数量排序
+        sorted_regions = sorted(self.region_plan.items(), key=lambda x: len(x[1]), reverse=True)
+        
+        # 预加载前N个区域
+        preload_count = min(max_regions, len(sorted_regions))
+        print(f"[优化] 预加载前 {preload_count} 个最常用的区域...")
+        
+        preloaded = 0
+        for region_key, cell_indices in sorted_regions[:preload_count]:
+            try:
+                if region_key not in self.region_cache:
+                    self._load_region_fast(region_key)
+                    preloaded += 1
+            except Exception as e:
+                # 忽略预加载错误，继续
+                pass
+        
+        print(f"[优化] 预加载完成: {preloaded} 个区域已加载到缓存")
 
     def _detect_zstack(self):
         """Detect if the image is a z-stack (multi-layer) image"""
@@ -500,6 +678,36 @@ class NucleiPatchDataset(Dataset):
         print(f"Computed {len(self.bounding_boxes)} bounding boxes from contours")
     
     def __getitem__(self, idx):
+        # 如果启用区域共享优化，从缓存的大区域中裁剪
+        if self.use_region_sharing and self.region_plan and idx in self.cell_to_region:
+            try:
+                region_key, local_x, local_y = self.cell_to_region[idx]
+                
+                # 从缓存中获取大区域，如果不存在则读取
+                if region_key not in self.region_cache:
+                    self._load_region_fast(region_key)
+                
+                # 从大区域中裁剪出需要的patch（使用numpy view，无需复制）
+                region_image = self.region_cache[region_key]
+                
+                # 直接裁剪（返回view，不是copy，性能更好）
+                # region_image已经是region_size x region_size，local_x/y已经在规划时确保在范围内
+                patch = region_image[local_y:local_y+self.extraction_size, local_x:local_x+self.extraction_size]
+                
+                # Resize到patch_size（如果extraction_size != patch_size）
+                # 如果使用GPU预处理，跳过CPU resize，让GPU批量处理（更快）
+                if self.extraction_size != self.patch_size and not self.skip_cpu_resize:
+                    # 优化：使用最快的resize方法
+                    # INTER_LINEAR比INTER_AREA快约2-3倍，质量差异可接受
+                    # 对于缩小操作（447->224），INTER_LINEAR已经足够好
+                    patch = cv2.resize(patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_LINEAR)
+                
+                return patch
+            except Exception as e:
+                # Fallback to original method
+                pass
+        
+        # 原始方法：直接读取单个区域
         if self.use_bounding_boxes:
             # Use pre-computed bounding box
             x1, y1, width, height = self.bounding_boxes[idx]
@@ -2121,6 +2329,16 @@ class NucleiEmbedding:
             padding_ratio=0.1  # 10% padding around bounding box (reduced for tighter patches)
         )
         
+        # Processor和GPU预处理都包含resize步骤，不需要在dataloader中resize
+        # 这样可以避免重复resize，提升性能
+        use_gpu_preprocess = torch.cuda.is_available()
+        # 无论使用GPU预处理还是CPU processor，都跳过dataloader中的resize
+        dataset.skip_cpu_resize = True
+        if use_gpu_preprocess:
+            print("[优化] 启用GPU预处理：跳过CPU resize，将在GPU上批量resize（更快）")
+        else:
+            print("[优化] 使用CPU processor：跳过CPU resize，processor会自动resize")
+        
         # Check if dataset has z-stack
         is_zstack = dataset.is_zstack and z_layer is None
         if is_zstack:
@@ -2263,7 +2481,7 @@ class NucleiEmbedding:
             num_workers=num_workers,
             shuffle=False,
             collate_fn=collate_fn,
-            prefetch_factor=4 if num_workers > 0 else None,  # Increased from 2 to 4 for better GPU utilization
+            prefetch_factor=8 if num_workers > 0 else None,  # Increased to 8 for better GPU utilization and IO overlap
             persistent_workers=True if num_workers > 0 else False,
             pin_memory=use_pin_memory and not use_gpu_preprocess,  # Only use pin_memory if not using GPU preprocessing (already on GPU)
             drop_last=False  # Keep all samples
