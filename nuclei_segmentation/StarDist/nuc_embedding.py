@@ -408,6 +408,74 @@ class NucleiPatchDataset(Dataset):
             self.cell_to_region[cell_idx] = (region_key, local_x_int[cell_idx], local_y_int[cell_idx])
         
         self.region_plan = dict(region_plan_dict)
+        
+        # 优化：按 region 重新排序 cells，使同一 region 的 cells 连续处理
+        # 这样可以提升 batch 中同一 region 的 cells 比例，更好地利用 GPU region crop 优化
+        self._reorder_cells_by_region()
+    
+    def _reorder_cells_by_region(self):
+        """
+        按 region 重新排序 cells，使同一 region 的 cells 连续处理
+        这样可以提升 batch 中同一 region 的 cells 比例，减少数据传输
+        """
+        if not self.region_plan or len(self.region_plan) == 0:
+            return
+        
+        # 创建排序索引：按照 region_key 排序，同一 region 内的 cells 保持相对顺序
+        # 使用稳定的排序算法，保持同一 region 内 cells 的原始顺序
+        sort_keys = []
+        for cell_idx in range(len(self.centroids)):
+            region_key = (self.region_keys_array[cell_idx][0], self.region_keys_array[cell_idx][1])
+            # 使用 region_key 作为主排序键，cell_idx 作为次排序键（保持稳定性）
+            sort_keys.append((region_key, cell_idx))
+        
+        # 排序：先按 region_key (x, y)，再按 cell_idx（保持稳定性）
+        sorted_indices = sorted(range(len(sort_keys)), key=lambda i: sort_keys[i])
+        
+        # 重新排列所有相关数据
+        if self.centroids is not None:
+            if isinstance(self.centroids, np.ndarray):
+                self.centroids = self.centroids[sorted_indices]
+            else:
+                self.centroids = [self.centroids[i] for i in sorted_indices]
+        
+        if self.contours is not None:
+            if isinstance(self.contours, list):
+                self.contours = [self.contours[i] for i in sorted_indices]
+            elif isinstance(self.contours, np.ndarray):
+                self.contours = self.contours[sorted_indices]
+        
+        # 更新数组
+        self.region_keys_array = self.region_keys_array[sorted_indices]
+        self.local_coords_array = self.local_coords_array[sorted_indices]
+        
+        # 重新构建 region_plan 和 cell_to_region（使用新的索引）
+        new_region_plan = defaultdict(list)
+        new_cell_to_region = {}
+        
+        for new_idx in range(len(self.centroids)):
+            region_key = (self.region_keys_array[new_idx][0], self.region_keys_array[new_idx][1])
+            local_x = self.local_coords_array[new_idx][0]
+            local_y = self.local_coords_array[new_idx][1]
+            
+            new_region_plan[region_key].append(new_idx)
+            new_cell_to_region[new_idx] = (region_key, local_x, local_y)
+        
+        self.region_plan = dict(new_region_plan)
+        self.cell_to_region = new_cell_to_region
+        
+        # 更新 bounding_boxes（如果存在）
+        if hasattr(self, 'bounding_boxes') and self.bounding_boxes is not None:
+            if isinstance(self.bounding_boxes, list):
+                self.bounding_boxes = [self.bounding_boxes[i] for i in sorted_indices]
+            elif isinstance(self.bounding_boxes, np.ndarray):
+                self.bounding_boxes = self.bounding_boxes[sorted_indices]
+        
+        # 统计信息
+        regions_count = len(self.region_plan)
+        avg_cells_per_region = len(self.centroids) / regions_count if regions_count > 0 else 0
+        print(f"[优化] 按 region 重新排序完成: {regions_count} 个 regions, 平均每个 region {avg_cells_per_region:.1f} 个 cells")
+        print(f"[优化] 同一 region 的 cells 现在连续处理，将提升 batch 中同一 region 的 cells 比例")
     
     def _load_region_sync(self, region_key):
         """
