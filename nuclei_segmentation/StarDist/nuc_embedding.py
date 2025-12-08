@@ -1075,12 +1075,13 @@ class NucleiPatchDataset(Dataset):
                 patch = region_image[local_y:local_y+self.extraction_size, local_x:local_x+self.extraction_size]
                 
                 # Resize到patch_size（如果extraction_size != patch_size）
-                # 如果使用GPU预处理，跳过CPU resize，让GPU批量处理（更快）
+                # OPTIMIZATION: 如果启用GPU预处理，完全跳过CPU resize，让GPU批量处理（更快）
+                # GPU批量resize比CPU逐个resize快很多（并行处理整个batch）
                 if self.extraction_size != self.patch_size and not self.skip_cpu_resize:
-                    # 优化：使用最快的resize方法
-                    # INTER_LINEAR比INTER_AREA快约2-3倍，质量差异可接受
-                    # 对于缩小操作（447->224），INTER_LINEAR已经足够好
+                    # 只有在没有GPU预处理时才进行CPU resize
+                    # 使用最快的resize方法：INTER_LINEAR比INTER_AREA快约2-3倍
                     patch = cv2.resize(patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_LINEAR)
+                # 如果skip_cpu_resize=True，patch保持原始尺寸，由GPU预处理批量resize
                 
                 return patch
             except Exception as e:
@@ -1796,20 +1797,22 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
     
     preprocess_start = time.time()
     
-    # Convert PIL Images to numpy arrays and ensure uint8 format
+    # OPTIMIZATION: Convert PIL Images to numpy arrays efficiently
+    # Most images should already be numpy arrays from dataset (faster path)
     numpy_images = []
     for img in images:
-        if isinstance(img, Image.Image):
-            # Convert PIL to numpy (H, W, C)
-            arr = np.array(img, dtype=np.uint8)
+        if isinstance(img, np.ndarray):
+            # Already numpy - just ensure correct format (fastest path)
+            arr = img.astype(np.uint8) if img.dtype != np.uint8 else img
             if len(arr.shape) == 2:
                 arr = np.repeat(arr[:, :, np.newaxis], 3, axis=2)
             elif arr.shape[2] == 1:
                 arr = np.repeat(arr, 3, axis=2)
             elif arr.shape[2] > 3:
                 arr = arr[:, :, :3]
-        elif isinstance(img, np.ndarray):
-            arr = img.astype(np.uint8) if img.dtype != np.uint8 else img
+        elif isinstance(img, Image.Image):
+            # PIL Image - convert to numpy (slower, but necessary for PIL inputs)
+            arr = np.array(img, dtype=np.uint8)
             if len(arr.shape) == 2:
                 arr = np.repeat(arr[:, :, np.newaxis], 3, axis=2)
             elif arr.shape[2] == 1:
@@ -1820,8 +1823,9 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
             raise ValueError(f"Unsupported image type: {type(img)}")
         numpy_images.append(arr)
     
-    # 优化：批量处理相同尺寸的图像（所有patch都是447x447）
-    # 检查是否所有图像尺寸相同，如果是，可以真正批量处理
+    # OPTIMIZATION: Batch process images of the same size (all patches are same size after extraction)
+    # Check if all images have the same size, if so, can truly batch process (much faster)
+    # This is the key optimization - batch resize on GPU is 10-100x faster than CPU resize per image
     first_shape = numpy_images[0].shape[:2] if len(numpy_images) > 0 else None
     all_same_size = all(arr.shape[:2] == first_shape for arr in numpy_images)
     
@@ -1872,14 +1876,16 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
                 antialias=True
             )
     else:
-        # 逐个处理（兼容不同尺寸的情况）
+        # Fallback: Process individually (for different sizes - should be rare)
+        # This path is slower but handles edge cases
         processed_tensors = []
         
         for arr in numpy_images:
             h, w = arr.shape[:2]
             
             # Convert to tensor and move to GPU (H, W, C) -> (1, C, H, W)
-            img_tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().to(device)
+            # Use non_blocking=True for async transfer
+            img_tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().to(device, non_blocking=True)
             
             shortest_edge = min(h, w)
             scale = target_size / shortest_edge
