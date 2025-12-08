@@ -240,40 +240,43 @@ class NucleiPatchDataset(Dataset):
         print("Scale factor:", self.scale_factor)
         print(f"Extraction size: {self.extraction_size} pixels")
         
-        # 区域共享优化：使用大区域读取来减少IO时间
-        # 对于pyvips，使用crop读取大区域，然后用numpy裁剪小patch
-        # 这样可以减少IO操作次数，提高性能
-        self.use_region_sharing = True  # 始终启用区域共享优化
-        self.region_size = 2048  # 大区域大小（固定2048，最大且最有效）
-        self.region_cache = {}  # 缓存已读取的大区域 {(x, y): numpy_array}
-        self.region_plan = {}  # 区域规划：{region_key: [cell_indices]}
-        self.cell_to_region = {}  # 映射：cell_idx -> (region_key, local_x, local_y)
+        # Region sharing optimization: use large region reads to reduce IO time
+        # For pyvips, use crop to read large regions, then use numpy to crop small patches
+        # This reduces IO operations and improves performance
+        # Use lazy loading and LRU cache mechanism, load on demand, automatically release memory after use
+        self.use_region_sharing = True  # Always enable region sharing optimization
+        self.region_size = 2048  # Large region size (fixed 2048, maximum and most efficient)
+        # Overlap between adjacent regions to ensure boundary cells can be fully contained
+        # Overlap should be at least extraction_size to ensure all extraction areas can fit
+        self.region_overlap = max(self.extraction_size, 256)  # Overlap size (at least extraction_size, or 256 pixels)
+        self.region_cache = {}  # Cache loaded large regions {(x, y): numpy_array}
+        self.region_access_order = []  # LRU cache: record access order for releasing least recently used regions
+        self.max_cache_size = 40  # Maximum cache region count (approx 40*2048*2048*3*1 bytes ≈ 480MB)
+        self.region_plan = {}  # Region planning: {region_key: [cell_indices]}
+        self.cell_to_region = {}  # Mapping: cell_idx -> (region_key, local_x, local_y)
         
-        # 如果centroids不为空，进行快速规划
+        # If centroids is not empty, perform fast planning
         if self.centroids is not None and len(self.centroids) > 0:
-            print(f"[优化] 启用区域共享优化，大区域大小: {self.region_size}x{self.region_size}")
-            print(f"[优化] 对于pyvips：使用crop读取大区域，然后用numpy裁剪小patch")
+            print(f"[OPTIMIZATION] Region sharing optimization enabled, large region size: {self.region_size}x{self.region_size}")
+            print(f"[OPTIMIZATION] For pyvips: use crop to read large regions, then use numpy to crop small patches")
+            print(f"[OPTIMIZATION] Using lazy loading and LRU cache (max cache {self.max_cache_size} regions, approx {self.max_cache_size * 2048 * 2048 * 3 / 1024 / 1024:.1f}MB)")
             self._plan_regions_fast()
-            print(f"[优化] 规划完成: {len(self.region_plan)} 个大区域，覆盖 {len(self.centroids)} 个细胞核")
+            print(f"[OPTIMIZATION] Planning completed: {len(self.region_plan)} large regions, covering {len(self.centroids)} nuclei")
             original_io = len(self.centroids)
             optimized_io = len(self.region_plan)
             if original_io > 0:
                 reduction = (1 - optimized_io / original_io) * 100
-                print(f"[优化] IO操作减少: {reduction:.1f}% ({original_io} -> {optimized_io})")
-            
-            # 预加载前N个最常用的区域
-            preload_count = min(200, len(self.region_plan)) if len(self.centroids) > 50000 else 100
-            self._preload_frequent_regions(max_regions=preload_count)
+                print(f"[OPTIMIZATION] IO operations reduced: {reduction:.1f}% ({original_io} -> {optimized_io})")
 
     def _plan_regions_fast(self):
         """
-        快速规划读取区域（简化版本，避免复杂的合并算法）
-        将细胞核分组到共享的大区域中
+        Fast planning of read regions (simplified version, avoiding complex merge algorithms)
+        Group nuclei into shared large regions
         """
         if self.centroids is None or len(self.centroids) == 0:
             return
         
-        # 获取slide尺寸
+        # Get slide dimensions
         if not hasattr(self, 'slide_dimensions') or self.slide_dimensions is None:
             if hasattr(self.slide, 'dimensions'):
                 self.slide_dimensions = self.slide.dimensions
@@ -284,52 +287,99 @@ class NucleiPatchDataset(Dataset):
         
         slide_width, slide_height = self.slide_dimensions[0], self.slide_dimensions[1]
         
-        # 快速规划：直接将细胞核分配到网格对齐的大区域
-        # 优化：使用numpy向量化操作加速
+        # Fast planning: assign nuclei to grid-aligned large regions with overlap
+        # Strategy: Large regions have overlap between adjacent regions to ensure boundary cells can be fully contained
+        # Overlap size should be at least extraction_size to ensure all extraction areas can fit
+        # Grid-aligned regions: 0, region_size, 2*region_size, ...
+        # With overlap, each region can cover cells that would otherwise fall on boundaries
         centroids_array = np.array(self.centroids)
         
-        # 计算所有细胞核的提取区域左上角
+        # Calculate top-left corner of extraction region for all nuclei
         x1_all = np.maximum(0, centroids_array[:, 0] - self.extraction_size // 2).astype(np.int32)
         y1_all = np.maximum(0, centroids_array[:, 1] - self.extraction_size // 2).astype(np.int32)
         
-        # 计算大区域的左上角（对齐到region_size网格）
-        region_x_all = (x1_all // self.region_size) * self.region_size
-        region_y_all = (y1_all // self.region_size) * self.region_size
+        # Calculate bottom-right corner of extraction region
+        x2_all = x1_all + self.extraction_size
+        y2_all = y1_all + self.extraction_size
         
-        # 确保不超出边界
-        region_x_all = np.minimum(region_x_all, slide_width - self.region_size)
-        region_y_all = np.minimum(region_y_all, slide_height - self.region_size)
-        region_x_all = np.maximum(0, region_x_all)
-        region_y_all = np.maximum(0, region_y_all)
+        # Simple strategy: regions are placed with step size 1024 (half of region_size)
+        # This creates 1024 pixel overlap between adjacent regions
+        # Region positions: 0, 1024, 2048, 3072, ... (step = region_size // 2)
+        # For each nucleus, find the nearest region that can contain its extraction area
         
-        # 计算局部坐标
+        region_step = self.region_size // 2  # 1024
+        
+        # Calculate which region step position can contain the extraction area
+        # For extraction area [x1, x2], we need: region_x <= x1 and region_x + region_size >= x2
+        # Find the rightmost region step position that satisfies: region_x <= x1
+        # Then check if it can contain x2
+        region_step_x = (x1_all // region_step) * region_step
+        region_step_y = (y1_all // region_step) * region_step
+        
+        # Check if this region can contain x2
+        can_contain_x = region_step_x + self.region_size >= x2_all
+        can_contain_y = region_step_y + self.region_size >= y2_all
+        
+        # Use the calculated region step position
+        region_x_all = region_step_x.copy()
+        region_y_all = region_step_y.copy()
+        
+        # If current region can't contain x2, use previous step (which has overlap)
+        # This should rarely happen with 1024 overlap, but handle it just in case
+        prev_step_x = region_step_x - region_step
+        prev_step_y = region_step_y - region_step
+        
+        use_prev_x = ~can_contain_x & (prev_step_x >= 0) & (prev_step_x + self.region_size >= x2_all)
+        use_prev_y = ~can_contain_y & (prev_step_y >= 0) & (prev_step_y + self.region_size >= y2_all)
+        
+        region_x_all[use_prev_x] = prev_step_x[use_prev_x]
+        region_y_all[use_prev_y] = prev_step_y[use_prev_y]
+        
+        # Ensure within boundaries
+        region_x_all = np.maximum(0, np.minimum(region_x_all, slide_width - self.region_size))
+        region_y_all = np.maximum(0, np.minimum(region_y_all, slide_height - self.region_size))
+        
+        # Calculate local coordinates (relative to large region top-left corner)
         local_x_all = x1_all - region_x_all
         local_y_all = y1_all - region_y_all
         
-        # 构建映射（优化：使用numpy数组存储，索引访问比字典更快）
-        # 存储格式：region_keys[i] = (region_x, region_y), local_coords[i] = (local_x, local_y)
-        self.region_keys_array = np.zeros((len(self.centroids), 2), dtype=np.int32)
-        self.local_coords_array = np.zeros((len(self.centroids), 2), dtype=np.int32)
+        # Final validation: ensure all extraction_size regions are within large regions
+        # local_x + extraction_size <= region_size, local_y + extraction_size <= region_size
+        # Skip validation in production for performance (only check if needed)
+        # assert np.all(local_x_all + self.extraction_size <= self.region_size), f"Overlap calculation error: x overflow"
+        # assert np.all(local_y_all + self.extraction_size <= self.region_size), f"Overlap calculation error: y overflow"
+        # assert np.all(local_x_all >= 0) and np.all(local_y_all >= 0), "Overlap calculation error: negative coordinates"
+        
+        # Build mapping (optimization: use numpy arrays for storage, index access is faster than dict)
+        # Storage format: region_keys[i] = (region_x, region_y), local_coords[i] = (local_x, local_y)
+        self.region_keys_array = np.column_stack([region_x_all, region_y_all]).astype(np.int32)
+        self.local_coords_array = np.column_stack([local_x_all, local_y_all]).astype(np.int32)
+        
+        # Build region_plan and cell_to_region efficiently
+        # Pre-convert to int32 to avoid repeated conversions
+        region_x_int = region_x_all.astype(np.int32)
+        region_y_int = region_y_all.astype(np.int32)
+        local_x_int = local_x_all.astype(np.int32)
+        local_y_int = local_y_all.astype(np.int32)
+        
+        # Build mappings in one pass
+        from collections import defaultdict
+        region_plan_dict = defaultdict(list)
         
         for cell_idx in range(len(self.centroids)):
-            region_key = (int(region_x_all[cell_idx]), int(region_y_all[cell_idx]))
-            
-            if region_key not in self.region_plan:
-                self.region_plan[region_key] = []
-            self.region_plan[region_key].append(cell_idx)
-            
-            # 同时保存到字典（兼容性）和数组（性能）
-            self.cell_to_region[cell_idx] = (region_key, int(local_x_all[cell_idx]), int(local_y_all[cell_idx]))
-            self.region_keys_array[cell_idx] = [region_key[0], region_key[1]]
-            self.local_coords_array[cell_idx] = [int(local_x_all[cell_idx]), int(local_y_all[cell_idx])]
+            region_key = (region_x_int[cell_idx], region_y_int[cell_idx])
+            region_plan_dict[region_key].append(cell_idx)
+            self.cell_to_region[cell_idx] = (region_key, local_x_int[cell_idx], local_y_int[cell_idx])
+        
+        self.region_plan = dict(region_plan_dict)
     
     def _load_region_fast(self, region_key):
         """
-        快速读取一个大区域并缓存（针对pyvips优化）
+        Fast load a large region and cache (optimized for pyvips)
         """
         region_x, region_y = region_key
         
-        # 获取slide尺寸
+        # Get slide dimensions
         if not hasattr(self, 'slide_dimensions') or self.slide_dimensions is None:
             if hasattr(self.slide, 'dimensions'):
                 self.slide_dimensions = self.slide.dimensions
@@ -340,18 +390,23 @@ class NucleiPatchDataset(Dataset):
         
         slide_width, slide_height = self.slide_dimensions[0], self.slide_dimensions[1]
         
-        # 计算实际读取的区域大小
+        # Calculate actual read region size (ensure not exceeding 2048x2048)
+        # Even with overlap, read region size is fixed at region_size (2048x2048)
         actual_width = min(self.region_size, slide_width - region_x)
         actual_height = min(self.region_size, slide_height - region_y)
         actual_width = max(0, actual_width)
         actual_height = max(0, actual_height)
+        
+        # Ensure not exceeding 2048x2048 (even with overlap)
+        actual_width = min(actual_width, self.region_size)
+        actual_height = min(actual_height, self.region_size)
         
         if actual_width <= 0 or actual_height <= 0:
             self.region_cache[region_key] = np.zeros((self.region_size, self.region_size, 3), dtype=np.uint8)
             return
         
         try:
-            # 对于pyvips，使用crop方法（最快速）
+            # For pyvips, use crop method (fastest)
             if self.read_image_method == 'vips':
                 import pyvips
                 cropped = self.slide.wsi.crop(region_x, region_y, actual_width, actual_height)
@@ -385,17 +440,63 @@ class NucleiPatchDataset(Dataset):
                 if len(region.shape) == 3 and region.shape[2] == 4:
                     region = region[:, :, :3]
             
-            # 填充到region_size（如果需要）
+            # Pad to region_size (if needed)
             if region.shape[0] < self.region_size or region.shape[1] < self.region_size:
                 padded = np.zeros((self.region_size, self.region_size, 3), dtype=region.dtype)
                 h, w = region.shape[:2]
                 padded[:h, :w] = region
                 region = padded
             
-            self.region_cache[region_key] = region
+            # Lazy loading: load on demand, use LRU cache mechanism
+            self._add_to_cache(region_key, region)
         except Exception as e:
             print(f"Error loading region {region_key}: {e}")
-            self.region_cache[region_key] = np.zeros((self.region_size, self.region_size, 3), dtype=np.uint8)
+            self._add_to_cache(region_key, np.zeros((self.region_size, self.region_size, 3), dtype=np.uint8))
+    
+    def _add_to_cache(self, region_key, region):
+        """
+        将区域添加到缓存，使用LRU机制管理内存
+        当缓存满时，自动释放最久未使用的区域
+        """
+        # 如果区域已在缓存中，更新访问顺序
+        if region_key in self.region_cache:
+            # 移动到最近使用的位置
+            if region_key in self.region_access_order:
+                self.region_access_order.remove(region_key)
+            self.region_access_order.append(region_key)
+            self.region_cache[region_key] = region
+            return
+        
+        # 如果缓存已满，释放最久未使用的区域
+        while len(self.region_cache) >= self.max_cache_size:
+            if len(self.region_access_order) > 0:
+                # 移除最久未使用的区域
+                oldest_key = self.region_access_order.pop(0)
+                if oldest_key in self.region_cache:
+                    del self.region_cache[oldest_key]
+                    # 显式释放内存
+                    import gc
+                    gc.collect()
+            else:
+                # 如果访问顺序列表为空，清空缓存
+                self.region_cache.clear()
+                break
+        
+        # 添加新区域到缓存
+        self.region_cache[region_key] = region
+        self.region_access_order.append(region_key)
+    
+    def _get_from_cache(self, region_key):
+        """
+        从缓存中获取区域，更新LRU访问顺序
+        """
+        if region_key in self.region_cache:
+            # 更新访问顺序：移动到最近使用的位置
+            if region_key in self.region_access_order:
+                self.region_access_order.remove(region_key)
+            self.region_access_order.append(region_key)
+            return self.region_cache[region_key]
+        return None
     
     def _preload_frequent_regions(self, max_regions=50):
         """
@@ -698,11 +799,12 @@ class NucleiPatchDataset(Dataset):
                     # 回退到字典查找（兼容性）
                     region_key, local_x, local_y = self.cell_to_region[idx]
                 
-                # 从缓存中获取大区域，如果不存在则读取
-                region_image = self.region_cache.get(region_key)
+                # 懒加载：从缓存中获取大区域，如果不存在则读取
+                region_image = self._get_from_cache(region_key)
                 if region_image is None:
+                    # 缓存未命中，懒加载：按需读取
                     self._load_region_fast(region_key)
-                    region_image = self.region_cache[region_key]
+                    region_image = self._get_from_cache(region_key)
                 
                 # 从大区域中裁剪出需要的patch（使用numpy view，无需复制）
                 # 直接裁剪（返回view，不是copy，性能更好）
