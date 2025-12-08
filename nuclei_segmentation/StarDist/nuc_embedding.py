@@ -419,6 +419,9 @@ class NucleiPatchDataset(Dataset):
         这样可以提升 batch 中同一 region 的 cells 比例，减少数据传输
         """
         if not self.region_plan or len(self.region_plan) == 0:
+            # 如果没有 region_plan，不进行重新排序，设置映射为 None
+            self.new_to_old_index = None
+            self.old_to_new_index = None
             return
         
         # 创建排序索引：按照 region_key 排序，同一 region 内的 cells 保持相对顺序
@@ -431,6 +434,12 @@ class NucleiPatchDataset(Dataset):
         
         # 排序：先按 region_key (x, y)，再按 cell_idx（保持稳定性）
         sorted_indices = sorted(range(len(sort_keys)), key=lambda i: sort_keys[i])
+        
+        # 保存反向映射：从新索引到旧索引（用于恢复原始顺序）
+        # new_to_old[i] = 原始索引，即 sorted_indices[i] 是原始索引
+        # old_to_new[old_idx] = 新索引，用于查找某个原始索引对应的新位置
+        self.old_to_new_index = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted_indices)}
+        self.new_to_old_index = sorted_indices  # 新索引 -> 旧索引的映射
         
         # 重新排列所有相关数据
         if self.centroids is not None:
@@ -3540,9 +3549,21 @@ class NucleiEmbedding:
         total_processed = 0
         if ds_name in parent:
             del parent[ds_name]
+        
+        # 优化：如果 cells 被重新排序，需要按照原始顺序写入 embeddings
+        # 使用临时数组存储所有 embeddings，然后按照原始顺序写入
+        need_reorder = hasattr(dataset, 'new_to_old_index') and dataset.new_to_old_index is not None
+        temp_embeddings = None
+        temp_embeddings_filled = None
+        if need_reorder:
+            print("[优化] 检测到 cells 已重新排序，将按照原始顺序写入 embeddings")
+            # 创建临时数组存储所有 embeddings（按新索引顺序）
+            temp_embeddings = np.zeros((len(dataset), 768), dtype=np.float16)
+            temp_embeddings_filled = np.zeros(len(dataset), dtype=bool)  # 标记哪些位置已填充
+        
         embeddings_dset = parent.create_dataset(
             ds_name,
-            shape=(0, 768),
+            shape=(len(dataset), 768) if need_reorder else (0, 768),
             chunks=(min(1000, batch_size), 768),
             dtype=np.float16
         )
@@ -3556,6 +3577,7 @@ class NucleiEmbedding:
         log_interval_batches = 10  # Log stats every 10 batches
         
         try:
+            current_new_idx = 0  # 当前处理的新索引位置
             for batch in dataloader:
                 # Measure dataloader time (time from previous batch end to current batch received)
                 dataloader_start_time = time.time()
@@ -3625,10 +3647,20 @@ class NucleiEmbedding:
                     # Convert to float16 before saving (matches server version)
                     if isinstance(batch_embeddings, np.ndarray):
                         batch_embeddings = batch_embeddings.astype(np.float16, copy=False)
-                    current_size = embeddings_dset.shape[0]
-                    new_size = current_size + batch_embeddings.shape[0]
-                    embeddings_dset.resize((new_size, 768))
-                    embeddings_dset[current_size:new_size, :] = batch_embeddings
+                    
+                    if need_reorder:
+                        # 如果重新排序了，先存储到临时数组（按新索引顺序）
+                        batch_size_actual = batch_embeddings.shape[0]
+                        temp_embeddings[current_new_idx:current_new_idx + batch_size_actual] = batch_embeddings
+                        temp_embeddings_filled[current_new_idx:current_new_idx + batch_size_actual] = True
+                        current_new_idx += batch_size_actual
+                    else:
+                        # 原始逻辑：直接写入
+                        current_size = embeddings_dset.shape[0]
+                        new_size = current_size + batch_embeddings.shape[0]
+                        embeddings_dset.resize((new_size, 768))
+                        embeddings_dset[current_size:new_size, :] = batch_embeddings
+                    
                     perf_stats['io_time'] += time.time() - io_start
                     
                     # Update statistics
@@ -3682,11 +3714,32 @@ class NucleiEmbedding:
             traceback.print_exc()
             raise
         finally:
+            # 如果重新排序了，按照原始顺序写入 embeddings
+            if need_reorder and temp_embeddings is not None:
+                print("[优化] 按照原始顺序写入 embeddings...")
+                io_start = time.time()
+                # 按照原始索引顺序重新排列 embeddings
+                # new_to_old_index[new_idx] = old_idx，所以我们需要创建一个反向映射
+                # 创建一个数组，old_idx -> embedding
+                reordered_embeddings = np.zeros_like(temp_embeddings)
+                for new_idx in range(len(dataset)):
+                    old_idx = dataset.new_to_old_index[new_idx]
+                    reordered_embeddings[old_idx] = temp_embeddings[new_idx]
+                
+                # 写入到 zarr dataset
+                embeddings_dset[:] = reordered_embeddings
+                perf_stats['io_time'] += time.time() - io_start
+                print(f"[优化] 已按照原始顺序写入 {len(dataset)} 个 embeddings")
+            
             # Cleanup
             if 'batch_embeddings' in locals():
                 del batch_embeddings
             if 'processed_batch' in locals():
                 del processed_batch
+            if 'temp_embeddings' in locals():
+                del temp_embeddings
+            if 'temp_embeddings_filled' in locals():
+                del temp_embeddings_filled
             torch.cuda.empty_cache()
             pbar.close()
             total_time = time.time() - total_start_time
