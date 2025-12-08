@@ -7,10 +7,11 @@ Created on Feb 03 2025
 """
 
 # Standard library imports
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 import gc
 import importlib
+import importlib.util  # Used for VIPS_AVAILABLE check
 import os
 import pathlib
 import platform
@@ -47,7 +48,6 @@ For 250K cells, it takes 10 mins to embed all cells with CUDA (NVIDIA 4060). Wit
 
 class NucleiPatchDataset(Dataset):
     def __init__(self, slide_path, read_image_method=None, centroids=None, contours=None, patch_size=224, magnification=40, processor=None, z_layer=None, padding_ratio=0.1):
-
         self.slide_path = slide_path
         self.centroids = centroids
         self.contours = contours  # Contours for bounding box extraction
@@ -56,7 +56,7 @@ class NucleiPatchDataset(Dataset):
         self.z_layer = z_layer  # Specific Z layer for segmentation, None means use all layers for embedding
         self.padding_ratio = padding_ratio  # Padding as fraction of bounding box size (e.g., 0.2 = 20%)
         self.skip_cpu_resize = False  # 如果使用GPU预处理，跳过CPU resize以提升性能
-        self.use_gpu_region_crop = False  # 是否在GPU上进行region裁剪优化（减少CPU->GPU传输量）
+        self.use_gpu_region_crop = False  # 是否在GPU上进行region裁剪优化（减少CPU->GPU传输量），由generate_embeddings自动设置
         
         # Performance profiling for detailed analysis
         self.perf_stats = {
@@ -252,9 +252,12 @@ class NucleiPatchDataset(Dataset):
         # Use lazy loading and LRU cache mechanism, load on demand, automatically release memory after use
         self.use_region_sharing = True  # Always enable region sharing optimization
         self.region_size = 2048  # Large region size (fixed 2048, maximum and most efficient)
-        # Overlap between adjacent regions to ensure boundary cells can be fully contained
-        # Overlap should be at least extraction_size to ensure all extraction areas can fit
-        self.region_overlap = max(self.extraction_size, 256)  # Overlap size (at least extraction_size, or 256 pixels)
+        # Overlap between adjacent regions: need extraction_size to ensure boundary extraction areas can be extracted
+        # This minimizes overlap while ensuring all extraction areas can fit within regions
+        # region_step = region_size - overlap, so overlap = region_size - region_step
+        # We want overlap >= extraction_size, so region_step = region_size - extraction_size
+        # Use extraction_size (not patch_size) because we extract extraction_size patches, not patch_size
+        self.region_overlap = self.extraction_size  # Overlap size = extraction_size (sufficient for extraction area)
         self.region_cache = {}  # Cache loaded large regions {(x, y): numpy_array}
         self.region_access_order = []  # Simple FIFO order for fallback (when marked regions are exhausted)
         self.max_cache_size = 40  # Maximum cache region count (approx 40*2048*2048*3*1 bytes ≈ 480MB)
@@ -289,6 +292,8 @@ class NucleiPatchDataset(Dataset):
         # If centroids is not empty, perform fast planning
         if self.centroids is not None and len(self.centroids) > 0:
             print(f"[OPTIMIZATION] Region sharing optimization enabled, large region size: {self.region_size}x{self.region_size}")
+            print(f"[OPTIMIZATION] Region overlap: {self.region_overlap} pixels (extraction_size, minimal overlap)")
+            print(f"[OPTIMIZATION] Region step: {self.region_size - self.region_overlap} pixels (reduces region count)")
             print(f"[OPTIMIZATION] For pyvips: use crop to read large regions, then use numpy to crop small patches")
             print(f"[OPTIMIZATION] Using lazy loading and LRU cache (max cache {self.max_cache_size} regions, approx {self.max_cache_size * 2048 * 2048 * 3 / 1024 / 1024:.1f}MB)")
             self._plan_regions_fast()
@@ -333,12 +338,13 @@ class NucleiPatchDataset(Dataset):
         x2_all = x1_all + self.extraction_size
         y2_all = y1_all + self.extraction_size
         
-        # Simple strategy: regions are placed with step size 1024 (half of region_size)
-        # This creates 1024 pixel overlap between adjacent regions
-        # Region positions: 0, 1024, 2048, 3072, ... (step = region_size // 2)
+        # OPTIMIZATION: Regions are placed with step size = region_size - extraction_size
+        # This creates extraction_size overlap between adjacent regions (minimal overlap needed)
+        # Region positions: 0, (region_size - extraction_size), 2*(region_size - extraction_size), ...
         # For each nucleus, find the nearest region that can contain its extraction area
+        # This reduces the number of regions needed compared to region_size // 2 step
         
-        region_step = self.region_size // 2  # 1024
+        region_step = self.region_size - self.region_overlap  # e.g., 2048 - 222 = 1826
         
         # Calculate which region step position can contain the extraction area
         # For extraction area [x1, x2], we need: region_x <= x1 and region_x + region_size >= x2
@@ -356,7 +362,7 @@ class NucleiPatchDataset(Dataset):
         region_y_all = region_step_y.copy()
         
         # If current region can't contain x2, use previous step (which has overlap)
-        # This should rarely happen with 1024 overlap, but handle it just in case
+        # With extraction_size overlap, this should rarely happen, but handle it just in case
         prev_step_x = region_step_x - region_step
         prev_step_y = region_step_y - region_step
         
@@ -1069,6 +1075,9 @@ class NucleiPatchDataset(Dataset):
                     # Cache miss, load synchronously (async load may not be ready)
                     self._load_region_fast(region_key, async_load=False)
                     region_image = self._get_from_cache(region_key)
+                    # 如果加载后仍然是None，说明加载失败，应该抛出错误或使用fallback
+                    if region_image is None:
+                        raise ValueError(f"Failed to load region {region_key} for nucleus {idx}")
                 
                 # OPTIMIZATION: 如果启用GPU region crop，返回region信息而不是单个patch
                 # 这样可以减少CPU->GPU传输量：一次传输大Tile到GPU，然后在GPU上裁剪多个patch
@@ -1999,26 +2008,54 @@ def _preprocess_clip_gpu_with_region_crop(region_images, crop_coords_list, devic
         # 关键优化：一次性传输整个region到GPU，而不是逐个传输patch
         region_tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().to(device, non_blocking=True)
         
+        # Get region dimensions for bounds checking
+        region_h, region_w = region_tensor.shape[2], region_tensor.shape[3]
+        
         # Extract patches on GPU using indexing (much faster than CPU crop + transfer)
         # 在GPU上批量crop：使用tensor索引操作，性能远优于CPU crop + 多次传输
         patches_list = []
         for local_x, local_y, ext_size in crop_coords:
-            # GPU上的crop操作（使用索引切片，非常快）
-            patch = region_tensor[:, :, local_y:local_y+ext_size, local_x:local_x+ext_size]
+            # Bounds checking: ensure crop coordinates are within region bounds
+            # 确保裁剪坐标在有效范围内（正常情况下应该都在范围内，但添加检查以防万一）
+            local_x_clamped = max(0, min(int(local_x), region_w - 1))
+            local_y_clamped = max(0, min(int(local_y), region_h - 1))
+            # 确保裁剪大小不超过region边界
+            crop_w = min(int(ext_size), region_w - local_x_clamped)
+            crop_h = min(int(ext_size), region_h - local_y_clamped)
             
-            # Resize to target_size on GPU
+            # 验证裁剪区域有效性
+            if crop_w <= 0 or crop_h <= 0:
+                # 无效的裁剪区域，创建空patch（使用ext_size而不是crop_w/h，因为后续需要resize）
+                # 注意：空patch在normalize后会变成负值，这是正常的
+                patch = torch.zeros((1, 3, ext_size, ext_size), device=device, dtype=torch.float32)
+            else:
+                # GPU上的crop操作（使用索引切片，非常快）
+                patch = region_tensor[:, :, local_y_clamped:local_y_clamped+crop_h, local_x_clamped:local_x_clamped+crop_w]
+                
+                # 如果裁剪的patch小于ext_size，需要padding（正常情况下不应该发生，但处理边界情况）
+                if crop_h < ext_size or crop_w < ext_size:
+                    # Pad to ext_size
+                    padded_patch = torch.zeros((1, 3, ext_size, ext_size), device=device, dtype=patch.dtype)
+                    padded_patch[:, :, :crop_h, :crop_w] = patch
+                    patch = padded_patch
+            
+            # Resize to target_size on GPU (matching _preprocess_clip_gpu behavior)
+            # This matches the CPU preprocessing flow: resize shortest edge, then center crop
             h, w = patch.shape[2], patch.shape[3]
             shortest_edge = min(h, w)
+            
+            # Calculate scale factor based on shortest edge (matching _preprocess_clip_gpu)
             scale = target_size / shortest_edge
             new_h = int(np.floor(h * scale))
             new_w = int(np.floor(w * scale))
             
+            # Ensure at least target_size for both dimensions
             if new_h < target_size:
                 new_h = target_size
             if new_w < target_size:
                 new_w = target_size
             
-            # Resize on GPU
+            # Resize on GPU (BICUBIC interpolation, matching processor behavior)
             patch = torch.nn.functional.interpolate(
                 patch,
                 size=(new_h, new_w),
@@ -2027,13 +2064,13 @@ def _preprocess_clip_gpu_with_region_crop(region_images, crop_coords_list, devic
                 antialias=True
             )
             
-            # Center crop on GPU
+            # Center crop on GPU (matching _preprocess_clip_gpu)
             if new_h != target_size or new_w != target_size:
                 top = (new_h - target_size) // 2
                 left = (new_w - target_size) // 2
                 patch = patch[:, :, top:top+target_size, left:left+target_size]
             
-            # Final check
+            # Final check: ensure exact target_size (shouldn't be needed, but safety check)
             if patch.shape[2] != target_size or patch.shape[3] != target_size:
                 patch = torch.nn.functional.interpolate(
                     patch,
@@ -2891,26 +2928,19 @@ class NucleiEmbedding:
         
         # GPU Region Crop优化：将大Tile传输到GPU，然后在GPU上批量crop，减少传输量
         # 这个优化特别适合batch中有多个patches来自同一region的情况
-        # 支持通过环境变量或args参数控制（用于性能测试）
-        force_gpu_region_crop = None
-        if hasattr(self.args, 'use_gpu_region_crop'):
-            force_gpu_region_crop = self.args.use_gpu_region_crop
-        elif 'USE_GPU_REGION_CROP' in os.environ:
-            force_gpu_region_crop = os.environ['USE_GPU_REGION_CROP'].lower() in ('true', '1', 'yes')
-        
-        if force_gpu_region_crop is not None:
-            # 强制使用指定设置（用于测试）
-            dataset.use_gpu_region_crop = force_gpu_region_crop
-            if force_gpu_region_crop:
-                print("[优化] 强制启用GPU Region Crop（通过参数/环境变量）")
-            else:
-                print("[优化] 强制禁用GPU Region Crop（通过参数/环境变量）")
-        elif use_gpu_preprocess and dataset.use_region_sharing:
-            # 自动启用（默认行为）
+        # 自动检测GPU可用性并启用
+        if use_gpu_preprocess and dataset.use_region_sharing:
+            # 自动启用：GPU可用且启用了region sharing时，自动使用GPU region crop优化
             dataset.use_gpu_region_crop = True
-            print("[优化] 启用GPU Region Crop：将大Tile传输到GPU，在GPU上批量crop，减少CPU->GPU传输量")
+            print("[优化] 自动启用GPU Region Crop：GPU可用，将大Tile传输到GPU，在GPU上批量crop，减少CPU->GPU传输量")
             print("[优化] 预期效果：传输量减少约 50-90%（取决于同一region中的patch数量）")
+        elif use_gpu_preprocess:
+            # GPU可用但未启用region sharing
+            # 注意：GPU region crop需要region sharing支持，所以这里禁用
+            dataset.use_gpu_region_crop = False
+            print("[优化] GPU可用但未启用region sharing，跳过GPU Region Crop优化")
         else:
+            # GPU不可用，使用CPU路径
             dataset.use_gpu_region_crop = False
             
         if use_gpu_preprocess:
@@ -3003,13 +3033,16 @@ class NucleiEmbedding:
                 
                 if use_region_crop:
                     # GPU Region Crop优化路径：按region分组，批量处理
-                    from collections import defaultdict
                     region_groups = defaultdict(list)  # {region_key: [(batch_idx, local_x, local_y, extraction_size)]}
                     regular_items = []  # 非region类型的items
                     regular_indices = []
                     
+                    # 记录batch中每个item的原始索引和类型
+                    batch_item_info = []  # [(is_region, region_key, batch_idx), ...]
+                    
                     for i, item in enumerate(batch):
                         if item is None:
+                            batch_item_info.append((False, None, i))
                             continue
                         if isinstance(item, dict) and item.get('type') == 'region':
                             # Region类型的数据
@@ -3020,17 +3053,31 @@ class NucleiEmbedding:
                                 item['local_y'],
                                 item['extraction_size']
                             ))
+                            batch_item_info.append((True, region_key, i))
                         else:
                             # 常规patch数据
                             regular_items.append(item)
                             regular_indices.append(i)
+                            batch_item_info.append((False, None, i))
                     
                     # 处理region groups：按region合并，传输到GPU，批量crop
+                    # 使用OrderedDict保持顺序（虽然Python 3.7+ dict已经有序，但明确使用OrderedDict更安全）
                     region_images = []
                     crop_coords_list = []
-                    region_batch_indices = []  # 记录每个region对应的batch indices
+                    region_batch_indices = []  # 记录每个region对应的batch indices（保持顺序）
+                    region_key_to_output_idx = {}  # 映射：region_key -> 在region_images中的索引
                     
-                    for region_key, coords_list in region_groups.items():
+                    # 按照batch中第一次出现的顺序处理regions（保持顺序）
+                    seen_regions = OrderedDict()
+                    for is_region, region_key, batch_idx in batch_item_info:
+                        if is_region and region_key is not None and region_key not in seen_regions:
+                            seen_regions[region_key] = True
+                    
+                    for region_key in seen_regions.keys():
+                        coords_list = region_groups[region_key]
+                        # CRITICAL: 按照batch中的顺序排序coords_list，确保patches顺序正确
+                        coords_list = sorted(coords_list, key=lambda x: x[0])  # 按batch_idx排序
+                        
                         # 获取第一个item的region_image（同一region的所有patches共享同一个region_image）
                         first_item_idx = coords_list[0][0]
                         region_item = batch[first_item_idx]
@@ -3038,19 +3085,26 @@ class NucleiEmbedding:
                         
                         # 检查region_image是否有效
                         if region_image is None:
-                            # 如果region_image为None，将这些items转为常规处理
-                            for idx, local_x, local_y, ext_size in coords_list:
-                                # 尝试从原始item获取patch（如果可用）
-                                if isinstance(batch[idx], dict) and 'region_image' in batch[idx]:
-                                    # 如果region_image是None，跳过这个region group
-                                    continue
-                                regular_items.append(batch[idx])
-                                regular_indices.append(idx)
-                            continue
+                            # 如果region_image为None，尝试从dataset重新加载region
+                            try:
+                                dataset._load_region_fast(region_key, async_load=False)
+                                region_image = dataset._get_from_cache(region_key)
+                            except Exception:
+                                # 加载失败，region_image保持为None
+                                pass
+                            
+                            if region_image is None:
+                                # 如果仍然无法加载，将这些items转为常规处理（fallback到CPU路径）
+                                # 为每个patch创建空patch（与CPU路径一致）
+                                for idx, local_x, local_y, ext_size in coords_list:
+                                    empty_patch = np.zeros((ext_size, ext_size, 3), dtype=np.uint8)
+                                    regular_items.append(empty_patch)
+                                    regular_indices.append(idx)
+                                continue
                         
                         region_images.append(region_image)
                         
-                        # 收集所有crop坐标
+                        # 收集所有crop坐标（按照batch顺序）
                         crop_coords = [(local_x, local_y, ext_size) for _, local_x, local_y, ext_size in coords_list]
                         crop_coords_list.append(crop_coords)
                         region_batch_indices.append([idx for idx, _, _, _ in coords_list])
