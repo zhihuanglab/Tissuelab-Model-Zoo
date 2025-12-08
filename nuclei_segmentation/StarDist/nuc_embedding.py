@@ -264,12 +264,25 @@ class NucleiPatchDataset(Dataset):
         self.region_loading = {}  # Track loading status: {region_key: Future or None}
         self.region_marked_for_discard = set()  # Regions marked for discard
         self.async_enabled = True  # Enable async loading
-        self.preload_ahead = 20  # Number of regions to keep preloaded ahead
+        
+        # Adaptive preloading: dynamically adjust window size based on load speed
+        self.preload_ahead = 40  # Initial number of regions to keep preloaded ahead
+        self.preload_ahead_min = 20  # Minimum preload window size
+        self.preload_ahead_max = 80  # Maximum preload window size
         self.current_idx = -1  # Track current processing index for preload window
         self.preload_window = set()  # Track indices in current preload window
+        
+        # Adaptive preloading metrics
+        self.load_times = []  # Track recent load times for adaptation
+        self.load_time_window = 50  # Number of recent loads to consider
+        self.adaptation_interval = 100  # Adjust window size every N accesses
+        self.last_adaptation_idx = 0
+        
         if self.async_enabled:
-            # Increase worker count for better IO parallelism (4-8 workers for better throughput)
-            max_workers = min(8, max(4, os.cpu_count() or 4))
+            # Increase worker count for better IO parallelism (8-16 workers for maximum throughput)
+            # More workers = more parallel IO operations
+            cpu_count = os.cpu_count() or 4
+            max_workers = min(16, max(8, cpu_count))
             self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="region_loader")
         
         # If centroids is not empty, perform fast planning
@@ -464,10 +477,11 @@ class NucleiPatchDataset(Dataset):
             print(f"Error loading region {region_key}: {e}")
             return np.zeros((self.region_size, self.region_size, 3), dtype=np.uint8)
     
-    def _load_region_fast(self, region_key, async_load=False):
+    def _load_region_fast(self, region_key, async_load=False, track_time=False):
         """
         Fast load a large region and cache (optimized for pyvips)
         If async_load=True, returns immediately and loads in background
+        If track_time=True, track load time for adaptive preloading
         """
         # Check if already in cache
         if region_key in self.region_cache:
@@ -478,6 +492,9 @@ class NucleiPatchDataset(Dataset):
             return
         
         if async_load and self.async_enabled and hasattr(self, 'executor'):
+            # Track load start time for adaptive preloading
+            load_start_time = time.time() if track_time else None
+            
             # Async load: submit to thread pool
             future = self.executor.submit(self._load_region_sync, region_key)
             self.region_loading[region_key] = future
@@ -488,6 +505,14 @@ class NucleiPatchDataset(Dataset):
                     region = f.result()
                     if region_key not in self.region_marked_for_discard:
                         self._add_to_cache(region_key, region)
+                    
+                    # Track load time for adaptive preloading
+                    if track_time and load_start_time is not None:
+                        load_time = time.time() - load_start_time
+                        self.load_times.append(load_time)
+                        # Keep only recent load times
+                        if len(self.load_times) > self.load_time_window:
+                            self.load_times.pop(0)
                 except Exception as e:
                     print(f"Error in async load for {region_key}: {e}")
                 finally:
@@ -496,10 +521,18 @@ class NucleiPatchDataset(Dataset):
             
             future.add_done_callback(cache_when_done)
         else:
-            # Synchronous load
+            # Synchronous load - track time
+            load_start = time.time() if track_time else None
             region = self._load_region_sync(region_key)
             if region_key not in self.region_marked_for_discard:
                 self._add_to_cache(region_key, region)
+            
+            # Track load time
+            if track_time and load_start is not None:
+                load_time = time.time() - load_start
+                self.load_times.append(load_time)
+                if len(self.load_times) > self.load_time_window:
+                    self.load_times.pop(0)
     
     def _add_to_cache(self, region_key, region):
         """
@@ -556,25 +589,27 @@ class NucleiPatchDataset(Dataset):
     
     def _get_from_cache(self, region_key):
         """
-        Get region from cache
-        Also checks if async load is complete
+        Get region from cache with aggressive async load checking
+        Also checks if async load is complete and waits if needed
         """
         # Check if async load is complete
         if region_key in self.region_loading:
             future = self.region_loading[region_key]
             if future.done():
                 # Load complete, should be in cache now
-                del self.region_loading[region_key]
-            else:
-                # Still loading, wait for it
                 try:
-                    region = future.result(timeout=0.1)  # Short timeout
+                    region = future.result()  # Get result (should be fast since done)
                     if region_key not in self.region_marked_for_discard:
                         self._add_to_cache(region_key, region)
                     del self.region_loading[region_key]
-                except:
-                    # Timeout or error, return None (will trigger sync load)
+                except Exception as e:
+                    # Error loading, remove from loading and return None
+                    del self.region_loading[region_key]
                     return None
+            else:
+                # Still loading - don't wait here, let caller decide
+                # This allows preloading to continue in background
+                pass
         
         if region_key in self.region_cache:
             # Unmark if was marked for discard (now being used)
@@ -582,14 +617,63 @@ class NucleiPatchDataset(Dataset):
             return self.region_cache[region_key]
         return None
     
+    def _adapt_preload_window(self, current_idx):
+        """
+        Adaptively adjust preload window size based on actual load performance
+        Uses recent load times to determine if we should increase or decrease window
+        """
+        # Only adapt periodically to avoid overhead
+        if current_idx - self.last_adaptation_idx < self.adaptation_interval:
+            return
+        
+        self.last_adaptation_idx = current_idx
+        
+        # Need enough data to make decision (at least 10 samples)
+        if len(self.load_times) < 10:
+            return
+        
+        # Calculate statistics from recent load times
+        recent_times = self.load_times[-20:]  # Use last 20 samples for more stable decision
+        avg_load_time = sum(recent_times) / len(recent_times)
+        median_load_time = sorted(recent_times)[len(recent_times) // 2]
+        
+        # Use median for more robust decision (less affected by outliers)
+        decision_time = median_load_time
+        
+        # Define adaptive thresholds (in seconds)
+        # These are tuned based on typical region load times
+        fast_threshold = 0.05   # If median < 50ms, loading is fast, can increase window
+        slow_threshold = 0.15   # If median > 150ms, loading is slow, should decrease window
+        
+        # Adjust preload window based on performance
+        old_size = self.preload_ahead
+        if decision_time < fast_threshold:
+            # Loading is fast, can increase window (but not too much at once)
+            new_size = min(self.preload_ahead_max, self.preload_ahead + 10)
+            if new_size != self.preload_ahead:
+                self.preload_ahead = new_size
+                print(f"[ADAPTIVE] Load speed fast (median={decision_time*1000:.1f}ms, avg={avg_load_time*1000:.1f}ms), "
+                      f"increased preload window: {old_size} -> {self.preload_ahead}")
+        elif decision_time > slow_threshold:
+            # Loading is slow, decrease window to reduce memory pressure and improve cache hit rate
+            new_size = max(self.preload_ahead_min, self.preload_ahead - 10)
+            if new_size != self.preload_ahead:
+                self.preload_ahead = new_size
+                print(f"[ADAPTIVE] Load speed slow (median={decision_time*1000:.1f}ms, avg={avg_load_time*1000:.1f}ms), "
+                      f"decreased preload window: {old_size} -> {self.preload_ahead}")
+        # If in between thresholds, keep current size (stable zone)
+    
     def _preload_regions_ahead(self, current_idx):
         """
         Maintain a sliding window of preloaded regions ahead of current index
-        Keep exactly preload_ahead regions in the preload window
+        Keep exactly preload_ahead regions in the preload window (adaptively adjusted)
         Update more aggressively to ensure regions are loaded ahead of time
         """
         if not self.async_enabled or not hasattr(self, 'region_keys_array'):
             return
+        
+        # Adapt preload window size based on performance
+        self._adapt_preload_window(current_idx)
         
         # Update current index
         if current_idx == self.current_idx:
@@ -611,22 +695,36 @@ class NucleiPatchDataset(Dataset):
         # Find indices to remove (in old window but not in new window)
         to_remove = self.preload_window - new_window
         
-        # Load regions for new indices (aggressively preload)
+        # Collect all region keys that need to be loaded (use dict to deduplicate)
+        # Group by region_key to avoid loading same region multiple times
+        regions_to_load = {}
         for idx in to_add:
             region_x, region_y = self.region_keys_array[idx]
             region_key = (int(region_x), int(region_y))
-            
             # Only preload if not in cache and not already loading
             if region_key not in self.region_cache and region_key not in self.region_loading:
-                self._load_region_fast(region_key, async_load=True)
+                regions_to_load[region_key] = idx  # Track which index needs this region
         
-        # Also check existing window for regions that failed to load
+        # Also check existing window for regions that failed to load or are still loading
         for idx in new_window:
             region_x, region_y = self.region_keys_array[idx]
             region_key = (int(region_x), int(region_y))
-            # If not in cache and not loading, try to load it
+            # If not in cache and not loading, add to load list
             if region_key not in self.region_cache and region_key not in self.region_loading:
-                self._load_region_fast(region_key, async_load=True)
+                if region_key not in regions_to_load:  # Avoid duplicates
+                    regions_to_load[region_key] = idx
+        
+        # Batch submit all preload tasks in parallel (maximize thread pool utilization)
+        # Submit all at once to maximize parallelism - executor will handle queueing
+        # Track time for adaptive preloading (sample some loads to track performance)
+        # Track time for a subset to avoid overhead while still getting good metrics
+        regions_list = list(regions_to_load.keys())
+        if len(regions_list) > 0:
+            # Track time for first few regions in each batch to monitor performance
+            track_count = min(5, len(regions_list))  # Track first 5 or all if less
+            for i, region_key in enumerate(regions_list):
+                track_time = i < track_count and len(self.load_times) < self.load_time_window
+                self._load_region_fast(region_key, async_load=True, track_time=track_time)
         
         # Mark regions for discard that are no longer in window
         for idx in to_remove:
