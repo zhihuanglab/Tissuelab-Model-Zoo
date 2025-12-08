@@ -6,32 +6,37 @@ Created on Feb 03 2025
 @author: zhihuang
 """
 
+# Standard library imports
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+import gc
+import importlib
 import os
+import pathlib
+import platform
+import sys
+import time
+import traceback
 
 # Limit TorchInductor GEMM autotuning to avoid unnecessary compile overhead
 os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM", "0")
 
-import importlib
+# Third-party imports
+import cv2
+import multiprocess as mp
 import numpy as np
 import torch
-from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
 import torchvision.transforms as transforms
-
-from PIL import Image, ImageDraw
-import multiprocess as mp
-from tqdm import tqdm
 import zarr
-from nuc_stat import PILSlide, NumpySlide, VipsSlide
-from torch.utils.data import Dataset, DataLoader
-import time
-from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
-import pathlib
-import cv2
+from PIL import Image, ImageDraw
 from scipy.ndimage import zoom
-import gc
-import sys
-import platform
-import traceback
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
+
+# Local imports
+from nuc_stat import NumpySlide, PILSlide, VipsSlide
+from tissuelab_sdk.wrapper import DicomImageWrapper, SimpleImageWrapper, TiffFileWrapper
 
 VIPS_AVAILABLE = importlib.util.find_spec("pyvips") is not None
 
@@ -259,12 +264,13 @@ class NucleiPatchDataset(Dataset):
         self.region_loading = {}  # Track loading status: {region_key: Future or None}
         self.region_marked_for_discard = set()  # Regions marked for discard
         self.async_enabled = True  # Enable async loading
-        self.preload_ahead = 10  # Number of regions to keep preloaded ahead
+        self.preload_ahead = 20  # Number of regions to keep preloaded ahead
         self.current_idx = -1  # Track current processing index for preload window
         self.preload_window = set()  # Track indices in current preload window
         if self.async_enabled:
-            from concurrent.futures import ThreadPoolExecutor
-            self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="region_loader")
+            # Increase worker count for better IO parallelism (4-8 workers for better throughput)
+            max_workers = min(8, max(4, os.cpu_count() or 4))
+            self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="region_loader")
         
         # If centroids is not empty, perform fast planning
         if self.centroids is not None and len(self.centroids) > 0:
@@ -374,7 +380,6 @@ class NucleiPatchDataset(Dataset):
         local_y_int = local_y_all.astype(np.int32)
         
         # Build mappings in one pass
-        from collections import defaultdict
         region_plan_dict = defaultdict(list)
         
         for cell_idx in range(len(self.centroids)):
@@ -581,16 +586,18 @@ class NucleiPatchDataset(Dataset):
         """
         Maintain a sliding window of preloaded regions ahead of current index
         Keep exactly preload_ahead regions in the preload window
+        Update more aggressively to ensure regions are loaded ahead of time
         """
         if not self.async_enabled or not hasattr(self, 'region_keys_array'):
             return
         
         # Update current index
         if current_idx == self.current_idx:
-            # Same index, no need to update window
-            return
-        
-        self.current_idx = current_idx
+            # Same index, but still check if we need to load more regions
+            # (in case some failed to load)
+            pass
+        else:
+            self.current_idx = current_idx
         
         # Define new preload window: [current_idx + 1, current_idx + preload_ahead]
         new_window = set()
@@ -604,12 +611,20 @@ class NucleiPatchDataset(Dataset):
         # Find indices to remove (in old window but not in new window)
         to_remove = self.preload_window - new_window
         
-        # Load regions for new indices
+        # Load regions for new indices (aggressively preload)
         for idx in to_add:
             region_x, region_y = self.region_keys_array[idx]
             region_key = (int(region_x), int(region_y))
             
             # Only preload if not in cache and not already loading
+            if region_key not in self.region_cache and region_key not in self.region_loading:
+                self._load_region_fast(region_key, async_load=True)
+        
+        # Also check existing window for regions that failed to load
+        for idx in new_window:
+            region_x, region_y = self.region_keys_array[idx]
+            region_key = (int(region_x), int(region_y))
+            # If not in cache and not loading, try to load it
             if region_key not in self.region_cache and region_key not in self.region_loading:
                 self._load_region_fast(region_key, async_load=True)
         
@@ -946,15 +961,15 @@ class NucleiPatchDataset(Dataset):
                     # 回退到字典查找（兼容性）
                     region_key, local_x, local_y = self.cell_to_region[idx]
                 
+                # Maintain preload window first (to start loading ahead of time)
+                self._preload_regions_ahead(idx)
+                
                 # Get region from cache (with async load support)
                 region_image = self._get_from_cache(region_key)
                 if region_image is None:
                     # Cache miss, load synchronously (async load may not be ready)
                     self._load_region_fast(region_key, async_load=False)
                     region_image = self._get_from_cache(region_key)
-                
-                # Maintain preload window (keeps exactly preload_ahead regions preloaded)
-                self._preload_regions_ahead(idx)
                 
                 # 从大区域中裁剪出需要的patch（使用numpy view，无需复制）
                 # 直接裁剪（返回view，不是copy，性能更好）
