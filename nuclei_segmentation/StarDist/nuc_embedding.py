@@ -250,10 +250,21 @@ class NucleiPatchDataset(Dataset):
         # Overlap should be at least extraction_size to ensure all extraction areas can fit
         self.region_overlap = max(self.extraction_size, 256)  # Overlap size (at least extraction_size, or 256 pixels)
         self.region_cache = {}  # Cache loaded large regions {(x, y): numpy_array}
-        self.region_access_order = []  # LRU cache: record access order for releasing least recently used regions
+        self.region_access_order = []  # Simple FIFO order for fallback (when marked regions are exhausted)
         self.max_cache_size = 40  # Maximum cache region count (approx 40*2048*2048*3*1 bytes ≈ 480MB)
         self.region_plan = {}  # Region planning: {region_key: [cell_indices]}
         self.cell_to_region = {}  # Mapping: cell_idx -> (region_key, local_x, local_y)
+        
+        # Async loading and preloading
+        self.region_loading = {}  # Track loading status: {region_key: Future or None}
+        self.region_marked_for_discard = set()  # Regions marked for discard
+        self.async_enabled = True  # Enable async loading
+        self.preload_ahead = 10  # Number of regions to keep preloaded ahead
+        self.current_idx = -1  # Track current processing index for preload window
+        self.preload_window = set()  # Track indices in current preload window
+        if self.async_enabled:
+            from concurrent.futures import ThreadPoolExecutor
+            self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="region_loader")
         
         # If centroids is not empty, perform fast planning
         if self.centroids is not None and len(self.centroids) > 0:
@@ -373,9 +384,9 @@ class NucleiPatchDataset(Dataset):
         
         self.region_plan = dict(region_plan_dict)
     
-    def _load_region_fast(self, region_key):
+    def _load_region_sync(self, region_key):
         """
-        Fast load a large region and cache (optimized for pyvips)
+        Synchronous region loading (internal method)
         """
         region_x, region_y = region_key
         
@@ -391,19 +402,15 @@ class NucleiPatchDataset(Dataset):
         slide_width, slide_height = self.slide_dimensions[0], self.slide_dimensions[1]
         
         # Calculate actual read region size (ensure not exceeding 2048x2048)
-        # Even with overlap, read region size is fixed at region_size (2048x2048)
         actual_width = min(self.region_size, slide_width - region_x)
         actual_height = min(self.region_size, slide_height - region_y)
         actual_width = max(0, actual_width)
         actual_height = max(0, actual_height)
-        
-        # Ensure not exceeding 2048x2048 (even with overlap)
         actual_width = min(actual_width, self.region_size)
         actual_height = min(actual_height, self.region_size)
         
         if actual_width <= 0 or actual_height <= 0:
-            self.region_cache[region_key] = np.zeros((self.region_size, self.region_size, 3), dtype=np.uint8)
-            return
+            return np.zeros((self.region_size, self.region_size, 3), dtype=np.uint8)
         
         try:
             # For pyvips, use crop method (fastest)
@@ -447,56 +454,196 @@ class NucleiPatchDataset(Dataset):
                 padded[:h, :w] = region
                 region = padded
             
-            # Lazy loading: load on demand, use LRU cache mechanism
-            self._add_to_cache(region_key, region)
+            return region
         except Exception as e:
             print(f"Error loading region {region_key}: {e}")
-            self._add_to_cache(region_key, np.zeros((self.region_size, self.region_size, 3), dtype=np.uint8))
+            return np.zeros((self.region_size, self.region_size, 3), dtype=np.uint8)
+    
+    def _load_region_fast(self, region_key, async_load=False):
+        """
+        Fast load a large region and cache (optimized for pyvips)
+        If async_load=True, returns immediately and loads in background
+        """
+        # Check if already in cache
+        if region_key in self.region_cache:
+            return
+        
+        # Check if already loading
+        if region_key in self.region_loading:
+            return
+        
+        if async_load and self.async_enabled and hasattr(self, 'executor'):
+            # Async load: submit to thread pool
+            future = self.executor.submit(self._load_region_sync, region_key)
+            self.region_loading[region_key] = future
+            
+            # Add callback to cache when done
+            def cache_when_done(f):
+                try:
+                    region = f.result()
+                    if region_key not in self.region_marked_for_discard:
+                        self._add_to_cache(region_key, region)
+                except Exception as e:
+                    print(f"Error in async load for {region_key}: {e}")
+                finally:
+                    if region_key in self.region_loading:
+                        del self.region_loading[region_key]
+            
+            future.add_done_callback(cache_when_done)
+        else:
+            # Synchronous load
+            region = self._load_region_sync(region_key)
+            if region_key not in self.region_marked_for_discard:
+                self._add_to_cache(region_key, region)
     
     def _add_to_cache(self, region_key, region):
         """
-        将区域添加到缓存，使用LRU机制管理内存
-        当缓存满时，自动释放最久未使用的区域
+        Add region to cache with discard-first strategy
+        When cache is full, first remove marked regions, then use FIFO as fallback
         """
-        # 如果区域已在缓存中，更新访问顺序
+        # Skip if marked for discard
+        if region_key in self.region_marked_for_discard:
+            return
+        
+        # If region already in cache, just update it (no need to change order)
         if region_key in self.region_cache:
-            # 移动到最近使用的位置
-            if region_key in self.region_access_order:
-                self.region_access_order.remove(region_key)
-            self.region_access_order.append(region_key)
             self.region_cache[region_key] = region
             return
         
-        # 如果缓存已满，释放最久未使用的区域
+        # If cache is full, remove regions (prefer marked ones, then FIFO)
         while len(self.region_cache) >= self.max_cache_size:
-            if len(self.region_access_order) > 0:
-                # 移除最久未使用的区域
+            # First, try to remove marked regions
+            removed = False
+            # Check all marked regions (not just in access_order)
+            for key in list(self.region_marked_for_discard):
+                if key in self.region_cache:
+                    if key in self.region_access_order:
+                        self.region_access_order.remove(key)
+                    del self.region_cache[key]
+                    removed = True
+                    break
+            
+            if not removed and len(self.region_access_order) > 0:
+                # Fallback: Remove oldest region (FIFO)
                 oldest_key = self.region_access_order.pop(0)
                 if oldest_key in self.region_cache:
                     del self.region_cache[oldest_key]
-                    # 显式释放内存
-                    import gc
-                    gc.collect()
             else:
-                # 如果访问顺序列表为空，清空缓存
+                # If no marked regions and access order is empty, clear cache
                 self.region_cache.clear()
                 break
         
-        # 添加新区域到缓存
+        # Add new region to cache
         self.region_cache[region_key] = region
         self.region_access_order.append(region_key)
     
+    def mark_region_for_discard(self, region_key):
+        """
+        Mark a region for discard (will be removed when cache is full)
+        """
+        self.region_marked_for_discard.add(region_key)
+    
+    def unmark_region_for_discard(self, region_key):
+        """
+        Unmark a region (prevent it from being discarded)
+        """
+        self.region_marked_for_discard.discard(region_key)
+    
     def _get_from_cache(self, region_key):
         """
-        从缓存中获取区域，更新LRU访问顺序
+        Get region from cache
+        Also checks if async load is complete
         """
+        # Check if async load is complete
+        if region_key in self.region_loading:
+            future = self.region_loading[region_key]
+            if future.done():
+                # Load complete, should be in cache now
+                del self.region_loading[region_key]
+            else:
+                # Still loading, wait for it
+                try:
+                    region = future.result(timeout=0.1)  # Short timeout
+                    if region_key not in self.region_marked_for_discard:
+                        self._add_to_cache(region_key, region)
+                    del self.region_loading[region_key]
+                except:
+                    # Timeout or error, return None (will trigger sync load)
+                    return None
+        
         if region_key in self.region_cache:
-            # 更新访问顺序：移动到最近使用的位置
-            if region_key in self.region_access_order:
-                self.region_access_order.remove(region_key)
-            self.region_access_order.append(region_key)
+            # Unmark if was marked for discard (now being used)
+            self.unmark_region_for_discard(region_key)
             return self.region_cache[region_key]
         return None
+    
+    def _preload_regions_ahead(self, current_idx):
+        """
+        Maintain a sliding window of preloaded regions ahead of current index
+        Keep exactly preload_ahead regions in the preload window
+        """
+        if not self.async_enabled or not hasattr(self, 'region_keys_array'):
+            return
+        
+        # Update current index
+        if current_idx == self.current_idx:
+            # Same index, no need to update window
+            return
+        
+        self.current_idx = current_idx
+        
+        # Define new preload window: [current_idx + 1, current_idx + preload_ahead]
+        new_window = set()
+        for i in range(1, self.preload_ahead + 1):
+            idx = current_idx + i
+            if idx < len(self.centroids):
+                new_window.add(idx)
+        
+        # Find indices to add (in new window but not in old window)
+        to_add = new_window - self.preload_window
+        # Find indices to remove (in old window but not in new window)
+        to_remove = self.preload_window - new_window
+        
+        # Load regions for new indices
+        for idx in to_add:
+            region_x, region_y = self.region_keys_array[idx]
+            region_key = (int(region_x), int(region_y))
+            
+            # Only preload if not in cache and not already loading
+            if region_key not in self.region_cache and region_key not in self.region_loading:
+                self._load_region_fast(region_key, async_load=True)
+        
+        # Mark regions for discard that are no longer in window
+        for idx in to_remove:
+            region_x, region_y = self.region_keys_array[idx]
+            region_key = (int(region_x), int(region_y))
+            # Only mark if not currently being used (not at current_idx)
+            if idx != current_idx:
+                self.mark_region_for_discard(region_key)
+        
+        # Update preload window
+        self.preload_window = new_window
+    
+    def cleanup(self):
+        """
+        Cleanup resources: shutdown executor and clear cache
+        """
+        if hasattr(self, 'executor') and self.executor:
+            # Wait for pending loads to complete
+            for future in list(self.region_loading.values()):
+                try:
+                    future.result(timeout=1.0)
+                except:
+                    pass
+            self.executor.shutdown(wait=True)
+            self.executor = None
+        
+        # Clear cache
+        self.region_cache.clear()
+        self.region_loading.clear()
+        self.region_marked_for_discard.clear()
+        self.region_access_order.clear()
+    
     
     def _preload_frequent_regions(self, max_regions=50):
         """
@@ -799,12 +946,15 @@ class NucleiPatchDataset(Dataset):
                     # 回退到字典查找（兼容性）
                     region_key, local_x, local_y = self.cell_to_region[idx]
                 
-                # 懒加载：从缓存中获取大区域，如果不存在则读取
+                # Get region from cache (with async load support)
                 region_image = self._get_from_cache(region_key)
                 if region_image is None:
-                    # 缓存未命中，懒加载：按需读取
-                    self._load_region_fast(region_key)
+                    # Cache miss, load synchronously (async load may not be ready)
+                    self._load_region_fast(region_key, async_load=False)
                     region_image = self._get_from_cache(region_key)
+                
+                # Maintain preload window (keeps exactly preload_ahead regions preloaded)
+                self._preload_regions_ahead(idx)
                 
                 # 从大区域中裁剪出需要的patch（使用numpy view，无需复制）
                 # 直接裁剪（返回view，不是copy，性能更好）
