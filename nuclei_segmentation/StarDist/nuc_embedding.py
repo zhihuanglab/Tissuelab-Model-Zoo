@@ -56,6 +56,7 @@ class NucleiPatchDataset(Dataset):
         self.z_layer = z_layer  # Specific Z layer for segmentation, None means use all layers for embedding
         self.padding_ratio = padding_ratio  # Padding as fraction of bounding box size (e.g., 0.2 = 20%)
         self.skip_cpu_resize = False  # 如果使用GPU预处理，跳过CPU resize以提升性能
+        self.use_gpu_region_crop = False  # 是否在GPU上进行region裁剪优化（减少CPU->GPU传输量）
         
         # Performance profiling for detailed analysis
         self.perf_stats = {
@@ -1069,6 +1070,19 @@ class NucleiPatchDataset(Dataset):
                     self._load_region_fast(region_key, async_load=False)
                     region_image = self._get_from_cache(region_key)
                 
+                # OPTIMIZATION: 如果启用GPU region crop，返回region信息而不是单个patch
+                # 这样可以减少CPU->GPU传输量：一次传输大Tile到GPU，然后在GPU上裁剪多个patch
+                if self.use_gpu_region_crop:
+                    # 返回region信息和裁剪坐标，让GPU在collate函数中批量处理
+                    return {
+                        'type': 'region',
+                        'region_image': region_image,  # 整个region图像
+                        'region_key': region_key,
+                        'local_x': local_x,
+                        'local_y': local_y,
+                        'extraction_size': self.extraction_size
+                    }
+                
                 # 从大区域中裁剪出需要的patch（使用numpy view，无需复制）
                 # 直接裁剪（返回view，不是copy，性能更好）
                 # region_image已经是region_size x region_size，local_x/y已经在规划时确保在范围内
@@ -1931,6 +1945,124 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
     
     return normalized_batch
 
+def _preprocess_clip_gpu_with_region_crop(region_images, crop_coords_list, device, target_size=224, extraction_size=None, perf_stats=None):
+    """
+    GPU-accelerated preprocessing with region-level batching:
+    将大Tile传输到GPU，然后在GPU上批量crop多个patch，大幅减少CPU->GPU传输量
+    
+    Args:
+        region_images: List of region images (large tiles, e.g., 2048x2048) - numpy arrays (H, W, C)
+        crop_coords_list: List of crop coordinate lists for each region
+                         Each element is a list of (local_x, local_y, extraction_size) tuples
+        device: torch device to use
+        target_size: Target size for resize and crop (default: 224)
+        extraction_size: Size of extraction patches (if None, will be inferred from crop_coords)
+        perf_stats: Optional dict to track preprocessing timing
+        
+    Returns:
+        torch.Tensor of shape (N, C, H, W) with normalized float32 values
+        where N is the total number of patches across all regions
+    """
+    if len(region_images) == 0:
+        return torch.zeros((0, 3, target_size, target_size), device=device, dtype=torch.float32)
+    
+    preprocess_start = time.time()
+    
+    all_patches = []
+    
+    # Process each region
+    for region_img, crop_coords in zip(region_images, crop_coords_list):
+        if len(crop_coords) == 0:
+            continue
+        
+        # Skip None region images
+        if region_img is None:
+            # 为这个region的所有patches创建空patch
+            for _ in crop_coords:
+                empty_patch = torch.zeros((3, target_size, target_size), dtype=torch.float32, device=device)
+                all_patches.append(empty_patch)
+            continue
+        
+        # Ensure region_img is numpy array with correct format
+        if isinstance(region_img, np.ndarray):
+            arr = region_img.astype(np.uint8) if region_img.dtype != np.uint8 else region_img
+            if len(arr.shape) == 2:
+                arr = np.repeat(arr[:, :, np.newaxis], 3, axis=2)
+            elif arr.shape[2] == 1:
+                arr = np.repeat(arr, 3, axis=2)
+            elif arr.shape[2] > 3:
+                arr = arr[:, :, :3]
+        else:
+            raise ValueError(f"Unsupported image type: {type(region_img)}")
+        
+        # Convert entire region to GPU tensor: (H, W, C) -> (1, C, H, W)
+        # 关键优化：一次性传输整个region到GPU，而不是逐个传输patch
+        region_tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().to(device, non_blocking=True)
+        
+        # Extract patches on GPU using indexing (much faster than CPU crop + transfer)
+        # 在GPU上批量crop：使用tensor索引操作，性能远优于CPU crop + 多次传输
+        patches_list = []
+        for local_x, local_y, ext_size in crop_coords:
+            # GPU上的crop操作（使用索引切片，非常快）
+            patch = region_tensor[:, :, local_y:local_y+ext_size, local_x:local_x+ext_size]
+            
+            # Resize to target_size on GPU
+            h, w = patch.shape[2], patch.shape[3]
+            shortest_edge = min(h, w)
+            scale = target_size / shortest_edge
+            new_h = int(np.floor(h * scale))
+            new_w = int(np.floor(w * scale))
+            
+            if new_h < target_size:
+                new_h = target_size
+            if new_w < target_size:
+                new_w = target_size
+            
+            # Resize on GPU
+            patch = torch.nn.functional.interpolate(
+                patch,
+                size=(new_h, new_w),
+                mode='bicubic',
+                align_corners=False,
+                antialias=True
+            )
+            
+            # Center crop on GPU
+            if new_h != target_size or new_w != target_size:
+                top = (new_h - target_size) // 2
+                left = (new_w - target_size) // 2
+                patch = patch[:, :, top:top+target_size, left:left+target_size]
+            
+            # Final check
+            if patch.shape[2] != target_size or patch.shape[3] != target_size:
+                patch = torch.nn.functional.interpolate(
+                    patch,
+                    size=(target_size, target_size),
+                    mode='bicubic',
+                    align_corners=False,
+                    antialias=True
+                )
+            
+            patches_list.append(patch.squeeze(0))  # Remove batch dimension
+        
+        all_patches.extend(patches_list)
+    
+    if len(all_patches) == 0:
+        return torch.zeros((0, 3, target_size, target_size), device=device, dtype=torch.float32)
+    
+    # Stack all patches
+    batch_tensor = torch.stack(all_patches, dim=0)
+    
+    # Normalize with CLIP statistics (GPU-accelerated)
+    normalized_batch = _normalize_clip_gpu(batch_tensor, device)
+    
+    if perf_stats is not None:
+        perf_stats['gpu_preprocessing_time'] = perf_stats.get('gpu_preprocessing_time', 0) + (time.time() - preprocess_start)
+        perf_stats['gpu_region_crop_transfers'] = perf_stats.get('gpu_region_crop_transfers', 0) + len(region_images)
+        perf_stats['gpu_patch_crops'] = perf_stats.get('gpu_patch_crops', 0) + sum(len(coords) for coords in crop_coords_list)
+    
+    return normalized_batch
+
 def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return_uint8=False):
     """Ultra-fast batch preprocessing using optimized numpy operations with minimal overhead.
     
@@ -2756,6 +2888,31 @@ class NucleiEmbedding:
         use_gpu_preprocess = torch.cuda.is_available()
         # 无论使用GPU预处理还是CPU processor，都跳过dataloader中的resize
         dataset.skip_cpu_resize = True
+        
+        # GPU Region Crop优化：将大Tile传输到GPU，然后在GPU上批量crop，减少传输量
+        # 这个优化特别适合batch中有多个patches来自同一region的情况
+        # 支持通过环境变量或args参数控制（用于性能测试）
+        force_gpu_region_crop = None
+        if hasattr(self.args, 'use_gpu_region_crop'):
+            force_gpu_region_crop = self.args.use_gpu_region_crop
+        elif 'USE_GPU_REGION_CROP' in os.environ:
+            force_gpu_region_crop = os.environ['USE_GPU_REGION_CROP'].lower() in ('true', '1', 'yes')
+        
+        if force_gpu_region_crop is not None:
+            # 强制使用指定设置（用于测试）
+            dataset.use_gpu_region_crop = force_gpu_region_crop
+            if force_gpu_region_crop:
+                print("[优化] 强制启用GPU Region Crop（通过参数/环境变量）")
+            else:
+                print("[优化] 强制禁用GPU Region Crop（通过参数/环境变量）")
+        elif use_gpu_preprocess and dataset.use_region_sharing:
+            # 自动启用（默认行为）
+            dataset.use_gpu_region_crop = True
+            print("[优化] 启用GPU Region Crop：将大Tile传输到GPU，在GPU上批量crop，减少CPU->GPU传输量")
+            print("[优化] 预期效果：传输量减少约 50-90%（取决于同一region中的patch数量）")
+        else:
+            dataset.use_gpu_region_crop = False
+            
         if use_gpu_preprocess:
             print("[优化] 启用GPU预处理：跳过CPU resize，将在GPU上批量resize（更快）")
         else:
@@ -2829,10 +2986,119 @@ class NucleiEmbedding:
                 3. Normalize with CLIP statistics
                 
                 优化：批量处理所有items，而不是逐个处理，大幅提升性能
+                
+                GPU Region Crop优化：如果batch中包含region类型的数据，将同一region的patches合并，
+                一次性传输大Tile到GPU，然后在GPU上批量crop，大幅减少CPU->GPU传输量
                 """
                 if len(batch) == 0:
                     return torch.zeros((0, 3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
                 
+                # 检测是否启用了GPU region crop优化
+                use_region_crop = dataset.use_gpu_region_crop and len(batch) > 0
+                if use_region_crop:
+                    # 检查batch中是否有region类型的数据
+                    has_region_data = any(isinstance(item, dict) and item.get('type') == 'region' for item in batch if item is not None)
+                    if not has_region_data:
+                        use_region_crop = False
+                
+                if use_region_crop:
+                    # GPU Region Crop优化路径：按region分组，批量处理
+                    from collections import defaultdict
+                    region_groups = defaultdict(list)  # {region_key: [(batch_idx, local_x, local_y, extraction_size)]}
+                    regular_items = []  # 非region类型的items
+                    regular_indices = []
+                    
+                    for i, item in enumerate(batch):
+                        if item is None:
+                            continue
+                        if isinstance(item, dict) and item.get('type') == 'region':
+                            # Region类型的数据
+                            region_key = item['region_key']
+                            region_groups[region_key].append((
+                                i,
+                                item['local_x'],
+                                item['local_y'],
+                                item['extraction_size']
+                            ))
+                        else:
+                            # 常规patch数据
+                            regular_items.append(item)
+                            regular_indices.append(i)
+                    
+                    # 处理region groups：按region合并，传输到GPU，批量crop
+                    region_images = []
+                    crop_coords_list = []
+                    region_batch_indices = []  # 记录每个region对应的batch indices
+                    
+                    for region_key, coords_list in region_groups.items():
+                        # 获取第一个item的region_image（同一region的所有patches共享同一个region_image）
+                        first_item_idx = coords_list[0][0]
+                        region_item = batch[first_item_idx]
+                        region_image = region_item.get('region_image') if isinstance(region_item, dict) else None
+                        
+                        # 检查region_image是否有效
+                        if region_image is None:
+                            # 如果region_image为None，将这些items转为常规处理
+                            for idx, local_x, local_y, ext_size in coords_list:
+                                # 尝试从原始item获取patch（如果可用）
+                                if isinstance(batch[idx], dict) and 'region_image' in batch[idx]:
+                                    # 如果region_image是None，跳过这个region group
+                                    continue
+                                regular_items.append(batch[idx])
+                                regular_indices.append(idx)
+                            continue
+                        
+                        region_images.append(region_image)
+                        
+                        # 收集所有crop坐标
+                        crop_coords = [(local_x, local_y, ext_size) for _, local_x, local_y, ext_size in coords_list]
+                        crop_coords_list.append(crop_coords)
+                        region_batch_indices.append([idx for idx, _, _, _ in coords_list])
+                    
+                    # 使用GPU region crop函数批量处理
+                    if len(region_images) > 0:
+                        region_patches = _preprocess_clip_gpu_with_region_crop(
+                            region_images,
+                            crop_coords_list,
+                            self.device,
+                            target_size=dataset.patch_size,
+                            extraction_size=dataset.extraction_size,
+                            perf_stats=perf_stats
+                        )
+                    else:
+                        region_patches = torch.zeros((0, 3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
+                    
+                    # 处理常规items
+                    if len(regular_items) > 0:
+                        regular_patches = _preprocess_clip_gpu(regular_items, self.device, target_size=dataset.patch_size, perf_stats=perf_stats)
+                    else:
+                        regular_patches = torch.zeros((0, 3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
+                    
+                    # 合并结果：按照batch顺序重新排列
+                    final_batch = [None] * len(batch)
+                    region_patch_idx = 0
+                    regular_patch_idx = 0
+                    
+                    # 填充region patches
+                    for region_idx, (region_image, batch_indices) in enumerate(zip(region_images, region_batch_indices)):
+                        num_patches = len(batch_indices)
+                        for local_idx, batch_idx in enumerate(batch_indices):
+                            final_batch[batch_idx] = region_patches[region_patch_idx + local_idx]
+                        region_patch_idx += num_patches
+                    
+                    # 填充常规patches
+                    for local_idx, batch_idx in enumerate(regular_indices):
+                        final_batch[batch_idx] = regular_patches[regular_patch_idx]
+                        regular_patch_idx += 1
+                    
+                    # 处理None值
+                    for i in range(len(batch)):
+                        if final_batch[i] is None:
+                            final_batch[i] = torch.zeros((3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
+                    
+                    return torch.stack(final_batch, dim=0)
+                
+                # 原有路径：处理常规patches
                 # 过滤None值，收集有效items
                 valid_items = []
                 valid_indices = []
