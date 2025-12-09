@@ -55,8 +55,8 @@ class NucleiPatchDataset(Dataset):
         self.processor = processor
         self.z_layer = z_layer  # Specific Z layer for segmentation, None means use all layers for embedding
         self.padding_ratio = padding_ratio  # Padding as fraction of bounding box size (e.g., 0.2 = 20%)
-        self.skip_cpu_resize = False  # 如果使用GPU预处理，跳过CPU resize以提升性能
-        self.use_gpu_region_crop = False  # 是否在GPU上进行region裁剪优化（减少CPU->GPU传输量），由generate_embeddings自动设置
+        self.skip_cpu_resize = False  # If using GPU preprocessing, skip CPU resize to improve performance
+        self.use_gpu_region_crop = False  # Whether to perform region crop optimization on GPU (reduces CPU->GPU transfer), automatically set by generate_embeddings
         
         # Performance profiling for detailed analysis
         self.perf_stats = {
@@ -409,39 +409,39 @@ class NucleiPatchDataset(Dataset):
         
         self.region_plan = dict(region_plan_dict)
         
-        # 优化：按 region 重新排序 cells，使同一 region 的 cells 连续处理
-        # 这样可以提升 batch 中同一 region 的 cells 比例，更好地利用 GPU region crop 优化
+        # Optimization: Reorder cells by region so cells from the same region are processed consecutively
+        # This improves the ratio of same-region cells in batches, better utilizing GPU region crop optimization
         self._reorder_cells_by_region()
     
     def _reorder_cells_by_region(self):
         """
-        按 region 重新排序 cells，使同一 region 的 cells 连续处理
-        这样可以提升 batch 中同一 region 的 cells 比例，减少数据传输
+        Reorder cells by region so cells from the same region are processed consecutively.
+        This improves the ratio of same-region cells in batches and reduces data transfer.
         """
         if not self.region_plan or len(self.region_plan) == 0:
-            # 如果没有 region_plan，不进行重新排序，设置映射为 None
+            # If no region_plan, skip reordering and set mappings to None
             self.new_to_old_index = None
             self.old_to_new_index = None
             return
         
-        # 创建排序索引：按照 region_key 排序，同一 region 内的 cells 保持相对顺序
-        # 使用稳定的排序算法，保持同一 region 内 cells 的原始顺序
+        # Create sort indices: sort by region_key, maintain relative order of cells within the same region
+        # Use stable sort algorithm to preserve original order of cells within each region
         sort_keys = []
         for cell_idx in range(len(self.centroids)):
             region_key = (self.region_keys_array[cell_idx][0], self.region_keys_array[cell_idx][1])
-            # 使用 region_key 作为主排序键，cell_idx 作为次排序键（保持稳定性）
+            # Use region_key as primary sort key, cell_idx as secondary sort key (for stability)
             sort_keys.append((region_key, cell_idx))
         
-        # 排序：先按 region_key (x, y)，再按 cell_idx（保持稳定性）
+        # Sort: first by region_key (x, y), then by cell_idx (for stability)
         sorted_indices = sorted(range(len(sort_keys)), key=lambda i: sort_keys[i])
         
-        # 保存反向映射：从新索引到旧索引（用于恢复原始顺序）
-        # new_to_old[i] = 原始索引，即 sorted_indices[i] 是原始索引
-        # old_to_new[old_idx] = 新索引，用于查找某个原始索引对应的新位置
+        # Save reverse mapping: from new index to old index (for restoring original order)
+        # new_to_old[i] = original index, i.e., sorted_indices[i] is the original index
+        # old_to_new[old_idx] = new index, used to find the new position of an original index
         self.old_to_new_index = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted_indices)}
-        self.new_to_old_index = sorted_indices  # 新索引 -> 旧索引的映射
+        self.new_to_old_index = sorted_indices  # New index -> old index mapping
         
-        # 重新排列所有相关数据
+        # Reorder all related data
         if self.centroids is not None:
             if isinstance(self.centroids, np.ndarray):
                 self.centroids = self.centroids[sorted_indices]
@@ -454,11 +454,11 @@ class NucleiPatchDataset(Dataset):
             elif isinstance(self.contours, np.ndarray):
                 self.contours = self.contours[sorted_indices]
         
-        # 更新数组
+        # Update arrays
         self.region_keys_array = self.region_keys_array[sorted_indices]
         self.local_coords_array = self.local_coords_array[sorted_indices]
         
-        # 重新构建 region_plan 和 cell_to_region（使用新的索引）
+        # Rebuild region_plan and cell_to_region (using new indices)
         new_region_plan = defaultdict(list)
         new_cell_to_region = {}
         
@@ -473,18 +473,18 @@ class NucleiPatchDataset(Dataset):
         self.region_plan = dict(new_region_plan)
         self.cell_to_region = new_cell_to_region
         
-        # 更新 bounding_boxes（如果存在）
+        # Update bounding_boxes (if exists)
         if hasattr(self, 'bounding_boxes') and self.bounding_boxes is not None:
             if isinstance(self.bounding_boxes, list):
                 self.bounding_boxes = [self.bounding_boxes[i] for i in sorted_indices]
             elif isinstance(self.bounding_boxes, np.ndarray):
                 self.bounding_boxes = self.bounding_boxes[sorted_indices]
         
-        # 统计信息
+        # Statistics
         regions_count = len(self.region_plan)
         avg_cells_per_region = len(self.centroids) / regions_count if regions_count > 0 else 0
-        print(f"[优化] 按 region 重新排序完成: {regions_count} 个 regions, 平均每个 region {avg_cells_per_region:.1f} 个 cells")
-        print(f"[优化] 同一 region 的 cells 现在连续处理，将提升 batch 中同一 region 的 cells 比例")
+        print(f"[OPTIMIZATION] Region-based reordering completed: {regions_count} regions, average {avg_cells_per_region:.1f} cells per region")
+        print(f"[OPTIMIZATION] Cells from the same region are now processed consecutively, improving the ratio of same-region cells in batches")
     
     def _load_region_sync(self, region_key):
         """
@@ -844,18 +844,18 @@ class NucleiPatchDataset(Dataset):
     
     def _preload_frequent_regions(self, max_regions=50):
         """
-        预加载最常用的区域（包含最多细胞的区域）
-        这样可以减少DataLoader的IO等待时间
+        Preload the most frequently accessed regions (regions containing the most cells)
+        This reduces DataLoader IO wait time
         """
         if not self.region_plan or len(self.region_plan) == 0:
             return
         
-        # 按包含的细胞数量排序
+        # Sort by number of cells contained
         sorted_regions = sorted(self.region_plan.items(), key=lambda x: len(x[1]), reverse=True)
         
-        # 预加载前N个区域
+        # Preload top N regions
         preload_count = min(max_regions, len(sorted_regions))
-        print(f"[优化] 预加载前 {preload_count} 个最常用的区域...")
+        print(f"[OPTIMIZATION] Preloading top {preload_count} most frequently accessed regions...")
         
         preloaded = 0
         for region_key, cell_indices in sorted_regions[:preload_count]:
@@ -864,10 +864,10 @@ class NucleiPatchDataset(Dataset):
                     self._load_region_fast(region_key)
                     preloaded += 1
             except Exception as e:
-                # 忽略预加载错误，继续
+                # Ignore preload errors, continue
                 pass
         
-        print(f"[优化] 预加载完成: {preloaded} 个区域已加载到缓存")
+        print(f"[OPTIMIZATION] Preloading completed: {preloaded} regions loaded into cache")
 
     def _detect_zstack(self):
         """Detect if the image is a z-stack (multi-layer) image"""
@@ -1130,17 +1130,17 @@ class NucleiPatchDataset(Dataset):
         print(f"Computed {len(self.bounding_boxes)} bounding boxes from contours")
     
     def __getitem__(self, idx):
-        # 如果启用区域共享优化，从缓存的大区域中裁剪
+        # If region sharing optimization is enabled, crop from cached large regions
         if self.use_region_sharing and self.region_plan and idx < len(self.centroids):
             try:
-                # 优化：使用数组索引而不是字典查找（更快）
+                # Optimization: Use array indexing instead of dict lookup (faster)
                 if hasattr(self, 'region_keys_array') and hasattr(self, 'local_coords_array'):
-                    # 使用数组索引（O(1)，比字典查找稍快）
+                    # Use array indexing (O(1), slightly faster than dict lookup)
                     region_x, region_y = self.region_keys_array[idx]
                     local_x, local_y = self.local_coords_array[idx]
                     region_key = (int(region_x), int(region_y))
                 else:
-                    # 回退到字典查找（兼容性）
+                    # Fallback to dict lookup (for compatibility)
                     region_key, local_x, local_y = self.cell_to_region[idx]
                 
                 # Maintain preload window first (to start loading ahead of time)
@@ -1152,43 +1152,43 @@ class NucleiPatchDataset(Dataset):
                     # Cache miss, load synchronously (async load may not be ready)
                     self._load_region_fast(region_key, async_load=False)
                     region_image = self._get_from_cache(region_key)
-                    # 如果加载后仍然是None，说明加载失败，应该抛出错误或使用fallback
+                    # If still None after loading, loading failed, should raise error or use fallback
                     if region_image is None:
                         raise ValueError(f"Failed to load region {region_key} for nucleus {idx}")
                 
-                # OPTIMIZATION: 如果启用GPU region crop，返回region信息而不是单个patch
-                # 这样可以减少CPU->GPU传输量：一次传输大Tile到GPU，然后在GPU上裁剪多个patch
+                # OPTIMIZATION: If GPU region crop is enabled, return region info instead of single patch
+                # This reduces CPU->GPU transfer: transfer large tile to GPU once, then crop multiple patches on GPU
                 if self.use_gpu_region_crop:
-                    # 返回region信息和裁剪坐标，让GPU在collate函数中批量处理
+                    # Return region info and crop coordinates, let GPU batch process in collate function
                     return {
                         'type': 'region',
-                        'region_image': region_image,  # 整个region图像
+                        'region_image': region_image,  # Entire region image
                         'region_key': region_key,
                         'local_x': local_x,
                         'local_y': local_y,
                         'extraction_size': self.extraction_size
                     }
                 
-                # 从大区域中裁剪出需要的patch（使用numpy view，无需复制）
-                # 直接裁剪（返回view，不是copy，性能更好）
-                # region_image已经是region_size x region_size，local_x/y已经在规划时确保在范围内
+                # Crop required patch from large region (using numpy view, no copy needed)
+                # Direct crop (returns view, not copy, better performance)
+                # region_image is already region_size x region_size, local_x/y are guaranteed to be in range during planning
                 patch = region_image[local_y:local_y+self.extraction_size, local_x:local_x+self.extraction_size]
                 
-                # Resize到patch_size（如果extraction_size != patch_size）
-                # OPTIMIZATION: 如果启用GPU预处理，完全跳过CPU resize，让GPU批量处理（更快）
-                # GPU批量resize比CPU逐个resize快很多（并行处理整个batch）
+                # Resize to patch_size (if extraction_size != patch_size)
+                # OPTIMIZATION: If GPU preprocessing is enabled, completely skip CPU resize, let GPU batch process (faster)
+                # GPU batch resize is much faster than CPU per-image resize (parallel processing of entire batch)
                 if self.extraction_size != self.patch_size and not self.skip_cpu_resize:
-                    # 只有在没有GPU预处理时才进行CPU resize
-                    # 使用最快的resize方法：INTER_LINEAR比INTER_AREA快约2-3倍
+                    # Only perform CPU resize when GPU preprocessing is not available
+                    # Use fastest resize method: INTER_LINEAR is about 2-3x faster than INTER_AREA
                     patch = cv2.resize(patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_LINEAR)
-                # 如果skip_cpu_resize=True，patch保持原始尺寸，由GPU预处理批量resize
+                # If skip_cpu_resize=True, patch keeps original size, will be batch resized by GPU preprocessing
                 
                 return patch
             except Exception as e:
                 # Fallback to original method
                 pass
         
-        # 原始方法：直接读取单个区域
+        # Original method: Directly read single region
         if self.use_bounding_boxes:
             # Use pre-computed bounding box
             x1, y1, width, height = self.bounding_boxes[idx]
@@ -1930,7 +1930,7 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
     all_same_size = all(arr.shape[:2] == first_shape for arr in numpy_images)
     
     if all_same_size and len(numpy_images) > 1:
-        # 批量处理：一次性处理整个batch，大幅提升性能
+        # Batch processing: process entire batch at once, significantly improves performance
         # Stack all images into batch: (N, H, W, C)
         batch_array = np.stack(numpy_images, axis=0)
         
@@ -1951,7 +1951,7 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
         if new_w < target_size:
             new_w = target_size
         
-        # Batch resize: 一次性resize整个batch
+        # Batch resize: resize entire batch at once
         batch_tensor = torch.nn.functional.interpolate(
             batch_tensor,
             size=(new_h, new_w),
@@ -2034,7 +2034,7 @@ def _preprocess_clip_gpu(images, device, target_size=224, perf_stats=None):
 def _preprocess_clip_gpu_with_region_crop(region_images, crop_coords_list, device, target_size=224, extraction_size=None, perf_stats=None):
     """
     GPU-accelerated preprocessing with region-level batching:
-    将大Tile传输到GPU，然后在GPU上批量crop多个patch，大幅减少CPU->GPU传输量
+    Transfer large tiles to GPU, then batch crop multiple patches on GPU, greatly reducing CPU->GPU transfer
     
     Args:
         region_images: List of region images (large tiles, e.g., 2048x2048) - numpy arrays (H, W, C)
@@ -2063,7 +2063,7 @@ def _preprocess_clip_gpu_with_region_crop(region_images, crop_coords_list, devic
         
         # Skip None region images
         if region_img is None:
-            # 为这个region的所有patches创建空patch
+            # Create empty patches for all patches in this region
             for _ in crop_coords:
                 empty_patch = torch.zeros((3, target_size, target_size), dtype=torch.float32, device=device)
                 all_patches.append(empty_patch)
@@ -2082,34 +2082,34 @@ def _preprocess_clip_gpu_with_region_crop(region_images, crop_coords_list, devic
             raise ValueError(f"Unsupported image type: {type(region_img)}")
         
         # Convert entire region to GPU tensor: (H, W, C) -> (1, C, H, W)
-        # 关键优化：一次性传输整个region到GPU，而不是逐个传输patch
+        # Key optimization: Transfer entire region to GPU at once, instead of transferring patches one by one
         region_tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().to(device, non_blocking=True)
         
         # Get region dimensions for bounds checking
         region_h, region_w = region_tensor.shape[2], region_tensor.shape[3]
         
         # Extract patches on GPU using indexing (much faster than CPU crop + transfer)
-        # 在GPU上批量crop：使用tensor索引操作，性能远优于CPU crop + 多次传输
+        # Batch crop on GPU: use tensor indexing operations, performance far superior to CPU crop + multiple transfers
         patches_list = []
         for local_x, local_y, ext_size in crop_coords:
             # Bounds checking: ensure crop coordinates are within region bounds
-            # 确保裁剪坐标在有效范围内（正常情况下应该都在范围内，但添加检查以防万一）
+            # Ensure crop coordinates are within valid range (normally should all be in range, but add check just in case)
             local_x_clamped = max(0, min(int(local_x), region_w - 1))
             local_y_clamped = max(0, min(int(local_y), region_h - 1))
-            # 确保裁剪大小不超过region边界
+            # Ensure crop size does not exceed region boundaries
             crop_w = min(int(ext_size), region_w - local_x_clamped)
             crop_h = min(int(ext_size), region_h - local_y_clamped)
             
-            # 验证裁剪区域有效性
+            # Validate crop region validity
             if crop_w <= 0 or crop_h <= 0:
-                # 无效的裁剪区域，创建空patch（使用ext_size而不是crop_w/h，因为后续需要resize）
-                # 注意：空patch在normalize后会变成负值，这是正常的
+                # Invalid crop region, create empty patch (use ext_size instead of crop_w/h, as resize is needed later)
+                # Note: empty patch will become negative values after normalization, this is normal
                 patch = torch.zeros((1, 3, ext_size, ext_size), device=device, dtype=torch.float32)
             else:
-                # GPU上的crop操作（使用索引切片，非常快）
+                # Crop operation on GPU (using index slicing, very fast)
                 patch = region_tensor[:, :, local_y_clamped:local_y_clamped+crop_h, local_x_clamped:local_x_clamped+crop_w]
                 
-                # 如果裁剪的patch小于ext_size，需要padding（正常情况下不应该发生，但处理边界情况）
+                # If cropped patch is smaller than ext_size, need padding (shouldn't happen normally, but handle edge cases)
                 if crop_h < ext_size or crop_w < ext_size:
                     # Pad to ext_size
                     padded_patch = torch.zeros((1, 3, ext_size, ext_size), device=device, dtype=patch.dtype)
@@ -2997,33 +2997,33 @@ class NucleiEmbedding:
             padding_ratio=0.1  # 10% padding around bounding box (reduced for tighter patches)
         )
         
-        # Processor和GPU预处理都包含resize步骤，不需要在dataloader中resize
-        # 这样可以避免重复resize，提升性能
+        # Both processor and GPU preprocessing include resize step, no need to resize in dataloader
+        # This avoids duplicate resize, improving performance
         use_gpu_preprocess = torch.cuda.is_available()
-        # 无论使用GPU预处理还是CPU processor，都跳过dataloader中的resize
+        # Skip resize in dataloader regardless of using GPU preprocessing or CPU processor
         dataset.skip_cpu_resize = True
         
-        # GPU Region Crop优化：将大Tile传输到GPU，然后在GPU上批量crop，减少传输量
-        # 这个优化特别适合batch中有多个patches来自同一region的情况
-        # 自动检测GPU可用性并启用
+        # GPU Region Crop optimization: Transfer large tiles to GPU, then batch crop on GPU to reduce transfer
+        # This optimization is particularly suitable when multiple patches in a batch come from the same region
+        # Automatically detect GPU availability and enable
         if use_gpu_preprocess and dataset.use_region_sharing:
-            # 自动启用：GPU可用且启用了region sharing时，自动使用GPU region crop优化
+            # Auto-enable: When GPU is available and region sharing is enabled, automatically use GPU region crop optimization
             dataset.use_gpu_region_crop = True
-            print("[优化] 自动启用GPU Region Crop：GPU可用，将大Tile传输到GPU，在GPU上批量crop，减少CPU->GPU传输量")
-            print("[优化] 预期效果：传输量减少约 50-90%（取决于同一region中的patch数量）")
+            print("[OPTIMIZATION] Auto-enabled GPU Region Crop: GPU available, transferring large tiles to GPU and batch cropping on GPU to reduce CPU->GPU transfer")
+            print("[OPTIMIZATION] Expected effect: Transfer reduction of approximately 50-90% (depending on number of patches in the same region)")
         elif use_gpu_preprocess:
-            # GPU可用但未启用region sharing
-            # 注意：GPU region crop需要region sharing支持，所以这里禁用
+            # GPU available but region sharing not enabled
+            # Note: GPU region crop requires region sharing support, so disable here
             dataset.use_gpu_region_crop = False
-            print("[优化] GPU可用但未启用region sharing，跳过GPU Region Crop优化")
+            print("[OPTIMIZATION] GPU available but region sharing not enabled, skipping GPU Region Crop optimization")
         else:
-            # GPU不可用，使用CPU路径
+            # GPU not available, use CPU path
             dataset.use_gpu_region_crop = False
             
         if use_gpu_preprocess:
-            print("[优化] 启用GPU预处理：跳过CPU resize，将在GPU上批量resize（更快）")
+            print("[OPTIMIZATION] GPU preprocessing enabled: Skip CPU resize, will batch resize on GPU (faster)")
         else:
-            print("[优化] 使用CPU processor：跳过CPU resize，processor会自动resize")
+            print("[OPTIMIZATION] Using CPU processor: Skip CPU resize, processor will automatically resize")
         
         # Check if dataset has z-stack
         is_zstack = dataset.is_zstack and z_layer is None
@@ -3092,29 +3092,29 @@ class NucleiEmbedding:
                 2. Center crop to 224x224
                 3. Normalize with CLIP statistics
                 
-                优化：批量处理所有items，而不是逐个处理，大幅提升性能
+                Optimization: Batch process all items instead of processing one by one, significantly improving performance.
                 
-                GPU Region Crop优化：如果batch中包含region类型的数据，将同一region的patches合并，
-                一次性传输大Tile到GPU，然后在GPU上批量crop，大幅减少CPU->GPU传输量
+                GPU Region Crop optimization: If batch contains region-type data, merge patches from the same region,
+                transfer large tiles to GPU once, then batch crop on GPU, greatly reducing CPU->GPU transfer.
                 """
                 if len(batch) == 0:
                     return torch.zeros((0, 3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
                 
-                # 检测是否启用了GPU region crop优化
+                # Check if GPU region crop optimization is enabled
                 use_region_crop = dataset.use_gpu_region_crop and len(batch) > 0
                 if use_region_crop:
-                    # 检查batch中是否有region类型的数据
+                    # Check if batch contains region-type data
                     has_region_data = any(isinstance(item, dict) and item.get('type') == 'region' for item in batch if item is not None)
                     if not has_region_data:
                         use_region_crop = False
                 
                 if use_region_crop:
-                    # GPU Region Crop优化路径：按region分组，批量处理
+                    # GPU Region Crop optimization path: Group by region, batch process
                     region_groups = defaultdict(list)  # {region_key: [(batch_idx, local_x, local_y, extraction_size)]}
-                    regular_items = []  # 非region类型的items
+                    regular_items = []  # Non-region type items
                     regular_indices = []
                     
-                    # 记录batch中每个item的原始索引和类型
+                    # Record original index and type of each item in batch
                     batch_item_info = []  # [(is_region, region_key, batch_idx), ...]
                     
                     for i, item in enumerate(batch):
@@ -3122,7 +3122,7 @@ class NucleiEmbedding:
                             batch_item_info.append((False, None, i))
                             continue
                         if isinstance(item, dict) and item.get('type') == 'region':
-                            # Region类型的数据
+                            # Region type data
                             region_key = item['region_key']
                             region_groups[region_key].append((
                                 i,
@@ -3132,19 +3132,19 @@ class NucleiEmbedding:
                             ))
                             batch_item_info.append((True, region_key, i))
                         else:
-                            # 常规patch数据
+                            # Regular patch data
                             regular_items.append(item)
                             regular_indices.append(i)
                             batch_item_info.append((False, None, i))
                     
-                    # 处理region groups：按region合并，传输到GPU，批量crop
-                    # 使用OrderedDict保持顺序（虽然Python 3.7+ dict已经有序，但明确使用OrderedDict更安全）
+                    # Process region groups: Merge by region, transfer to GPU, batch crop
+                    # Use OrderedDict to maintain order (though Python 3.7+ dict is ordered, explicitly using OrderedDict is safer)
                     region_images = []
                     crop_coords_list = []
-                    region_batch_indices = []  # 记录每个region对应的batch indices（保持顺序）
-                    region_key_to_output_idx = {}  # 映射：region_key -> 在region_images中的索引
+                    region_batch_indices = []  # Record batch indices for each region (maintain order)
+                    region_key_to_output_idx = {}  # Mapping: region_key -> index in region_images
                     
-                    # 按照batch中第一次出现的顺序处理regions（保持顺序）
+                    # Process regions in the order they first appear in batch (maintain order)
                     seen_regions = OrderedDict()
                     for is_region, region_key, batch_idx in batch_item_info:
                         if is_region and region_key is not None and region_key not in seen_regions:
@@ -3152,27 +3152,27 @@ class NucleiEmbedding:
                     
                     for region_key in seen_regions.keys():
                         coords_list = region_groups[region_key]
-                        # CRITICAL: 按照batch中的顺序排序coords_list，确保patches顺序正确
-                        coords_list = sorted(coords_list, key=lambda x: x[0])  # 按batch_idx排序
+                        # CRITICAL: Sort coords_list by batch order to ensure patches are in correct order
+                        coords_list = sorted(coords_list, key=lambda x: x[0])  # Sort by batch_idx
                         
-                        # 获取第一个item的region_image（同一region的所有patches共享同一个region_image）
+                        # Get region_image from first item (all patches from same region share the same region_image)
                         first_item_idx = coords_list[0][0]
                         region_item = batch[first_item_idx]
                         region_image = region_item.get('region_image') if isinstance(region_item, dict) else None
                         
-                        # 检查region_image是否有效
+                        # Check if region_image is valid
                         if region_image is None:
-                            # 如果region_image为None，尝试从dataset重新加载region
+                            # If region_image is None, try to reload region from dataset
                             try:
                                 dataset._load_region_fast(region_key, async_load=False)
                                 region_image = dataset._get_from_cache(region_key)
                             except Exception:
-                                # 加载失败，region_image保持为None
+                                # Load failed, region_image remains None
                                 pass
                             
                             if region_image is None:
-                                # 如果仍然无法加载，将这些items转为常规处理（fallback到CPU路径）
-                                # 为每个patch创建空patch（与CPU路径一致）
+                                # If still cannot load, convert these items to regular processing (fallback to CPU path)
+                                # Create empty patch for each patch (consistent with CPU path)
                                 for idx, local_x, local_y, ext_size in coords_list:
                                     empty_patch = np.zeros((ext_size, ext_size, 3), dtype=np.uint8)
                                     regular_items.append(empty_patch)
@@ -3181,12 +3181,12 @@ class NucleiEmbedding:
                         
                         region_images.append(region_image)
                         
-                        # 收集所有crop坐标（按照batch顺序）
+                        # Collect all crop coordinates (in batch order)
                         crop_coords = [(local_x, local_y, ext_size) for _, local_x, local_y, ext_size in coords_list]
                         crop_coords_list.append(crop_coords)
                         region_batch_indices.append([idx for idx, _, _, _ in coords_list])
                     
-                    # 使用GPU region crop函数批量处理
+                    # Use GPU region crop function for batch processing
                     if len(region_images) > 0:
                         region_patches = _preprocess_clip_gpu_with_region_crop(
                             region_images,
@@ -3199,38 +3199,38 @@ class NucleiEmbedding:
                     else:
                         region_patches = torch.zeros((0, 3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
                     
-                    # 处理常规items
+                    # Process regular items
                     if len(regular_items) > 0:
                         regular_patches = _preprocess_clip_gpu(regular_items, self.device, target_size=dataset.patch_size, perf_stats=perf_stats)
                     else:
                         regular_patches = torch.zeros((0, 3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
                     
-                    # 合并结果：按照batch顺序重新排列
+                    # Merge results: Rearrange according to batch order
                     final_batch = [None] * len(batch)
                     region_patch_idx = 0
                     regular_patch_idx = 0
                     
-                    # 填充region patches
+                    # Fill region patches
                     for region_idx, (region_image, batch_indices) in enumerate(zip(region_images, region_batch_indices)):
                         num_patches = len(batch_indices)
                         for local_idx, batch_idx in enumerate(batch_indices):
                             final_batch[batch_idx] = region_patches[region_patch_idx + local_idx]
                         region_patch_idx += num_patches
                     
-                    # 填充常规patches
+                    # Fill regular patches
                     for local_idx, batch_idx in enumerate(regular_indices):
                         final_batch[batch_idx] = regular_patches[regular_patch_idx]
                         regular_patch_idx += 1
                     
-                    # 处理None值
+                    # Handle None values
                     for i in range(len(batch)):
                         if final_batch[i] is None:
                             final_batch[i] = torch.zeros((3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
                     
                     return torch.stack(final_batch, dim=0)
                 
-                # 原有路径：处理常规patches
-                # 过滤None值，收集有效items
+                # Original path: process regular patches
+                # Filter None values, collect valid items
                 valid_items = []
                 valid_indices = []
                 for i, item in enumerate(batch):
@@ -3249,16 +3249,16 @@ class NucleiEmbedding:
                         print(f"[DEBUG] GPU preprocessing: input image size = {item_w}x{item_h}, target_size = {dataset.patch_size}")
                         _debug_first_image_logged['value'] = True
                 
-                # 批量处理所有有效items（关键优化：一次性处理整个batch）
+                # Batch process all valid items (key optimization: process entire batch at once)
                 if len(valid_items) > 0:
                     processed_tensors = _preprocess_clip_gpu(valid_items, self.device, target_size=dataset.patch_size, perf_stats=perf_stats)
                     # processed_tensors shape: (N, C, H, W)
                 else:
                     processed_tensors = torch.zeros((0, 3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
                 
-                # 处理None值：创建空patch
+                # Handle None values: Create empty patch
                 if len(valid_indices) < len(batch):
-                    # 有None值，需要填充
+                    # Has None values, need to fill
                     final_batch = []
                     valid_idx = 0
                     for i in range(len(batch)):
@@ -3266,12 +3266,12 @@ class NucleiEmbedding:
                             final_batch.append(processed_tensors[valid_idx])
                             valid_idx += 1
                         else:
-                            # None值：创建空normalized patch
+                            # None value: Create empty normalized patch
                             empty_patch = torch.zeros((3, dataset.patch_size, dataset.patch_size), dtype=torch.float32, device=self.device)
                             final_batch.append(empty_patch)
                     return torch.stack(final_batch, dim=0)
                 else:
-                    # 没有None值，直接返回
+                    # No None values, return directly
                     return processed_tensors
             
             collate_fn = collate_with_gpu_preprocess
@@ -3550,12 +3550,12 @@ class NucleiEmbedding:
         if ds_name in parent:
             del parent[ds_name]
         
-        # 优化：如果 cells 被重新排序，先按顺序写入，最后重新排序
+        # Optimization: If cells are reordered, write sequentially first, then reorder at the end
         need_reorder = hasattr(dataset, 'new_to_old_index') and dataset.new_to_old_index is not None
         if need_reorder:
-            print("[优化] 检测到 cells 已重新排序，将先按顺序写入，最后重新排序")
-            # 先按顺序写入（按新索引顺序），最后再重新排序
-            # 这样可以获得顺序写入的性能优势
+            print("[OPTIMIZATION] Detected cell reordering: will write sequentially first, then reorder at the end")
+            # Write sequentially (in new index order) first, then reorder at the end
+            # This provides the performance benefit of sequential writes
         
         embeddings_dset = parent.create_dataset(
             ds_name,
@@ -3573,7 +3573,7 @@ class NucleiEmbedding:
         log_interval_batches = 10  # Log stats every 10 batches
         
         try:
-            current_new_idx = 0  # 当前处理的新索引位置
+            current_new_idx = 0  # Current new index position being processed
             for batch in dataloader:
                 # Measure dataloader time (time from previous batch end to current batch received)
                 dataloader_start_time = time.time()
@@ -3645,13 +3645,13 @@ class NucleiEmbedding:
                         batch_embeddings = batch_embeddings.astype(np.float16, copy=False)
                     
                     if need_reorder:
-                        # 先按顺序写入（按新索引顺序，即按处理顺序）
-                        # 这样可以获得顺序写入的性能优势
+                        # Write sequentially first (in new index order, i.e., processing order)
+                        # This provides the performance benefit of sequential writes
                         batch_size_actual = batch_embeddings.shape[0]
                         embeddings_dset[current_new_idx:current_new_idx + batch_size_actual, :] = batch_embeddings
                         current_new_idx += batch_size_actual
                     else:
-                        # 原始逻辑：直接写入
+                        # Original logic: direct write
                         current_size = embeddings_dset.shape[0]
                         new_size = current_size + batch_embeddings.shape[0]
                         embeddings_dset.resize((new_size, 768))
@@ -3710,47 +3710,47 @@ class NucleiEmbedding:
             traceback.print_exc()
             raise
         finally:
-            # 如果重新排序了，最后重新排序整个 zarr dataset
+            # If reordered, reorder the entire zarr dataset at the end
             if need_reorder:
-                print("[优化] 开始重新排序 embeddings 到原始顺序...")
+                print("[OPTIMIZATION] Starting to reorder embeddings to original order...")
                 io_start = time.time()
                 
-                # 读取整个 zarr dataset（按新索引顺序）
-                print(f"[优化] 读取 {len(dataset)} 个 embeddings...")
+                # Read the entire zarr dataset (in new index order)
+                print(f"[OPTIMIZATION] Reading {len(dataset)} embeddings...")
                 embeddings_in_new_order = embeddings_dset[:]
                 
-                # 按照原始索引顺序重新排列
+                # Reorder according to original index order
                 # new_to_old_index[new_idx] = old_idx
-                # 使用 NumPy 高级索引加速重排序
-                print("[优化] 重新排序 embeddings...")
-                # 创建 old_to_new_index 数组（从字典转换为数组）
+                # Use NumPy advanced indexing to accelerate reordering
+                print("[OPTIMIZATION] Reordering embeddings...")
+                # Create old_to_new_index array (convert from dict to array)
                 if hasattr(dataset, 'old_to_new_index') and dataset.old_to_new_index is not None:
-                    # old_to_new_index 是字典，需要转换为数组
+                    # old_to_new_index is a dict, need to convert to array
                     if isinstance(dataset.old_to_new_index, dict):
                         old_to_new_index = np.array([dataset.old_to_new_index[old_idx] for old_idx in range(len(dataset))], dtype=np.int64)
                     else:
                         old_to_new_index = np.array(dataset.old_to_new_index, dtype=np.int64)
                 else:
-                    # 从 new_to_old_index 创建 old_to_new_index 数组
+                    # Create old_to_new_index array from new_to_old_index
                     old_to_new_index = np.zeros(len(dataset), dtype=np.int64)
                     for new_idx in range(len(dataset)):
                         old_idx = dataset.new_to_old_index[new_idx]
                         old_to_new_index[old_idx] = new_idx
                 
-                # 使用高级索引：reordered_embeddings[old_idx] = embeddings_in_new_order[new_idx]
-                # 即：reordered_embeddings = embeddings_in_new_order[old_to_new_index]
+                # Use advanced indexing: reordered_embeddings[old_idx] = embeddings_in_new_order[new_idx]
+                # i.e., reordered_embeddings = embeddings_in_new_order[old_to_new_index]
                 reordered_embeddings = embeddings_in_new_order[old_to_new_index]
                 
-                # 写回 zarr dataset
-                print("[优化] 写入重新排序后的 embeddings...")
+                # Write back to zarr dataset
+                print("[OPTIMIZATION] Writing reordered embeddings...")
                 embeddings_dset[:] = reordered_embeddings
                 
-                # 清理临时数组
+                # Clean up temporary arrays
                 del embeddings_in_new_order
                 del reordered_embeddings
                 
                 perf_stats['io_time'] += time.time() - io_start
-                print(f"[优化] 已按照原始顺序重新排序并写入 {len(dataset)} 个 embeddings")
+                print(f"[OPTIMIZATION] Reordered and wrote {len(dataset)} embeddings in original order")
             
             # Cleanup
             if 'batch_embeddings' in locals():
