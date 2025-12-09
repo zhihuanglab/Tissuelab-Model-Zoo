@@ -154,7 +154,7 @@ def parse_args():
                         help='Processing method')
     parser.add_argument('--tile_size', default=1024, type=int,
                         help='Tile size for medium/large images')
-    parser.add_argument('--batch_size', default=64, type=int,
+    parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size for tiled processing')
     parser.add_argument('--overlap', default=50, type=int,
                         help='Overlap between tiles for WSI processing')
@@ -525,7 +525,7 @@ def init_node():
                     pixel_size=None,
                     processing_method='auto',
                     tile_size=1024,
-                    batch_size=64,
+                    batch_size=32,
                     overlap=50,
                     normalise=True,
                     use_otsu=True,
@@ -579,7 +579,7 @@ def read_node(data: Dict[str, Any]):
             pixel_size=None,
             processing_method="auto",
             tile_size=1024,
-            batch_size=64,
+            batch_size=32,
             overlap=50,
             normalise=True,
             use_otsu=True,
