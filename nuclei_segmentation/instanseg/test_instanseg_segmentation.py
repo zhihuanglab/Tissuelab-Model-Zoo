@@ -24,10 +24,6 @@ from instanseg.pipeline import (
     _centroids_and_areas,
     _apply_core_and_area_filters,
 )
-from instanseg.segmentation_taskNode import (
-    extract_contours_and_centroids_from_labels,
-    NucleiEmbedding,
-)
 from instanseg.utils.pytorch_utils import _to_tensor_float32, torch_fastremap
 from instanseg.utils.tiling import _remove_edge_labels
 import torch
