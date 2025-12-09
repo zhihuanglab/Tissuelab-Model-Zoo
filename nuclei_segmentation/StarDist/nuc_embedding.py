@@ -3550,16 +3550,12 @@ class NucleiEmbedding:
         if ds_name in parent:
             del parent[ds_name]
         
-        # 优化：如果 cells 被重新排序，需要按照原始顺序写入 embeddings
-        # 使用临时数组存储所有 embeddings，然后按照原始顺序写入
+        # 优化：如果 cells 被重新排序，先按顺序写入，最后重新排序
         need_reorder = hasattr(dataset, 'new_to_old_index') and dataset.new_to_old_index is not None
-        temp_embeddings = None
-        temp_embeddings_filled = None
         if need_reorder:
-            print("[优化] 检测到 cells 已重新排序，将按照原始顺序写入 embeddings")
-            # 创建临时数组存储所有 embeddings（按新索引顺序）
-            temp_embeddings = np.zeros((len(dataset), 768), dtype=np.float16)
-            temp_embeddings_filled = np.zeros(len(dataset), dtype=bool)  # 标记哪些位置已填充
+            print("[优化] 检测到 cells 已重新排序，将先按顺序写入，最后重新排序")
+            # 先按顺序写入（按新索引顺序），最后再重新排序
+            # 这样可以获得顺序写入的性能优势
         
         embeddings_dset = parent.create_dataset(
             ds_name,
@@ -3649,10 +3645,10 @@ class NucleiEmbedding:
                         batch_embeddings = batch_embeddings.astype(np.float16, copy=False)
                     
                     if need_reorder:
-                        # 如果重新排序了，先存储到临时数组（按新索引顺序）
+                        # 先按顺序写入（按新索引顺序，即按处理顺序）
+                        # 这样可以获得顺序写入的性能优势
                         batch_size_actual = batch_embeddings.shape[0]
-                        temp_embeddings[current_new_idx:current_new_idx + batch_size_actual] = batch_embeddings
-                        temp_embeddings_filled[current_new_idx:current_new_idx + batch_size_actual] = True
+                        embeddings_dset[current_new_idx:current_new_idx + batch_size_actual, :] = batch_embeddings
                         current_new_idx += batch_size_actual
                     else:
                         # 原始逻辑：直接写入
@@ -3714,32 +3710,53 @@ class NucleiEmbedding:
             traceback.print_exc()
             raise
         finally:
-            # 如果重新排序了，按照原始顺序写入 embeddings
-            if need_reorder and temp_embeddings is not None:
-                print("[优化] 按照原始顺序写入 embeddings...")
+            # 如果重新排序了，最后重新排序整个 zarr dataset
+            if need_reorder:
+                print("[优化] 开始重新排序 embeddings 到原始顺序...")
                 io_start = time.time()
-                # 按照原始索引顺序重新排列 embeddings
-                # new_to_old_index[new_idx] = old_idx，所以我们需要创建一个反向映射
-                # 创建一个数组，old_idx -> embedding
-                reordered_embeddings = np.zeros_like(temp_embeddings)
-                for new_idx in range(len(dataset)):
-                    old_idx = dataset.new_to_old_index[new_idx]
-                    reordered_embeddings[old_idx] = temp_embeddings[new_idx]
                 
-                # 写入到 zarr dataset
+                # 读取整个 zarr dataset（按新索引顺序）
+                print(f"[优化] 读取 {len(dataset)} 个 embeddings...")
+                embeddings_in_new_order = embeddings_dset[:]
+                
+                # 按照原始索引顺序重新排列
+                # new_to_old_index[new_idx] = old_idx
+                # 使用 NumPy 高级索引加速重排序
+                print("[优化] 重新排序 embeddings...")
+                # 创建 old_to_new_index 数组（从字典转换为数组）
+                if hasattr(dataset, 'old_to_new_index') and dataset.old_to_new_index is not None:
+                    # old_to_new_index 是字典，需要转换为数组
+                    if isinstance(dataset.old_to_new_index, dict):
+                        old_to_new_index = np.array([dataset.old_to_new_index[old_idx] for old_idx in range(len(dataset))], dtype=np.int64)
+                    else:
+                        old_to_new_index = np.array(dataset.old_to_new_index, dtype=np.int64)
+                else:
+                    # 从 new_to_old_index 创建 old_to_new_index 数组
+                    old_to_new_index = np.zeros(len(dataset), dtype=np.int64)
+                    for new_idx in range(len(dataset)):
+                        old_idx = dataset.new_to_old_index[new_idx]
+                        old_to_new_index[old_idx] = new_idx
+                
+                # 使用高级索引：reordered_embeddings[old_idx] = embeddings_in_new_order[new_idx]
+                # 即：reordered_embeddings = embeddings_in_new_order[old_to_new_index]
+                reordered_embeddings = embeddings_in_new_order[old_to_new_index]
+                
+                # 写回 zarr dataset
+                print("[优化] 写入重新排序后的 embeddings...")
                 embeddings_dset[:] = reordered_embeddings
+                
+                # 清理临时数组
+                del embeddings_in_new_order
+                del reordered_embeddings
+                
                 perf_stats['io_time'] += time.time() - io_start
-                print(f"[优化] 已按照原始顺序写入 {len(dataset)} 个 embeddings")
+                print(f"[优化] 已按照原始顺序重新排序并写入 {len(dataset)} 个 embeddings")
             
             # Cleanup
             if 'batch_embeddings' in locals():
                 del batch_embeddings
             if 'processed_batch' in locals():
                 del processed_batch
-            if 'temp_embeddings' in locals():
-                del temp_embeddings
-            if 'temp_embeddings_filled' in locals():
-                del temp_embeddings_filled
             torch.cuda.empty_cache()
             pbar.close()
             total_time = time.time() - total_start_time
