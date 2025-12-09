@@ -28,9 +28,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any, Tuple, Optional
 from pathlib import Path
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+# Add parent directory (nuclei_segmentation) to path so 'from instanseg.xxx' imports work
+# This mirrors how StarDist works when run from its directory
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Import InstanSeg modules (they use 'from instanseg.xxx' internally)
 from instanseg.inference_class import InstanSeg
 from instanseg.pipeline import run_wsi
 
