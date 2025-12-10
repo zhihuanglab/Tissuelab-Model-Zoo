@@ -9,6 +9,14 @@ import torch
 from torch.utils.cpp_extension import load_inline
 
 
+_CPP_FORWARD_DECL = r"""
+#include <torch/extension.h>
+#include <vector>
+
+// Forward declaration for the CUDA function
+std::vector<torch::Tensor> centroid_reduce(torch::Tensor labels, int width);
+"""
+
 _CUDA_KERNEL = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -44,7 +52,8 @@ __global__ void centroid_accumulate_kernel(
     atomicAdd(&sum_x[label], x);
 
 #if __CUDA_ARCH__ >= 700
-    atomicMin(&first_idx[label], idx);
+    // Cast to long long* for atomicMin compatibility on Linux (int64_t = long, not long long)
+    atomicMin(reinterpret_cast<long long*>(&first_idx[label]), static_cast<long long>(idx));
 #else
     int64_t old = first_idx[label];
     while (idx < old) {
@@ -83,9 +92,13 @@ std::vector<torch::Tensor> centroid_reduce(torch::Tensor labels, int width) {
         return {counts, sum_y, sum_x, first_idx};
     }
 
-    const int threads = 256;
+    // Use 512 threads for better occupancy on modern GPUs (H100/H200)
+    const int threads = 512;
     const int blocks = (numel + threads - 1) / threads;
-    centroid_accumulate_kernel<<<blocks, threads>>>(
+    
+    // Get current CUDA stream for async execution
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    centroid_accumulate_kernel<<<blocks, threads, 0, stream>>>(
         labels_contig.data_ptr<int32_t>(),
         static_cast<int64_t>(numel),
         width,
@@ -106,12 +119,19 @@ def _load_module():
     if not torch.cuda.is_available():
         return None
     try:
+        # Optimization flags for faster kernel execution
+        extra_cuda_cflags = [
+            "-O3",  # Maximum optimization
+            "--use_fast_math",  # Fast math operations
+            "-lineinfo",  # For profiling (minimal overhead)
+        ]
         return load_inline(
             name="instanseg_centroid_cuda",
-            cpp_sources="",
+            cpp_sources=_CPP_FORWARD_DECL,
             cuda_sources=_CUDA_KERNEL,
             functions=["centroid_reduce"],
             verbose=False,
+            extra_cuda_cflags=extra_cuda_cflags,
         )
     except (RuntimeError, OSError):
         # Missing toolchain (e.g., ninja) or unsupported environment.
