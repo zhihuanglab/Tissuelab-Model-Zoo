@@ -28,9 +28,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any, Tuple, Optional
 from pathlib import Path
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+# Add parent directory (nuclei_segmentation) to path so 'from instanseg.xxx' imports work
+# This mirrors how StarDist works when run from its directory
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Import InstanSeg modules (they use 'from instanseg.xxx' internally)
 from instanseg.inference_class import InstanSeg
 from instanseg.pipeline import run_wsi
 
@@ -154,7 +156,7 @@ def parse_args():
                         help='Processing method')
     parser.add_argument('--tile_size', default=1024, type=int,
                         help='Tile size for medium/large images')
-    parser.add_argument('--batch_size', default=64, type=int,
+    parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size for tiled processing')
     parser.add_argument('--overlap', default=50, type=int,
                         help='Overlap between tiles for WSI processing')
@@ -525,7 +527,7 @@ def init_node():
                     pixel_size=None,
                     processing_method='auto',
                     tile_size=1024,
-                    batch_size=64,
+                    batch_size=32,
                     overlap=50,
                     normalise=True,
                     use_otsu=True,
@@ -579,7 +581,7 @@ def read_node(data: Dict[str, Any]):
             pixel_size=None,
             processing_method="auto",
             tile_size=1024,
-            batch_size=64,
+            batch_size=32,
             overlap=50,
             normalise=True,
             use_otsu=True,
