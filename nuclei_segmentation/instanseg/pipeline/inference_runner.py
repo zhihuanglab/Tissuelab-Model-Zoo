@@ -89,8 +89,16 @@ def run_wsi(
 
     slide = model.read_slide(image_path)
     n_dim = 2 if instanseg.cells_and_nuclei else 1
-    new_stem = Path(image_path).stem + model.prediction_tag
-    file_with_zarr_extension = Path(image_path).parent / (new_stem + ".zarr")
+    
+    # Use provided zarr_path if available, otherwise generate default
+    provided_zarr_path = kwargs.pop("zarr_path", None)
+    provided_node_name = kwargs.pop("node_name", None)
+    
+    if provided_zarr_path:
+        file_with_zarr_extension = Path(provided_zarr_path)
+    else:
+        new_stem = Path(image_path).stem + model.prediction_tag
+        file_with_zarr_extension = Path(image_path).parent / (new_stem + ".zarr")
 
     if img_pixel_size is None or img_pixel_size > 1 or img_pixel_size < 0.1:
         import warnings
@@ -144,8 +152,10 @@ def run_wsi(
     }
 
     contour_fallback_stats = Counter()
+    effective_node_name = provided_node_name if provided_node_name else "SegmentationNode"
     writer = _StreamingSegmentationWriter(
         file_with_zarr_extension,
+        node_name=effective_node_name,
         enable_stardist=stardist_rays > 0,
         verbose=model.verbose,
     )
