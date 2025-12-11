@@ -395,6 +395,8 @@ def run_segmentation(args):
                 debug_tissue_mask=False,
                 min_area=getattr(args, "min_area_pixels", 50),
                 stardist_rays=getattr(args, "stardist_rays", 32),
+                zarr_path=ZARR_PATH,
+                node_name=NODE_NAME,
             )
             inference_time = time.time() - inference_start
             print(f"[SEG LOG] Streaming inference completed in {inference_time:.2f}s")
@@ -562,7 +564,7 @@ def init_node():
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
     global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS
-    NODE_NAME = data.get("node_name", "InstanSegNode")
+    NODE_NAME = data.get("zarr_group") or data.get("node_name", "SegmentationNode")
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)  # Changed from h5_path to zarr_path
 
