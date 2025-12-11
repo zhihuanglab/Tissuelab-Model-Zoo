@@ -836,21 +836,65 @@ class SlideSegmentation():
                 coord[:,1,:] += y_0
                 prob = dicts['prob']
                 
-                # Use core region approach - only keep nuclei in the core region of this tile
-                # Define the "core" region boundaries (excluding overlap areas)
-                core_x0 = x_0 + (half_overlap if ic > 0 else 0)
-                core_x1 = x_0 + self.tile_size - (half_overlap if ic < self.n_col - 1 else 0)
-                core_y0 = y_0 + (half_overlap if ir > 0 else 0)
-                core_y1 = y_0 + self.tile_size - (half_overlap if ir < self.n_row - 1 else 0)
+                # Overlap deduplication: assign cells to tiles based on centroid position in overlap regions
+                # 1. Determine overlap regions between adjacent tiles
+                # 2. Split overlap regions in half (horizontal → left/right; vertical → top/bottom)
+                # 3. Assign cells to tiles based on which half their centroid falls into
+                # 4. Remove cells that don't belong to current tile
                 
-                # Adjust for image boundaries
-                core_x1 = min(core_x1, self.dim[0])
-                core_y1 = min(core_y1, self.dim[1])
+                # Calculate tile boundaries
+                x_1 = min(x_0 + self.tile_size, self.dim[0])
+                y_1 = min(y_0 + self.tile_size, self.dim[1])
                 
-                # Keep only nuclei in core region
-                idx_keep = (points[:, 0] >= core_x0) & (points[:, 0] < core_x1) & \
-                          (points[:, 1] >= core_y0) & (points[:, 1] < core_y1)
+                # Initialize keep mask for all detected nuclei
+                idx_keep = np.ones(len(points), dtype=bool)
                 
+                # Process each nucleus to determine if it belongs to current tile
+                for idx in range(len(points)):
+                    cx, cy = points[idx, 0], points[idx, 1]  # Centroid coordinates
+                    belongs_to_current_tile = True
+                    
+                    # Check horizontal overlap (left/right boundaries)
+                    if ic > 0:  # Has left neighbor
+                        # Left overlap region: [x_0, x_0 + overlap)
+                        if x_0 <= cx < x_0 + self.overlap:
+                            # Split overlap in half: left half belongs to left tile, right half to current tile
+                            overlap_mid_x = x_0 + self.overlap / 2
+                            if cx < overlap_mid_x:
+                                # Centroid in left half → belongs to left tile, not current
+                                belongs_to_current_tile = False
+                    
+                    if ic < self.n_col - 1:  # Has right neighbor
+                        # Right overlap region: [x_1 - overlap, x_1)
+                        if x_1 - self.overlap <= cx < x_1:
+                            # Split overlap in half: left half belongs to current tile, right half to right tile
+                            overlap_mid_x = x_1 - self.overlap / 2
+                            if cx >= overlap_mid_x:
+                                # Centroid in right half → belongs to right tile, not current
+                                belongs_to_current_tile = False
+                    
+                    # Check vertical overlap (top/bottom boundaries)
+                    if ir > 0:  # Has top neighbor
+                        # Top overlap region: [y_0, y_0 + overlap)
+                        if y_0 <= cy < y_0 + self.overlap:
+                            # Split overlap in half: top half belongs to top tile, bottom half to current tile
+                            overlap_mid_y = y_0 + self.overlap / 2
+                            if cy < overlap_mid_y:
+                                # Centroid in top half → belongs to top tile, not current
+                                belongs_to_current_tile = False
+                    
+                    if ir < self.n_row - 1:  # Has bottom neighbor
+                        # Bottom overlap region: [y_1 - overlap, y_1)
+                        if y_1 - self.overlap <= cy < y_1:
+                            # Split overlap in half: top half belongs to current tile, bottom half to bottom tile
+                            overlap_mid_y = y_1 - self.overlap / 2
+                            if cy >= overlap_mid_y:
+                                # Centroid in bottom half → belongs to bottom tile, not current
+                                belongs_to_current_tile = False
+                    
+                    idx_keep[idx] = belongs_to_current_tile
+                
+                # Filter out cells that don't belong to current tile
                 points = points[idx_keep]
                 coord = coord[idx_keep, ...]
                 prob = prob[idx_keep]
@@ -875,7 +919,7 @@ class SlideSegmentation():
                 # Print time information (including reading time)
                 print(f"Block r{ir} c{ic} (x={x_0}, y={y_0}) processing time: {patch_duration:.4f}s (reading: {read_duration:.4f}s, computation: {patch_duration-read_duration:.4f}s)")
                 print(f"Start: {datetime.fromtimestamp(patch_start_time).strftime('%H:%M:%S')} - End: {datetime.fromtimestamp(patch_end_time).strftime('%H:%M:%S')}")
-                print(f"Detected {len(points)} nuclei in core region (x: {core_x0}-{core_x1}, y: {core_y0}-{core_y1})")
+                print(f"Detected {len(points)} nuclei after overlap deduplication (tile region: x: {x_0}-{x_1}, y: {y_0}-{y_1})")
 
         # Record overall end time and duration
         overall_end_time = time.time()
@@ -1261,14 +1305,164 @@ class SlideSegmentation():
                 coord[:,1,:] += y_0
                 prob = dicts['prob']
                 
+                # Overlap deduplication: assign cells to tiles based on centroid position in overlap regions
+                # 1. Determine overlap regions between adjacent tiles
+                # 2. Split overlap regions in half (horizontal → left/right; vertical → top/bottom)
+                # 3. Assign cells to tiles based on which half their centroid falls into
+                # 4. Remove cells that don't belong to current tile
+                
+                # Calculate tile boundaries
+                x_1 = min(x_0 + self.tile_size, self.dim[0])
+                y_1 = min(y_0 + self.tile_size, self.dim[1])
+                
+                # Initialize keep mask for all detected nuclei
+                idx_keep = np.ones(len(points), dtype=bool)
+                
+                # Debug: track overlap statistics (avoid double counting corner regions)
+                # Separate statistics for horizontal-only, vertical-only, and corner overlap regions
+                n_in_left_overlap_horizontal_only = 0
+                n_in_right_overlap_horizontal_only = 0
+                n_in_top_overlap_vertical_only = 0
+                n_in_bottom_overlap_vertical_only = 0
+                n_in_corner_overlap = 0  # Cells in corner overlap (both horizontal and vertical)
+                n_removed_left = 0
+                n_removed_right = 0
+                n_removed_top = 0
+                n_removed_bottom = 0
+                n_removed_corner = 0
+                
+                # Process each nucleus to determine if it belongs to current tile
+                for idx in range(len(points)):
+                    cx, cy = points.iloc[idx]['x'], points.iloc[idx]['y']  # Centroid coordinates from DataFrame
+                    belongs_to_current_tile = True
+                    
+                    # Determine which overlap regions this cell belongs to
+                    in_left_overlap = False
+                    in_right_overlap = False
+                    in_top_overlap = False
+                    in_bottom_overlap = False
+                    should_remove_left = False
+                    should_remove_right = False
+                    should_remove_top = False
+                    should_remove_bottom = False
+                    
+                    # Check horizontal overlap (left/right boundaries)
+                    if ic > 0:  # Has left neighbor
+                        # Left overlap region: [x_0, x_0 + overlap)
+                        if x_0 <= cx < x_0 + self.overlap:
+                            in_left_overlap = True
+                            # Split overlap in half: left half belongs to left tile, right half to current tile
+                            overlap_mid_x = x_0 + self.overlap / 2
+                            if cx < overlap_mid_x:
+                                # Centroid in left half → belongs to left tile, not current
+                                belongs_to_current_tile = False
+                                should_remove_left = True
+                    
+                    if ic < n_col - 1:  # Has right neighbor
+                        # Right overlap region: [x_1 - overlap, x_1)
+                        if x_1 - self.overlap <= cx < x_1:
+                            in_right_overlap = True
+                            # Split overlap in half: left half belongs to current tile, right half to right tile
+                            overlap_mid_x = x_1 - self.overlap / 2
+                            if cx >= overlap_mid_x:
+                                # Centroid in right half → belongs to right tile, not current
+                                belongs_to_current_tile = False
+                                should_remove_right = True
+                    
+                    # Check vertical overlap (top/bottom boundaries)
+                    if ir > 0:  # Has top neighbor
+                        # Top overlap region: [y_0, y_0 + overlap)
+                        if y_0 <= cy < y_0 + self.overlap:
+                            in_top_overlap = True
+                            # Split overlap in half: top half belongs to top tile, bottom half to current tile
+                            overlap_mid_y = y_0 + self.overlap / 2
+                            if cy < overlap_mid_y:
+                                # Centroid in top half → belongs to top tile, not current
+                                belongs_to_current_tile = False
+                                should_remove_top = True
+                    
+                    if ir < n_row - 1:  # Has bottom neighbor
+                        # Bottom overlap region: [y_1 - overlap, y_1)
+                        if y_1 - self.overlap <= cy < y_1:
+                            in_bottom_overlap = True
+                            # Split overlap in half: top half belongs to current tile, bottom half to bottom tile
+                            overlap_mid_y = y_1 - self.overlap / 2
+                            if cy >= overlap_mid_y:
+                                # Centroid in bottom half → belongs to bottom tile, not current
+                                belongs_to_current_tile = False
+                                should_remove_bottom = True
+                    
+                    # Classify overlap region to avoid double counting
+                    # Corner overlap: both horizontal and vertical overlap
+                    in_corner = (in_left_overlap or in_right_overlap) and (in_top_overlap or in_bottom_overlap)
+                    
+                    if in_corner:
+                        # Corner region: count only once to avoid double counting
+                        n_in_corner_overlap += 1
+                        if not belongs_to_current_tile:
+                            n_removed_corner += 1
+                    else:
+                        # Non-corner regions: count separately
+                        # Horizontal-only overlap (not in vertical overlap)
+                        if in_left_overlap:
+                            n_in_left_overlap_horizontal_only += 1
+                            if should_remove_left:
+                                n_removed_left += 1
+                        if in_right_overlap:
+                            n_in_right_overlap_horizontal_only += 1
+                            if should_remove_right:
+                                n_removed_right += 1
+                        # Vertical-only overlap (not in horizontal overlap)
+                        if in_top_overlap:
+                            n_in_top_overlap_vertical_only += 1
+                            if should_remove_top:
+                                n_removed_top += 1
+                        if in_bottom_overlap:
+                            n_in_bottom_overlap_vertical_only += 1
+                            if should_remove_bottom:
+                                n_removed_bottom += 1
+                    
+                    idx_keep[idx] = belongs_to_current_tile
+                
+                # Filter out cells that don't belong to current tile
+                n_before_overlap = len(points)
+                points = points[idx_keep].reset_index(drop=True)
+                coord = coord[idx_keep, ...]
+                prob = prob[idx_keep]
+                n_after_overlap = len(points)
+                n_removed_overlap = n_before_overlap - n_after_overlap
+                
                 # Calculate tile processing time
                 patch_end_time = time.time()
                 patch_duration = patch_end_time - patch_start_time
                 compute_duration = patch_duration - read_duration
                 
-                # Log tile results
+                # Log tile results with detailed overlap deduplication info (avoiding double counting)
                 if len(points) > 0:
-                    print(f"Tile r{ir}c{ic}: {len(points)} nuclei ({patch_duration:.2f}s)")
+                    overlap_info = []
+                    # Horizontal-only overlap (excluding corners)
+                    if n_in_left_overlap_horizontal_only > 0 or n_removed_left > 0:
+                        overlap_info.append(f"left_horizontal: {n_in_left_overlap_horizontal_only} cells ({n_removed_left} removed)")
+                    if n_in_right_overlap_horizontal_only > 0 or n_removed_right > 0:
+                        overlap_info.append(f"right_horizontal: {n_in_right_overlap_horizontal_only} cells ({n_removed_right} removed)")
+                    # Vertical-only overlap (excluding corners)
+                    if n_in_top_overlap_vertical_only > 0 or n_removed_top > 0:
+                        overlap_info.append(f"top_vertical: {n_in_top_overlap_vertical_only} cells ({n_removed_top} removed)")
+                    if n_in_bottom_overlap_vertical_only > 0 or n_removed_bottom > 0:
+                        overlap_info.append(f"bottom_vertical: {n_in_bottom_overlap_vertical_only} cells ({n_removed_bottom} removed)")
+                    # Corner overlap (counted separately to avoid double counting)
+                    if n_in_corner_overlap > 0 or n_removed_corner > 0:
+                        overlap_info.append(f"corner: {n_in_corner_overlap} cells ({n_removed_corner} removed)")
+                    
+                    if n_removed_overlap > 0:
+                        overlap_str = ", ".join(overlap_info) if overlap_info else "overlap regions"
+                        print(f"Tile r{ir}c{ic}: {len(points)} nuclei after overlap dedup (removed {n_removed_overlap} total, {overlap_str}) ({patch_duration:.2f}s)")
+                    elif overlap_info:
+                        # Show overlap info even if no cells were removed (for debugging)
+                        overlap_str = ", ".join(overlap_info)
+                        print(f"Tile r{ir}c{ic}: {len(points)} nuclei (overlap regions detected: {overlap_str}, but no cells removed) ({patch_duration:.2f}s)")
+                    else:
+                        print(f"Tile r{ir}c{ic}: {len(points)} nuclei ({patch_duration:.2f}s)")
                 
                 # Note here: correctly accumulate results from all tiles instead of overwriting
                 if points_all is None:
