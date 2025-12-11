@@ -57,6 +57,7 @@ cover/
 
 *.h5
 *.h5ad
+*.pt
 
 # Translations
 *.mo
