@@ -376,9 +376,12 @@ def run_segmentation(args):
             if MODEL is None:
                 raise ValueError("InstanSeg model not initialized. Call /init first.")
 
-            update_progress(5, "initialization")
-
             inference_start = time.time()
+            
+            # Progress callback: pass 0-100, update_progress scales to 0-50
+            def seg_progress_callback(pct):
+                update_progress(pct, "segmentation")
+            
             run_wsi(
                 model=MODEL,
                 image=args.slidepath,
@@ -397,10 +400,10 @@ def run_segmentation(args):
                 stardist_rays=getattr(args, "stardist_rays", 32),
                 zarr_path=ZARR_PATH,
                 node_name=NODE_NAME,
+                progress_callback=seg_progress_callback,
             )
             inference_time = time.time() - inference_start
             print(f"[SEG LOG] Streaming inference completed in {inference_time:.2f}s")
-            update_progress(65, "streaming_complete")
 
             centroids, contours, probability = _read_streamed_vectors_from_zarr(ZARR_PATH, NODE_NAME)
             if centroids is None or centroids.size == 0:
@@ -419,8 +422,6 @@ def run_segmentation(args):
             end_time = time.time()
             print(f"Time taken: {end_time - start_time:.2f}s")
             return result
-        else:
-            update_progress(75, "core_data_saved")
 
         # ------------------------------------------------------------------
         # Step D: generate / reuse embeddings (aligned with StarDist node)
@@ -451,7 +452,6 @@ def run_segmentation(args):
                         print(f"[EMBED LOG] Warning: Could not load contours for embedding: {e}")
 
                 embedding_start = time.time()
-                update_progress(76, "generating_embeddings")
 
                 # Use StarDist's PLIP-based embedding generator
                 # Note: centroids are already in slide-space coordinates (from streaming pipeline)
@@ -459,7 +459,7 @@ def run_segmentation(args):
                     args,
                     centroids=centroids,
                     contours=contours_for_embedding,
-                    progress_callback=lambda x: update_progress(76 + int(x * 0.16), "embedding")
+                    progress_callback=lambda x: update_progress(x, "embedding")
                 )
                 ne.generate_embeddings(
                     zarr_path=ZARR_PATH,
@@ -468,15 +468,12 @@ def run_segmentation(args):
 
                 embedding_time = time.time() - embedding_start
                 print(f"[SEG LOG] Generated PLIP embeddings in {embedding_time:.2f}s")
-
-                update_progress(92, "embeddings_saved")
             else:
                 print("[EMBED LOG] Reusing cached embeddings from Zarr.")
 
         # ------------------------------------------------------------------
         # Step E: verification and final progress update
         # ------------------------------------------------------------------
-        update_progress(94, "verifying_data")
         try:
             zf = zarr.open_group(ZARR_PATH, mode='r')
             if NODE_NAME in zf:
@@ -495,7 +492,7 @@ def run_segmentation(args):
             print(f"[ZARR VERIFY] Verification skipped due to error: {e}")
 
         progress_complete = True
-        update_progress(100, "segmentation")
+        update_progress(100, "embedding")
 
         end_time = time.time()
         print(f"Time taken: {end_time - start_time:.2f}s")
@@ -710,10 +707,21 @@ def execute_node():
 
 def update_progress(value, phase="segmentation"):
     """
-    Update progress value (0-100)
+    Update progress with phase-specific scaling (matching StarDist pattern)
+    - segmentation: 0-50
+    - embedding: 50-100
     """
     global progress_value
-    progress_value = int(value)
+    
+    if phase == "segmentation":
+        # Scale segmentation progress from 0-100 to 0-50
+        progress_value = int(value * 0.5)
+    elif phase == "embedding":
+        # Scale embedding progress from 0-100 to 50-100
+        progress_value = 50 + int(value * 0.5)
+    else:
+        # Default behavior - use raw value
+        progress_value = int(value)
     # print(f"Global progress updated: {progress_value}% (phase: {phase})")
 
 
