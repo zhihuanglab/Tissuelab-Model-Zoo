@@ -139,6 +139,7 @@ def run_wsi(
 
     min_area = kwargs.pop("min_area", 50)
     stardist_rays = kwargs.pop("stardist_rays", 32)
+    progress_callback = kwargs.pop("progress_callback", None)
 
     perf_stats = {
         "total_time": 0.0,
@@ -345,6 +346,11 @@ def run_wsi(
         pending_start_time = batch_start_time
         read_future = next_read
         convert_future = next_convert
+
+        # Report progress after each batch (0-100 scale for the segmentation phase)
+        if progress_callback is not None:
+            progress_pct = int(((batch_idx + 1) / num_batches) * 100)
+            progress_callback(progress_pct)
 
     if pending_results is not None:
         process_inferred_batch(
