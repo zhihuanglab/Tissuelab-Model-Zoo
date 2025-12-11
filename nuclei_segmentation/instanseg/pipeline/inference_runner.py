@@ -487,7 +487,7 @@ def process_inferred_batch(
                 label_tile = _remove_edge_labels(label_tile, ignore=ignore_list)
 
                 if isinstance(label_tile, torch.Tensor):
-                    label_tile = label_tile.to(inference_device)
+                    label_tile = label_tile.to(device=inference_device, dtype=torch.int32)
                 else:
                     label_tile = torch.tensor(label_tile, device=inference_device, dtype=torch.int32)
 
@@ -569,15 +569,6 @@ def process_inferred_batch(
                         coords_gpu[:, :, 1] += window_i
                         torch.cuda.synchronize(device=label_tile.device)
                         contour_time_batch += time.time() - contour_block_start
-                        if verbose and batch_idx < 2:
-                            zero_mask = (dists_gpu < 1e-3).all(dim=1)
-                            mean_radius_gpu = dists_gpu.mean().item()
-                            frac_zero = zero_mask.float().mean().item() * 100.0
-                            print(
-                                f"    [DEBUG] GPU contours (batch {batch_idx}, labels={len(label_ids_kernel)}): "
-                                f"mean_radius={mean_radius_gpu:.2f}px, "
-                                f"degenerate={frac_zero:.2f}%"
-                            )
                         coords_gpu_np = coords_gpu.detach().cpu().numpy()
                         centroids_accum.append(global_centroids.clone())
                         areas_accum.append(areas_tile.to(torch.float32))
