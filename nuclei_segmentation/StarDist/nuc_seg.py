@@ -1237,6 +1237,10 @@ class SlideSegmentation():
                 else:
                     et = time.time()
                     normalize_template = self.normalize_template
+                    # Use original values when no resize
+                    tile_size = self.tile_size
+                    overlap = self.overlap
+                    dim = self.dim
 
                 img_np = np.array(img)
                 if len(img_np.shape) == 3:
@@ -1311,9 +1315,9 @@ class SlideSegmentation():
                 # 3. Assign cells to tiles based on which half their centroid falls into
                 # 4. Remove cells that don't belong to current tile
                 
-                # Calculate tile boundaries
-                x_1 = min(x_0 + self.tile_size, self.dim[0])
-                y_1 = min(y_0 + self.tile_size, self.dim[1])
+                # Calculate tile boundaries using correct tile_size and dim (accounting for resize_factor)
+                x_1 = min(x_0 + tile_size, dim[0])
+                y_1 = min(y_0 + tile_size, dim[1])
                 
                 # Initialize keep mask for all detected nuclei
                 idx_keep = np.ones(len(points), dtype=bool)
@@ -1347,12 +1351,13 @@ class SlideSegmentation():
                     should_remove_bottom = False
                     
                     # Check horizontal overlap (left/right boundaries)
+                    # Use local variable 'overlap' which accounts for resize_factor if applicable
                     if ic > 0:  # Has left neighbor
                         # Left overlap region: [x_0, x_0 + overlap)
-                        if x_0 <= cx < x_0 + self.overlap:
+                        if x_0 <= cx < x_0 + overlap:
                             in_left_overlap = True
                             # Split overlap in half: left half belongs to left tile, right half to current tile
-                            overlap_mid_x = x_0 + self.overlap / 2
+                            overlap_mid_x = x_0 + overlap / 2
                             if cx < overlap_mid_x:
                                 # Centroid in left half → belongs to left tile, not current
                                 belongs_to_current_tile = False
@@ -1360,10 +1365,10 @@ class SlideSegmentation():
                     
                     if ic < n_col - 1:  # Has right neighbor
                         # Right overlap region: [x_1 - overlap, x_1)
-                        if x_1 - self.overlap <= cx < x_1:
+                        if x_1 - overlap <= cx < x_1:
                             in_right_overlap = True
                             # Split overlap in half: left half belongs to current tile, right half to right tile
-                            overlap_mid_x = x_1 - self.overlap / 2
+                            overlap_mid_x = x_1 - overlap / 2
                             if cx >= overlap_mid_x:
                                 # Centroid in right half → belongs to right tile, not current
                                 belongs_to_current_tile = False
@@ -1372,10 +1377,10 @@ class SlideSegmentation():
                     # Check vertical overlap (top/bottom boundaries)
                     if ir > 0:  # Has top neighbor
                         # Top overlap region: [y_0, y_0 + overlap)
-                        if y_0 <= cy < y_0 + self.overlap:
+                        if y_0 <= cy < y_0 + overlap:
                             in_top_overlap = True
                             # Split overlap in half: top half belongs to top tile, bottom half to current tile
-                            overlap_mid_y = y_0 + self.overlap / 2
+                            overlap_mid_y = y_0 + overlap / 2
                             if cy < overlap_mid_y:
                                 # Centroid in top half → belongs to top tile, not current
                                 belongs_to_current_tile = False
@@ -1383,10 +1388,10 @@ class SlideSegmentation():
                     
                     if ir < n_row - 1:  # Has bottom neighbor
                         # Bottom overlap region: [y_1 - overlap, y_1)
-                        if y_1 - self.overlap <= cy < y_1:
+                        if y_1 - overlap <= cy < y_1:
                             in_bottom_overlap = True
                             # Split overlap in half: top half belongs to current tile, bottom half to bottom tile
-                            overlap_mid_y = y_1 - self.overlap / 2
+                            overlap_mid_y = y_1 - overlap / 2
                             if cy >= overlap_mid_y:
                                 # Centroid in bottom half → belongs to bottom tile, not current
                                 belongs_to_current_tile = False
