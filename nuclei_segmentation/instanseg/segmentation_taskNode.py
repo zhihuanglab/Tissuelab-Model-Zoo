@@ -36,13 +36,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from instanseg.inference_class import InstanSeg
 from instanseg.pipeline import run_wsi
 
-# Add StarDist to path for PLIP embedding imports
-stardist_path = Path(__file__).parent.parent / "StarDist"
-if str(stardist_path) not in sys.path:
-    sys.path.insert(0, str(stardist_path))
-
 # Import StarDist's PLIP-based embedding generator
-from nuc_embedding import NucleiEmbedding as StarDistNucleiEmbedding
+from nuc_embedding import NucleiEmbedding
 
 app = FastAPI()
 
@@ -455,7 +450,7 @@ def run_segmentation(args):
 
                 # Use StarDist's PLIP-based embedding generator
                 # Note: centroids are already in slide-space coordinates (from streaming pipeline)
-                ne = StarDistNucleiEmbedding(
+                ne = NucleiEmbedding(
                     args,
                     centroids=centroids,
                     contours=contours_for_embedding,
