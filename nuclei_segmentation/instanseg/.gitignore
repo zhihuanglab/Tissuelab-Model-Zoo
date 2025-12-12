@@ -1,0 +1,5 @@
+# Local/generated artifacts for InstanSeg
+/transformer_cache/
+/thumbnails_output/
+/result/
+/checkpoints/
