@@ -66,8 +66,8 @@ def run_wsi(
     normalise: bool = True,
     normalisation_subsampling_factor: int = 1,
     tile_size: int = 1024,
-    overlap: int = 50,
-    detection_size: int = 20,
+    overlap: int = 80,
+    detection_size: int = 10,
     save_geojson: bool = False,
     use_otsu_threshold: bool = False,
     batch_size: Optional[int] = None,
@@ -137,7 +137,7 @@ def run_wsi(
     num_rows = plan.num_rows
     num_cols = plan.num_cols
 
-    min_area = kwargs.pop("min_area", 50)
+    min_area = kwargs.pop("min_area", 10)
     stardist_rays = kwargs.pop("stardist_rays", 32)
     progress_callback = kwargs.pop("progress_callback", None)
 
@@ -573,7 +573,7 @@ def process_inferred_batch(
                         centroids_accum.append(global_centroids.clone())
                         areas_accum.append(areas_tile.to(torch.float32))
                         for obj_coords in coords_gpu_np:
-                            contours_accum.append(obj_coords.astype(np.int32))
+                            contours_accum.append(np.round(obj_coords).astype(np.int32))
                         stardist_accum.append(coords_gpu_np.astype(np.float32))
                         continue
                     except Exception as exc:  # pragma: no cover - GPU optional
