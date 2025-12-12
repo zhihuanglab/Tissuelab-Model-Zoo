@@ -83,17 +83,40 @@ class InstanSeg():
         if self.prefered_image_reader == "tiffslide":
 
             from tiffslide import TiffSlide
+            from tissuelab_sdk.wrapper import TiffFileWrapper
             image_array = None
             img_pixel_size = None
+            slide = None
 
             try:
                 slide = TiffSlide(image_str)
-            except Exception:
-                slide = None
-
-            if slide is not None:
+                # Test that we can access properties (some NDPI files fail here)
                 img_pixel_size = slide.properties['tiffslide.mpp-x']
                 width, height = slide.dimensions[0], slide.dimensions[1]
+            except Exception as e:
+                print(f"TiffSlide failed for {image_str}: {e}")
+                print("Falling back to TiffFileWrapper...")
+                slide = None
+
+            # Fallback to TiffFileWrapper for formats TiffSlide can't handle (e.g., z-stack NDPI)
+            if slide is None:
+                try:
+                    slide = TiffFileWrapper(image_str)
+                    width, height = slide.dimensions[0], slide.dimensions[1]
+                    print(f"TiffFileWrapper fallback successful: {width}x{height}")
+                    
+                    # Get MPP from properties (computed from TIFF resolution tags)
+                    img_pixel_size = slide.properties.get('tiffslide.mpp-x', None)
+                    if img_pixel_size is not None:
+                        print(f"MPP from TiffFileWrapper: {img_pixel_size:.4f} µm/px")
+                    else:
+                        img_pixel_size = 0.25  # Default fallback
+                        print(f"Using default MPP: {img_pixel_size} µm/px")
+                except Exception as e2:
+                    print(f"TiffFileWrapper fallback also failed: {e2}")
+                    slide = None
+
+            if slide is not None:
                 num_pixels = width * height
 
                 eval_function_str = self._get_eval_function_to_use(num_pixels, processing_method)
@@ -104,7 +127,7 @@ class InstanSeg():
                     return image_str, img_pixel_size
             else:
                 if processing_method == "wsi":
-                    raise AssertionError("Processing method 'wsi' requires a whole-slide compatible reader.")
+                    raise AssertionError("Processing method 'wsi' requires a whole-slide compatible reader (TiffSlide and TiffFileWrapper both failed).")
                 try:
                     from skimage.io import imread
                     image_array = imread(image_str)
@@ -234,7 +257,26 @@ class InstanSeg():
         :param image_str: The path to the image.
         """
         if self.prefered_image_reader == "tiffslide":
-            slide = TiffSlide(image_str)
+            from tissuelab_sdk.wrapper import TiffFileWrapper
+            slide = None
+            
+            # Try TiffSlide first (faster for most formats)
+            try:
+                slide = TiffSlide(image_str)
+                # Test that we can access properties (some NDPI files fail here)
+                _ = slide.properties
+            except Exception as e:
+                print(f"TiffSlide failed for {image_str}: {e}")
+                print("Falling back to TiffFileWrapper...")
+                slide = None
+            
+            # Fallback to TiffFileWrapper for formats TiffSlide can't handle
+            if slide is None:
+                try:
+                    slide = TiffFileWrapper(image_str)
+                    print(f"TiffFileWrapper fallback successful for: {image_str}")
+                except Exception as e2:
+                    raise RuntimeError(f"Both TiffSlide and TiffFileWrapper failed for {image_str}: {e2}")
         # elif self.prefered_image_reader == "AICSImageIO":
         #     from aicsimageio import AICSImage
         #     slide = AICSImage(image_str)
