@@ -490,9 +490,207 @@ class SlideSegmentation():
             
             if tile_x1 < bbox_x or tile_x0 > bbox_x1 or tile_y1 < bbox_y or tile_y0 > bbox_y1:
                 return False
-            
+        
         return True
     
+    def filter_nuclei_by_overlap_rule(self, points, coord, prob, ir, ic, x_0, y_0, x_1, y_1, 
+                                       n_row, n_col, overlap, tile_size, dim):
+        """
+        Fully vectorized 4-quadrant tile overlap deduplication
+        
+        Parameters:
+            points: numpy array, shape (n, 2), each row is (x, y) centroid (converted to global coordinate system)
+            coord: numpy array, shape (n, 2, m), contour coordinates (converted to global coordinate system)
+            prob: numpy array, shape (n,), probability values
+            ir, ic: current tile row and column indices (based on original grid)
+            x_0, y_0, x_1, y_1: current tile boundary coordinates (if resize_factor is used, these are resized coordinates)
+            n_row, n_col: tile grid row and column counts (based on original size, used to determine boundary tiles)
+            overlap: overlap size (if resize_factor is used, this is the resized value)
+            tile_size: tile size (if resize_factor is used, this is the resized value)
+            dim: image dimensions (width, height) (if resize_factor is used, this is the resized value)
+        
+        Returns:
+            filtered_points, filtered_coord, filtered_prob: filtered results (numpy arrays)
+        """
+        if len(points) == 0:
+            return points, coord, prob
+
+        # Extract x, y arrays
+        if isinstance(points, pd.DataFrame):
+            pts = points[['x', 'y']].values
+        else:
+            pts = points
+
+        x = pts[:, 0]
+        y = pts[:, 1]
+
+        half = overlap / 2
+        keep = np.ones(len(pts), dtype=bool)
+
+        # Locate overlaps (vectorized)
+        left_overlap  = (ic > 0)         & (x >= x_0)        & (x < x_0 + overlap)
+        right_overlap = (ic < n_col-1)   & (x >= x_1-overlap) & (x < x_1)
+        top_overlap    = (ir > 0)        & (y >= y_0)        & (y < y_0 + overlap)
+        bottom_overlap = (ir < n_row-1)  & (y >= y_1-overlap) & (y < y_1)
+
+        # Corner = both horizontal & vertical
+        corner = (left_overlap | right_overlap) & (top_overlap | bottom_overlap)
+
+        # Corner quadrants (vectorized)
+        # TL corner: current tile (ir, ic) is BR quadrant → keep x >= mid_x AND y >= mid_y
+        TL = corner & left_overlap & top_overlap
+        mid_x_tl = x_0 + half
+        mid_y_tl = y_0 + half
+        TL_bad = TL & ((x < mid_x_tl) | (y < mid_y_tl))
+        keep[TL_bad] = False
+
+        # BL corner: current tile (ir, ic) is TR quadrant → keep x >= mid_x AND y < mid_y
+        BL = corner & left_overlap & bottom_overlap
+        mid_x_bl = x_0 + half
+        mid_y_bl = y_1 - half
+        BL_bad = BL & ((x < mid_x_bl) | (y >= mid_y_bl))
+        keep[BL_bad] = False
+
+        # TR corner: current tile (ir, ic) is BL quadrant → keep x < mid_x AND y >= mid_y
+        TR = corner & right_overlap & top_overlap
+        mid_x_tr = x_1 - half
+        mid_y_tr = y_0 + half
+        TR_bad = TR & ((x >= mid_x_tr) | (y < mid_y_tr))
+        keep[TR_bad] = False
+
+        # BR corner: current tile (ir, ic) is TL quadrant → keep x < mid_x AND y < mid_y
+        BR = corner & right_overlap & bottom_overlap
+        mid_x_br = x_1 - half
+        mid_y_br = y_1 - half
+        BR_bad = BR & ((x >= mid_x_br) | (y >= mid_y_br))
+        keep[BR_bad] = False
+
+        # Non-corner horizontal splits
+        # Left overlap: left half belongs to left neighbor → remove x < mid
+        non_corner_left = left_overlap & ~corner
+        mid_left = x_0 + half
+        keep[non_corner_left & (x < mid_left)] = False
+
+        # Right overlap: right half belongs to right neighbor → remove x >= mid
+        non_corner_right = right_overlap & ~corner
+        mid_right = x_1 - half
+        keep[non_corner_right & (x >= mid_right)] = False
+
+        # Non-corner vertical splits
+        # Top overlap: top half belongs to top tile → remove y < mid_y
+        non_corner_top = top_overlap & ~corner
+        mid_top = y_0 + half
+        keep[non_corner_top & (y < mid_top)] = False
+
+        # Bottom overlap: bottom half belongs to bottom tile → remove y >= mid_y
+        non_corner_bottom = bottom_overlap & ~corner
+        mid_bottom = y_1 - half
+        keep[non_corner_bottom & (y >= mid_bottom)] = False
+
+        # Output
+        pts_filtered = pts[keep]
+        coord_f = coord[keep] if coord is not None else None
+        prob_f = prob[keep] if prob is not None else None
+
+        return pts_filtered, coord_f, prob_f
+    
+    def validate_overlap_complementarity(self, n_row=None, n_col=None, debug=True):
+        """
+        Validate tile-level overlap deduplication correctness.
+
+        Checks:
+            1. Global: nuclei appear in exactly one tile
+            2. Boundary dedup consistency
+        """
+        import numpy as np
+        from collections import defaultdict
+
+        if not hasattr(self, '_tile_overlap_info') or len(self._tile_overlap_info) == 0:
+            if debug:
+                print("[VALIDATOR] No tile overlap info found.")
+            return
+
+        # Parse ROI (three possible formats)
+        def inside_roi(p):
+            """Safely return whether point p=(x,y) lies inside the ROI."""
+
+            # Case 1 — ROI as bounding box
+            if hasattr(self, 'roi_bbox') and self.roi_bbox is not None:
+                bx, by, bw, bh = self.roi_bbox
+                return (bx <= p[0] < bx + bw) and (by <= p[1] < by + bh)
+
+            # Case 2 — ROI as polygon
+            if hasattr(self, 'roi_polygon') and self.roi_polygon is not None:
+                return self.point_in_polygon(p[0], p[1], self.roi_polygon)
+
+            # Case 3 — No ROI → everything considered inside
+            return True
+
+        keep_count = defaultdict(int)
+        boundary_count = defaultdict(int)
+
+        # Walk through tiles
+        for (ir, ic), info in self._tile_overlap_info.items():
+            before = info["points_before"]
+            after  = info["points_after"]
+            x0, x1 = info["x_0"], info["x_1"]
+            y0, y1 = info["y_0"], info["y_1"]
+            overlap = info["overlap"]
+
+            if before is None or len(before) == 0:
+                continue
+
+            pts_before = np.round(before).astype(int)
+            # Handle after: None, empty array, or valid array
+            if after is None or len(after) == 0:
+                pts_after = np.zeros((0, 2), dtype=int)
+            else:
+                pts_after = np.round(after).astype(int)
+            pts_after_set = {tuple(p) for p in pts_after}
+
+            # Count after-dedup nuclei
+            for p in pts_after:
+                keep_count[tuple(p)] += 1
+
+            # boundary detection (only if pts_before is not empty)
+            if len(pts_before) > 0:
+                left_zone   = (pts_before[:,0] >= x0) & (pts_before[:,0] < x0+overlap)
+                right_zone  = (pts_before[:,0] >= x1-overlap) & (pts_before[:,0] < x1)
+                top_zone    = (pts_before[:,1] >= y0) & (pts_before[:,1] < y0+overlap)
+                bottom_zone = (pts_before[:,1] >= y1-overlap) & (pts_before[:,1] < y1)
+
+                boundary_pts = pts_before[left_zone | right_zone | top_zone | bottom_zone]
+            else:
+                boundary_pts = np.zeros((0, 2), dtype=int)
+
+            for p in boundary_pts:
+                if tuple(p) in pts_after_set:
+                    boundary_count[tuple(p)] += 1
+        # Compute global violations
+        after_all = set(keep_count.keys())
+
+        duplicated = [p for p, c in keep_count.items() if c > 1]
+        boundary_duplicated = [p for p, c in boundary_count.items() if c > 1]
+
+        # PRINT SUMMARY
+        if debug:
+            print("\n================= GLOBAL DEDUP VALIDATION =================")
+            print(f"Total nuclei AFTER dedup:            {len(after_all)}")
+            print(f"Duplicated nuclei (>1 tile):         {len(duplicated)}")
+
+            print("\n================= BOUNDARY REGION VALIDATION =================")
+            print(f"Boundary nuclei tested:              {len(boundary_count)}")
+            print(f"Boundary duplicated nuclei:          {len(boundary_duplicated)}")
+
+            if len(duplicated)==0 and len(boundary_duplicated)==0:
+                print("✔ PASS — dedup and boundary consistency validated.")
+            else:
+                print("❌ FAIL — inconsistencies detected.")
+
+            print("====================================================\n")
+
+        # cleanup
+        delattr(self, '_tile_overlap_info')    
     def read_data(self):
         print("Reading data ...", datetime.now().strftime("%H:%M:%S"))
 
@@ -836,65 +1034,21 @@ class SlideSegmentation():
                 coord[:,1,:] += y_0
                 prob = dicts['prob']
                 
-                # Overlap deduplication: assign cells to tiles based on centroid position in overlap regions
-                # 1. Determine overlap regions between adjacent tiles
-                # 2. Split overlap regions in half (horizontal → left/right; vertical → top/bottom)
-                # 3. Assign cells to tiles based on which half their centroid falls into
-                # 4. Remove cells that don't belong to current tile
+                # Use core region approach - only keep nuclei in the core region of this tile
+                # Define the "core" region boundaries (excluding overlap areas)
+                core_x0 = x_0 + (half_overlap if ic > 0 else 0)
+                core_x1 = x_0 + self.tile_size - (half_overlap if ic < self.n_col - 1 else 0)
+                core_y0 = y_0 + (half_overlap if ir > 0 else 0)
+                core_y1 = y_0 + self.tile_size - (half_overlap if ir < self.n_row - 1 else 0)
                 
-                # Calculate tile boundaries
-                x_1 = min(x_0 + self.tile_size, self.dim[0])
-                y_1 = min(y_0 + self.tile_size, self.dim[1])
+                # Adjust for image boundaries
+                core_x1 = min(core_x1, self.dim[0])
+                core_y1 = min(core_y1, self.dim[1])
                 
-                # Initialize keep mask for all detected nuclei
-                idx_keep = np.ones(len(points), dtype=bool)
+                # Keep only nuclei in core region
+                idx_keep = (points[:, 0] >= core_x0) & (points[:, 0] < core_x1) & \
+                          (points[:, 1] >= core_y0) & (points[:, 1] < core_y1)
                 
-                # Process each nucleus to determine if it belongs to current tile
-                for idx in range(len(points)):
-                    cx, cy = points[idx, 0], points[idx, 1]  # Centroid coordinates
-                    belongs_to_current_tile = True
-                    
-                    # Check horizontal overlap (left/right boundaries)
-                    if ic > 0:  # Has left neighbor
-                        # Left overlap region: [x_0, x_0 + overlap)
-                        if x_0 <= cx < x_0 + self.overlap:
-                            # Split overlap in half: left half belongs to left tile, right half to current tile
-                            overlap_mid_x = x_0 + self.overlap / 2
-                            if cx < overlap_mid_x:
-                                # Centroid in left half → belongs to left tile, not current
-                                belongs_to_current_tile = False
-                    
-                    if ic < self.n_col - 1:  # Has right neighbor
-                        # Right overlap region: [x_1 - overlap, x_1)
-                        if x_1 - self.overlap <= cx < x_1:
-                            # Split overlap in half: left half belongs to current tile, right half to right tile
-                            overlap_mid_x = x_1 - self.overlap / 2
-                            if cx >= overlap_mid_x:
-                                # Centroid in right half → belongs to right tile, not current
-                                belongs_to_current_tile = False
-                    
-                    # Check vertical overlap (top/bottom boundaries)
-                    if ir > 0:  # Has top neighbor
-                        # Top overlap region: [y_0, y_0 + overlap)
-                        if y_0 <= cy < y_0 + self.overlap:
-                            # Split overlap in half: top half belongs to top tile, bottom half to current tile
-                            overlap_mid_y = y_0 + self.overlap / 2
-                            if cy < overlap_mid_y:
-                                # Centroid in top half → belongs to top tile, not current
-                                belongs_to_current_tile = False
-                    
-                    if ir < self.n_row - 1:  # Has bottom neighbor
-                        # Bottom overlap region: [y_1 - overlap, y_1)
-                        if y_1 - self.overlap <= cy < y_1:
-                            # Split overlap in half: top half belongs to current tile, bottom half to bottom tile
-                            overlap_mid_y = y_1 - self.overlap / 2
-                            if cy >= overlap_mid_y:
-                                # Centroid in bottom half → belongs to bottom tile, not current
-                                belongs_to_current_tile = False
-                    
-                    idx_keep[idx] = belongs_to_current_tile
-                
-                # Filter out cells that don't belong to current tile
                 points = points[idx_keep]
                 coord = coord[idx_keep, ...]
                 prob = prob[idx_keep]
@@ -919,7 +1073,7 @@ class SlideSegmentation():
                 # Print time information (including reading time)
                 print(f"Block r{ir} c{ic} (x={x_0}, y={y_0}) processing time: {patch_duration:.4f}s (reading: {read_duration:.4f}s, computation: {patch_duration-read_duration:.4f}s)")
                 print(f"Start: {datetime.fromtimestamp(patch_start_time).strftime('%H:%M:%S')} - End: {datetime.fromtimestamp(patch_end_time).strftime('%H:%M:%S')}")
-                print(f"Detected {len(points)} nuclei after overlap deduplication (tile region: x: {x_0}-{x_1}, y: {y_0}-{y_1})")
+                print(f"Detected {len(points)} nuclei in core region (x: {core_x0}-{core_x1}, y: {core_y0}-{core_y1})")
 
         # Record overall end time and duration
         overall_end_time = time.time()
@@ -1217,6 +1371,10 @@ class SlideSegmentation():
                 
                 # Resize to achieve target MPP if provided
                 resize_factor = None
+                current_tile_size = self.tile_size
+                current_overlap = self.overlap
+                current_dim = self.dim
+                
                 if hasattr(self, 'mpp_resize_factor') and self.mpp_resize_factor is not None:
                     resize_factor = self.mpp_resize_factor
                     img = img.resize((int(np.round(w_col*resize_factor)), int(np.round(h_row*resize_factor))))
@@ -1230,17 +1388,13 @@ class SlideSegmentation():
                     w_col = x_1 - x_0
                     h_row = y_1 - y_0
                     
-                    tile_size = self.tile_size*resize_factor
-                    overlap = self.overlap*resize_factor
-                    dim = (self.dim[0]*resize_factor, self.dim[1]*resize_factor)
+                    current_tile_size = self.tile_size*resize_factor
+                    current_overlap = self.overlap*resize_factor
+                    current_dim = (self.dim[0]*resize_factor, self.dim[1]*resize_factor)
                     normalize_template = np.array(Image.fromarray(self.normalize_template).resize(img.size))
                 else:
                     et = time.time()
                     normalize_template = self.normalize_template
-                    # Use original values when no resize
-                    tile_size = self.tile_size
-                    overlap = self.overlap
-                    dim = self.dim
 
                 img_np = np.array(img)
                 if len(img_np.shape) == 3:
@@ -1299,6 +1453,11 @@ class SlideSegmentation():
                 points = dicts['points'] # y,x
                 points[:, [1, 0]] = points[:, [0, 1]] # x,y
 
+                # StarDist outputs coordinates relative to the input image
+                # If resize_factor is used, the input image is resized, so StarDist outputs
+                # coordinates relative to the resized image. We need to add the resized x_0, y_0
+                # to get global coordinates in the resized coordinate system.
+                # Note: x_0, y_0, x_1, y_1 are already in the resized coordinate system if resize_factor is used
                 points[:,0] += x_0
                 points[:,1] += y_0
                 points = pd.DataFrame(points, index=[(ir, ic)]*len(points), columns=['x','y']).reset_index()
@@ -1309,165 +1468,57 @@ class SlideSegmentation():
                 coord[:,1,:] += y_0
                 prob = dicts['prob']
                 
-                # Overlap deduplication: assign cells to tiles based on centroid position in overlap regions
-                # 1. Determine overlap regions between adjacent tiles
-                # 2. Split overlap regions in half (horizontal → left/right; vertical → top/bottom)
-                # 3. Assign cells to tiles based on which half their centroid falls into
-                # 4. Remove cells that don't belong to current tile
+                # Apply tile-level overlap deduplication
+                # Extract numpy array from points for filtering
+                points_array = points[['x', 'y']].values if isinstance(points, pd.DataFrame) else points
                 
-                # Calculate tile boundaries using correct tile_size and dim (accounting for resize_factor)
-                x_1 = min(x_0 + tile_size, dim[0])
-                y_1 = min(y_0 + tile_size, dim[1])
+                # Print before deduplication
+                n_before_dedup = len(points_array)
                 
-                # Initialize keep mask for all detected nuclei
-                idx_keep = np.ones(len(points), dtype=bool)
+                filtered_points_array, filtered_coord, filtered_prob = self.filter_nuclei_by_overlap_rule(
+                    points_array, coord, prob, ir, ic, x_0, y_0, x_1, y_1,
+                    n_row, n_col, current_overlap, current_tile_size, current_dim
+                )
                 
-                # Debug: track overlap statistics (avoid double counting corner regions)
-                # Separate statistics for horizontal-only, vertical-only, and corner overlap regions
-                n_in_left_overlap_horizontal_only = 0
-                n_in_right_overlap_horizontal_only = 0
-                n_in_top_overlap_vertical_only = 0
-                n_in_bottom_overlap_vertical_only = 0
-                n_in_corner_overlap = 0  # Cells in corner overlap (both horizontal and vertical)
-                n_removed_left = 0
-                n_removed_right = 0
-                n_removed_top = 0
-                n_removed_bottom = 0
-                n_removed_corner = 0
+                # Print after deduplication
+                n_after_dedup = len(filtered_points_array) if len(filtered_points_array) > 0 else 0
+                n_removed = n_before_dedup - n_after_dedup
+                print(f"Tile r{ir}c{ic}: {n_before_dedup} -> {n_after_dedup} nuclei (removed {n_removed} in overlap regions)")
                 
-                # Process each nucleus to determine if it belongs to current tile
-                for idx in range(len(points)):
-                    cx, cy = points.iloc[idx]['x'], points.iloc[idx]['y']  # Centroid coordinates from DataFrame
-                    belongs_to_current_tile = True
-                    
-                    # Determine which overlap regions this cell belongs to
-                    in_left_overlap = False
-                    in_right_overlap = False
-                    in_top_overlap = False
-                    in_bottom_overlap = False
-                    should_remove_left = False
-                    should_remove_right = False
-                    should_remove_top = False
-                    should_remove_bottom = False
-                    
-                    # Check horizontal overlap (left/right boundaries)
-                    # Use local variable 'overlap' which accounts for resize_factor if applicable
-                    if ic > 0:  # Has left neighbor
-                        # Left overlap region: [x_0, x_0 + overlap)
-                        if x_0 <= cx < x_0 + overlap:
-                            in_left_overlap = True
-                            # Split overlap in half: left half belongs to left tile, right half to current tile
-                            overlap_mid_x = x_0 + overlap / 2
-                            if cx < overlap_mid_x:
-                                # Centroid in left half → belongs to left tile, not current
-                                belongs_to_current_tile = False
-                                should_remove_left = True
-                    
-                    if ic < n_col - 1:  # Has right neighbor
-                        # Right overlap region: [x_1 - overlap, x_1)
-                        if x_1 - overlap <= cx < x_1:
-                            in_right_overlap = True
-                            # Split overlap in half: left half belongs to current tile, right half to right tile
-                            overlap_mid_x = x_1 - overlap / 2
-                            if cx >= overlap_mid_x:
-                                # Centroid in right half → belongs to right tile, not current
-                                belongs_to_current_tile = False
-                                should_remove_right = True
-                    
-                    # Check vertical overlap (top/bottom boundaries)
-                    if ir > 0:  # Has top neighbor
-                        # Top overlap region: [y_0, y_0 + overlap)
-                        if y_0 <= cy < y_0 + overlap:
-                            in_top_overlap = True
-                            # Split overlap in half: top half belongs to top tile, bottom half to current tile
-                            overlap_mid_y = y_0 + overlap / 2
-                            if cy < overlap_mid_y:
-                                # Centroid in top half → belongs to top tile, not current
-                                belongs_to_current_tile = False
-                                should_remove_top = True
-                    
-                    if ir < n_row - 1:  # Has bottom neighbor
-                        # Bottom overlap region: [y_1 - overlap, y_1)
-                        if y_1 - overlap <= cy < y_1:
-                            in_bottom_overlap = True
-                            # Split overlap in half: top half belongs to current tile, bottom half to bottom tile
-                            overlap_mid_y = y_1 - overlap / 2
-                            if cy >= overlap_mid_y:
-                                # Centroid in bottom half → belongs to bottom tile, not current
-                                belongs_to_current_tile = False
-                                should_remove_bottom = True
-                    
-                    # Classify overlap region to avoid double counting
-                    # Corner overlap: both horizontal and vertical overlap
-                    in_corner = (in_left_overlap or in_right_overlap) and (in_top_overlap or in_bottom_overlap)
-                    
-                    if in_corner:
-                        # Corner region: count only once to avoid double counting
-                        n_in_corner_overlap += 1
-                        if not belongs_to_current_tile:
-                            n_removed_corner += 1
-                    else:
-                        # Non-corner regions: count separately
-                        # Horizontal-only overlap (not in vertical overlap)
-                        if in_left_overlap:
-                            n_in_left_overlap_horizontal_only += 1
-                            if should_remove_left:
-                                n_removed_left += 1
-                        if in_right_overlap:
-                            n_in_right_overlap_horizontal_only += 1
-                            if should_remove_right:
-                                n_removed_right += 1
-                        # Vertical-only overlap (not in horizontal overlap)
-                        if in_top_overlap:
-                            n_in_top_overlap_vertical_only += 1
-                            if should_remove_top:
-                                n_removed_top += 1
-                        if in_bottom_overlap:
-                            n_in_bottom_overlap_vertical_only += 1
-                            if should_remove_bottom:
-                                n_removed_bottom += 1
-                    
-                    idx_keep[idx] = belongs_to_current_tile
+                if not hasattr(self, '_tile_overlap_info'):
+                    self._tile_overlap_info = {}
                 
-                # Filter out cells that don't belong to current tile
-                n_before_overlap = len(points)
-                points = points[idx_keep].reset_index(drop=True)
-                coord = coord[idx_keep, ...]
-                prob = prob[idx_keep]
-                n_after_overlap = len(points)
-                n_removed_overlap = n_before_overlap - n_after_overlap
+                # Debug: print tile info and actual points range
+                if len(points_array) > 0:
+                    print(f"[TILE INFO] r{ir}c{ic}: x0={x_0}, x1={x_1}, y0={y_0}, y1={y_1}, half={current_overlap/2:.1f}")
+                    print(f"[TILE INFO] actual pts x range = {points_array[:,0].min():.1f} ~ {points_array[:,0].max():.1f}")
+                    print(f"[TILE INFO] actual pts y range = {points_array[:,1].min():.1f} ~ {points_array[:,1].max():.1f}")
+                
+                self._tile_overlap_info[(ir, ic)] = {
+                    'points_before': points_array.copy(),
+                    'points_after': filtered_points_array.copy() if len(filtered_points_array) > 0 else np.array([]).reshape(0, 2),
+                    'x_0': x_0, 'y_0': y_0, 'x_1': x_1, 'y_1': y_1,
+                    'overlap': current_overlap,
+                    'half_overlap': current_overlap / 2
+                }
+                if isinstance(points, pd.DataFrame) and len(filtered_points_array) > 0:
+                    filtered_points = pd.DataFrame(
+                        filtered_points_array, 
+                        columns=['x', 'y']
+                    )
+                    filtered_points = filtered_points.reset_index(drop=True)
+                elif isinstance(points, pd.DataFrame):
+                    filtered_points = pd.DataFrame(columns=['x', 'y'])
+                else:
+                    filtered_points = filtered_points_array
+                points = filtered_points
+                coord = filtered_coord
+                prob = filtered_prob
                 
                 # Calculate tile processing time
                 patch_end_time = time.time()
                 patch_duration = patch_end_time - patch_start_time
                 compute_duration = patch_duration - read_duration
-                
-                # Log tile results with detailed overlap deduplication info (avoiding double counting)
-                if len(points) > 0:
-                    overlap_info = []
-                    # Horizontal-only overlap (excluding corners)
-                    if n_in_left_overlap_horizontal_only > 0 or n_removed_left > 0:
-                        overlap_info.append(f"left_horizontal: {n_in_left_overlap_horizontal_only} cells ({n_removed_left} removed)")
-                    if n_in_right_overlap_horizontal_only > 0 or n_removed_right > 0:
-                        overlap_info.append(f"right_horizontal: {n_in_right_overlap_horizontal_only} cells ({n_removed_right} removed)")
-                    # Vertical-only overlap (excluding corners)
-                    if n_in_top_overlap_vertical_only > 0 or n_removed_top > 0:
-                        overlap_info.append(f"top_vertical: {n_in_top_overlap_vertical_only} cells ({n_removed_top} removed)")
-                    if n_in_bottom_overlap_vertical_only > 0 or n_removed_bottom > 0:
-                        overlap_info.append(f"bottom_vertical: {n_in_bottom_overlap_vertical_only} cells ({n_removed_bottom} removed)")
-                    # Corner overlap (counted separately to avoid double counting)
-                    if n_in_corner_overlap > 0 or n_removed_corner > 0:
-                        overlap_info.append(f"corner: {n_in_corner_overlap} cells ({n_removed_corner} removed)")
-                    
-                    if n_removed_overlap > 0:
-                        overlap_str = ", ".join(overlap_info) if overlap_info else "overlap regions"
-                        print(f"Tile r{ir}c{ic}: {len(points)} nuclei after overlap dedup (removed {n_removed_overlap} total, {overlap_str}) ({patch_duration:.2f}s)")
-                    elif overlap_info:
-                        # Show overlap info even if no cells were removed (for debugging)
-                        overlap_str = ", ".join(overlap_info)
-                        print(f"Tile r{ir}c{ic}: {len(points)} nuclei (overlap regions detected: {overlap_str}, but no cells removed) ({patch_duration:.2f}s)")
-                    else:
-                        print(f"Tile r{ir}c{ic}: {len(points)} nuclei ({patch_duration:.2f}s)")
                 
                 # Note here: correctly accumulate results from all tiles instead of overwriting
                 if points_all is None:
@@ -1478,6 +1529,10 @@ class SlideSegmentation():
                     points_all = pd.concat((points_all, points), axis=0, ignore_index=True)
                     coord_all = np.concatenate((coord_all, coord), axis=0)
                     prob_all = np.concatenate((prob_all, prob), axis=0)
+        
+        # Validate overlap complementarity between adjacent tiles
+        if hasattr(self, '_tile_overlap_info') and len(self._tile_overlap_info) > 0:
+            self.validate_overlap_complementarity(n_row, n_col, debug=True)
         
         # Ensure progress reaches 100% after tile processing
         if self.progress_callback:
@@ -1636,7 +1691,6 @@ class SlideSegmentation():
             print("No nuclei to process for duplicate removal")
             return 0
         
-        print("\nStarting multi-pass duplicate removal...")
         start_time = time.time()
         original_count = len(self.final_points)
         '''
@@ -1700,7 +1754,6 @@ class SlideSegmentation():
         # ========== STEP 2: MULTI-PASS GLOBAL DEDUPLICATION ==========
         total_global_removed = 0
         if len(self.final_points) > 0:
-            print("\nStep 2: Stricter Global Deduplication (Centroid Proximity, Highest Probability Wins)")
             self.final_points, self.final_coord, self.prob_all = self.remove_strict_duplicate_cells_global(
                 self.final_points,
                 self.final_coord,
@@ -1708,7 +1761,6 @@ class SlideSegmentation():
                 distance_threshold=6,  # try 6-8 pixels for histology images
                 debug=debug
             )
-        print(f"   - Final nuclei count: {len(self.final_points)}")
             
         if debug:
             print(f"   - Total global deduplication: {total_global_removed:,} cells removed")
