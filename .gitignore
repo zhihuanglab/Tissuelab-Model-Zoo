@@ -173,3 +173,5 @@ cython_debug/
 **/checkpoints/
 # Vips
 vips/
+
+tissue_segmentation/TotalSegmentator/models/
