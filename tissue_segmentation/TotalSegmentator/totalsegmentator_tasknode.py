@@ -456,9 +456,6 @@ class InputData(BaseModel):
     classifier_path: Optional[str] = None
     save_classifier_path: Optional[str] = None
     
-    # Legacy fields for backward compatibility
-    cerebral_bleed: Optional[str] = None
-    
     class Config:
         extra = "allow"  # Allow extra fields
 
@@ -1040,27 +1037,9 @@ async def init_model_flexible(request: Dict[str, Any]):
         tissue_classes = input_data.get('tissue_classes', [])
         print(f"[Init-Flexible] Tissue classes: {tissue_classes}")
         
-        # Extract legacy cerebral_bleed field for backward compatibility
-        cerebral_bleed_value = input_data.get('cerebral_bleed')
-        print(f"[Init-Flexible] Cerebral_bleed value (legacy): '{cerebral_bleed_value}'")
-        
-        # Determine tissue classes from either new format or legacy format
-        if tissue_classes:
-            # Use new format
-            organs_list = tissue_classes
-            print(f"[Init-Flexible] Using new format tissue_classes: {organs_list}")
-        elif cerebral_bleed_value and isinstance(cerebral_bleed_value, str):
-            # Use legacy format
-            if cerebral_bleed_value.startswith('[') and cerebral_bleed_value.endswith(']'):
-                organs_str = cerebral_bleed_value[1:-1]
-                organs_list = [organ.strip() for organ in organs_str.split(',')]
-                print(f"[Init-Flexible] Extracted organs from legacy format: {organs_list}")
-            else:
-                organs_list = [cerebral_bleed_value.strip()]
-                print(f"[Init-Flexible] Single organ from legacy format: {organs_list}")
-        else:
-            organs_list = []
-            print(f"[Init-Flexible] No organs specified")
+        # Use new format tissue_classes
+        organs_list = tissue_classes if tissue_classes else []
+        print(f"[Init-Flexible] Using tissue_classes: {organs_list}")
         
         # Normalize tissue class names to lowercase for TotalSegmentator compatibility
         organs_list = normalize_tissue_classes(organs_list)
@@ -1155,7 +1134,10 @@ def read_node(data: Dict[str, Any]):
             if user_data_path in store:
                 print(f"[Read] Found userData in Zarr file")
                 tissue_classes_found = []
+                model_field_value = None  # Track model field separately
+                has_tissue_classes_field = False  # Track if tissue_classes field was processed
 
+                # First pass: collect all data
                 for k in store[user_data_path].keys():
                     raw_bytes = store[user_data_path][k][()]
                     raw_str = raw_bytes.decode("utf-8")
@@ -1167,65 +1149,53 @@ def read_node(data: Dict[str, Any]):
 
                     if k == "path":
                         INPUT_PATH = val_json
+                    elif k == "model":
+                        # Store model field value for later processing
+                        model_field_value = val_json if isinstance(val_json, str) else str(val_json)
                     elif k == "tissue_classes":
-                            # New format: tissue_classes is a list
-                            if isinstance(val_json, list):
-                                tissue_classes_found = val_json
-                                print(f"[Read] Found tissue_classes: {tissue_classes_found}")
-                            else:
-                                print(f"[Read] tissue_classes is not a list: {type(val_json)}")
+                        # New format: tissue_classes is a list
+                        has_tissue_classes_field = True
+                        if isinstance(val_json, list):
+                            tissue_classes_found = val_json
+                            print(f"[Read] Found tissue_classes: {tissue_classes_found}")
+                        else:
+                            print(f"[Read] tissue_classes is not a list: {type(val_json)}")
                     elif k == "prompt":
-                            # Extract tissue classes from prompt field
-                            prompt_classes = parse_prompt_for_tissue_classes(val_json)
-                            if prompt_classes:
-                                print(f"[Read] Found classes in prompt: {prompt_classes}")
-                                # If we don't have tissue_classes yet, use prompt classes
-                                if not tissue_classes_found:
-                                    tissue_classes_found = prompt_classes
-                                else:
-                                    # Merge with existing tissue_classes
-                                    tissue_classes_found.extend(prompt_classes)
-                                    print(f"[Read] Merged prompt classes with existing: {tissue_classes_found}")
+                        # Extract tissue classes from prompt field
+                        prompt_classes = parse_prompt_for_tissue_classes(val_json)
+                        if prompt_classes:
+                            print(f"[Read] Found classes in prompt: {prompt_classes}")
+                            # If we don't have tissue_classes yet, use prompt classes
+                            if not tissue_classes_found:
+                                tissue_classes_found = prompt_classes
+                            else:
+                                # Merge with existing tissue_classes
+                                tissue_classes_found.extend(prompt_classes)
+                                print(f"[Read] Merged prompt classes with existing: {tissue_classes_found}")
+
+                # Step 1: Set model first (priority: model field > tissue_classes)
+                if model_field_value:
+                    # Handle model field directly - highest priority
+                    MODEL_CONFIG = AVAILABLE_MODELS.get(model_field_value)
+                    if MODEL_CONFIG:
+                        print(f"[Read] Model field '{model_field_value}' => Model config set")
                     else:
-                        # Legacy format handling
-                        # Map frontend field names to model names
-                        field_to_model_map = {
-                            "total": "total_3mm",  # Default to 3mm version
-                            "total_fast": "total_6mm",
-                            "cerebral_bleed": "cerebral_bleed",
-                            "lung_vessels": "lung_vessels",
-                            "body": "body",
-                            "total_mr": "total_mr",
-                            "total_mr_fast": "total_mr_fast"
-                        }
+                        print(f"[Read] Warning: Model '{model_field_value}' not found in AVAILABLE_MODELS")
+                elif tissue_classes_found:
+                    # Only determine model from tissue_classes if model field is not provided
+                    # Normalize tissue class names to lowercase
+                    normalized_classes = normalize_tissue_classes(tissue_classes_found)
+                    # Determine model based on tissue classes
+                    selected_model = determine_model_from_tissue_classes(normalized_classes)
+                    MODEL_CONFIG = AVAILABLE_MODELS.get(selected_model)
+                    print(f"[Read] Using new format tissue_classes: {normalized_classes}")
+                    print(f"[Read] Selected model: {selected_model}")
 
-                        # Check if this field corresponds to a model
-                        if k in field_to_model_map:
-                            model_name = field_to_model_map[k]
-
-                            # Extract organs from field value
-                            if isinstance(val_json, str):
-                                if val_json.startswith('[') and val_json.endswith(']'):
-                                    organs_str = val_json[1:-1]
-                                    ROI_SUBSET = [organ.strip() for organ in organs_str.split(',')]
-                                else:
-                                    ROI_SUBSET = [val_json.strip()]
-                            elif isinstance(val_json, list):
-                                ROI_SUBSET = val_json
-
-                            # Set model configuration
-                            MODEL_CONFIG = AVAILABLE_MODELS.get(model_name)
-                            print(f"[Read] Field '{k}' => Model '{model_name}', ROI: {ROI_SUBSET}")
-
-            # If we found tissue_classes in new format, use that instead
-            if tissue_classes_found:
-                # Normalize tissue class names to lowercase
-                ROI_SUBSET = normalize_tissue_classes(tissue_classes_found)
-                # Determine model based on tissue classes
-                selected_model = determine_model_from_tissue_classes(ROI_SUBSET)
-                MODEL_CONFIG = AVAILABLE_MODELS.get(selected_model)
-                print(f"[Read] Using new format tissue_classes: {ROI_SUBSET}")
-                print(f"[Read] Selected model: {selected_model}")
+                # Step 2: Set ROI_SUBSET from tissue_classes (if field was found)
+                if has_tissue_classes_field:
+                    # Normalize tissue class names to lowercase
+                    ROI_SUBSET = normalize_tissue_classes(tissue_classes_found) if tissue_classes_found else []
+                    print(f"[Read] ROI_SUBSET set from tissue_classes: {ROI_SUBSET}")
 
         except Exception as e:
             print(f"[Read] Error reading Zarr file: {e}")
@@ -1537,9 +1507,42 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
                 
                 print(f"[Process] Completed processing requested organs")
             else:
-                # Process all organs (you might need to implement organ detection logic)
-                print(f"[Process] No ROI subset provided, processing all organs")
-                update_progress(100, "All organs processed")
+                # Process all organs - auto-detect from output files
+                print(f"[Process] No ROI subset provided, auto-detecting organs from output files")
+                
+                # Find all NIfTI files in output directory
+                nii_files = []
+                if temp_output.is_dir():
+                    nii_files = list(temp_output.glob("*.nii.gz")) + list(temp_output.glob("*.nii"))
+                elif temp_output.is_file() and (temp_output.suffix == ".gz" or temp_output.suffix == ".nii"):
+                    nii_files = [temp_output]
+                
+                if nii_files:
+                    print(f"[Process] Found {len(nii_files)} NIfTI file(s) to process")
+                    for i, nii_file in enumerate(nii_files):
+                        # Extract organ name from filename (remove .nii.gz extension)
+                        organ_name = nii_file.stem
+                        if organ_name.endswith('.nii'):
+                            organ_name = organ_name[:-4]  # Remove .nii if present
+                        print(f"[Process] Processing file {i+1}/{len(nii_files)}: {nii_file.name} -> organ: {organ_name}")
+                        
+                        try:
+                            # Process the file directly (it's already a single-organ file)
+                            process_single_organ(organ_name, str(nii_file), ZARR_PATH, metadata, organ_name)
+                            
+                            # Update progress
+                            progress = 75 + (i + 1) / len(nii_files) * 20  # 75-95%
+                            update_progress(int(progress), f"Completed {organ_name} ({i+1}/{len(nii_files)})")
+                        except Exception as e:
+                            print(f"[Process] Warning: Could not process file '{nii_file.name}': {e}")
+                            import traceback
+                            traceback.print_exc()
+                            # Continue with next file
+                    
+                    print(f"[Process] Completed processing all detected files")
+                else:
+                    print(f"[Process] WARNING: No NIfTI files found in output directory")
+                    update_progress(100, "No output files found")
             
             update_progress(100, "Processing completed successfully")
             progress_complete = True  # Mark completion
