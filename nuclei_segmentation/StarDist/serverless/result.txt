@@ -1,0 +1,91 @@
+======================================================================
+  StarDist Modal - Full Pipeline Benchmark Results
+  Generated: 2025-12-17 17:40:46
+======================================================================
+
+Configuration:
+  • File: /Users/Donytu/Desktop/tissue_lab/Tissuelab-Model-Zoo/nuclei_segmentation/StarDist/serverless/TCGA-AZ-6600-01Z-00-DX1.9afe2f8f-bcfe-43df-a83b-6c183f226757.svs
+  • File size: 933.70 MB
+  • tiles_per_batch: 90
+  • nuclei_per_gpu: 500000 (单 GPU 处理所有)
+  • parallel_threshold: 500000 (强制单 GPU)
+  • Number of runs: 1
+
+
+**********************************************************************
+*  RUN #1  *********************************************************
+**********************************************************************
+
+╔════════════════════════════════════════════════════════════════════╗
+║  RUN #1 of 1                                                       ║
+╚════════════════════════════════════════════════════════════════════╝
+📅 Start Time: 2025-12-17 16:40:56
+
+──────────────────────────────────────────────────────────────────────
+  STEP 1: Parallel Segmentation
+──────────────────────────────────────────────────────────────────────
+🚀 Starting parallel segmentation...
+✅ Segmentation completed! Nuclei: 1,322,163
+   Server time: 7m 23.23s | Client time: 11m 58.18s
+   Workers: 35 | Tiles: 3120
+
+──────────────────────────────────────────────────────────────────────
+  STEP 2: Smart Embedding (auto-select single vs parallel GPU)
+──────────────────────────────────────────────────────────────────────
+🚀 Starting smart embedding... (1,322,163 nuclei)
+   策略: 单 GPU 模式 (parallel_threshold=500000)
+❌ Embedding error: Function call was cancelled by user.
+
+──────────────────────────────────────────────────────────────────────
+  RUN #1 SUMMARY
+──────────────────────────────────────────────────────────────────────
+📅 End Time: 2025-12-17 17:40:46
+
+⏱️  Time Summary:
+   • Segmentation (client):  11m 58.18s
+   • Segmentation (server):  7m 23.23s
+   • Embedding (client):     0.00s
+   • Embedding (server):     0.00s
+   ─────────────────────────────
+   • TOTAL PIPELINE:         59m 50.16s
+   • Throughput:             368.3 nuclei/s
+
+
+######################################################################
+#  SUMMARY STATISTICS  ###############################################
+######################################################################
+
+Successful runs: 1/1
+
+SEGMENTATION TIME (Client):
+  Min:   11m 58.18s
+  Max:   11m 58.18s
+  Avg:   11m 58.18s
+  Range: 0.00s
+
+EMBEDDING TIME (Client):
+  Min:   0.00s
+  Max:   0.00s
+  Avg:   0.00s
+  Range: 0.00s
+
+TOTAL PIPELINE TIME:
+  Min:   59m 50.16s
+  Max:   59m 50.16s
+  Avg:   59m 50.16s
+  Range: 0.00s
+
+THROUGHPUT:
+  Min:   368.3 nuclei/s
+  Max:   368.3 nuclei/s
+  Avg:   368.3 nuclei/s
+
+Total benchmark time: 59m 50.16s
+
+======================================================================
+  QUICK REFERENCE TABLE
+======================================================================
+Run   Seg(client)     Emb(client)     Total           Throughput     
+----------------------------------------------------------------------
+1     11m 58.18s      0.00s           59m 50.16s      368.3 n/s
+----------------------------------------------------------------------

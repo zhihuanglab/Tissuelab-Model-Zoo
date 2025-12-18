@@ -1,0 +1,63 @@
+CMU-1 test (169.33 MB)
+
+STEP 1: Parallel Segmentation
+──────────────────────────────────────────────────────────────────────
+🚀 Starting parallel segmentation...
+✅ Segmentation completed! Nuclei: 250,250
+   Server time: 3m 18.70s 
+   Workers: 6 | Tiles: 494
+
+──────────────────────────────────────────────────────────────────────
+  STEP 2: Smart Embedding (auto-select single vs parallel GPU)
+──────────────────────────────────────────────────────────────────────
+🚀 Starting smart embedding... (250,250 nuclei)
+   single GPU (parallel_threshold=500000)
+✅ Embedding completed! Nuclei: 250,250
+   Mode: single_gpu_fast | Server time: 3m 17.49s 
+   GPU workers: 1
+
+total time: 6 min
+
+#######################################################################
+
+
+CMU-1-small-region test (1.85 MB)
+STEP 1: Parallel Segmentation
+──────────────────────────────────────────────────────────────────────
+🚀 Starting parallel segmentation...
+✅ Segmentation completed! Nuclei: 2,209
+   Server time: 16.87s
+   Workers: 1 | Tiles: 4
+
+──────────────────────────────────────────────────────────────────────
+  STEP 2: Smart Embedding (auto-select single vs parallel GPU)
+──────────────────────────────────────────────────────────────────────
+🚀 Starting smart embedding... (2,209 nuclei)
+   single GPU (parallel_threshold=500000)
+✅ Embedding completed! Nuclei: 2,209
+   Mode: single_gpu_fast | Server time: 18.76s
+   GPU workers: 1
+total time: 35 s
+
+
+
+
+#######################################################################
+CMU-2 test (372.65 MB)
+STEP 1: Parallel Segmentation
+──────────────────────────────────────────────────────────────────────
+🚀 Starting parallel segmentation...
+✅ Segmentation completed! Nuclei: 333,320
+   Server time: 4m 0.13s
+   Workers: 9 | Tiles: 748
+
+──────────────────────────────────────────────────────────────────────
+  STEP 2: Smart Embedding (auto-select single vs parallel GPU)
+──────────────────────────────────────────────────────────────────────
+🚀 Starting smart embedding... (333,320 nuclei)
+   singal GPU (parallel_threshold=500000)
+✅ Embedding completed! Nuclei: 333,320
+   Mode: single_gpu_fast | Server time: 4m 21.47s
+   GPU workers: 1
+total time: 8 min
+
