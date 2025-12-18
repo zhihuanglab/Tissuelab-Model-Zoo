@@ -155,8 +155,8 @@ def parse_args():
                         help='Batch size for tiled processing')
     parser.add_argument('--overlap', default=50, type=int,
                         help='Overlap between tiles for WSI processing')
-    parser.add_argument('--normalise', default=True, type=bool,
-                        help='Normalize input images')
+    parser.add_argument('--normalise', default=False, type=lambda x: str(x).lower() != 'false',
+                        help='Normalize input images (default: False for best performance)')
     parser.add_argument('--use_tissue_mask', default=True, type=lambda x: str(x).lower() != 'false',
                         help='Enable tissue masking to skip background tiles (default: True). '
                              'Uses adaptive thresholding with morphological cleanup.')
@@ -523,7 +523,7 @@ def init_node():
                     tile_size=1024,
                     batch_size=32,
                     overlap=50,
-                    normalise=True,
+                    normalise=False,
                     use_tissue_mask=True,
                     min_area_pixels=25,
                     detection_size=15,
@@ -577,7 +577,7 @@ def read_node(data: Dict[str, Any]):
             tile_size=1024,
             batch_size=32,
             overlap=50,
-            normalise=True,
+            normalise=False,
             use_tissue_mask=True,
             min_area_pixels=25,
             detection_size=15,

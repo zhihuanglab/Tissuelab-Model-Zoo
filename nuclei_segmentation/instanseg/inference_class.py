@@ -458,7 +458,7 @@ class InstanSeg():
     def eval_small_image(self,
                          image: torch.Tensor,
                          pixel_size: Optional[float] = None,
-                         normalise: bool = True,
+                         normalise: bool = False,
                          return_image_tensor: bool = True,
                          target: str = "all_outputs", #or "nuclei" or "cells"
                          rescale_output: bool = True,

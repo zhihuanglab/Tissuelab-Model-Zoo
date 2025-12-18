@@ -63,7 +63,7 @@ def run_wsi(
     image: str,
     *,
     pixel_size: Optional[float] = None,
-    normalise: bool = True,
+    normalise: bool = False,
     normalisation_subsampling_factor: int = 1,
     tile_size: int = 1024,
     overlap: int = 50,
