@@ -329,16 +329,24 @@ def run_segmentation(args):
         # Step C: generate embedding if not cached; write directly to Zarr
         if centroids is not None and len(centroids) > 0: # Ensure centroids exist and are not empty
             have_cached_embedding = False
-            zf = zarr.open_group(ZARR_PATH, mode='a')
-            node_grp_path = f"{NODE_NAME}"
-            if NODE_NAME in zf and 'embedding' in zf[NODE_NAME]:
-                try:
-                    existing_len = zf[NODE_NAME]['embedding'].shape[0]
-                    if existing_len == len(centroids):
-                        have_cached_embedding = True
-                        print("found existing embeddings in store => skip embedding calculation")
-                except Exception:
-                    have_cached_embedding = False
+            # If segmentation was just re-run (ALREADY_HAVE_SEG == False), we must regenerate embedding
+            # because centroids have changed even if count is the same
+            if not ALREADY_HAVE_SEG:
+                # Segmentation was just re-run, so embedding must be regenerated
+                print("Segmentation was re-run, will regenerate embedding even if count matches")
+                have_cached_embedding = False
+            else:
+                # Segmentation was skipped (using existing data), check if embedding exists and matches
+                zf = zarr.open_group(ZARR_PATH, mode='a')
+                node_grp_path = f"{NODE_NAME}"
+                if NODE_NAME in zf and 'embedding' in zf[NODE_NAME]:
+                    try:
+                        existing_len = zf[NODE_NAME]['embedding'].shape[0]
+                        if existing_len == len(centroids):
+                            have_cached_embedding = True
+                            print("found existing embeddings in store => skip embedding calculation")
+                    except Exception:
+                        have_cached_embedding = False
 
             if not have_cached_embedding:
                 print("no cached embeddings => generate new embeddings directly into Zarr")
