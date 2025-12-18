@@ -233,6 +233,22 @@ def run_segmentation(args):
                                 # If we can't verify, assume mismatch to be safe
                                 params_match = False
                         
+                        # Check if current parameters are None but saved parameters exist (ROI was removed)
+                        # This handles the case: previously ran with bbox/polygon, now running without ROI (full image)
+                        if params_match and current_bbox is None and current_polygon_points is None:
+                            # Check if saved bbox exists in attrs
+                            saved_bbox = node_grp.attrs.get('bbox', '')
+                            saved_polygon_str = node_grp.attrs.get('polygon_points', '')
+                            
+                            if saved_bbox and saved_bbox.strip():
+                                # Previously had bbox, now no bbox -> mismatch (user wants full image)
+                                params_match = False
+                                print(f"Parameter mismatch: current bbox is None, but saved bbox was '{saved_bbox}' (user wants full image segmentation)")
+                            elif saved_polygon_str and saved_polygon_str.strip():
+                                # Previously had polygon, now no polygon -> mismatch (user wants full image)
+                                params_match = False
+                                print(f"Parameter mismatch: current polygon_points is None, but saved polygon_points exists (user wants full image segmentation)")
+                        
                         # Note: target_mpp affects processing resolution but doesn't change ROI boundaries
                         # So we don't need to verify it against centroids range
                         # If target_mpp changed, the data would still be valid, just at different resolution
