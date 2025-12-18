@@ -14,6 +14,7 @@ import requests
 import platform
 import numpy as np
 import cv2
+from matplotlib.path import Path as MplPath
 from sse_starlette.sse import EventSourceResponse
 import asyncio
 
@@ -113,6 +114,11 @@ def run_segmentation(args):
         centroids = None
         contours = None
         probability = None # Initialize probability
+        
+        # Get current parameters once (used for both checking and saving)
+        current_bbox = getattr(args, 'bbox', None)
+        current_polygon_points = getattr(args, 'polygon_points', None)
+        current_target_mpp = getattr(args, 'target_mpp', None)
 
         if os.path.exists(ZARR_PATH):
             zf = zarr.open_group(ZARR_PATH, mode='r')
@@ -130,9 +136,6 @@ def run_segmentation(args):
                         # Verify if existing centroids match current ROI parameters by checking data range
                         # This avoids needing to store parameters separately - we check if centroids match current ROI
                         params_match = True
-                        current_bbox = getattr(args, 'bbox', None)
-                        current_polygon_points = getattr(args, 'polygon_points', None)
-                        current_target_mpp = getattr(args, 'target_mpp', None)
                         
                         # Check target_mpp: read from node attrs (saved when segmentation was generated)
                         # target_mpp affects processing resolution, so we need to verify it matches
@@ -171,7 +174,7 @@ def run_segmentation(args):
                                 print("No target_mpp in attrs but current args has target_mpp - will re-run with new parameters.")
                         
                         # Check bbox: verify centroids match the bbox
-                        if current_bbox is not None:
+                        if params_match and current_bbox is not None:
                             try:
                                 bbox_parts = current_bbox.split(',')
                                 if len(bbox_parts) == 4:
@@ -217,9 +220,8 @@ def run_segmentation(args):
                                 params_match = False
                         
                         # Check polygon_points: verify all centroids are within the polygon if specified
-                        elif current_polygon_points is not None and len(current_polygon_points) > 0:
+                        elif params_match and current_polygon_points is not None and len(current_polygon_points) > 0:
                             try:
-                                from matplotlib.path import Path as MplPath
                                 polygon_path = MplPath(current_polygon_points)
                                 centroids_xy = centroids[:, :2]
                                 in_polygon = polygon_path.contains_points(centroids_xy)
@@ -248,10 +250,6 @@ def run_segmentation(args):
                                 # Previously had polygon, now no polygon -> mismatch (user wants full image)
                                 params_match = False
                                 print(f"Parameter mismatch: current polygon_points is None, but saved polygon_points exists (user wants full image segmentation)")
-                        
-                        # Note: target_mpp affects processing resolution but doesn't change ROI boundaries
-                        # So we don't need to verify it against centroids range
-                        # If target_mpp changed, the data would still be valid, just at different resolution
                         
                         if params_match:
                             ALREADY_HAVE_SEG = True
@@ -416,9 +414,7 @@ def run_segmentation(args):
             # Save parameters used to generate this segmentation in node attrs for future comparison
             # This allows us to detect parameter changes and re-run if needed
             # Using attrs instead of separate datasets to avoid changing zarr structure
-            current_bbox = getattr(args, 'bbox', None)
-            current_target_mpp = getattr(args, 'target_mpp', None)
-            current_polygon_points = getattr(args, 'polygon_points', None)
+            # Note: current_bbox, current_target_mpp, current_polygon_points are already retrieved at the start of Step A
             
             # Save parameters to attrs (zarr attrs support various types including float and string)
             node_grp.attrs['bbox'] = current_bbox if current_bbox is not None else ''
