@@ -46,25 +46,25 @@ For 250K cells, it takes 10 mins to embed all cells with CUDA (NVIDIA 4060). Wit
 # ==============================================================================
 class TileBasedPatchDataset(Dataset):
     """
-    高性能 Patch Dataset - 使用 Tile-based 批量读取策略
+    High-performance Patch Dataset - Using Tile-based batch reading strategy
     
-    优化原理：
-    - 原始方案：每个 centroid 单独调用 read_region() → 97,792 次 I/O
-    - 优化方案：将 centroids 按 tile 分组，一次读取整个 tile → ~100-200 次 I/O
+    Optimization principle:
+    - Original approach: Each centroid calls read_region() individually -> 97,792 I/O calls
+    - Optimized approach: Group centroids by tile, read entire tile at once -> ~100-200 I/O calls
     
-    性能提升：I/O 次数减少 500-1000 倍
+    Performance improvement: I/O calls reduced by 500-1000x
     """
     
     def __init__(self, slide_path, centroids, patch_size=224, magnification=40, 
                  tile_size=4096, read_image_method='tiffslide'):
         """
         Args:
-            slide_path: 图像文件路径
-            centroids: [[x, y], ...] 细胞核中心点列表
-            patch_size: 输出 patch 大小 (224 for PLIP)
-            magnification: 图像放大倍率
-            tile_size: 每次读取的 tile 大小 (建议 4096-8192)
-            read_image_method: 读取方法 ('tiffslide', 'openslide', 等)
+            slide_path: Path to image file
+            centroids: [[x, y], ...] List of nuclei center points
+            patch_size: Output patch size (224 for PLIP)
+            magnification: Image magnification
+            tile_size: Tile size for each read (recommended 4096-8192)
+            read_image_method: Reading method ('tiffslide', 'openslide', etc.)
         """
         self.slide_path = slide_path
         self.centroids = np.array(centroids) if not isinstance(centroids, np.ndarray) else centroids
@@ -73,15 +73,15 @@ class TileBasedPatchDataset(Dataset):
         self.tile_size = tile_size
         self.read_image_method = read_image_method
         
-        # 计算提取尺寸 (与原始实现一致)
+        # Calculate extraction size (consistent with original implementation)
         self.scale_factor = 40 / magnification
         self.extraction_size = int(patch_size * self.scale_factor)
         
-        # 打开 slide
+        # Open slide
         self.slide = None
         self._open_slide()
         
-        # 性能统计
+        # Performance statistics
         self.perf_stats = {
             'tile_reads': 0,
             'tile_cache_hits': 0,
@@ -90,11 +90,11 @@ class TileBasedPatchDataset(Dataset):
             'total_crop_time': 0.0,
         }
         
-        # Tile 缓存 (只缓存当前 tile 以节省内存)
+        # Tile cache (only cache current tile to save memory)
         self._current_tile = None
         self._current_tile_bounds = None  # (x0, y0, x1, y1)
         
-        # 预计算每个 centroid 所属的 tile
+        # Precompute tile assignment for each centroid
         self._precompute_tile_assignments()
         
         print(f"[TileBasedPatchDataset] Initialized:")
@@ -105,7 +105,7 @@ class TileBasedPatchDataset(Dataset):
         print(f"  - Expected I/O reduction: {len(self.centroids)}/{len(self.unique_tiles)} = {len(self.centroids)/max(1, len(self.unique_tiles)):.1f}x")
     
     def _open_slide(self):
-        """打开 slide 文件"""
+        """Open slide file"""
         if self.read_image_method == 'tiffslide':
             import tiffslide
             self.slide = tiffslide.TiffSlide(self.slide_path)
@@ -119,33 +119,33 @@ class TileBasedPatchDataset(Dataset):
         self.slide_dimensions = self.slide.dimensions
     
     def _precompute_tile_assignments(self):
-        """预计算每个 centroid 所属的 tile"""
+        """Precompute tile assignment for each centroid"""
         half_ext = self.extraction_size // 2
         
-        # 计算每个 centroid 的 tile 索引
-        # tile 索引 = floor((centroid - half_extraction) / tile_size)
+        # Calculate tile index for each centroid
+        # tile index = floor((centroid - half_extraction) / tile_size)
         tile_indices_x = ((self.centroids[:, 0] - half_ext) // self.tile_size).astype(int)
         tile_indices_y = ((self.centroids[:, 1] - half_ext) // self.tile_size).astype(int)
         
-        # 确保 tile 索引非负
+        # Ensure tile indices are non-negative
         tile_indices_x = np.maximum(0, tile_indices_x)
         tile_indices_y = np.maximum(0, tile_indices_y)
         
         self.tile_indices = np.stack([tile_indices_x, tile_indices_y], axis=1)
         
-        # 获取唯一的 tiles (用于统计)
+        # Get unique tiles (for statistics)
         self.unique_tiles = set(map(tuple, self.tile_indices))
         
-        # 按 tile 索引排序 centroids 以优化缓存命中
-        # 这样连续的 centroids 更可能在同一个 tile 中
-        sort_keys = tile_indices_y * 10000 + tile_indices_x  # 按行优先排序
+        # Sort centroids by tile index to optimize cache hits
+        # This way consecutive centroids are more likely to be in the same tile
+        sort_keys = tile_indices_y * 10000 + tile_indices_x  # Row-major sorting
         self.sorted_indices = np.argsort(sort_keys)
         
-        # 创建重新排序的数据
+        # Create reordered data
         self.centroids_sorted = self.centroids[self.sorted_indices]
         self.tile_indices_sorted = self.tile_indices[self.sorted_indices]
         
-        # 创建反向映射 (sorted_idx -> original_idx)
+        # Create reverse mapping (sorted_idx -> original_idx)
         self.reverse_mapping = self.sorted_indices
     
     def __len__(self):
@@ -153,21 +153,21 @@ class TileBasedPatchDataset(Dataset):
     
     def __getitem__(self, idx):
         """
-        获取排序后索引 idx 对应的 patch
-        注意：返回的顺序是按 tile 优化排序的
+        Get patch corresponding to sorted index idx
+        Note: Return order is optimized by tile sorting
         """
-        # 使用排序后的 centroid
+        # Use sorted centroid
         x, y = self.centroids_sorted[idx]
         tile_ix, tile_iy = self.tile_indices_sorted[idx]
         
-        # 检查当前 tile 是否匹配
+        # Check if current tile matches
         tile_x0 = tile_ix * self.tile_size
         tile_y0 = tile_iy * self.tile_size
         tile_x1 = min(tile_x0 + self.tile_size, self.slide_dimensions[0])
         tile_y1 = min(tile_y0 + self.tile_size, self.slide_dimensions[1])
         tile_bounds = (tile_x0, tile_y0, tile_x1, tile_y1)
         
-        # 如果 tile 缓存未命中，读取新 tile
+        # If tile cache miss, read new tile
         if self._current_tile_bounds != tile_bounds:
             t0 = time.time()
             self._load_tile(tile_x0, tile_y0, tile_x1 - tile_x0, tile_y1 - tile_y0)
@@ -177,19 +177,19 @@ class TileBasedPatchDataset(Dataset):
         else:
             self.perf_stats['tile_cache_hits'] += 1
         
-        # 从缓存的 tile 中裁剪 patch
+        # Crop patch from cached tile
         t0 = time.time()
         patch = self._crop_patch_from_tile(x, y, tile_x0, tile_y0)
         self.perf_stats['total_crop_time'] += time.time() - t0
         self.perf_stats['total_patches'] += 1
         
-        return patch, self.reverse_mapping[idx]  # 返回 patch 和原始索引
+        return patch, self.reverse_mapping[idx]  # Return patch and original index
     
     def _load_tile(self, x0, y0, width, height):
-        """读取一个 tile 到缓存"""
+        """Read a tile into cache"""
         try:
             if self.read_image_method in ['tiffslide', 'openslide']:
-                # 使用 as_array=True 直接获取 numpy 数组
+                # Use as_array=True to get numpy array directly
                 try:
                     self._current_tile = self.slide.read_region(
                         location=(x0, y0),
@@ -198,14 +198,14 @@ class TileBasedPatchDataset(Dataset):
                         as_array=True
                     )
                 except TypeError:
-                    # OpenSlide 不支持 as_array
+                    # OpenSlide doesn't support as_array
                     img = self.slide.read_region((x0, y0), 0, (width, height))
                     self._current_tile = np.array(img)[:, :, :3]
             else:
                 img = self.slide.read_region((x0, y0), 0, (width, height))
                 self._current_tile = np.array(img)[:, :, :3]
             
-            # 确保是 RGB 格式
+            # Ensure RGB format
             if self._current_tile.ndim == 3 and self._current_tile.shape[2] == 4:
                 self._current_tile = self._current_tile[:, :, :3]
             
@@ -214,58 +214,58 @@ class TileBasedPatchDataset(Dataset):
             self._current_tile = np.zeros((height, width, 3), dtype=np.uint8)
     
     def _crop_patch_from_tile(self, center_x, center_y, tile_x0, tile_y0):
-        """从缓存的 tile 中裁剪 patch"""
+        """Crop patch from cached tile"""
         half_ext = self.extraction_size // 2
         
-        # 计算在 tile 坐标系中的位置
+        # Calculate position in tile coordinate system
         local_x = center_x - tile_x0
         local_y = center_y - tile_y0
         
-        # 计算裁剪区域
+        # Calculate crop region
         crop_x0 = max(0, local_x - half_ext)
         crop_y0 = max(0, local_y - half_ext)
         crop_x1 = min(self._current_tile.shape[1], local_x + half_ext)
         crop_y1 = min(self._current_tile.shape[0], local_y + half_ext)
         
-        # 裁剪
+        # Crop
         patch = self._current_tile[int(crop_y0):int(crop_y1), int(crop_x0):int(crop_x1)]
         
-        # 如果 patch 尺寸不对，进行 padding
+        # If patch size is incorrect, apply padding
         if patch.shape[0] != self.extraction_size or patch.shape[1] != self.extraction_size:
             padded = np.zeros((self.extraction_size, self.extraction_size, 3), dtype=np.uint8)
             h, w = min(patch.shape[0], self.extraction_size), min(patch.shape[1], self.extraction_size)
             padded[:h, :w] = patch[:h, :w]
             patch = padded
         
-        # Resize 到 patch_size (如果需要)
+        # Resize to patch_size (if needed)
         if patch.shape[0] != self.patch_size or patch.shape[1] != self.patch_size:
             patch = cv2.resize(patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_LINEAR)
         
         return patch
     
     def get_original_order_indices(self):
-        """返回用于恢复原始顺序的索引"""
+        """Return indices for restoring original order"""
         return self.reverse_mapping
     
     def print_stats(self):
-        """打印性能统计"""
+        """Print performance statistics"""
         stats = self.perf_stats
         total_time = stats['total_tile_read_time'] + stats['total_crop_time']
         print(f"\n{'='*60}")
-        print(f"TileBasedPatchDataset 性能统计")
+        print(f"TileBasedPatchDataset Performance Statistics")
         print(f"{'='*60}")
-        print(f"  总 patches: {stats['total_patches']:,}")
-        print(f"  Tile 读取次数: {stats['tile_reads']:,}")
-        print(f"  Tile 缓存命中: {stats['tile_cache_hits']:,}")
-        print(f"  缓存命中率: {stats['tile_cache_hits']/(stats['tile_reads']+stats['tile_cache_hits']+1e-6)*100:.1f}%")
-        print(f"  I/O 减少倍数: {stats['total_patches']/(stats['tile_reads']+1e-6):.1f}x")
-        print(f"  Tile 读取总时间: {stats['total_tile_read_time']:.2f}s")
-        print(f"  裁剪总时间: {stats['total_crop_time']:.2f}s")
-        print(f"  平均每 patch 时间: {total_time/(stats['total_patches']+1e-6)*1000:.2f}ms")
+        print(f"  Total patches: {stats['total_patches']:,}")
+        print(f"  Tile reads: {stats['tile_reads']:,}")
+        print(f"  Tile cache hits: {stats['tile_cache_hits']:,}")
+        print(f"  Cache hit rate: {stats['tile_cache_hits']/(stats['tile_reads']+stats['tile_cache_hits']+1e-6)*100:.1f}%")
+        print(f"  I/O reduction factor: {stats['total_patches']/(stats['tile_reads']+1e-6):.1f}x")
+        print(f"  Total tile read time: {stats['total_tile_read_time']:.2f}s")
+        print(f"  Total crop time: {stats['total_crop_time']:.2f}s")
+        print(f"  Average time per patch: {total_time/(stats['total_patches']+1e-6)*1000:.2f}ms")
         print(f"{'='*60}")
     
     def close(self):
-        """关闭 slide"""
+        """Close slide"""
         if self.slide is not None:
             try:
                 self.slide.close()
@@ -2935,18 +2935,18 @@ class NucleiEmbedding:
 
     def generate_embeddings_fast(self, batch_size=None, zarr_path=None, dataset_path='embedding', tile_size=4096):
         """
-        高性能 Embedding 生成 - 使用 Tile-based 批量读取
+        High-performance Embedding generation - Using Tile-based batch reading
         
-        核心优化：
-        - 原始方案：每个 centroid 单独调用 read_region() → ~98K 次 I/O
-        - 优化方案：按 tile 分组批量读取 → ~100-200 次 I/O
-        - 预期性能提升：DataLoader 阶段 500-1000x 加速
+        Core optimization:
+        - Original approach: Each centroid calls read_region() individually -> ~98K I/O calls
+        - Optimized approach: Batch read by tile grouping -> ~100-200 I/O calls
+        - Expected performance improvement: 500-1000x speedup in DataLoader stage
         
         Args:
-            batch_size: 批大小 (默认自动计算)
-            zarr_path: Zarr 存储路径
-            dataset_path: 数据集路径
-            tile_size: Tile 大小 (建议 4096-8192)
+            batch_size: Batch size (auto-calculated by default)
+            zarr_path: Zarr storage path
+            dataset_path: Dataset path
+            tile_size: Tile size (recommended 4096-8192)
         """
         if zarr_path is None:
             raise ValueError("zarr_path must be provided")
@@ -2964,7 +2964,7 @@ class NucleiEmbedding:
         print(f"  Device: {self.device}")
         print(f"{'='*70}")
         
-        # 自动计算 batch_size
+        # Auto-calculate batch_size
         if batch_size is None:
             if torch.cuda.is_available():
                 total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
@@ -2975,17 +2975,17 @@ class NucleiEmbedding:
                 batch_size = 256
         print(f"  Batch size: {batch_size}")
         
-        # 创建 Tile-based Dataset
+        # Create Tile-based Dataset
         dataset = TileBasedPatchDataset(
             slide_path=self.args.slidepath,
             centroids=self.centroids,
             patch_size=self.patch_size,
             magnification=self.args.magnification,
             tile_size=tile_size,
-            read_image_method='tiffslide'  # 默认使用 tiffslide
+            read_image_method='tiffslide'  # Default to tiffslide
         )
         
-        # 自定义 collate 函数 - 处理 (patch, original_idx) 元组
+        # Custom collate function - handles (patch, original_idx) tuples
         def collate_fn(batch):
             patches = []
             indices = []
@@ -2997,14 +2997,14 @@ class NucleiEmbedding:
             if not patches:
                 return None, []
             
-            # 转换为 tensor 并预处理
+            # Convert to tensor and preprocess
             batch_np = np.stack(patches, axis=0)
             
-            # GPU 预处理
+            # GPU preprocessing
             if torch.cuda.is_available():
                 batch_tensor = _preprocess_clip_gpu(batch_np, self.device, target_size=self.patch_size)
             else:
-                # CPU 预处理
+                # CPU preprocessing
                 processed = []
                 for p in patches:
                     if isinstance(p, np.ndarray):
@@ -3015,18 +3015,18 @@ class NucleiEmbedding:
             
             return batch_tensor, indices
         
-        # DataLoader - 不需要 num_workers，因为 I/O 已经在主进程优化了
+        # DataLoader - no num_workers needed since I/O is already optimized in main process
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
-            num_workers=0,  # 单进程，避免 slide handle 问题
+            num_workers=0,  # Single process to avoid slide handle issues
             shuffle=False,
             collate_fn=collate_fn,
-            pin_memory=False,  # 数据已经在 collate_fn 中处理
+            pin_memory=False,  # Data already processed in collate_fn
             drop_last=False
         )
         
-        # 性能统计
+        # Performance statistics
         perf_stats = {
             'dataloader_time': 0.0,
             'model_time': 0.0,
@@ -3035,12 +3035,12 @@ class NucleiEmbedding:
             'total_samples': 0,
         }
         
-        # ★★★ 优化: 使用内存缓冲，最后一次性写入 Zarr ★★★
-        # 原问题: 每个 embedding 逐个写入 Zarr (250K 次写操作，73% 时间)
-        # 优化: 在内存中收集所有 embeddings，最后批量写入
+        # Optimization: Use memory buffer, write to Zarr all at once at the end
+        # Original issue: Each embedding written to Zarr individually (250K write ops, 73% of time)
+        # Optimization: Collect all embeddings in memory, batch write at the end
         embedding_dim = 768
         embeddings_buffer = np.zeros((total_nuclei, embedding_dim), dtype=np.float16)
-        processed_mask = np.zeros(total_nuclei, dtype=bool)  # 追踪哪些已处理
+        processed_mask = np.zeros(total_nuclei, dtype=bool)  # Track which are processed
         
         total_start = time.time()
         pbar = tqdm(total=total_nuclei, desc="Generating embeddings")
@@ -3055,18 +3055,18 @@ class NucleiEmbedding:
                 batch_size_actual = len(original_indices)
                 perf_stats['total_samples'] += batch_size_actual
                 
-                # 模型推理
+                # Model inference
                 t0 = time.time()
                 embeddings = self.embed_batch(batch_tensor, is_zstack=False)
                 perf_stats['model_time'] += time.time() - t0
                 
-                # L2 归一化
+                # L2 normalization
                 norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
                 norms = np.where(norms > 0, norms, 1)
                 embeddings = embeddings / norms
                 embeddings = embeddings.astype(np.float16)
                 
-                # 写入内存缓冲 (几乎无开销)
+                # Write to memory buffer (almost no overhead)
                 for i, orig_idx in enumerate(original_indices):
                     embeddings_buffer[orig_idx] = embeddings[i]
                     processed_mask[orig_idx] = True
@@ -3076,11 +3076,11 @@ class NucleiEmbedding:
         pbar.close()
         inference_time = time.time() - total_start
         
-        # ★★★ 批量写入 Zarr (一次性写入，大幅减少 I/O 开销) ★★★
+        # Batch write to Zarr (single write, significantly reduces I/O overhead)
         print(f"\n📦 Writing {total_nuclei:,} embeddings to Zarr...")
         t0 = time.time()
         
-        # 准备 Zarr 存储
+        # Prepare Zarr storage
         root = zarr.open_group(zarr_path, mode='a')
         parts = dataset_path.strip('/').split('/')
         parent = root
@@ -3088,19 +3088,19 @@ class NucleiEmbedding:
             parent = parent.require_group(group_name)
         ds_name = parts[-1]
         
-        # 删除已存在的 dataset
+        # Delete existing dataset
         if ds_name in parent:
             del parent[ds_name]
         
-        # 使用更大的 chunk 以优化写入性能
-        # chunk_size 设为 10000 或总数的 1%，取较大值
+        # Use larger chunk for optimized write performance
+        # chunk_size set to 10000 or 1% of total, whichever is larger
         optimal_chunk = max(10000, total_nuclei // 100)
-        optimal_chunk = min(optimal_chunk, 50000)  # 但不超过 50000
+        optimal_chunk = min(optimal_chunk, 50000)  # But not exceeding 50000
         
-        # 创建 dataset 并一次性写入整个 buffer
+        # Create dataset and write entire buffer at once
         final_dset = parent.create_dataset(
             ds_name,
-            data=embeddings_buffer,  # ★ 直接传入数据，一次性写入
+            data=embeddings_buffer,  # Pass data directly for single write
             chunks=(optimal_chunk, embedding_dim),
             dtype=np.float16
         )
@@ -3108,12 +3108,12 @@ class NucleiEmbedding:
         perf_stats['write_time'] = time.time() - t0
         total_time = time.time() - total_start
         
-        # 检查未处理的 centroids
+        # Check for unprocessed centroids
         unprocessed = np.sum(~processed_mask)
         if unprocessed > 0:
             print(f"⚠️  Warning: {unprocessed} centroids were not processed")
         
-        # 打印性能统计
+        # Print performance statistics
         print(f"\n{'='*70}")
         print(f"✅ FAST EMBEDDING COMPLETE")
         print(f"{'='*70}")
@@ -3126,7 +3126,7 @@ class NucleiEmbedding:
         data_time = total_time - perf_stats['model_time'] - perf_stats['write_time']
         print(f"    - Data loading: {data_time:.2f}s ({data_time/total_time*100:.1f}%)")
         
-        # 打印 Dataset 统计
+        # Print Dataset statistics
         dataset.print_stats()
         dataset.close()
         
