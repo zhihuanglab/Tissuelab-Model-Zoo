@@ -39,12 +39,17 @@ def prepare_tile_plan(
     tile_size: int,
     overlap: int,
     detection_size: int,
-    use_tissue_mask: bool,
-    use_otsu_threshold: bool,
-    debug_tissue_mask: bool,
-    verbose: bool,
+    use_tissue_mask: bool = True,
+    debug_tissue_mask: bool = False,
+    verbose: bool = False,
 ) -> TilePlan:
-    """Compute tiling metadata, including ROI filtering and scale factors."""
+    """Compute tiling metadata, including ROI filtering and scale factors.
+    
+    Args:
+        use_tissue_mask: If True (default), uses adaptive tissue masking to skip
+            background tiles. Uses StarDist-style adaptive thresholding with
+            morphological cleanup for robust tissue detection.
+    """
 
     if img_pixel_size is None or img_pixel_size > 1 or img_pixel_size < 0.1:
         if pixel_size_override is not None:
@@ -66,14 +71,22 @@ def prepare_tile_plan(
 
     mask = None
     thumbnail_for_debug = None
+    
     if use_tissue_mask:
-        mask, _, thumbnail_for_debug = _generate_tissue_mask(slide, max_dim=2048)
-        valid_positions = _find_non_empty_positions(mask, chop_list, shape[0], dims)
-    elif use_otsu_threshold:
-        mask, _, thumbnail_for_debug = _threshold_thumbnail(slide)
-        valid_positions = _find_non_empty_positions(mask, chop_list, shape[0], dims)
+        try:
+            mask, _, thumbnail_for_debug = _adaptive_threshold_mask(slide, max_dim=2048)
+            valid_positions = _find_non_empty_positions(mask, chop_list, shape[0], dims)
+            method_name = "ADAPTIVE"
+        except ImportError:
+            # Fall back to simple color-based if dependencies missing
+            if verbose:
+                print("[WARN] scikit-image not available, using simple color-based tissue mask")
+            mask, _, thumbnail_for_debug = _generate_tissue_mask(slide, max_dim=2048)
+            valid_positions = _find_non_empty_positions(mask, chop_list, shape[0], dims)
+            method_name = "COLOR (fallback)"
     else:
         valid_positions = np.ones((total_possible_tiles,), dtype=np.int32)
+        method_name = "DISABLED"
 
     valid_tile_count = int(np.sum(valid_positions))
 
@@ -110,6 +123,7 @@ def prepare_tile_plan(
         print(f"[PERF] Requested overlap: {overlap} pixels")
         print(f"[PERF] Core margin: {core_margin} pixels (excludes {core_margin}px from each edge)")
         print(f"[PERF] Effective overlap: {effective_overlap} pixels (ensures core regions are covered)")
+        print(f"[PERF] Tissue mask method: {method_name}")
         print(f"[PERF] Total possible tiles: {total_possible_tiles} ({len(chop_list[0])} rows x {len(chop_list[1])} cols)")
         print(f"[PERF] Selected tiles: {valid_tile_count}/{total_possible_tiles} ({100 * valid_tile_count / total_possible_tiles:.1f}%)")
 
@@ -178,6 +192,77 @@ def _threshold_thumbnail(slide):
     mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, kernel)
     mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, kernel)
     mask = mask_uint8 > 0
+    downsample = slide.level_downsamples[level]
+    return mask, downsample, thumbnail
+
+
+def _adaptive_threshold_mask(slide, max_dim: int = 2048):
+    """
+    StarDist-style tissue mask using adaptive thresholding + morphological cleanup.
+    
+    This is more robust than global Otsu because:
+    1. Adaptive thresholding adjusts locally to staining variations
+    2. Morphological cleanup removes noise and fills holes
+    3. Dilation expands the mask to include tissue edges
+    
+    Returns:
+        mask: Boolean array where True = tissue
+        downsample: Downsampling factor used
+        thumbnail: RGB thumbnail image
+    """
+    try:
+        import cv2
+        from skimage import morphology
+    except ImportError as exc:
+        raise RuntimeError(
+            "OpenCV and scikit-image are required for adaptive tissue masking. "
+            "Install with: pip install opencv-python scikit-image"
+        ) from exc
+
+    # Get appropriate level for thumbnail
+    level = slide.get_best_level_for_downsample(slide.dimensions[0] / max_dim)
+    dim = slide.level_dimensions[level]
+    
+    # Limit size if still too large
+    if dim[0] > 10000 or dim[1] > 10000:
+        level = min(level + 1, slide.level_count - 1)
+        dim = slide.level_dimensions[level]
+    
+    # Read thumbnail
+    region = slide.read_region((0, 0), level, dim, as_array=True)
+    thumbnail = region[..., :3].copy()
+    
+    # Convert to grayscale
+    gray = cv2.cvtColor(thumbnail, cv2.COLOR_RGB2GRAY)
+    
+    # STEP 1: Adaptive thresholding (key difference from Otsu)
+    # block_size must be odd, controls local neighborhood
+    # C is a constant subtracted from mean (higher = less sensitive)
+    block_size = 51
+    C = 2
+    binary_mask = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,  # Invert: dark tissue becomes white
+        block_size,
+        C
+    )
+    
+    # STEP 2: Morphological cleanup
+    mask = (binary_mask > 0)
+    
+    # Remove small noise (objects smaller than 16x16 pixels)
+    mask = morphology.remove_small_objects(mask, min_size=16 * 16, connectivity=2)
+    
+    # Fill small holes (holes smaller than 128x128 pixels)
+    mask = morphology.remove_small_holes(mask, area_threshold=128 * 128)
+    
+    # STEP 3: Dilation to expand mask slightly (catches tissue edges)
+    # Matches StarDist implementation: disk(16)
+    struct_element = morphology.disk(16)
+    mask = morphology.binary_dilation(mask, struct_element)
+    
     downsample = slide.level_downsamples[level]
     return mask, downsample, thumbnail
 

@@ -69,7 +69,7 @@ def run_wsi(
     overlap: int = 50,
     detection_size: int = 20,
     save_geojson: bool = False,
-    use_otsu_threshold: bool = False,
+    use_tissue_mask: bool = True,
     batch_size: Optional[int] = None,
     to_ndim_fn: Callable[[torch.Tensor, int], torch.Tensor] = lambda x, _: x,
     **kwargs: Any,
@@ -109,7 +109,6 @@ def run_wsi(
         else:
             raise ValueError("The image pixel size {} is not in microns.".format(img_pixel_size))
 
-    use_tissue_mask = kwargs.pop("use_tissue_mask", False)
     debug_tissue_mask = kwargs.pop("debug_tissue_mask", False)
 
     plan = prepare_tile_plan(
@@ -122,7 +121,6 @@ def run_wsi(
         overlap=overlap,
         detection_size=detection_size,
         use_tissue_mask=use_tissue_mask,
-        use_otsu_threshold=use_otsu_threshold,
         debug_tissue_mask=debug_tissue_mask,
         verbose=model.verbose,
     )
