@@ -157,8 +157,9 @@ def parse_args():
                         help='Overlap between tiles for WSI processing')
     parser.add_argument('--normalise', default=True, type=bool,
                         help='Normalize input images')
-    parser.add_argument('--use_otsu', default=True, type=bool,
-                        help='Use Otsu thresholding for WSI tissue detection')
+    parser.add_argument('--use_tissue_mask', default=True, type=lambda x: str(x).lower() != 'false',
+                        help='Enable tissue masking to skip background tiles (default: True). '
+                             'Uses adaptive thresholding with morphological cleanup.')
     parser.add_argument('--min_area_pixels', default=25, type=int,
                         help='Minimum nucleus area (pixels) kept after filtering')
     parser.add_argument('--detection_size', default=15, type=int,
@@ -387,9 +388,8 @@ def run_segmentation(args):
                 overlap=args.overlap,
                 detection_size=getattr(args, "detection_size", 20),
                 save_geojson=False,
-                use_otsu_threshold=args.use_otsu,
+                use_tissue_mask=getattr(args, "use_tissue_mask", True),
                 batch_size=args.batch_size,
-                use_tissue_mask=args.use_otsu is False,
                 debug_tissue_mask=False,
                 min_area=getattr(args, "min_area_pixels", 50),
                 stardist_rays=getattr(args, "stardist_rays", 32),
@@ -524,7 +524,7 @@ def init_node():
                     batch_size=32,
                     overlap=50,
                     normalise=True,
-                    use_otsu=True,
+                    use_tissue_mask=True,
                     min_area_pixels=25,
                     detection_size=15,
                     stardist_rays=32,
@@ -578,7 +578,7 @@ def read_node(data: Dict[str, Any]):
             batch_size=32,
             overlap=50,
             normalise=True,
-            use_otsu=True,
+            use_tissue_mask=True,
             min_area_pixels=25,
             detection_size=15,
             stardist_rays=32,
@@ -645,8 +645,8 @@ def read_node(data: Dict[str, Any]):
                     print(f"Warning: Could not parse overlap value '{val_json}' as int.")
             elif k == "normalise":
                 ARGS.normalise = (val_json in [True, "true", "True"])
-            elif k == "use_otsu":
-                ARGS.use_otsu = (val_json in [True, "true", "True"])
+            elif k == "use_tissue_mask":
+                ARGS.use_tissue_mask = (val_json in [True, "true", "True", 1, "1"])
             elif k == "target_mpp":
                 try:
                     ARGS.target_mpp = float(val_json)
