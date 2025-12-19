@@ -63,7 +63,7 @@ def run_wsi(
     image: str,
     *,
     pixel_size: Optional[float] = None,
-    normalise: bool = True,
+    normalise: bool = False,
     normalisation_subsampling_factor: int = 1,
     tile_size: int = 1024,
     overlap: int = 50,
@@ -249,6 +249,8 @@ def run_wsi(
             tensor_start = time.time()
             tensor_list = [_to_tensor_float32(t) for t in batch_tensors]
             batch_tensor = torch.stack(tensor_list) if len(tensor_list) > 1 else tensor_list[0].unsqueeze(0)
+            if batch_tensor.max() > 1.0:
+                batch_tensor = batch_tensor / 255.0
             if stream_main is not None and not batch_tensor.is_pinned():
                 batch_tensor = batch_tensor.pin_memory()
             tensor_elapsed = time.time() - tensor_start
