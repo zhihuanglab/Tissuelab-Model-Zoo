@@ -327,7 +327,10 @@ def run_segmentation(args):
     4) Write core data (centroids / contours / probability) to Zarr
     5) Generate embeddings if not cached already and append to Zarr
     """
-    global progress_complete, MODEL
+    global progress_complete, progress_value, MODEL
+    
+    progress_value = 0
+    progress_complete = False
 
     if ZARR_PATH is None or NODE_NAME is None:
         raise ValueError("ZARR_PATH and NODE_NAME must be set before running segmentation")
@@ -352,6 +355,7 @@ def run_segmentation(args):
                 result["message"] = "Using existing nuclei segmentation"
                 result["nuclei_count"] = len(centroids)
                 print(f"[SEG LOG] Using existing segmentation with {len(centroids)} nuclei")
+                update_progress(100, "segmentation")
             else:
                 centroids = None
                 contours = None
