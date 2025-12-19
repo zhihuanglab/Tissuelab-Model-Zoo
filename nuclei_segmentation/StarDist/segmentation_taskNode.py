@@ -150,6 +150,8 @@ def run_segmentation(args):
                                 print("No target_mpp in attrs but current args has target_mpp - will re-run with new parameters.")
                         
                         # Check bbox: verify centroids match the bbox
+                        # Note: Only one ROI type (bbox or polygon) should be active at a time
+                        # If both are specified, bbox takes precedence
                         if params_match and current_bbox is not None:
                             try:
                                 bbox_parts = current_bbox.split(',')
@@ -348,8 +350,10 @@ def run_segmentation(args):
                 if contours_for_embedding is not None:
                     print(f"Using contours for embedding: shape {contours_for_embedding.shape}, centroids count: {len(centroids)}")
                     # Verify contours and centroids count match
+                    # Note: contours are from current segmentation (in memory), not from zarr
+                    # If count mismatch occurs, it indicates an issue with the current segmentation run
                     if len(contours_for_embedding) != len(centroids):
-                        print(f"Warning: Contours count ({len(contours_for_embedding)}) doesn't match centroids count ({len(centroids)}). Using None for contours.")
+                        print(f"Warning: Contours count ({len(contours_for_embedding)}) doesn't match centroids count ({len(centroids)}) from current segmentation. Using None for contours.")
                         contours_for_embedding = None
                 else:
                     print("Contours are None, embedding will use centroid-based patch extraction")
@@ -397,6 +401,7 @@ def run_segmentation(args):
             # Save parameters to attrs (zarr attrs support various types including float and string)
             node_grp.attrs['bbox'] = current_bbox if current_bbox is not None else ''
             # Save target_mpp as float if not None, empty string if None
+            # Note: attrs['target_mpp'] can be either float or empty string (for None case)
             if current_target_mpp is not None:
                 node_grp.attrs['target_mpp'] = float(current_target_mpp)
             else:
