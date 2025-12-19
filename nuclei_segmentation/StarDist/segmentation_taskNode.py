@@ -5,15 +5,12 @@ Segmentation Node for nuclei segmentation + embedding generation
 """
 import argparse
 import os
-import sys
 import time
 import json
 import zarr
 import uvicorn
 import requests
-import platform
 import numpy as np
-import cv2
 from matplotlib.path import Path as MplPath
 from sse_starlette.sse import EventSourceResponse
 import asyncio
@@ -64,31 +61,10 @@ def parse_args():
     parser.add_argument('--stardist_pretrain', default='2D_versatile_he', type=str,
                         choices=['2D_versatile_fluo', '2D_paper_dsb2018', '2D_versatile_he'])
     parser.add_argument('--isIHC', default=False, type=bool)
-    # New arguments for downsampling and bounding box
-    parser.add_argument('--target_mpp', default=None, type=float, help='Target microns per pixel for processing')
-    parser.add_argument('--bbox', default=None, type=str, help='Bounding box for segmentation in format "x,y,width,height"')
-    parser.add_argument('--polygon_points', default=None, type=json.loads, help='Polygon points for segmentation in JSON string format "[[x1,y1],[x2,y2],...]".')
-    
     # CPU control parameter
     parser.add_argument('--max_workers', type=int, default=15, help='Maximum number of CPU workers for processing (default: 4)')
 
     return parser.parse_args()
-
-def print_h5_structure(file_path):
-    """Helper to print Zarr structure."""
-    def _visit(group, prefix=""):
-        for key, val in group.items():
-            name = f"{prefix}/{key}" if prefix else key
-            if isinstance(val, zarr.hierarchy.Group):
-                print(f"{name} (Group)")
-                _visit(val, name)
-            else:
-                shape = getattr(val, 'shape', None)
-                dtype = getattr(val, 'dtype', None)
-                print(f"{name} (Dataset), shape: {shape}, dtype: {dtype}")
-    zf = zarr.open_group(file_path, mode='r')
-    _visit(zf)
-
 
 
 def run_segmentation(args):
@@ -97,7 +73,7 @@ def run_segmentation(args):
     1) if already have segmentation => skip stardist
     2) or run stardist to get segmentation
     3) according to segmentation, generate embedding
-    4) write segmentation + embedding to workflow_data.h5
+    4) write segmentation + embedding to zarr
     """
     global progress_complete
 
@@ -188,11 +164,13 @@ def run_segmentation(args):
                                     bbox_y2 = bbox_y + bbox_h
                                     
                                     # Check if all centroids are within bbox
+                                    # Allow small tolerance for floating point errors (1 pixel)
+                                    tolerance = 1.0
                                     centroids_x = centroids[:, 0]
                                     centroids_y = centroids[:, 1]
                                     in_bbox = (
-                                        (centroids_x >= bbox_x1) & (centroids_x <= bbox_x2) &
-                                        (centroids_y >= bbox_y1) & (centroids_y <= bbox_y2)
+                                        (centroids_x >= bbox_x1 - tolerance) & (centroids_x <= bbox_x2 + tolerance) &
+                                        (centroids_y >= bbox_y1 - tolerance) & (centroids_y <= bbox_y2 + tolerance)
                                     )
                                     
                                     if not np.all(in_bbox):
@@ -207,9 +185,8 @@ def run_segmentation(args):
                                         centroids_min_x, centroids_max_x = np.min(centroids_x), np.max(centroids_x)
                                         centroids_min_y, centroids_max_y = np.min(centroids_y), np.max(centroids_y)
                                         
-                                        # Allow small tolerance for floating point errors (1 pixel)
-                                        tolerance = 1.0
                                         # Check if centroids range significantly exceeds bbox (indicating old data with larger ROI)
+                                        # Use same tolerance as above for consistency
                                         if (centroids_min_x < bbox_x1 - tolerance or centroids_max_x > bbox_x2 + tolerance or
                                             centroids_min_y < bbox_y1 - tolerance or centroids_max_y > bbox_y2 + tolerance):
                                             params_match = False
@@ -237,6 +214,8 @@ def run_segmentation(args):
                         
                         # Check if current parameters are None but saved parameters exist (ROI was removed)
                         # This handles the case: previously ran with bbox/polygon, now running without ROI (full image)
+                        # This check is independent of bbox/polygon checks above and should run regardless of their results
+                        # Only check if both current parameters are None (user wants full image)
                         if params_match and current_bbox is None and current_polygon_points is None:
                             # Check if saved bbox exists in attrs
                             saved_bbox = node_grp.attrs.get('bbox', '')
@@ -351,11 +330,10 @@ def run_segmentation(args):
                 have_cached_embedding = False
             else:
                 # Segmentation was skipped (using existing data), check if embedding exists and matches
-                zf = zarr.open_group(ZARR_PATH, mode='a')
-                node_grp_path = f"{NODE_NAME}"
-                if NODE_NAME in zf and 'embedding' in zf[NODE_NAME]:
+                zf_embed = zarr.open_group(ZARR_PATH, mode='a')
+                if NODE_NAME in zf_embed and 'embedding' in zf_embed[NODE_NAME]:
                     try:
-                        existing_len = zf[NODE_NAME]['embedding'].shape[0]
+                        existing_len = zf_embed[NODE_NAME]['embedding'].shape[0]
                         if existing_len == len(centroids):
                             have_cached_embedding = True
                             print("found existing embeddings in store => skip embedding calculation")
