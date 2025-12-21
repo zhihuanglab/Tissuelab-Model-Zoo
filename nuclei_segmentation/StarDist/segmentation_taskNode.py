@@ -5,15 +5,13 @@ Segmentation Node for nuclei segmentation + embedding generation
 """
 import argparse
 import os
-import sys
 import time
 import json
 import zarr
 import uvicorn
 import requests
-import platform
 import numpy as np
-import cv2
+from matplotlib.path import Path as MplPath
 from sse_starlette.sse import EventSourceResponse
 import asyncio
 
@@ -63,31 +61,10 @@ def parse_args():
     parser.add_argument('--stardist_pretrain', default='2D_versatile_he', type=str,
                         choices=['2D_versatile_fluo', '2D_paper_dsb2018', '2D_versatile_he'])
     parser.add_argument('--isIHC', default=False, type=bool)
-    # New arguments for downsampling and bounding box
-    parser.add_argument('--target_mpp', default=None, type=float, help='Target microns per pixel for processing')
-    parser.add_argument('--bbox', default=None, type=str, help='Bounding box for segmentation in format "x,y,width,height"')
-    parser.add_argument('--polygon_points', default=None, type=json.loads, help='Polygon points for segmentation in JSON string format "[[x1,y1],[x2,y2],...]".')
-    
     # CPU control parameter
     parser.add_argument('--max_workers', type=int, default=15, help='Maximum number of CPU workers for processing (default: 4)')
 
     return parser.parse_args()
-
-def print_h5_structure(file_path):
-    """Helper to print Zarr structure."""
-    def _visit(group, prefix=""):
-        for key, val in group.items():
-            name = f"{prefix}/{key}" if prefix else key
-            if isinstance(val, zarr.hierarchy.Group):
-                print(f"{name} (Group)")
-                _visit(val, name)
-            else:
-                shape = getattr(val, 'shape', None)
-                dtype = getattr(val, 'dtype', None)
-                print(f"{name} (Dataset), shape: {shape}, dtype: {dtype}")
-    zf = zarr.open_group(file_path, mode='r')
-    _visit(zf)
-
 
 
 def run_segmentation(args):
@@ -96,7 +73,7 @@ def run_segmentation(args):
     1) if already have segmentation => skip stardist
     2) or run stardist to get segmentation
     3) according to segmentation, generate embedding
-    4) write segmentation + embedding to workflow_data.h5
+    4) write segmentation + embedding to zarr
     """
     global progress_complete
 
@@ -113,6 +90,11 @@ def run_segmentation(args):
         centroids = None
         contours = None
         probability = None # Initialize probability
+        
+        # Get current parameters once (used for both checking and saving)
+        current_bbox = getattr(args, 'bbox', None)
+        current_polygon_points = getattr(args, 'polygon_points', None)
+        current_target_mpp = getattr(args, 'target_mpp', None)
 
         if os.path.exists(ZARR_PATH):
             zf = zarr.open_group(ZARR_PATH, mode='r')
@@ -127,10 +109,140 @@ def run_segmentation(args):
 
                     # Check if essential data (centroids) is valid
                     if centroids is not None and centroids.size > 0:  # Basic check for non-empty centroids
-                        ALREADY_HAVE_SEG = True
-                        print("Using existing nuclei segmentation => skip stardist.")
-                        result["message"] = "Using existing nuclei segmentation"
-                        result["nuclei_count"] = len(centroids)
+                        # Verify if existing centroids match current ROI parameters by checking data range
+                        # This avoids needing to store parameters separately - we check if centroids match current ROI
+                        params_match = True
+                        
+                        # Check target_mpp: read from node attrs (saved when segmentation was generated)
+                        # target_mpp affects processing resolution, so we need to verify it matches
+                        # Note: userData is updated before each run, so we can't use it to get old parameters
+                        node_grp = zf[NODE_NAME]
+                        saved_target_mpp = None
+                        has_target_mpp_attr = 'target_mpp' in node_grp.attrs
+                        
+                        if has_target_mpp_attr:
+                            try:
+                                saved_target_mpp_val = node_grp.attrs['target_mpp']
+                                if isinstance(saved_target_mpp_val, str):
+                                    saved_target_mpp = float(saved_target_mpp_val) if saved_target_mpp_val and saved_target_mpp_val.strip() else None
+                                elif isinstance(saved_target_mpp_val, (int, float)):
+                                    saved_target_mpp = float(saved_target_mpp_val)
+                            except Exception as e:
+                                print(f"Warning: Could not read saved target_mpp from attrs: {e}")
+                        
+                        # Compare saved target_mpp with current target_mpp
+                        if has_target_mpp_attr:
+                            # Parameters were saved, compare them
+                            if saved_target_mpp is not None and current_target_mpp is not None:
+                                if abs(saved_target_mpp - current_target_mpp) > 1e-6:
+                                    params_match = False
+                                    print(f"Parameter mismatch: target_mpp - saved={saved_target_mpp}, current={current_target_mpp}")
+                            elif saved_target_mpp is not None or current_target_mpp is not None:
+                                # One is None, other is not -> mismatch
+                                params_match = False
+                                print(f"Parameter mismatch: target_mpp - saved={saved_target_mpp}, current={current_target_mpp}")
+                            # If both are None, they match (no target_mpp specified in either case)
+                        else:
+                            # No target_mpp in attrs - this is old data generated before parameter tracking
+                            # If current args has target_mpp, we should re-run
+                            if current_target_mpp is not None:
+                                params_match = False
+                                print("No target_mpp in attrs but current args has target_mpp - will re-run with new parameters.")
+                        
+                        # Check bbox: verify centroids match the bbox
+                        # Note: Only one ROI type (bbox or polygon) should be active at a time
+                        # If both are specified, bbox takes precedence
+                        if params_match and current_bbox is not None:
+                            try:
+                                bbox_parts = current_bbox.split(',')
+                                if len(bbox_parts) == 4:
+                                    bbox_x = float(bbox_parts[0])
+                                    bbox_y = float(bbox_parts[1])
+                                    bbox_w = float(bbox_parts[2])
+                                    bbox_h = float(bbox_parts[3])
+                                    bbox_x1 = bbox_x
+                                    bbox_y1 = bbox_y
+                                    bbox_x2 = bbox_x + bbox_w
+                                    bbox_y2 = bbox_y + bbox_h
+                                    
+                                    # Check if all centroids are within bbox
+                                    # Allow small tolerance for floating point errors (1 pixel)
+                                    tolerance = 1.0
+                                    centroids_x = centroids[:, 0]
+                                    centroids_y = centroids[:, 1]
+                                    in_bbox = (
+                                        (centroids_x >= bbox_x1 - tolerance) & (centroids_x <= bbox_x2 + tolerance) &
+                                        (centroids_y >= bbox_y1 - tolerance) & (centroids_y <= bbox_y2 + tolerance)
+                                    )
+                                    
+                                    if not np.all(in_bbox):
+                                        # Some centroids are outside bbox - parameters don't match
+                                        params_match = False
+                                        out_of_range_count = np.sum(~in_bbox)
+                                        print(f"Parameter mismatch: {out_of_range_count} centroids are outside current bbox ({current_bbox})")
+                                    else:
+                                        # All centroids are within bbox, but need to check if data range matches bbox
+                                        # If centroids were generated with a larger bbox, they might all be within current bbox
+                                        # but the data range would be larger than current bbox
+                                        centroids_min_x, centroids_max_x = np.min(centroids_x), np.max(centroids_x)
+                                        centroids_min_y, centroids_max_y = np.min(centroids_y), np.max(centroids_y)
+                                        
+                                        # Check if centroids range significantly exceeds bbox (indicating old data with larger ROI)
+                                        # Use same tolerance as above for consistency
+                                        if (centroids_min_x < bbox_x1 - tolerance or centroids_max_x > bbox_x2 + tolerance or
+                                            centroids_min_y < bbox_y1 - tolerance or centroids_max_y > bbox_y2 + tolerance):
+                                            params_match = False
+                                            print(f"Parameter mismatch: centroids range ({centroids_min_x:.0f}-{centroids_max_x:.0f}, {centroids_min_y:.0f}-{centroids_max_y:.0f}) exceeds bbox ({bbox_x1:.0f}-{bbox_x2:.0f}, {bbox_y1:.0f}-{bbox_y2:.0f})")
+                            except Exception as e:
+                                print(f"Warning: Could not verify bbox match: {e}")
+                                # If we can't verify, assume mismatch to be safe
+                                params_match = False
+                        
+                        # Check polygon_points: verify all centroids are within the polygon if specified
+                        elif params_match and current_polygon_points is not None and len(current_polygon_points) > 0:
+                            try:
+                                polygon_path = MplPath(current_polygon_points)
+                                centroids_xy = centroids[:, :2]
+                                in_polygon = polygon_path.contains_points(centroids_xy)
+                                
+                                if not np.all(in_polygon):
+                                    params_match = False
+                                    out_of_range_count = np.sum(~in_polygon)
+                                    print(f"Parameter mismatch: {out_of_range_count} centroids are outside current polygon")
+                            except Exception as e:
+                                print(f"Warning: Could not verify polygon match: {e}")
+                                # If we can't verify, assume mismatch to be safe
+                                params_match = False
+                        
+                        # Check if current parameters are None but saved parameters exist (ROI was removed)
+                        # This handles the case: previously ran with bbox/polygon, now running without ROI (full image)
+                        # This check is independent of bbox/polygon checks above and should run regardless of their results
+                        # Only check if both current parameters are None (user wants full image)
+                        if params_match and current_bbox is None and current_polygon_points is None:
+                            # Check if saved bbox exists in attrs
+                            saved_bbox = node_grp.attrs.get('bbox', '')
+                            saved_polygon_str = node_grp.attrs.get('polygon_points', '')
+                            
+                            if saved_bbox and saved_bbox.strip():
+                                # Previously had bbox, now no bbox -> mismatch (user wants full image)
+                                params_match = False
+                                print(f"Parameter mismatch: current bbox is None, but saved bbox was '{saved_bbox}' (user wants full image segmentation)")
+                            elif saved_polygon_str and saved_polygon_str.strip():
+                                # Previously had polygon, now no polygon -> mismatch (user wants full image)
+                                params_match = False
+                                print(f"Parameter mismatch: current polygon_points is None, but saved polygon_points exists (user wants full image segmentation)")
+                        
+                        if params_match:
+                            ALREADY_HAVE_SEG = True
+                            print("Using existing nuclei segmentation => skip stardist.")
+                            result["message"] = "Using existing nuclei segmentation"
+                            result["nuclei_count"] = len(centroids)
+                        else:
+                            print("Existing centroids do not match current ROI parameters. Will re-run stardist with new parameters.")
+                            ALREADY_HAVE_SEG = False
+                            centroids = None  # Clear loaded data
+                            contours = None
+                            probability = None
                     else:
                         print("Warning: Existing centroids are missing or empty. Will re-run stardist.")
                         ALREADY_HAVE_SEG = False
@@ -212,27 +324,39 @@ def run_segmentation(args):
         # Step C: generate embedding if not cached; write directly to Zarr
         if centroids is not None and len(centroids) > 0: # Ensure centroids exist and are not empty
             have_cached_embedding = False
-            zf = zarr.open_group(ZARR_PATH, mode='a')
-            node_grp_path = f"{NODE_NAME}"
-            if NODE_NAME in zf and 'embedding' in zf[NODE_NAME]:
-                try:
-                    existing_len = zf[NODE_NAME]['embedding'].shape[0]
-                    if existing_len == len(centroids):
-                        have_cached_embedding = True
-                        print("found existing embeddings in store => skip embedding calculation")
-                except Exception:
-                    have_cached_embedding = False
+            # If segmentation was just re-run (ALREADY_HAVE_SEG == False), we must regenerate embedding
+            # because centroids have changed even if count is the same
+            if not ALREADY_HAVE_SEG:
+                # Segmentation was just re-run, so embedding must be regenerated
+                print("Segmentation was re-run, will regenerate embedding even if count matches")
+                have_cached_embedding = False
+            else:
+                # Segmentation was skipped (using existing data), check if embedding exists and matches
+                zf_embed = zarr.open_group(ZARR_PATH, mode='a')
+                if NODE_NAME in zf_embed and 'embedding' in zf_embed[NODE_NAME]:
+                    try:
+                        existing_len = zf_embed[NODE_NAME]['embedding'].shape[0]
+                        if existing_len == len(centroids):
+                            have_cached_embedding = True
+                            print("found existing embeddings in store => skip embedding calculation")
+                    except Exception:
+                        have_cached_embedding = False
 
             if not have_cached_embedding:
                 print("no cached embeddings => generate new embeddings directly into Zarr")
-                # Load contours for bounding box extraction
-                contours_for_embedding = None
-                if NODE_NAME in zf and 'contours' in zf[NODE_NAME]:
-                    try:
-                        contours_for_embedding = zf[f"{NODE_NAME}/contours"][()]
-                        print(f"Loaded contours for embedding: shape {contours_for_embedding.shape}")
-                    except Exception as e:
-                        print(f"Warning: Could not load contours for embedding: {e}")
+                # Use contours from current segmentation (in memory), not from zarr
+                # This ensures contours match centroids count
+                contours_for_embedding = contours  # Use the contours we just generated/loaded
+                if contours_for_embedding is not None:
+                    print(f"Using contours for embedding: shape {contours_for_embedding.shape}, centroids count: {len(centroids)}")
+                    # Verify contours and centroids count match
+                    # Note: contours are from current segmentation (in memory), not from zarr
+                    # If count mismatch occurs, it indicates an issue with the current segmentation run
+                    if len(contours_for_embedding) != len(centroids):
+                        print(f"Warning: Contours count ({len(contours_for_embedding)}) doesn't match centroids count ({len(centroids)}) from current segmentation. Using None for contours.")
+                        contours_for_embedding = None
+                else:
+                    print("Contours are None, embedding will use centroid-based patch extraction")
                 ne = NucleiEmbedding(args, centroids, contours=contours_for_embedding, progress_callback=lambda x: update_progress(x, "embedding"))
                 ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{NODE_NAME}/embedding")
         elif centroids is not None and len(centroids) == 0:
@@ -268,6 +392,27 @@ def run_segmentation(args):
                 node_grp.create_dataset('probability', data=probability)
             else: # This case should be less common if prob is always attempted
                 print("[ZARR WRITE] Probability is None, not writing.")
+
+            # Save parameters used to generate this segmentation in node attrs for future comparison
+            # This allows us to detect parameter changes and re-run if needed
+            # Using attrs instead of separate datasets to avoid changing zarr structure
+            # Note: current_bbox, current_target_mpp, current_polygon_points are already retrieved at the start of Step A
+            
+            # Save parameters to attrs (zarr attrs support various types including float and string)
+            node_grp.attrs['bbox'] = current_bbox if current_bbox is not None else ''
+            # Save target_mpp as float if not None, empty string if None
+            # Note: attrs['target_mpp'] can be either float or empty string (for None case)
+            if current_target_mpp is not None:
+                node_grp.attrs['target_mpp'] = float(current_target_mpp)
+            else:
+                node_grp.attrs['target_mpp'] = ''
+            # Save polygon_points as JSON string
+            if current_polygon_points is not None:
+                node_grp.attrs['polygon_points'] = json.dumps(current_polygon_points, ensure_ascii=False)
+            else:
+                node_grp.attrs['polygon_points'] = ''
+            
+            print(f"[ZARR WRITE] Saved segmentation parameters to attrs: bbox={current_bbox}, target_mpp={current_target_mpp}, polygon_points={current_polygon_points is not None}")
 
             # Embedding has been written directly by NucleiEmbedding if needed
 
