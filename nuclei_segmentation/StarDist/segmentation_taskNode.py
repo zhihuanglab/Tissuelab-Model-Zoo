@@ -153,6 +153,7 @@ def run_segmentation(args):
                         # Note: Only one ROI type (bbox or polygon) should be active at a time
                         # If both are specified, bbox takes precedence
                         if params_match and current_bbox is not None:
+                            print(f"[BBOX CHECK] Starting bbox comparison: current_bbox='{current_bbox}', params_match={params_match}")
                             try:
                                 bbox_parts = current_bbox.split(',')
                                 if len(bbox_parts) == 4:
@@ -165,34 +166,74 @@ def run_segmentation(args):
                                     bbox_x2 = bbox_x + bbox_w
                                     bbox_y2 = bbox_y + bbox_h
                                     
-                                    # Check if all centroids are within bbox
-                                    # Allow small tolerance for floating point errors (1 pixel)
-                                    tolerance = 1.0
-                                    centroids_x = centroids[:, 0]
-                                    centroids_y = centroids[:, 1]
-                                    in_bbox = (
-                                        (centroids_x >= bbox_x1 - tolerance) & (centroids_x <= bbox_x2 + tolerance) &
-                                        (centroids_y >= bbox_y1 - tolerance) & (centroids_y <= bbox_y2 + tolerance)
-                                    )
-                                    
-                                    if not np.all(in_bbox):
-                                        # Some centroids are outside bbox - parameters don't match
-                                        params_match = False
-                                        out_of_range_count = np.sum(~in_bbox)
-                                        print(f"Parameter mismatch: {out_of_range_count} centroids are outside current bbox ({current_bbox})")
+                                    # First, check if saved bbox matches current bbox (direct comparison)
+                                    # This is the most reliable way to detect bbox changes
+                                    saved_bbox = node_grp.attrs.get('bbox', '')
+                                    print(f"[BBOX CHECK] Comparing: saved='{saved_bbox}' vs current='{current_bbox}'")
+                                    if saved_bbox and saved_bbox.strip():
+                                        try:
+                                            saved_bbox_parts = saved_bbox.split(',')
+                                            if len(saved_bbox_parts) == 4:
+                                                saved_bbox_x = float(saved_bbox_parts[0])
+                                                saved_bbox_y = float(saved_bbox_parts[1])
+                                                saved_bbox_w = float(saved_bbox_parts[2])
+                                                saved_bbox_h = float(saved_bbox_parts[3])
+                                                
+                                                # Compare bbox values with tolerance for floating point errors
+                                                bbox_tolerance = 1.0
+                                                x_diff = abs(bbox_x - saved_bbox_x)
+                                                y_diff = abs(bbox_y - saved_bbox_y)
+                                                w_diff = abs(bbox_w - saved_bbox_w)
+                                                h_diff = abs(bbox_h - saved_bbox_h)
+                                                
+                                                print(f"[DEBUG] Bbox differences: x={x_diff:.2f}, y={y_diff:.2f}, w={w_diff:.2f}, h={h_diff:.2f}, tolerance={bbox_tolerance}")
+                                                
+                                                if (x_diff > bbox_tolerance or y_diff > bbox_tolerance or
+                                                    w_diff > bbox_tolerance or h_diff > bbox_tolerance):
+                                                    params_match = False
+                                                    print(f"Parameter mismatch: saved bbox '{saved_bbox}' does not match current bbox '{current_bbox}'")
+                                                else:
+                                                    print(f"[DEBUG] Bbox matches (within tolerance)")
+                                        except Exception as e:
+                                            print(f"Warning: Could not parse saved bbox '{saved_bbox}': {e}")
+                                            # If we can't parse saved bbox, fall through to centroid-based check
                                     else:
-                                        # All centroids are within bbox, but need to check if data range matches bbox
-                                        # If centroids were generated with a larger bbox, they might all be within current bbox
-                                        # but the data range would be larger than current bbox
-                                        centroids_min_x, centroids_max_x = np.min(centroids_x), np.max(centroids_x)
-                                        centroids_min_y, centroids_max_y = np.min(centroids_y), np.max(centroids_y)
+                                        # No saved bbox in attrs, but current bbox is specified
+                                        # This means previous run was without bbox (full image), now user wants specific bbox
+                                        params_match = False
+                                        print(f"Parameter mismatch: no saved bbox, but current bbox is '{current_bbox}' (user wants specific ROI segmentation)")
+                                    
+                                    # If bbox comparison passed, also verify centroids are within bbox and range matches
+                                    # This provides additional validation
+                                    if params_match:
+                                        # Check if all centroids are within bbox
+                                        # Allow small tolerance for floating point errors (1 pixel)
+                                        tolerance = 1.0
+                                        centroids_x = centroids[:, 0]
+                                        centroids_y = centroids[:, 1]
+                                        in_bbox = (
+                                            (centroids_x >= bbox_x1 - tolerance) & (centroids_x <= bbox_x2 + tolerance) &
+                                            (centroids_y >= bbox_y1 - tolerance) & (centroids_y <= bbox_y2 + tolerance)
+                                        )
                                         
-                                        # Check if centroids range significantly exceeds bbox (indicating old data with larger ROI)
-                                        # Use same tolerance as above for consistency
-                                        if (centroids_min_x < bbox_x1 - tolerance or centroids_max_x > bbox_x2 + tolerance or
-                                            centroids_min_y < bbox_y1 - tolerance or centroids_max_y > bbox_y2 + tolerance):
+                                        if not np.all(in_bbox):
+                                            # Some centroids are outside bbox - parameters don't match
                                             params_match = False
-                                            print(f"Parameter mismatch: centroids range ({centroids_min_x:.0f}-{centroids_max_x:.0f}, {centroids_min_y:.0f}-{centroids_max_y:.0f}) exceeds bbox ({bbox_x1:.0f}-{bbox_x2:.0f}, {bbox_y1:.0f}-{bbox_y2:.0f})")
+                                            out_of_range_count = np.sum(~in_bbox)
+                                            print(f"Parameter mismatch: {out_of_range_count} centroids are outside current bbox ({current_bbox})")
+                                        else:
+                                            # All centroids are within bbox, but need to check if data range matches bbox
+                                            # If centroids were generated with a larger bbox, they might all be within current bbox
+                                            # but the data range would be larger than current bbox
+                                            centroids_min_x, centroids_max_x = np.min(centroids_x), np.max(centroids_x)
+                                            centroids_min_y, centroids_max_y = np.min(centroids_y), np.max(centroids_y)
+                                            
+                                            # Check if centroids range significantly exceeds bbox (indicating old data with larger ROI)
+                                            # Use same tolerance as above for consistency
+                                            if (centroids_min_x < bbox_x1 - tolerance or centroids_max_x > bbox_x2 + tolerance or
+                                                centroids_min_y < bbox_y1 - tolerance or centroids_max_y > bbox_y2 + tolerance):
+                                                params_match = False
+                                                print(f"Parameter mismatch: centroids range ({centroids_min_x:.0f}-{centroids_max_x:.0f}, {centroids_min_y:.0f}-{centroids_max_y:.0f}) exceeds bbox ({bbox_x1:.0f}-{bbox_x2:.0f}, {bbox_y1:.0f}-{bbox_y2:.0f})")
                             except Exception as e:
                                 print(f"Warning: Could not verify bbox match: {e}")
                                 # If we can't verify, assume mismatch to be safe
