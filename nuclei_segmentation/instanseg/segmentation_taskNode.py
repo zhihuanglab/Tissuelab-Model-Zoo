@@ -153,15 +153,16 @@ def parse_args():
                         help='Tile size for medium/large images')
     parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size for tiled processing')
-    parser.add_argument('--overlap', default=100, type=int,
+    parser.add_argument('--overlap', default=50, type=int,
                         help='Overlap between tiles for WSI processing')
-    parser.add_argument('--normalise', default=True, type=bool,
-                        help='Normalize input images')
-    parser.add_argument('--use_otsu', default=True, type=bool,
-                        help='Use Otsu thresholding for WSI tissue detection')
-    parser.add_argument('--min_area_pixels', default=10, type=int,
+    parser.add_argument('--normalise', default=False, type=lambda x: str(x).lower() != 'false',
+                        help='Normalize input images (default: False for best performance)')
+    parser.add_argument('--use_tissue_mask', default=True, type=lambda x: str(x).lower() != 'false',
+                        help='Enable tissue masking to skip background tiles (default: True). '
+                             'Uses adaptive thresholding with morphological cleanup.')
+    parser.add_argument('--min_area_pixels', default=25, type=int,
                         help='Minimum nucleus area (pixels) kept after filtering')
-    parser.add_argument('--detection_size', default=10, type=int,
+    parser.add_argument('--detection_size', default=15, type=int,
                         help='Expected half-size for detections (core region margin)')
     parser.add_argument('--stardist_rays', default=32, type=int,
                         help='Number of rays for StarDist-style contour export')
@@ -326,7 +327,10 @@ def run_segmentation(args):
     4) Write core data (centroids / contours / probability) to Zarr
     5) Generate embeddings if not cached already and append to Zarr
     """
-    global progress_complete, MODEL
+    global progress_complete, progress_value, MODEL
+    
+    progress_value = 0
+    progress_complete = False
 
     if ZARR_PATH is None or NODE_NAME is None:
         raise ValueError("ZARR_PATH and NODE_NAME must be set before running segmentation")
@@ -351,6 +355,7 @@ def run_segmentation(args):
                 result["message"] = "Using existing nuclei segmentation"
                 result["nuclei_count"] = len(centroids)
                 print(f"[SEG LOG] Using existing segmentation with {len(centroids)} nuclei")
+                update_progress(100, "segmentation")
             else:
                 centroids = None
                 contours = None
@@ -385,13 +390,12 @@ def run_segmentation(args):
                 normalisation_subsampling_factor=1,
                 tile_size=args.tile_size,
                 overlap=args.overlap,
-                detection_size=getattr(args, "detection_size", 10),
+                detection_size=getattr(args, "detection_size", 20),
                 save_geojson=False,
-                use_otsu_threshold=args.use_otsu,
+                use_tissue_mask=getattr(args, "use_tissue_mask", True),
                 batch_size=args.batch_size,
-                use_tissue_mask=args.use_otsu is False,
                 debug_tissue_mask=False,
-                min_area=getattr(args, "min_area_pixels", 10),
+                min_area=getattr(args, "min_area_pixels", 50),
                 stardist_rays=getattr(args, "stardist_rays", 32),
                 zarr_path=ZARR_PATH,
                 node_name=NODE_NAME,
@@ -522,11 +526,11 @@ def init_node():
                     processing_method='auto',
                     tile_size=1024,
                     batch_size=32,
-                    overlap=80,
-                    normalise=True,
-                    use_otsu=True,
-                    min_area_pixels=10,
-                    detection_size=10,
+                    overlap=50,
+                    normalise=False,
+                    use_tissue_mask=True,
+                    min_area_pixels=25,
+                    detection_size=15,
                     stardist_rays=32,
                     target_mpp=None,
                     bbox=None,
@@ -576,11 +580,11 @@ def read_node(data: Dict[str, Any]):
             processing_method="auto",
             tile_size=1024,
             batch_size=32,
-            overlap=80,
-            normalise=True,
-            use_otsu=True,
-            min_area_pixels=10,
-            detection_size=10,
+            overlap=50,
+            normalise=False,
+            use_tissue_mask=True,
+            min_area_pixels=25,
+            detection_size=15,
             stardist_rays=32,
             target_mpp=None,
             bbox=None,
@@ -645,8 +649,8 @@ def read_node(data: Dict[str, Any]):
                     print(f"Warning: Could not parse overlap value '{val_json}' as int.")
             elif k == "normalise":
                 ARGS.normalise = (val_json in [True, "true", "True"])
-            elif k == "use_otsu":
-                ARGS.use_otsu = (val_json in [True, "true", "True"])
+            elif k == "use_tissue_mask":
+                ARGS.use_tissue_mask = (val_json in [True, "true", "True", 1, "1"])
             elif k == "target_mpp":
                 try:
                     ARGS.target_mpp = float(val_json)

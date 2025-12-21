@@ -63,13 +63,13 @@ def run_wsi(
     image: str,
     *,
     pixel_size: Optional[float] = None,
-    normalise: bool = True,
+    normalise: bool = False,
     normalisation_subsampling_factor: int = 1,
     tile_size: int = 1024,
     overlap: int = 50,
     detection_size: int = 20,
     save_geojson: bool = False,
-    use_otsu_threshold: bool = False,
+    use_tissue_mask: bool = True,
     batch_size: Optional[int] = None,
     to_ndim_fn: Callable[[torch.Tensor, int], torch.Tensor] = lambda x, _: x,
     **kwargs: Any,
@@ -109,7 +109,6 @@ def run_wsi(
         else:
             raise ValueError("The image pixel size {} is not in microns.".format(img_pixel_size))
 
-    use_tissue_mask = kwargs.pop("use_tissue_mask", False)
     debug_tissue_mask = kwargs.pop("debug_tissue_mask", False)
 
     plan = prepare_tile_plan(
@@ -122,7 +121,6 @@ def run_wsi(
         overlap=overlap,
         detection_size=detection_size,
         use_tissue_mask=use_tissue_mask,
-        use_otsu_threshold=use_otsu_threshold,
         debug_tissue_mask=debug_tissue_mask,
         verbose=model.verbose,
     )
@@ -251,6 +249,8 @@ def run_wsi(
             tensor_start = time.time()
             tensor_list = [_to_tensor_float32(t) for t in batch_tensors]
             batch_tensor = torch.stack(tensor_list) if len(tensor_list) > 1 else tensor_list[0].unsqueeze(0)
+            if batch_tensor.max() > 1.0:
+                batch_tensor = batch_tensor / 255.0
             if stream_main is not None and not batch_tensor.is_pinned():
                 batch_tensor = batch_tensor.pin_memory()
             tensor_elapsed = time.time() - tensor_start

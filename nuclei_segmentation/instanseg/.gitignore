@@ -1,0 +1,9 @@
+# Transformers cache (for PLIP and other transformer models)
+transformer_cache/
+
+# Model checkpoints
+checkpoints/
+
+# Test files
+test_*
+
