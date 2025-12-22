@@ -5,10 +5,7 @@
 import os
 
 # Dynamic CPU thread limits based on server core count
-import threading
-from multiprocessing import Process, Queue, Pool
 import multiprocessing
-
 cpu_count = multiprocessing.cpu_count()
 if cpu_count > 64:
     # High-core server detected: Apply strict thread limits to prevent CPU overload
@@ -77,8 +74,7 @@ class SlideSegmentation():
                  n_tiles=(2,2,1),
                  stardist_pretrain='2D_versatile_he',
                  isIHC=False,
-                 progress_callback=None,
-                 results_queue=None
+                 progress_callback=None
                  ):
         
         super(SlideSegmentation, self).__init__()
@@ -121,7 +117,6 @@ class SlideSegmentation():
             
         self.args = args
         self.tile_size = tile_size
-        self.results_queue = results_queue
         
         # Initialize z-stack related attributes
         self.is_zstack = False
@@ -917,7 +912,7 @@ class SlideSegmentation():
                 slide.close()
 
     def load_img_patch(self):
-        preloader = threading.Thread(target=self.preload_slides, daemon=True)
+        preloader = Process(target=self.preload_slides)
         preloader.start()
 
         try:
@@ -1094,124 +1089,14 @@ class SlideSegmentation():
         
         print(f"parallel segmentation results: {self.points_all.shape if self.points_all is not None else 'None'}")
         
-    def analyze_img_patch_stream(self):
-        """
-        Streaming version of patch analysis with full performance logging.
-        Processes patches and pushes results to the results_queue immediately.
-        Used in run_WSI_segmentation_stream().
-        """
-        # Record overall start time
-        overall_start_time = time.time()
-        
-        total_tiles = self.n_row * self.n_col
-        pbar = tqdm(total=total_tiles)
-        pbar.update(1)
-        last_idx = 0
-        
-        # Calculate half overlap for core region approach
-        half_overlap = self.overlap / 2
-        
-        while True:
-            data = self.data_queue.get(block=True)
-            if data is None:
-                pbar.update(1)
-                break
-            else:
-                # Record patch processing start time
-                patch_start_time = time.time()
-                
-                ir, ic, x_0, y_0, img_norm, read_duration = data
-                curr_idx = ir * self.n_col + ic
-                pbar.update(curr_idx - last_idx)
-                last_idx = curr_idx
-                
-                # Update structured progress callback for the frontend
-                if self.progress_callback:
-                    self.progress_callback({
-                        "current_tile": curr_idx,
-                        "total_tiles": total_tiles,
-                        "tile_coords": [x_0, y_0]
-                    })
 
-                # Time the StarDist prediction
-                predict_start = time.time()
-                labels, dicts = self.model.predict_instances(
-                    img_norm,
-                    prob_thresh=self.prob_thresh,
-                    nms_thresh=self.nms_thresh,
-                    n_tiles=self.n_tiles,
-                    show_tile_progress=False,
-                    return_predict=False
-                )
-                predict_duration = time.time() - predict_start
-                
-                # GPU performance check
-                if predict_duration > 5.0:
-                    print(f"WARNING: StarDist prediction took {predict_duration:.2f}s (likely CPU mode)")
-                else:
-                    print(f"StarDist prediction: {predict_duration:.2f}s (GPU confirmed)")
-                
-                # Transform coordinates to global Level 0 space
-                points = dicts['points'] # y,x
-                points[:, [1, 0]] = points[:, [0, 1]] # x,y
-                points[:, 0] += x_0
-                points[:, 1] += y_0
-                
-                coord = dicts['coord']
-                coord[:, [1, 0], :] = coord[:, [0, 1], :]
-                coord = np.round(coord).astype(np.int32)
-                coord[:, 0, :] += x_0
-                coord[:, 1, :] += y_0
-                prob = dicts['prob']
-                
-                # Core region filtering (local tile deduplication)
-                core_x0 = x_0 + (half_overlap if ic > 0 else 0)
-                core_x1 = x_0 + self.tile_size - (half_overlap if ic < self.n_col - 1 else 0)
-                core_y0 = y_0 + (half_overlap if ir > 0 else 0)
-                core_y1 = y_0 + self.tile_size - (half_overlap if ir < self.n_row - 1 else 0)
-                
-                core_x1 = min(core_x1, self.dim[0])
-                core_y1 = min(core_y1, self.dim[1])
-                
-                idx_keep = (points[:, 0] >= core_x0) & (points[:, 0] < core_x1) & \
-                          (points[:, 1] >= core_y0) & (points[:, 1] < core_y1)
-                
-                # Filter results
-                final_pts = points[idx_keep]
-                final_coords = coord[idx_keep, ...]
-                final_probs = prob[idx_keep]
-
-                # Encapsulate and Handoff to Results Queue
-                if self.results_queue is not None:
-                    self.results_queue.put({
-                        "tile_index": curr_idx,
-                        "tile_coords": [x_0, y_0],
-                        "centroids": final_pts.astype(np.int32),
-                        "contours": final_coords.astype(np.int32),
-                        "probabilities": final_probs.astype(np.float32)
-                    })
-
-                # Log individual tile timing
-                patch_end_time = time.time()
-                patch_duration = patch_end_time - patch_start_time
-                print(f"Block r{ir} c{ic} (x={x_0}, y={y_0}) processing time: {patch_duration:.4f}s")
-                print(f"Detected {len(final_pts)} nuclei in core region")
-
-        # Record overall completion metrics
-        overall_end_time = time.time()
-        overall_duration = overall_end_time - overall_start_time
-        print(f"\nTotal segmentation time: {overall_duration:.2f}s ({overall_duration/60:.2f}min)")
-        print(f"Start time: {datetime.fromtimestamp(overall_start_time).strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"End time: {datetime.fromtimestamp(overall_end_time).strftime('%Y-%m-%d %H:%M:%S')}")
-        
-        pbar.close()
-        print("---- Streaming segmentation results to embedding worker complete ----")
-        
     def run_WSI_segmentation_parallel(self):
         '''
-        Streaming version of WSI segmentation. 
-        As tiles are proceesed by analyze_img_patch, results are dumped into self.results_queue. nuc_embedding listens to queue
-        and process new metadata asap to run parallel.
+        For a 500x500 patch,
+        hover-net takes 8 seconds.
+        Stardist takes 0.9 seconds (562 nuclei).
+        Stardist may 10 times faster than hovernet.
+        Ideally, stardist can get us 2M nuclei in 1 hours?
         '''
 
         self.normalize_template = self.get_normalized_template()
@@ -1226,18 +1111,16 @@ class SlideSegmentation():
         self.data_queue = Queue()
 
         # Run the reader process in the background...
-        # reader_process = Process(target=self.load_img_patch)
-        reader_process = threading.Thread(target=self.load_img_patch, daemon=True)
+        reader_process = Process(target=self.load_img_patch)
         reader_process.start()
 
+
         try:
-            self.analyze_img_patch_stream()
+            self.analyze_img_patch()
         finally:
             reader_process.join()
-            # signal to the embedding CONSUMER that segmentation is finished
-            if self.results_queue is not None:
-                print("[SEG PRODUCER] All tiles processed. Sending sentinel to results_queue.")
-                self.results_queue.put(None)
+
+        
         
 
     def run_WSI_segmentation(self):
