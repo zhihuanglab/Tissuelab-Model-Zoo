@@ -2574,6 +2574,45 @@ def collate_patches(batch, processor=None, perf_stats=None, use_fast_preprocess=
         
         return processed_batch
 
+def collate_patches_stream(batch, processor=None, perf_stats=None, use_fast_preprocess=True):
+    """
+    Streaming version of collate that returns float32 normalized Tensors ready for inference.
+    Used explicitly by generate_embeddings_stream to avoid the 'numpy has no attribute .to()' error.
+    """
+    valid_items = [item for item in batch if item is not None]
+    
+    if len(valid_items) == 0:
+        # Return empty float32 tensor
+        return torch.zeros((0, 3, 224, 224), dtype=torch.float32)
+    
+    # Check if we have z-stack data (list of lists)
+    if isinstance(valid_items[0], list):
+        # Z-stack case: return as list of lists (embedding loop handles normalization/stacking)
+        return valid_items
+    else:
+        # Single layer case: batch process
+        if use_fast_preprocess:
+            processed_numpy = _fast_batch_preprocess(
+                valid_items, 
+                use_torchvision=True, 
+                perf_stats=perf_stats, 
+                return_uint8=False
+            )
+            if processed_numpy is None:
+                return torch.zeros((0, 3, 224, 224), dtype=torch.float32)
+            
+            # Convert numpy array to PyTorch Tensor immediately
+            return torch.from_numpy(processed_numpy)
+        elif processor is not None:
+            # Fallback to processor
+            processed_batch = processor.image_processor(valid_items)['pixel_values']
+            if not isinstance(processed_batch, list):
+                processed_batch = np.array(processed_batch)
+            return torch.tensor(processed_batch)
+        else:
+            # No preprocessing fallback (shouldn't happen in standard flow)
+            return valid_items
+
 class NucleiEmbedding:
     def __init__(self, args, centroids=None, contours=None, progress_callback=None):
         self.args = args
@@ -2583,6 +2622,9 @@ class NucleiEmbedding:
             torch.cuda.set_device(0)
             self.device = torch.device("cuda:0")
             print("Forcing embeddings to run on GPU 0")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+            print("Using Apple MPS (Metal) acceleration")
         else:
             self.device = torch.device("cpu")
         
@@ -3796,3 +3838,143 @@ class NucleiEmbedding:
             
             print("embeddings calculation completed and written to Zarr store", flush=True)
         return dataset_path
+
+    def generate_embeddings_stream(self, results_queue, batch_size=None, zarr_path=None, dataset_path='embedding'):
+        """
+        Streaming consumer for nuclei embeddings.
+        Listens to results_queue and processes tiles as they are segmented.
+        """
+        # 1. Hardware & Zarr Setup
+        if batch_size is None:
+            # Optimize batch size for Mac (MPS usually prefers smaller batches than CUDA)
+            if self.device.type == 'mps':
+                batch_size = 64
+            elif self.device.type == 'cuda':
+                batch_size = 512
+            else:
+                batch_size = 32
+        
+        if zarr_path is None:
+            raise ValueError("zarr_path required for streaming mode")
+            
+        root = zarr.open_group(zarr_path, mode='a')
+        parts = dataset_path.strip('/').split('/')
+        parent = root
+        for group_name in parts[:-1]:
+            parent = parent.require_group(group_name)
+        ds_name = parts[-1]
+
+        # Clear/Prepare datasets for incremental appending
+        for ds in [ds_name, 'centroids', 'contours', 'probabilities']:
+            if ds in parent: del parent[ds]
+        
+        # Initialize datasets with 0 length
+        emb_ds = parent.create_dataset(ds_name, shape=(0, 768), chunks=(1000, 768), dtype=np.float16)
+        cent_ds = parent.create_dataset('centroids', shape=(0, 2), chunks=(1000, 2), dtype=np.int32)
+        cont_ds = parent.create_dataset('contours', shape=(0, 2, 32), chunks=(1000, 2, 32), dtype=np.int32)
+        prob_ds = parent.create_dataset('probabilities', shape=(0,), chunks=(1000,), dtype=np.float32)
+
+        total_processed = 0
+        print(f"[EMBED STREAM] Consumer started on {self.device}. Waiting for tiles...")
+
+        # 2. Consumer Loop
+        while True:
+            # Block until a tile package arrives from nuc_seg
+            package = results_queue.get(block=True)
+            
+            if package is None: # Sentinel value signals segmentation is finished
+                break
+                
+            tile_centroids = package['centroids']
+            tile_contours = package['contours']
+            tile_probs = package['probabilities']
+            tile_info = package.get('tile_coords', [0, 0])
+            
+            if len(tile_centroids) == 0:
+                if self.progress_callback:
+                    self.progress_callback({
+                        "embedding_count": total_processed,
+                        "phase": "processing",
+                        "tile_coords": tile_info 
+                    })
+                continue
+
+            # 3. Process Tile with Region Sharing Optimization
+            # We treat each tile as its own mini-dataset
+            tile_dataset = NucleiPatchDataset(
+                slide_path=self.args.slidepath,
+                read_image_method=self.read_image_method,
+                centroids=tile_centroids,
+                contours=tile_contours,
+                patch_size=self.patch_size,
+                magnification=getattr(self, 'magnification', 40),
+                processor=self.processor
+            )
+            
+            # CRITICAL UPDATE: Use collate_patches_stream to get Tensors
+            tile_loader = DataLoader(
+                tile_dataset,
+                batch_size=batch_size,
+                num_workers=0, 
+                shuffle=False,
+                collate_fn=lambda b: collate_patches_stream(b, self.processor, use_fast_preprocess=True)
+            )
+
+            tile_embeddings = []
+            for batch in tile_loader:
+                # Check for non-empty batch
+                is_valid_batch = False
+                if torch.is_tensor(batch):
+                    is_valid_batch = batch.numel() > 0
+                elif isinstance(batch, (list, np.ndarray)):
+                    is_valid_batch = len(batch) > 0
+
+                if is_valid_batch:
+                    # Move to GPU/CPU and infer
+                    # collate_patches_stream returns Tensor, so .to() works perfectly
+                    if torch.is_tensor(batch):
+                        inputs = batch.to(self.device)
+                    else:
+                        # Fallback for list/z-stack (unlikely in standard stream)
+                        inputs = batch 
+                        
+                    features = self.embed_batch(inputs)
+                    
+                    # L2 Normalize
+                    features = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-6)
+                    tile_embeddings.append(features.astype(np.float16))
+
+            if not tile_embeddings:
+                continue
+
+            # 4. Incremental Zarr Write
+            combined_embs = np.concatenate(tile_embeddings, axis=0)
+            n_new = combined_embs.shape[0]
+            curr_idx = emb_ds.shape[0]
+
+            # Resize datasets
+            emb_ds.resize((curr_idx + n_new, 768))
+            cent_ds.resize((curr_idx + n_new, 2))
+            cont_ds.resize((curr_idx + n_new, 2, 32))
+            prob_ds.resize((curr_idx + n_new,))
+
+            # Atomic-style write
+            emb_ds[curr_idx:] = combined_embs
+            cent_ds[curr_idx:] = tile_dataset.centroids
+            cont_ds[curr_idx:] = tile_dataset.contours
+            prob_ds[curr_idx:] = tile_probs
+
+            total_processed += n_new
+            
+            # 5. Progress Callback
+            if self.progress_callback:
+                self.progress_callback({
+                    "embedding_count": total_processed,
+                    "phase": "processing",
+                    "tile_coords": tile_info
+                })
+
+            print(f"[EMBED STREAM] Tile at {tile_info} processed. Total Nuclei: {total_processed}")
+
+        print(f"---- Embedding stream finished. Total nuclei embedded: {total_processed} ----")
+        return total_processed
