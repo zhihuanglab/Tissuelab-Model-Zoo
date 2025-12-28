@@ -794,7 +794,11 @@ def read_node(data: Dict[str, Any]):
     if user_data_path in zf:
         for k in zf[user_data_path].keys():
             raw_bytes = zf[user_data_path][k][()]
-            raw_str = raw_bytes.decode("utf-8")
+            # raw_str = raw_bytes.decode("utf-8")
+            if hasattr(raw_bytes, "decode"):
+                raw_str = raw_bytes.decode("utf-8")
+            else:
+                raw_str = str(raw_bytes)
             try:
                 val_json = json.loads(raw_str)
             except:
