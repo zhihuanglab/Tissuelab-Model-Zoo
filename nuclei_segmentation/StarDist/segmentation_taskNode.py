@@ -330,6 +330,8 @@ def run_segmentation(args):
     4) write segmentation + embedding to zarr
     """
     global progress_complete
+    from nuc_seg import SlideSegmentation
+    from nuc_embedding import NucleiEmbedding
 
     if ZARR_PATH is None or NODE_NAME is None:
         raise ValueError("ZARR_PATH and NODE_NAME must be set before running segmentation")
@@ -846,11 +848,11 @@ def execute_node():
         out_val = {"status": "ok", "message": "no path, skipping.", "nuclei_count": 0}
     else:
         # Switch to the new parallel orchestrator
-        # print(f"[SegmentationNode] Executing Parallel Streaming Workflow...")
-        # out_val = run_segmentation_parallel(ARGS)
+        print(f"[SegmentationNode] Executing Parallel Streaming Workflow...")
+        out_val = run_segmentation_parallel(ARGS)
         
-        print(f"[SegmentationNode] Executing OLD Sequential Workflow...")
-        out_val = run_segmentation(ARGS)
+        # print(f"[SegmentationNode] Executing OLD Sequential Workflow...")
+        # out_val = run_segmentation(ARGS)
 
     # Save output to Zarr
     if ZARR_PATH and os.path.exists(ZARR_PATH):
