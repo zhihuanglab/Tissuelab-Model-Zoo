@@ -848,11 +848,11 @@ def execute_node():
         out_val = {"status": "ok", "message": "no path, skipping.", "nuclei_count": 0}
     else:
         # Switch to the new parallel orchestrator
-        # print(f"[SegmentationNode] Executing Parallel Streaming Workflow...")
-        # out_val = run_segmentation_parallel(ARGS)
+        print(f"[SegmentationNode] Executing Parallel Streaming Workflow...")
+        out_val = run_segmentation_parallel(ARGS)
         
-        print(f"[SegmentationNode] Executing OLD Sequential Workflow...")
-        out_val = run_segmentation(ARGS)
+        # print(f"[SegmentationNode] Executing OLD Sequential Workflow...")
+        # out_val = run_segmentation(ARGS)
 
     # Save output to Zarr
     if ZARR_PATH and os.path.exists(ZARR_PATH):
