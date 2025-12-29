@@ -6,6 +6,7 @@ Segmentation Node for nuclei segmentation + embedding generation
 import argparse
 import os
 import time
+import sys
 import json
 import zarr
 import uvicorn
@@ -14,19 +15,30 @@ import numpy as np
 from matplotlib.path import Path as MplPath
 from sse_starlette.sse import EventSourceResponse
 import asyncio
-
+import traceback
 import multiprocessing
 import multiprocess
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+    # Also set it for the 'multiprocess' lib just in case it's used elsewhere
+    multiprocess.set_start_method('spawn', force=True)
+    print("[SYSTEM] Multiprocessing start method forced to 'spawn'")
+except RuntimeError:
+    # Context usually already set, ignore
+    pass
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from pathlib import Path
 
+# to prevent tf eating 100% VRAM
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+
 os.environ["TF_INTER_OP_PARALLELISM_THREADS"] = "2"
 os.environ["TF_INTRA_OP_PARALLELISM_THREADS"] = "16"
-from nuc_seg import SlideSegmentation
-from nuc_embedding import NucleiEmbedding
+# from nuc_seg import SlideSegmentation
+# from nuc_embedding import NucleiEmbedding
 
 app = FastAPI()
 
@@ -48,6 +60,97 @@ DEPENDENCIES = []
 progress_value = 0  # Global variable to track progress
 progress_complete = False  # New flag to indicate completion
 
+# added detailed progress info for separate progress checking on seg / emb
+progress_info = {
+    "master": 0,
+    "segmentation": 0,
+    "embedding": 0,
+    "phase": "idle",
+    "tile_info": { # Segmentation Cursor (Blue)
+        "current_tile": 0,
+        "total_tiles": 0,
+        "tile_coords": [0, 0]
+    },
+    "embed_tile_info": { # Embedding Cursor (Purple)
+        "tile_coords": [0, 0]
+    }
+}
+
+
+# global progress Q that listens to update in seg and execute embedding when update
+progress_queue = multiprocessing.Queue()
+
+def seg_worker(worker_args, res_q, prog_q):
+    # Configure StarDist for streaming
+    from nuc_seg import SlideSegmentation
+    try:
+        ss = SlideSegmentation(
+            worker_args,
+            progress_callback=lambda data: prog_q.put(data),
+            results_queue=res_q 
+        )
+        ss.run_WSI_segmentation_parallel()
+    except Exception as e:
+        print(f"[CRITICAL FAILURE] Segmentation Worker Crashed: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+def emb_worker(worker_args, res_q, prog_q, z_path, n_name):
+    import os
+    import sys
+    import traceback
+
+    print(f"[EMB-WORKER] Starting Process (PID: {os.getpid()})")
+
+    # 1. Environment Variables
+    os.environ["TF_VISIBLE_DEVICES"] = "-1"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["USE_TORCH"] = "1"
+    os.environ["USE_TF"] = "0"
+
+    # [CRITICAL FIX] Force disable 'pyvips' to prevent Segmentation Faults.
+    # This tricks Python into thinking pyvips is not installed, forcing the code 
+    # to fall back to 'tiffslide' or 'openslide', which are stable.
+    sys.modules["pyvips"] = None
+    print("[EMB-WORKER] Disabled 'pyvips' to prevent binary conflict crash.")
+
+    # 2. Import Application Modules
+    print("[EMB-WORKER] Importing NucleiEmbedding...")
+    try:
+        from nuc_embedding import NucleiEmbedding
+        print("[EMB-WORKER] Import 'nuc_embedding' SUCCESS.")
+    except ImportError as e:
+        # If nuc_embedding hard-requires pyvips, this might fail, but it's better than a Segfault.
+        print(f"[EMB-WORKER] Import failed (likely due to disabled pyvips): {e}")
+        traceback.print_exc()
+        sys.exit(1)
+    except Exception as e:
+        print(f"[EMB-WORKER] Import CRASHED: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+    # 3. Force the read method in args just in case
+    if hasattr(worker_args, 'read_image_method'):
+        print(f"[EMB-WORKER] Overriding read method to 'tiffslide'")
+        worker_args.read_image_method = 'tiffslide'
+
+    # 4. Execution
+    try:
+        ne = NucleiEmbedding(
+            worker_args,
+            progress_callback=lambda data: prog_q.put(data)
+        )
+        ne.generate_embeddings_stream(
+            results_queue=res_q,
+            zarr_path=z_path,
+            dataset_path=f"{n_name}/embedding"
+        )
+    except Exception as e:
+        print(f"[CRITICAL FAILURE] Embedding Worker Crashed: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8005, help='port')
@@ -66,7 +169,207 @@ def parse_args():
 
     return parser.parse_args()
 
+def print_h5_structure(file_path):
+    """Helper to print Zarr structure."""
+    def _visit(group, prefix=""):
+        for key, val in group.items():
+            name = f"{prefix}/{key}" if prefix else key
+            if isinstance(val, zarr.hierarchy.Group):
+                print(f"{name} (Group)")
+                _visit(val, name)
+            else:
+                shape = getattr(val, 'shape', None)
+                dtype = getattr(val, 'dtype', None)
+                print(f"{name} (Dataset), shape: {shape}, dtype: {dtype}")
+    zf = zarr.open_group(file_path, mode='r')
+    _visit(zf)
 
+async def progress_manager_task():
+    global progress_info, embedding_tiles_processed # Use the global counter
+    embedding_tiles_processed = 0
+    print("[ProgressManager] Started background watcher.")
+    
+    while True:
+        try:
+            while not progress_queue.empty():
+                update = progress_queue.get_nowait()
+                
+                # Handle Resets
+                if update.get("phase") == "reset":
+                    embedding_tiles_processed = 0
+                    progress_info["segmentation"] = 0
+                    progress_info["embedding"] = 0
+                    progress_info["master"] = 0
+                    continue
+
+                if update.get("phase") == "complete":
+                    progress_info["phase"] = "complete"
+                    progress_info["master"] = 100
+                    progress_info["segmentation"] = 100
+                    progress_info["embedding"] = 100
+                    # Clear overlays
+                    progress_info["tile_info"] = None
+                    progress_info["embed_tile_info"] = None
+                    continue
+
+                # Merge Segmentation Data
+                if "current_tile" in update:
+                    total = update["total_tiles"]
+                    current = update["current_tile"]
+                    prog_pct = int((current / total) * 100) if total > 0 else 0
+                    
+                    progress_info["segmentation"] = prog_pct
+                    progress_info["tile_info"] = {
+                        "current_tile": current,
+                        "total_tiles": total,
+                        "tile_coords": update["tile_coords"]
+                    }
+                    progress_info["phase"] = "segmentation"
+                
+                # Merge Embedding Data (Calculates Percentage now!)
+                if "embedding_count" in update:
+                    progress_info["embedding_count"] = update["embedding_count"]
+                    progress_info["phase"] = "embedding"
+                    
+                    # Increment our local tile counter
+                    embedding_tiles_processed += 1
+                    
+                    # Calculate Percentage
+                    total_tiles = 0
+                    if progress_info["tile_info"]:
+                        total_tiles = progress_info["tile_info"].get("total_tiles", 0)
+                    
+                    if total_tiles > 0:
+                        # Calculate % based on tiles processed vs total tiles
+                        emb_pct = int((embedding_tiles_processed / total_tiles) * 100)
+                        progress_info["embedding"] = min(99, emb_pct) # Cap at 99 until "complete"
+                    
+                    # Capture tile coords for overlay
+                    if "tile_coords" in update:
+                        progress_info["embed_tile_info"] = {
+                            "tile_coords": update["tile_coords"]
+                        }
+                
+                progress_info["master"] = (progress_info["segmentation"] // 2) + (progress_info["embedding"] // 2)
+
+            await asyncio.sleep(0.1) 
+        except Exception as e:
+            print(f"[ProgressManager] Error: {e}")
+            await asyncio.sleep(1)
+
+def progress_pusher(data):
+    """Simple wrapper to put data into the multiprocessing queue"""
+    try:
+        progress_queue.put(data)
+    except:
+        pass
+
+def run_segmentation_parallel(args):
+    """
+    Parallel Orchestrator with Deadlock Protection.
+    Monitors child processes and kills survivors if one crashes.
+    """
+    global progress_info
+
+    if ZARR_PATH is None or NODE_NAME is None:
+        raise ValueError("ZARR_PATH and NODE_NAME must be set before running segmentation")
+
+    result = {"status": "success", "message": "", "nuclei_count": 0}
+
+    try:
+        start_time = time.time()
+        progress_queue.put({"phase": "reset"})
+
+        # --- STEP A: CACHE CHECK ---
+        ALREADY_HAVE_SEG = False
+        ALREADY_HAVE_EMB = False
+        
+        if os.path.exists(ZARR_PATH):
+            zf = zarr.open_group(ZARR_PATH, mode='r')
+            if NODE_NAME in zf:
+                if "centroids" in zf[NODE_NAME] and zf[f"{NODE_NAME}/centroids"].size > 0:
+                    ALREADY_HAVE_SEG = True
+                    # Optimization: Get count immediately without loading all data
+                    result["nuclei_count"] = zf[f"{NODE_NAME}/centroids"].shape[0]
+                if "embedding" in zf[NODE_NAME] and zf[f"{NODE_NAME}/embedding"].shape[0] == result["nuclei_count"]:
+                    ALREADY_HAVE_EMB = True
+
+        if ALREADY_HAVE_SEG and ALREADY_HAVE_EMB:
+            print(">>> Fully cached results found. Skipping computation.")
+            progress_queue.put({"phase": "complete", "segmentation": 100, "embedding": 100})
+            return result
+
+        # --- STEP B: PARALLEL EXECUTION WITH MONITORING ---
+        ctx = multiprocessing.get_context('spawn')
+        # A size of 20 is too small for high-throughput producers; 
+        # it causes the CPU to pause frequently. 100-500 is safer.
+        results_queue = ctx.Queue(maxsize=100)
+
+        # p_seg = multiprocessing.Process(target=seg_worker, args=(args, results_queue, progress_queue))
+        # p_emb = multiprocessing.Process(target=emb_worker, args=(args, results_queue, progress_queue, ZARR_PATH, NODE_NAME))
+        p_seg = ctx.Process(target=seg_worker, args=(args, results_queue, progress_queue))
+        p_emb = ctx.Process(target=emb_worker, args=(args, results_queue, progress_queue, ZARR_PATH, NODE_NAME))
+        
+        print(f">>> Launching Parallel Pipeline: [Seg Producer] -> [Embed Consumer]")
+        p_seg.start()
+        p_emb.start()
+
+        # --- DEADLOCK PREVENTION LOOP ---
+        while True:
+            seg_alive = p_seg.is_alive()
+            emb_alive = p_emb.is_alive()
+
+            # 1. Happy Path: Both finished successfully
+            if not seg_alive and not emb_alive:
+                if p_seg.exitcode != 0 or p_emb.exitcode != 0:
+                     raise RuntimeError(f"Workers exited with errors. Seg:{p_seg.exitcode}, Emb:{p_emb.exitcode}")
+                break
+            
+            # 2. CRITICAL DEADLOCK CASE: Consumer died, Producer stuck
+            # If Embedding crashes (OOM), Segmentation waits forever on full queue.
+            if not emb_alive and seg_alive:
+                print("!!! [CRITICAL] Consumer (Embedding) died unexpectedly. Terminating Producer.")
+                p_seg.terminate()
+                p_seg.join()
+                raise RuntimeError(f"Embedding worker crashed (Exit code: {p_emb.exitcode}). Check logs.")
+            
+            # 3. Producer died, Consumer waiting
+            if not seg_alive and emb_alive:
+                if p_seg.exitcode != 0:
+                    print("!!! [CRITICAL] Producer (Segmentation) crashed. Terminating Consumer.")
+                    p_emb.terminate()
+                    p_emb.join()
+                    raise RuntimeError(f"Segmentation worker crashed (Exit code: {p_seg.exitcode}).")
+
+            time.sleep(1)
+        # --------------------------------
+
+        # --- STEP C: FINALIZE ---
+        zf = zarr.open_group(ZARR_PATH, mode='a')
+        if NODE_NAME in zf and "centroids" in zf[NODE_NAME]:
+            result["nuclei_count"] = zf[NODE_NAME]["centroids"].shape[0]
+        
+        progress_queue.put({"phase": "complete"})
+        
+        end_time = time.time()
+        print(f">>> Parallel Processing Complete in {end_time - start_time:.2f}s")
+        return result
+
+    except Exception as e:
+        import traceback
+        print(f"Parallel Execution Error: {str(e)}")
+        print(traceback.format_exc())
+        
+        # Cleanup on error: Ensure no zombie processes
+        try:
+            if 'p_seg' in locals() and p_seg.is_alive(): p_seg.terminate()
+            if 'p_emb' in locals() and p_emb.is_alive(): p_emb.terminate()
+        except:
+            pass
+            
+        return {"status": "error", "message": str(e)}
+    
+    
 def run_segmentation(args):
     """
     Combined "Segmentation + Embedding" logic in one node.
@@ -76,6 +379,8 @@ def run_segmentation(args):
     4) write segmentation + embedding to zarr
     """
     global progress_complete
+    from nuc_seg import SlideSegmentation
+    from nuc_embedding import NucleiEmbedding
 
     if ZARR_PATH is None or NODE_NAME is None:
         raise ValueError("ZARR_PATH and NODE_NAME must be set before running segmentation")
@@ -476,10 +781,14 @@ def run_segmentation(args):
         return {"status": "error", "message": str(e), "nuclei_count": 0}
 
 
+@app.on_event("startup")
+async def startup_event():
+    # Start the progress manager as a background task
+    asyncio.create_task(progress_manager_task())
+    
 @app.get("/status")
 def get_status():
     return {"status": "segmentation_node with embedding running"}
-
 
 @app.post("/init")
 def init_node():
@@ -536,7 +845,11 @@ def read_node(data: Dict[str, Any]):
     if user_data_path in zf:
         for k in zf[user_data_path].keys():
             raw_bytes = zf[user_data_path][k][()]
-            raw_str = raw_bytes.decode("utf-8")
+            # raw_str = raw_bytes.decode("utf-8")
+            if hasattr(raw_bytes, "decode"):
+                raw_str = raw_bytes.decode("utf-8")
+            else:
+                raw_str = str(raw_bytes)
             try:
                 val_json = json.loads(raw_str)
             except:
@@ -581,26 +894,22 @@ def execute_node():
         return {"status": "error", "message": "Please /init first."}
 
     if not ARGS or not getattr(ARGS, "slidepath", None):
-        print("[SegmentationNode] no path => skip.")
-        out_val = {
-            "status": "ok",
-            "message": "no path, skipping.",
-            "nuclei_count": 0
-        }
+        out_val = {"status": "ok", "message": "no path, skipping.", "nuclei_count": 0}
     else:
-        print(f"[SegmentationNode] /execute => run_segmentation with slidepath={ARGS.slidepath}")
-        out_val = run_segmentation(ARGS)
+        # Switch to the new parallel orchestrator
+        print(f"[SegmentationNode] Executing Parallel Streaming Workflow...")
+        out_val = run_segmentation_parallel(ARGS)
+        
+        # print(f"[SegmentationNode] Executing OLD Sequential Workflow...")
+        # out_val = run_segmentation(ARGS)
 
-    # store the result to 'output'
+    # Save output to Zarr
     if ZARR_PATH and os.path.exists(ZARR_PATH):
         zf = zarr.open_group(ZARR_PATH, mode='a')
         node_out_path = f"{NODE_NAME}/output"
-        if node_out_path in zf:
-            del zf[node_out_path]
-        out_str = json.dumps(out_val, ensure_ascii=False)
-        out_bytes = out_str.encode("utf-8")
+        if node_out_path in zf: del zf[node_out_path]
+        out_bytes = json.dumps(out_val).encode("utf-8")
         zf.create_dataset(node_out_path, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
-
     return {"status": "ok", "output": out_val}
 
 
@@ -627,39 +936,23 @@ def update_progress(value, phase="segmentation"):
 
 @app.get("/progress")
 async def progress():
-    """
-    SSE endpoint to provide progress updates
-    """
     async def event_generator():
-        global progress_value, progress_complete
-        last_value = -1
-        progress_value = 0  # Reset progress to 0 for each new connection
-        progress_complete = False  # Reset completion flag
+        global progress_info
         
         while True:
-            # Check if progress changed or if it's the final 100% update
-            if progress_value != last_value or (progress_value == 100 and progress_complete):
-                if last_value > progress_value:
-                    yield {"data": str(-1)}
-                print(f"[SSE] Progress: {progress_value}%")  # Add consistent debug output
-                yield {"data": str(progress_value)}
-                last_value = progress_value
+            # Yield the full ProgressDetail object
+            yield {"data": json.dumps(progress_info)}
 
-                # If progress reaches 100 and completion flag is set, wait a bit before breaking
-                if progress_value == 100 and progress_complete:
-                    print("Progress complete, closing connection.")  # Add debug output
-                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
-                    break
+            if progress_info["phase"] == "complete":
+                # Wait briefly so the client receives the 100% signal
+                # await asyncio.sleep(1)
+                # if closes too quickly frontend stalls.
+                for _ in range(6):
+                    yield {"data": json.dumps(progress_info)}
+                    await asyncio.sleep(0.5)
+                break
 
-            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
-
-        # Keep the connection open for a short time to ensure the client receives the final update
-        await asyncio.sleep(1)
-
-        # Reset progress to 0 and completion flag after sending the final update
-        progress_value = 0
-        progress_complete = False
-        print("Progress reset to 0.")  # Add debug output
+            await asyncio.sleep(0.5) # Throttle updates to 2Hz
 
     return EventSourceResponse(event_generator())
 
