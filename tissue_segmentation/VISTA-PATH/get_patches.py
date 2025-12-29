@@ -243,13 +243,13 @@ def parse_args():
     parser.add_argument(
         "--wsi_path",
         type=str,
-        required=True,
+        default="/home/peixian/PathSeg_Eva/data/Visium_Lung_crop/images/HE_img.png",
         help="Path to WSI file (e.g., .svs, .tif, .ndpi)",
     )
     parser.add_argument(
         "--zarr_path",
         type=str,
-        required=True,
+        default="./Visium_Lung/HE_img.png.zarr",
         help="Path to output Zarr store (directory). Will be created if not exists.",
     )
     parser.add_argument(
@@ -261,13 +261,13 @@ def parse_args():
     parser.add_argument(
         "--patch_size",
         type=int,
-        default=224,
+        default=512,
         help="Patch size at the chosen level (square).",
     )
     parser.add_argument(
         "--stride",
         type=int,
-        default=64,
+        default=512,
         help="Stride at the chosen level.",
     )
     parser.add_argument(

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SegNode: Patch-wise segmentation task node based on CustomSegmentationModel + CLIPProcessor.
+SegNode: Pixel-wise segmentation task node based on CustomSegmentationModel + CLIPProcessor.
 """
 
 import os
@@ -90,10 +90,6 @@ def open_zarr(path: str, mode: str = "a"):
     # zarr.open_group() 的正确用法：使用关键字参数
     return zarr.open_group(path, mode=mode)
 
-def bytes_json(obj: Dict[str, Any]) -> bytes:
-    s = json.dumps(obj, ensure_ascii=False)
-    return s.encode("utf-8")
-
 def recreate_group(zf, group_name: str, preserve_keys: List[str] = ()):
     """
     删除旧 group 并重建；可将指定 key 的 dataset 先读取出来保存。
@@ -110,10 +106,6 @@ def recreate_group(zf, group_name: str, preserve_keys: List[str] = ()):
 def resolve_patch_indices(zf, args) -> np.ndarray:
     """
     从 Zarr 里解析本次要处理的 patch 行索引。
-    如果提供了 bbox，只返回 bbox 内的 patch。
-
-    1) 从 images 数组获取所有 patch 的索引
-    2) 如果 args.bbox 存在，根据 coordinates 过滤出 bbox 内的 patch
 
     Returns:
         sel_indices: (K,) int64, 在 images 数组上的行索引
@@ -156,47 +148,6 @@ def resolve_patch_indices(zf, args) -> np.ndarray:
     img_arr = zf[image_array_path]
     N = img_arr.shape[0]
     all_indices = np.arange(N, dtype=np.int64)
-    
-    # 如果提供了 bbox，根据 coordinates 过滤
-    bbox = getattr(args, "bbox", None)
-    if bbox:
-        # 解析 bbox: "x,y,width,height"
-        try:
-            parts = [float(p.strip()) for p in str(bbox).split(',')]
-            if len(parts) != 4:
-                print(f"[{NODE_NAME}] Warning: bbox has {len(parts)} parts, expected 4. Ignoring bbox.")
-                bbox = None
-            else:
-                bbox_x, bbox_y, bbox_w, bbox_h = parts
-                bbox_x1 = bbox_x + bbox_w
-                bbox_y1 = bbox_y + bbox_h
-                
-                # 读取 coordinates（尝试多个可能的路径）
-                coords_paths = [
-                    f"{ZARR_GROUP}/coordinates",
-                    f"{NODE_NAME}/coordinates",
-                    "coordinates"
-                ]
-                coords_path = None
-                for path in coords_paths:
-                    if path in zf:
-                        coords_path = path
-                        break
-                
-                if coords_path:
-                    coordinates = zf[coords_path][()]  # (N, 4) [x0, y0, x1, y1]
-                    # 检查每个 patch 的中心点是否在 bbox 内
-                    patch_centers_x = (coordinates[:, 0] + coordinates[:, 2]) / 2
-                    patch_centers_y = (coordinates[:, 1] + coordinates[:, 3]) / 2
-                    in_bbox = (patch_centers_x >= bbox_x) & (patch_centers_x <= bbox_x1) & \
-                              (patch_centers_y >= bbox_y) & (patch_centers_y <= bbox_y1)
-                    all_indices = all_indices[in_bbox]
-                    print(f"[{NODE_NAME}] BBox filtering: {N} -> {len(all_indices)} patches")
-                else:
-                    print(f"[{NODE_NAME}] Warning: coordinates not found, cannot filter by bbox. Processing all patches.")
-        except Exception as e:
-            print(f"[{NODE_NAME}] Warning: Failed to parse bbox: {e}. Ignoring bbox.")
-            bbox = None
 
     return all_indices
 
@@ -464,14 +415,6 @@ def run_segmentation(args) -> Dict[str, Any]:
     # 7) 创建 userData 组（匹配 SegmentationNode 格式）
     user_data_grp = out_grp.require_group("userData")
     
-    # 保存 bbox（如果提供）
-    if hasattr(args, "bbox") and args.bbox:
-        bbox_bytes = str(args.bbox).encode("utf-8")
-        if 'bbox' in user_data_grp:
-            del user_data_grp['bbox']
-        bbox_array = np.frombuffer(bbox_bytes, dtype=f"S{len(bbox_bytes)}")
-        user_data_grp.create_array("bbox", data=bbox_array, dtype=f"S{len(bbox_bytes)}")
-    
     # 保存 path（图像路径，如果有）
     if hasattr(args, "image_path") and args.image_path:
         path_bytes = str(args.image_path).encode("utf-8")
@@ -517,7 +460,7 @@ def init_node():
     node_name = NODE_NAME if NODE_NAME else "SegNode"
     if not IS_MODEL_INITED:
         IS_MODEL_INITED = True
-        # 先用空 model_path 创建 holder，真正路径在 /read 后由 /execute 再加载
+        # the checkpoint is in the ./checkpoints/pytorch_model.bin
         PASEG_MODEL = PASeg(
             model_path="",
             device=("cuda" if torch.cuda.is_available() else "cpu"),
@@ -559,12 +502,11 @@ def read_node(data: Dict[str, Any]):
             batch_size=4,
             num_workers=0,
             amp=True,
-            default_text="an image of tissue",
+            default_text="an image of tumor",
             d_model=512,
             nhead=8,
             num_layers=4,
             bbx_random=0.5,
-            bbox=None,
             image_path="",
             target_mpp=None,
         )
@@ -572,7 +514,6 @@ def read_node(data: Dict[str, Any]):
         # Reset fields on every /read to prevent using values from a previous run
         ARGS.model_path = ""
         ARGS.image_array_path = f"{ZARR_GROUP}/images"
-        ARGS.bbox = None
 
     zf = zarr.open_group(ZARR_PATH, mode='r')
     user_data_path = f"{NODE_NAME}/userData"
@@ -586,14 +527,6 @@ def read_node(data: Dict[str, Any]):
                 val_json = raw_str
             print(f"[{NODE_NAME}] user param {k} => {val_json}")
             setattr(ARGS, k, val_json)
-    
-    # 解析 bbox（如果提供）
-    if hasattr(ARGS, "bbox") and ARGS.bbox:
-        if isinstance(ARGS.bbox, str) and len(ARGS.bbox.split(',')) == 4:
-            print(f"[{NODE_NAME}] BBox provided: {ARGS.bbox}")
-        else:
-            print(f"[{NODE_NAME}] Warning: bbox value '{ARGS.bbox}' is not in 'x,y,width,height' format.")
-            ARGS.bbox = None
 
     # 默认 image_array_path / default_text
     if not hasattr(ARGS, "image_array_path"):
@@ -636,22 +569,8 @@ def execute_node():
             zf.create_array(node_out_path, data=out_array, dtype=f'S{len(out_bytes)}')
         return {"status": "ok", "output": out_val}
 
-    # 根据 ARGS.model_path / ARGS.default_text 等懒加载 / 切换 checkpoint
-    model_path = getattr(ARGS, "model_path", "")
-    default_text = getattr(ARGS, "default_text", "an image of tissue")
-
-    # 简单策略：每次 /execute 根据当前 model_path 重建一次 PASeg
-    PASEG_MODEL = PASeg(
-        model_path=model_path,
-        default_text=default_text,
-        device=("cuda" if torch.cuda.is_available() else "cpu"),
-        # 如果有 d_model/nhead/num_layers/bbx_random 也可以从 ARGS 中读出来：
-        d_model=int(getattr(ARGS, "d_model", 512)),
-        nhead=int(getattr(ARGS, "nhead", 8)),
-        num_layers=int(getattr(ARGS, "num_layers", 4)),
-        bbx_random=float(getattr(ARGS, "bbx_random", 0.5)),
-    )
-    print(f"[{NODE_NAME}] PASeg loaded with model_path={model_path}, default_text={default_text}")
+    # 模型已在 /init 中加载，直接使用
+    print(f"[{NODE_NAME}] Using pre-loaded PASeg model")
 
     try:
         print(f"[{NODE_NAME}] /execute => run_segmentation with ZARR_PATH={ZARR_PATH}")

@@ -186,3 +186,5 @@ patch_classification/MUSK/debug/
 Scripts/
 
 tissue_segmentation/VISTA-PATH/patch_data
+
+tissue_segmentation/VISTA-PATH/Visium_Lung/
