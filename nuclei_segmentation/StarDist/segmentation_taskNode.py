@@ -96,12 +96,13 @@ def seg_worker(worker_args, res_q, prog_q):
         sys.exit(1)
 
 def emb_worker(worker_args, res_q, prog_q, z_path, n_name):
-    from nuc_embedding import NucleiEmbedding
     os.environ["TF_VISIBLE_DEVICES"] = "-1"
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     os.environ["USE_TORCH"] = "1"
     os.environ["USE_TF"] = "0"
+    
+    from nuc_embedding import NucleiEmbedding
     
     try:
         ne = NucleiEmbedding(
