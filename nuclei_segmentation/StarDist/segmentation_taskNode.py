@@ -96,19 +96,56 @@ def seg_worker(worker_args, res_q, prog_q):
         sys.exit(1)
 
 def emb_worker(worker_args, res_q, prog_q, z_path, n_name):
+    import os
+    import sys
+    import traceback
+    
+    print(f"[EMB-WORKER] Starting Process (PID: {os.getpid()})")
+    
     os.environ["TF_VISIBLE_DEVICES"] = "-1"
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     os.environ["USE_TORCH"] = "1"
     os.environ["USE_TF"] = "0"
     
-    from nuc_embedding import NucleiEmbedding
+    print(f"[EMB-WORKER] Env Vars Set: TF_VISIBLE_DEVICES={os.environ.get('TF_VISIBLE_DEVICES')}")
+
+    # 2. Check for Pollution (Is TF already here?)
+    if 'tensorflow' in sys.modules:
+        print("[EMB-WORKER] CRITICAL WARNING: 'tensorflow' is already loaded in sys.modules!")
+    else:
+        print("[EMB-WORKER] Clean State: 'tensorflow' not yet loaded.")
+
+    # 3. Safe Import
+    print("[EMB-WORKER] Importing NucleiEmbedding...")
+    try:
+        from nuc_embedding import NucleiEmbedding
+        print("[EMB-WORKER] Import 'nuc_embedding' SUCCESS.")
+    except Exception as e:
+        print(f"[EMB-WORKER] Import FAILED: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+    # 4. Check GPU Visibility (PyTorch)
+    try:
+        import torch
+        print(f"[EMB-WORKER] PyTorch Version: {torch.__version__}")
+        print(f"[EMB-WORKER] CUDA Available: {torch.cuda.is_available()}")
+        print(f"[EMB-WORKER] CUDA Device Count: {torch.cuda.device_count()}")
+        if torch.cuda.is_available():
+            print(f"[EMB-WORKER] Current Device: {torch.cuda.current_device()}")
+            print(f"[EMB-WORKER] Device Name: {torch.cuda.get_device_name(0)}")
+    except Exception as e:
+        print(f"[EMB-WORKER] PyTorch GPU check failed: {e}")
     
     try:
+        print("[EMB-WORKER] Initializing NucleiEmbedding Class...")
         ne = NucleiEmbedding(
             worker_args,
             progress_callback=lambda data: prog_q.put(data)
         )
+        
+        print(f"[EMB-WORKER] Class Initialized. Starting Stream to {n_name}/embedding...")
         # Use our new condensed streaming method
         ne.generate_embeddings_stream(
             results_queue=res_q,
