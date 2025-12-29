@@ -19,6 +19,15 @@ import traceback
 import multiprocessing
 import multiprocess
 
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+    # Also set it for the 'multiprocess' lib just in case it's used elsewhere
+    multiprocess.set_start_method('spawn', force=True)
+    print("[SYSTEM] Multiprocessing start method forced to 'spawn'")
+except RuntimeError:
+    # Context usually already set, ignore
+    pass
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
