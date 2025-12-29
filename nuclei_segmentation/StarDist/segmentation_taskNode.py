@@ -97,8 +97,11 @@ def seg_worker(worker_args, res_q, prog_q):
 
 def emb_worker(worker_args, res_q, prog_q, z_path, n_name):
     from nuc_embedding import NucleiEmbedding
+    os.environ["TF_VISIBLE_DEVICES"] = "-1"
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["USE_TORCH"] = "1"
+    os.environ["USE_TF"] = "0"
     
     try:
         ne = NucleiEmbedding(
@@ -268,7 +271,7 @@ def run_segmentation_parallel(args):
         ctx = multiprocessing.get_context('spawn')
         # A size of 20 is too small for high-throughput producers; 
         # it causes the CPU to pause frequently. 100-500 is safer.
-        results_queue = multiprocessing.Queue(maxsize=100)
+        results_queue = ctx.Queue(maxsize=100)
 
         # p_seg = multiprocessing.Process(target=seg_worker, args=(args, results_queue, progress_queue))
         # p_emb = multiprocessing.Process(target=emb_worker, args=(args, results_queue, progress_queue, ZARR_PATH, NODE_NAME))
