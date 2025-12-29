@@ -18,7 +18,6 @@ import asyncio
 import traceback
 import multiprocessing
 import multiprocess
-
 try:
     multiprocessing.set_start_method('spawn', force=True)
     # Also set it for the 'multiprocess' lib just in case it's used elsewhere
@@ -32,6 +31,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from pathlib import Path
+
+# to prevent tf eating 100% VRAM
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 
 os.environ["TF_INTER_OP_PARALLELISM_THREADS"] = "2"
 os.environ["TF_INTRA_OP_PARALLELISM_THREADS"] = "16"
@@ -95,6 +97,7 @@ def seg_worker(worker_args, res_q, prog_q):
 
 def emb_worker(worker_args, res_q, prog_q, z_path, n_name):
     from nuc_embedding import NucleiEmbedding
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     
     try:
@@ -262,14 +265,16 @@ def run_segmentation_parallel(args):
             return result
 
         # --- STEP B: PARALLEL EXECUTION WITH MONITORING ---
-        
+        ctx = multiprocessing.get_context('spawn')
         # A size of 20 is too small for high-throughput producers; 
         # it causes the CPU to pause frequently. 100-500 is safer.
         results_queue = multiprocessing.Queue(maxsize=100)
 
-        p_seg = multiprocessing.Process(target=seg_worker, args=(args, results_queue, progress_queue))
-        p_emb = multiprocessing.Process(target=emb_worker, args=(args, results_queue, progress_queue, ZARR_PATH, NODE_NAME))
-
+        # p_seg = multiprocessing.Process(target=seg_worker, args=(args, results_queue, progress_queue))
+        # p_emb = multiprocessing.Process(target=emb_worker, args=(args, results_queue, progress_queue, ZARR_PATH, NODE_NAME))
+        p_seg = ctx.Process(target=seg_worker, args=(args, results_queue, progress_queue))
+        p_emb = ctx.Process(target=emb_worker, args=(args, results_queue, progress_queue, ZARR_PATH, NODE_NAME))
+        
         print(f">>> Launching Parallel Pipeline: [Seg Producer] -> [Embed Consumer]")
         p_seg.start()
         p_emb.start()
