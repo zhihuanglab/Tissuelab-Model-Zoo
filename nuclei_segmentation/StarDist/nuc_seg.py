@@ -931,6 +931,9 @@ class SlideSegmentation():
                     w_col = x_1 - x_0
                     h_row = y_1 - y_0
 
+                    if not self.should_process_tile(x_0, y_0, x_1, y_1):
+                        if self.roi_bbox is not None or self.roi_polygon is not None:
+                            continue
                     if self.wsi_mask is not None:
                         mask = self.wsi_mask[int(y_0/self.mask_ratio_y):int(y_1/self.mask_ratio_y),
                                            int(x_0/self.mask_ratio_x):int(x_1/self.mask_ratio_x)]
@@ -1054,6 +1057,30 @@ class SlideSegmentation():
                 idx_keep = (points[:, 0] >= core_x0) & (points[:, 0] < core_x1) & \
                           (points[:, 1] >= core_y0) & (points[:, 1] < core_y1)
                 
+                if self.roi_polygon is not None:
+                    # Get current points
+                    curr_x = points[:, 0]
+                    curr_y = points[:, 1]
+                    
+                    # Check polygon containment for each point
+                    # Optimization: Only check points that passed core filter to save time
+                    roi_mask = np.array([self.point_in_polygon(x, y, self.roi_polygon) 
+                                        for x, y in zip(curr_x, curr_y)])
+                    
+                    # Combine with core region filter
+                    idx_keep = idx_keep & roi_mask
+
+                elif self.roi_bbox is not None:
+                    bbox_x, bbox_y, bbox_w, bbox_h = self.roi_bbox
+                    roi_x1 = bbox_x + bbox_w
+                    roi_y1 = bbox_y + bbox_h
+                    
+                    # Vectorized bbox check
+                    roi_mask = (points[:, 0] >= bbox_x) & (points[:, 0] <= roi_x1) & \
+                            (points[:, 1] >= bbox_y) & (points[:, 1] <= roi_y1)
+                            
+                    idx_keep = idx_keep & roi_mask
+                    
                 points = points[idx_keep]
                 coord = coord[idx_keep, ...]
                 prob = prob[idx_keep]
