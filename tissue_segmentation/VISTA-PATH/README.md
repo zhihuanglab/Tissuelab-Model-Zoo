@@ -47,7 +47,7 @@ HE_img.png.zarr/
 ```
 
 ```
-python3 python prepare_segnode_zarr.py \\
+python3 python get_patches.py \\
       --wsi_path /path/to/slide.svs \\
       --zarr_path /path/to/output.zarr \\
       --zarr_group SegNode \\
