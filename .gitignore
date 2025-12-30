@@ -57,7 +57,6 @@ cover/
 
 *.h5
 *.h5ad
-*.pt
 
 # Translations
 *.mo
@@ -171,7 +170,21 @@ cython_debug/
 #.idea/
 
 **/checkpoints/
-# Vips
-vips/
+!task_specific/Ark_Plus/checkpoints/
+!task_specific/Ark_Plus/checkpoints/**
+!patch_classification/MUSK/checkpoints/
+!patch_classification/MUSK/checkpoints/**
+!task_specific/Cardiac_Multi_view_segmentation-master/checkpoints/
+!task_specific/Cardiac_Multi_view_segmentation-master/checkpoints/**
 
-tissue_segmentation/TotalSegmentator/models/
+# TotalSegmentator model weights (very large files)
+tissue_segmentation/TotalSegmentator/models/nnunet/results/
+tissue_segmentation/TotalSegmentator/TotalSegmentator-master/tests/
+
+patch_classification/MUSK/debug/
+
+Scripts/
+
+tissue_segmentation/VISTA-PATH/patch_data
+
+tissue_segmentation/VISTA-PATH/Visium_Lung/
