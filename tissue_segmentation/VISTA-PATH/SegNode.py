@@ -35,6 +35,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import requests
 
+try:
+    import tiffslide
+    from tqdm import tqdm
+    HAS_TIFFSLIDE = True
+except ImportError:
+    HAS_TIFFSLIDE = False
+    print("[WARN] tiffslide not installed, WSI tiling will not work")
+
 Image.MAX_IMAGE_PIXELS = None
 
 # ======================= Logger & FastAPI =======================
@@ -67,16 +75,18 @@ set_seed(42)
 
 # ======================= Globals =======================
 
-ARGS = None  # argparse.Namespace-like（/read 里填充）
+ARGS = None  # argparse.Namespace-like（default settings）
+SLIDE_PATH = None
 IS_MODEL_INITED = False
 
 ZARR_PATH: Optional[str] = None
 ZARR_GROUP: Optional[str] = None
 NODE_NAME: Optional[str] = None
+ACTUAL_ZARR_GROUP: Optional[str] = None  # actual zarr group name
 DEPENDENCIES: List[str] = []
 DEP_ZARR_GROUPS: Dict[str, str] = {}
 
-progress_value = 0  # SSE 进度
+progress_value = 0  # SSE progress
 
 
 PASEG_MODEL: Optional[PASeg] = None
@@ -87,12 +97,182 @@ def now_iso() -> str:
     return datetime.now().isoformat()
 
 def open_zarr(path: str, mode: str = "a"):
-    # zarr.open_group() 的正确用法：使用关键字参数
+    # correct usage of zarr.open_group(): using keyword arguments
     return zarr.open_group(path, mode=mode)
+
+def compute_grid(width: int, height: int, patch_size: int, stride: int):
+    """
+    calculate the coordinates of the slice grid.
+    
+    Returns:
+        xs, ys: 1D numpy arrays of x0 and y0 positions (in level coordinates)
+    """
+    def _coords(limit, psize, step):
+        if limit <= psize:
+            return np.array([0], dtype=np.int64)
+        coords = list(range(0, limit - psize + 1, step))
+        if coords[-1] + psize < limit:
+            coords.append(limit - psize)
+        return np.array(coords, dtype=np.int64)
+
+    xs = _coords(width, patch_size, stride)
+    ys = _coords(height, patch_size, stride)
+    return xs, ys
+
+def create_segnode_zarr(
+    wsi_path: str,
+    zarr_path: str,
+    zarr_group: str = "SegNode",
+    patch_size: int = 512,
+    stride: int = 512,
+    level: int = 0,
+    chunk_size: int = 1,
+):
+    """
+    tile the WSI and save it to a Zarr file.
+    
+    Args:
+        wsi_path: WSI file path
+        zarr_path: output zarr path
+        zarr_group: zarr group name
+        patch_size: patch size
+        stride: sliding window stride
+        level: pyramid level (0 = highest resolution)
+        chunk_size: zarr chunk size
+    """
+    if not HAS_TIFFSLIDE:
+        raise ImportError("tiffslide is required for WSI tiling. Install it with: pip install tiffslide")
+    
+    wsi_path = os.path.abspath(wsi_path)
+    zarr_path = os.path.abspath(zarr_path)
+
+    print(f"[INFO] Opening WSI: {wsi_path}")
+    slide = tiffslide.open_slide(wsi_path)
+    level_dims = slide.level_dimensions
+    if level < 0 or level >= slide.level_count:
+        raise ValueError(f"Invalid level={level}. Slide has {slide.level_count} levels.")
+
+    level_width, level_height = level_dims[level]
+    print(f"[INFO] Level {level} size: width={level_width}, height={level_height}")
+
+    # calculate the grid
+    xs, ys = compute_grid(level_width, level_height, patch_size, stride)
+    num_x = len(xs)
+    num_y = len(ys)
+    N = num_x * num_y
+
+    print(f"[INFO] patch_size={patch_size}, stride={stride}, level={level}")
+    print(f"[INFO] Grid: num_x={num_x}, num_y={num_y}, total patches={N}")
+
+    # open or create Zarr
+    print(f"[INFO] Writing Zarr to: {zarr_path}, group={zarr_group}")
+    root = zarr.open_group(zarr_path, mode="a")
+
+    # if the group exists, delete it
+    if zarr_group in root:
+        print(f"[WARN] Group '{zarr_group}' already exists, deleting it.")
+        del root[zarr_group]
+    grp = root.create_group(zarr_group)
+
+    # create datasets
+    images_ds = grp.create_dataset(
+        "images",
+        shape=(N, patch_size, patch_size, 3),
+        chunks=(chunk_size, patch_size, patch_size, 3),
+        dtype="uint8",
+    )
+
+    patch_id_ds = grp.create_dataset(
+        "patch_id",
+        shape=(N,),
+        chunks=(chunk_size,),
+        dtype="int64",
+    )
+
+    coords_ds = grp.create_dataset(
+        "coordinates",
+        shape=(N, 4),
+        chunks=(chunk_size, 4),
+        dtype="int64",
+    )
+
+    # create userData group to save metadata
+    user_data_grp = grp.create_group("userData")
+
+    # save WSI path
+    path_bytes = wsi_path.encode("utf-8")
+    user_data_grp.create_dataset(
+        "path",
+        shape=(),
+        dtype=f"S{len(path_bytes)}",
+        data=path_bytes,
+    )
+
+    # save tiling parameters
+    tiling_params = {
+        "patch_size": patch_size,
+        "stride": stride,
+        "level": level,
+        "level_width": level_width,
+        "level_height": level_height,
+        "chunk_size": chunk_size,
+    }
+    tiling_bytes = json.dumps(tiling_params, ensure_ascii=False).encode("utf-8")
+    user_data_grp.create_dataset(
+        "tiling_params",
+        shape=(),
+        dtype=f"S{len(tiling_bytes)}",
+        data=tiling_bytes,
+    )
+
+    # get downsample factor
+    downsample = slide.level_downsamples[level]
+    if isinstance(downsample, (list, tuple)):
+        downsample_x = float(downsample[0])
+        downsample_y = float(downsample[1])
+    else:
+        downsample_x = float(downsample)
+        downsample_y = float(downsample)
+
+    print(f"[INFO] level_downsample: x={downsample_x}, y={downsample_y}")
+
+    # iterate over the grid and write patches
+    idx = 0
+    pbar = tqdm(total=N, desc="Extracting patches")
+
+    for y0 in ys:
+        for x0 in xs:
+            x1 = int(x0 + patch_size)
+            y1 = int(y0 + patch_size)
+
+            # map to level 0 coordinates
+            base_x = int(x0 * downsample_x)
+            base_y = int(y0 * downsample_y)
+
+            # read patch
+            patch_pil = slide.read_region(
+                (base_x, base_y), level, (patch_size, patch_size)
+            ).convert("RGB")
+
+            patch_np = np.array(patch_pil, dtype=np.uint8)
+
+            # write to Zarr
+            images_ds[idx] = patch_np
+            patch_id_ds[idx] = idx
+            coords_ds[idx] = np.array([x0, y0, x1, y1], dtype=np.int64)
+
+            idx += 1
+            pbar.update(1)
+
+    pbar.close()
+    slide.close()
+
+    print(f"[INFO] Done. Total patches: {N}")
+    print(f"[INFO] Zarr structure created at: {zarr_path}, group={zarr_group}")
 
 def recreate_group(zf, group_name: str, preserve_keys: List[str] = ()):
     """
-    删除旧 group 并重建；可将指定 key 的 dataset 先读取出来保存。
+    delete the old group and rebuild; can read out the specified key datasets first.
     """
     preserved = {}
     if group_name in zf:
@@ -103,25 +283,43 @@ def recreate_group(zf, group_name: str, preserve_keys: List[str] = ()):
     grp = zf.create_group(group_name)
     return grp, preserved
 
-def resolve_patch_indices(zf, args) -> np.ndarray:
+def resolve_patch_indices(zf, args) -> Tuple[np.ndarray, str]:
     """
-    从 Zarr 里解析本次要处理的 patch 行索引。
+    parse the patch row indices to be processed from Zarr.
 
     Returns:
-        sel_indices: (K,) int64, 在 images 数组上的行索引
+        sel_indices: (K,) int64, the row indices on the images array
+        image_array_path: str, the found image array path
     """
-    global ZARR_GROUP
+    global ZARR_GROUP, NODE_NAME
     image_array_path = getattr(args, "image_array_path", f"{ZARR_GROUP}/images")
     
-    # 尝试多个可能的路径
+    # try multiple possible paths
     if image_array_path not in zf:
-        # 尝试其他可能的路径
+        # dynamically search all possible paths containing 'images' array
         alternative_paths = [
             f"{NODE_NAME}/images",
             f"{ZARR_GROUP}/images",
             "images",
-            f"{NODE_NAME}/MuskNode/images",  # 常见的 MUSK 节点路径
         ]
+        
+        # iterate over all groups in zarr to find paths containing 'images'
+        def find_images_in_groups(group, prefix=""):
+            paths = []
+            for key in group.keys():
+                full_path = f"{prefix}/{key}" if prefix else key
+                if isinstance(group[key], zarr.Group):
+                    # check if this group has images
+                    if 'images' in group[key]:
+                        paths.append(f"{full_path}/images")
+                    # recursively search sub-groups
+                    paths.extend(find_images_in_groups(group[key], full_path))
+                elif key == 'images':
+                    paths.append(full_path)
+            return paths
+        
+        found_paths = find_images_in_groups(zf)
+        alternative_paths.extend(found_paths)
         
         found = False
         for alt_path in alternative_paths:
@@ -132,7 +330,7 @@ def resolve_patch_indices(zf, args) -> np.ndarray:
                 break
         
         if not found:
-            # 列出所有可用的路径以便调试
+            # list all available paths for debugging
             print(f"[{NODE_NAME}] Available paths in zarr:")
             def _print_paths(group, prefix=""):
                 for key in group.keys():
@@ -149,20 +347,20 @@ def resolve_patch_indices(zf, args) -> np.ndarray:
     N = img_arr.shape[0]
     all_indices = np.arange(N, dtype=np.int64)
 
-    return all_indices
+    return all_indices, image_array_path
 
-# ======================= Dataset: 从 Zarr 读 patch image =======================
+# ======================= Dataset: read patch image from Zarr =======================
 
 class PatchDatasetZarr(Dataset):
     """
-    从 Zarr 数组中读 patch image：
+    read patch image from Zarr array:
       - images_array: (N, H, W, 3) uint8
-      - sel_indices: 本次要处理的行索引 (K,)
+      - sel_indices: the row indices to be processed (K,)
     """
     def __init__(self, zf, image_array_path: str, sel_indices: np.ndarray):
         if image_array_path not in zf:
             raise ValueError(f"image array not found: {image_array_path}")
-        self.img_arr = zf[image_array_path]  # Zarr Array, 形状 (N, H, W, 3)
+        self.img_arr = zf[image_array_path]  # Zarr Array, shape (N, H, W, 3)
         self.sel = sel_indices
 
         if self.img_arr.ndim != 4 or self.img_arr.shape[-1] != 3:
@@ -184,9 +382,9 @@ class PatchDatasetZarr(Dataset):
 
 def run_segmentation(args) -> Dict[str, Any]:
     """
-    主逻辑：从 Zarr 中读 patch image -> 模型推理 -> 写回 mask/prob/metadata。
+    main logic: read patch image from Zarr -> model inference -> write back mask/prob/metadata.
     """
-    global progress_value, PASEG_MODEL
+    global progress_value, PASEG_MODEL, ACTUAL_ZARR_GROUP
     if ZARR_PATH is None:
         raise ValueError("ZARR_PATH not set. Call /read first.")
 
@@ -195,22 +393,19 @@ def run_segmentation(args) -> Dict[str, Any]:
 
     zf = open_zarr(ZARR_PATH, "a")
 
-    # 1) 解析 patch 索引
-    sel_indices = resolve_patch_indices(zf, args)  # (K,)
+    # 1) parse patch indices
+    sel_indices, image_array_path = resolve_patch_indices(zf, args)  # (K,), str
     K = len(sel_indices)
     if K == 0:
         raise ValueError("No patches to process.")
     print(f"[{NODE_NAME}] Will process {K} patches.")
 
-    # 2) 读取图像数组形状（获取 H, W）
-    image_array_path = getattr(args, "image_array_path", f"{ZARR_GROUP}/images")
-    if image_array_path not in zf:
-        raise ValueError(f"Image array not found at {image_array_path}")
+    # 2) read image array shape (get H, W)
     img_arr = zf[image_array_path]
     _, H, W, _ = img_arr.shape
     print(f"[{NODE_NAME}] Patch size: H={H}, W={W}")
 
-    # 3) 构建 DataLoader（从 Zarr 中读 image，返回 PIL Image）
+    # 3) build DataLoader (read image from Zarr, return PIL Image)
     ds = PatchDatasetZarr(zf, image_array_path, sel_indices)
 
     batch_size = int(getattr(args, "batch_size", 4))
@@ -227,15 +422,17 @@ def run_segmentation(args) -> Dict[str, Any]:
     device = PASEG_MODEL.device
     num_classes = int(getattr(PASEG_MODEL, "num_classes", 2))
 
-    # 4) 重建当前 group & 创建输出数组（使用 NODE_NAME 作为组名，匹配 SegmentationNode 格式）
-    out_grp, _ = recreate_group(zf, NODE_NAME, preserve_keys=[])
+    # 4) rebuild current group & create output array (using actual group name like SegmentationNode)
+    output_group_name = ACTUAL_ZARR_GROUP if ACTUAL_ZARR_GROUP else NODE_NAME
+    print(f"[{NODE_NAME}] Saving results to zarr group: {output_group_name}")
+    out_grp, _ = recreate_group(zf, output_group_name, preserve_keys=[])
 
-    # mask: (K,H,W) - 用于后续提取 contours 和 centroids
+    # mask: (K,H,W) - used for subsequent extraction of contours and centroids
     z_mask = out_grp.create_dataset(
         "mask", shape=(K, H, W), chunks=(1, H, W), dtype="uint8"
     )
 
-    # prob: (K,C,H,W) - 用于提取每个对象的概率
+    # prob: (K,C,H,W) - used for extracting the probability of each object
     z_prob = out_grp.create_dataset(
         "prob_patches",
         shape=(K, num_classes, H, W),
@@ -243,7 +440,7 @@ def run_segmentation(args) -> Dict[str, Any]:
         dtype="float16",
     )
 
-    # 5) 推理主循环
+    # 5) inference main loop
     PASEG_MODEL.model.eval()
     use_amp = bool(getattr(args, "amp", True))
     start = time.time()
@@ -278,14 +475,14 @@ def run_segmentation(args) -> Dict[str, Any]:
 
                 idx += bsz
 
-    # 6) 从 mask 中提取 contours 和 centroids，并提取 probability
+    # 6) extract contours and centroids from masks, and extract probability
     print(f"[{NODE_NAME}] Extracting contours, centroids and probability from masks...")
     
     all_contours = []
     all_centroids = []
     all_probabilities = []
     
-    # 读取 coordinates（如果存在）用于计算全局坐标
+    # read coordinates (if exists) for calculating global coordinates
     coords_paths = [
         f"{ZARR_GROUP}/coordinates",
         f"{NODE_NAME}/coordinates",
@@ -304,50 +501,50 @@ def run_segmentation(args) -> Dict[str, Any]:
     
     for i in range(K):
         mask = z_mask[i]  # (H, W) uint8
-        prob_patch = z_prob[i]  # (C, H, W) float16 - 需要转换为 float32 进行计算
+        prob_patch = z_prob[i]  # (C, H, W) float16 - need to convert to float32 for calculation
         prob_patch = prob_patch.astype(np.float32)
         
-        # 找到所有非零区域（假设 0 是背景，其他值是前景）
-        # 对于多类别，我们提取所有非背景区域
+        # find all non-zero regions (assuming 0 is background, other values are foreground)
+        # for multi-class, we extract all non-background regions
         binary_mask = (mask > 0).astype(np.uint8)
         
-        # 找到轮廓
+        # find contours
         contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # 计算每个轮廓的质心和概率
+        # calculate the centroid and probability of each contour
         for contour in contours:
-            if len(contour) < 3:  # 至少需要 3 个点才能形成轮廓
+            if len(contour) < 3:  # at least 3 points are needed to form a contour
                 continue
             
-            # 计算质心（轮廓内所有点的平均值）
+            # calculate the centroid (average of all points inside the contour)
             M = cv2.moments(contour)
             if M["m00"] != 0:
                 cx = int(M["m10"] / M["m00"])
                 cy = int(M["m01"] / M["m00"])
             else:
-                # 如果无法计算，使用轮廓的几何中心
+                # if cannot calculate, use the geometric center of the contour
                 cx = int(np.mean(contour[:, 0, 0]))
                 cy = int(np.mean(contour[:, 0, 1]))
             
-            # 提取该轮廓区域的最大概率（前景类的最大概率）
-            # 创建轮廓的 mask
+            # extract the maximum probability of this contour region (maximum probability of the foreground class)
+            # create the mask of the contour
             contour_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.fillPoly(contour_mask, [contour], 1)
             
-            # 获取该区域的前景概率（类别 1 到 C-1 的最大值）
+            # get the maximum probability of the foreground region (maximum probability of the classes 1 to C-1)
             if num_classes > 1:
                 foreground_probs = prob_patch[1:, :, :]  # (C-1, H, W)
                 max_foreground_prob = np.max(foreground_probs[:, contour_mask > 0])
             else:
                 max_foreground_prob = np.max(prob_patch[:, contour_mask > 0])
             
-            # 转换为全局坐标（如果有 coordinates）
+            # convert to global coordinates (if coordinates exist)
             if has_coords:
                 x0, y0, x1, y1 = selected_coords[i]
-                # 将 patch 内的相对坐标转换为全局坐标
+                # convert the relative coordinates inside the patch to global coordinates
                 global_cx = int(x0 + cx)
                 global_cy = int(y0 + cy)
-                # 轮廓点也需要转换
+                # contour points also need to be converted
                 contour_global = contour.copy()
                 contour_global[:, 0, 0] += int(x0)
                 contour_global[:, 0, 1] += int(y0)
@@ -357,10 +554,10 @@ def run_segmentation(args) -> Dict[str, Any]:
                 contour_global = contour
             
             all_centroids.append([global_cx, global_cy])
-            all_contours.append(contour_global[:, 0, :])  # 移除多余的维度
+            all_contours.append(contour_global[:, 0, :])  # remove the extra dimension
             all_probabilities.append(float(max_foreground_prob))
     
-    # 写入 contours, centroids 和 probability（匹配 SegmentationNode 格式）
+    # write contours, centroids and probability (matching SegmentationNode format)
     if len(all_centroids) > 0:
         centroids_array = np.array(all_centroids, dtype=np.int32)  # (N_objects, 2)
         out_grp.create_dataset("centroids", data=centroids_array, 
@@ -368,17 +565,17 @@ def run_segmentation(args) -> Dict[str, Any]:
                               dtype="int32",
                               compressor=zarr.Blosc(cname='lz4', clevel=5, shuffle=zarr.Blosc.SHUFFLE))
         
-        # contours 需要填充到相同长度（参考格式使用 32 个点）
-        # 如果轮廓点少于 32，填充；如果多于 32，下采样
+        # contours need to be padded to the same length (the reference format uses 32 points)
+        # if the contour points are less than 32, pad; if more than 32, downsample
         target_contour_len = 32
         contours_padded = []
         for c in all_contours:
             if len(c) < target_contour_len:
-                # 填充到 32 个点（重复最后一个点）
+                # pad to 32 points (repeat the last point)
                 n_pad = target_contour_len - len(c)
                 padded = np.pad(c, ((0, n_pad), (0, 0)), mode='edge')
             elif len(c) > target_contour_len:
-                # 下采样到 32 个点
+                # downsample to 32 points
                 indices = np.linspace(0, len(c) - 1, target_contour_len).astype(int)
                 padded = c[indices]
             else:
@@ -401,35 +598,35 @@ def run_segmentation(args) -> Dict[str, Any]:
         print(f"[{NODE_NAME}] Extracted {len(all_centroids)} objects (contours, centroids, probability)")
     else:
         print(f"[{NODE_NAME}] No objects found in masks")
-        # 创建空的数组（匹配格式）
+        # create empty arrays (matching format)
         out_grp.create_dataset("centroids", shape=(0, 2), dtype="int32")
         out_grp.create_dataset("contours", shape=(0, 32, 2), dtype="int32")
         out_grp.create_dataset("probability", shape=(0,), dtype="float32")
     
-    # 删除临时的 mask 和 prob_patches（参考格式中没有这些）
+    # delete the temporary mask and prob_patches (not present in the reference format)
     if 'mask' in out_grp:
         del out_grp['mask']
     if 'prob_patches' in out_grp:
         del out_grp['prob_patches']
 
-    # 7) 创建 userData 组（匹配 SegmentationNode 格式）
+    # 7) create userData group (matching SegmentationNode format)
     user_data_grp = out_grp.require_group("userData")
     
-    # 保存 path（图像路径，如果有）
+    # save path (image path, if exists)
     if hasattr(args, "image_path") and args.image_path:
         path_bytes = str(args.image_path).encode("utf-8")
         if 'path' in user_data_grp:
             del user_data_grp['path']
         path_array = np.frombuffer(path_bytes, dtype=f"S{len(path_bytes)}")
-        user_data_grp.create_array("path", data=path_array, dtype=f"S{len(path_bytes)}")
+        user_data_grp.create_dataset("path", data=path_array, dtype=f"S{len(path_bytes)}")
     
-    # 保存 target_mpp（如果有）
+    # save target_mpp (if exists)
     if hasattr(args, "target_mpp") and args.target_mpp:
         mpp_bytes = str(args.target_mpp).encode("utf-8")
         if 'target_mpp' in user_data_grp:
             del user_data_grp['target_mpp']
         mpp_array = np.frombuffer(mpp_bytes, dtype=f"S{len(mpp_bytes)}")
-        user_data_grp.create_array("target_mpp", data=mpp_array, dtype=f"S{len(mpp_bytes)}")
+        user_data_grp.create_dataset("target_mpp", data=mpp_array, dtype=f"S{len(mpp_bytes)}")
 
     elapsed = time.time() - start
     progress_value = 100
@@ -441,7 +638,7 @@ def run_segmentation(args) -> Dict[str, Any]:
         "nuclei_count": len(all_centroids),
     }
     
-    # output 会在 /execute 中写入，这里只返回结果
+    # output will be written in /execute, here only return the result
     return result
 
 # ======================= API routes =======================
@@ -453,8 +650,10 @@ def get_status():
 @app.post("/init")
 def init_node():
     """
-    一次性创建 PASeg holder（真正加载 checkpoint 可以放到 /execute 里）。
+    create PASeg holder (actually load the checkpoint can be done in /execute)
     """
+    print(f"[/init => slide_path={SLIDE_PATH}") 
+
     global IS_MODEL_INITED, PASEG_MODEL, progress_value, NODE_NAME
     progress_value = 10
     node_name = NODE_NAME if NODE_NAME else "SegNode"
@@ -474,20 +673,22 @@ def init_node():
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
     """
-    读取本次任务的上下文：
+    read the context of this task:
       - zarr_path / zarr_group / dependencies
-      - 从 {NODE_NAME}/userData 下读用户参数 JSON：
+      - read user parameters JSON from {NODE_NAME}/userData:
           model_path, patch_ids, image_array_path, patch_id_path,
           tissue_classes, tissue_colors, batch_size, num_workers, amp, save_prob, default_text, ...
     """
-    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ZARR_GROUP, DEP_ZARR_GROUPS, ARGS
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ZARR_GROUP, DEP_ZARR_GROUPS, ARGS, SLIDE_PATH, ACTUAL_ZARR_GROUP
     import argparse
 
     NODE_NAME = data.get("node_name", "SegNode")
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
-    ZARR_GROUP = data.get("zarr_group", NODE_NAME)  # 默认使用 NODE_NAME
+    ZARR_GROUP = data.get("zarr_group", NODE_NAME)  # use NODE_NAME by default
     DEP_ZARR_GROUPS = data.get("dependencies_zarr_groups", {})
+
+    print(f"[{NODE_NAME}] /read => slide_path={SLIDE_PATH}") 
 
     print(f"[{NODE_NAME}] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
 
@@ -516,36 +717,159 @@ def read_node(data: Dict[str, Any]):
         ARGS.image_array_path = f"{ZARR_GROUP}/images"
 
     zf = zarr.open_group(ZARR_PATH, mode='r')
+    
+    # try to read userData from multiple possible locations
     user_data_path = f"{NODE_NAME}/userData"
-    if user_data_path in zf:
-        for k in zf[user_data_path].keys():
-            raw_bytes = zf[user_data_path][k][()]
-            raw_str = raw_bytes.decode("utf-8")
+    alternative_user_data_paths = [
+        f"{NODE_NAME}/userData",
+        f"{ZARR_GROUP}/userData",
+        "userData",
+    ]
+    
+    # dynamically search for userData group
+    found_user_data = None
+    for path in alternative_user_data_paths:
+        if path in zf:
+            found_user_data = path
+            print(f"[{NODE_NAME}] Found userData at: {found_user_data}")
+            break
+    
+    # if not found, iterate over all groups to find paths containing userData
+    if not found_user_data:
+        def find_userdata_in_groups(group, prefix=""):
+            for key in group.keys():
+                full_path = f"{prefix}/{key}" if prefix else key
+                if key == "userData" and isinstance(group[key], zarr.Group):
+                    return full_path
+                elif isinstance(group[key], zarr.Group):
+                    result = find_userdata_in_groups(group[key], full_path)
+                    if result:
+                        return result
+            return None
+        
+        found_user_data = find_userdata_in_groups(zf)
+        if found_user_data:
+            print(f"[{NODE_NAME}] Found userData at alternative path: {found_user_data}")
+    
+    # extract the actual group name from the userData path (like SegmentationNode)
+    if found_user_data:
+        # e.g. "SegmentationNode/userData" -> "SegmentationNode"
+        if "/" in found_user_data:
+            ACTUAL_ZARR_GROUP = found_user_data.split("/")[0]
+            print(f"[{NODE_NAME}] Using actual zarr group: {ACTUAL_ZARR_GROUP}")
+        else:
+            ACTUAL_ZARR_GROUP = ZARR_GROUP
+    
+    if found_user_data and found_user_data in zf:
+        for k in zf[found_user_data].keys():
+            raw_bytes = zf[found_user_data][k][()]
+            raw_str = raw_bytes.decode("utf-8")            
             try:
                 val_json = json.loads(raw_str)
             except:
                 val_json = raw_str
+            
+            if k == "path":
+                SLIDE_PATH = val_json
             print(f"[{NODE_NAME}] user param {k} => {val_json}")
             setattr(ARGS, k, val_json)
 
-    # 默认 image_array_path / default_text
+    # default image_array_path / default_text
     if not hasattr(ARGS, "image_array_path"):
         setattr(ARGS, "image_array_path", f"{ZARR_GROUP}/images")
     if not hasattr(ARGS, "default_text"):
         setattr(ARGS, "default_text", "an image of tissue")
 
+    print(f"[{NODE_NAME}] /read done => SLIDE_PATH={SLIDE_PATH}")
     return {"status": "ok", "message": f"[{NODE_NAME}] read done"}
 
 @app.post("/execute")
 def execute_node():
     """
-    真正执行 segmentation。
+    execute the segmentation.
+    if slide_path is provided and zarr does not exist, tiling will be performed first.
     """
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, PASEG_MODEL, progress_value
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, PASEG_MODEL, progress_value, SLIDE_PATH, ZARR_GROUP, ACTUAL_ZARR_GROUP
 
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
 
+    # check if tiling is needed
+    # 1. if ZARR_PATH does not exist or the zarr file does not exist
+    # 2. or zarr exists but does not have images array
+    need_tiling = False
+    if SLIDE_PATH:
+        if not ZARR_PATH or not os.path.exists(ZARR_PATH):
+            need_tiling = True
+        else:
+            # check if zarr has images array
+            zf_check = zarr.open_group(ZARR_PATH, mode='r')
+            has_images = False
+            # search all possible images paths
+            def find_images(group, prefix=""):
+                for key in group.keys():
+                    if key == "images":
+                        return True
+                    full_path = f"{prefix}/{key}" if prefix else key
+                    if isinstance(group[key], zarr.Group):
+                        if find_images(group[key], full_path):
+                            return True
+                return False
+            
+            has_images = find_images(zf_check)
+            if not has_images:
+                print(f"[{NODE_NAME}] Zarr exists but no images found, need tiling.")
+                need_tiling = True
+    
+    if need_tiling and SLIDE_PATH:
+        print(f"[{NODE_NAME}] Starting tiling for slide: {SLIDE_PATH}")
+        progress_value = 20
+        
+        try:
+            # if ZARR_PATH is provided (from /read), use it directly
+            # otherwise generate ZARR_PATH based on slide path
+            if not ZARR_PATH:
+                slide_dir = os.path.dirname(SLIDE_PATH)
+                slide_basename = os.path.basename(SLIDE_PATH)
+                zarr_filename = slide_basename + ".zarr"
+                ZARR_PATH = os.path.join(slide_dir, zarr_filename)
+            
+            # get slicing parameters from ARGS (if exists)
+            patch_size = int(getattr(ARGS, "patch_size", 512))
+            stride = int(getattr(ARGS, "stride", 512))
+            level = int(getattr(ARGS, "level", 0))
+            chunk_size = int(getattr(ARGS, "chunk_size", 1))
+            
+            print(f"[{NODE_NAME}] Tiling WSI: {SLIDE_PATH}")
+            print(f"[{NODE_NAME}] Output Zarr: {ZARR_PATH}")
+            print(f"[{NODE_NAME}] Parameters: patch_size={patch_size}, stride={stride}, level={level}")
+            
+            # use actual group name (like SegmentationNode), if not provided, use default ZARR_GROUP
+            output_group_name = ACTUAL_ZARR_GROUP if ACTUAL_ZARR_GROUP else ZARR_GROUP
+            print(f"[{NODE_NAME}] Using zarr group: {output_group_name}")
+            
+            # execute tiling
+            create_segnode_zarr(
+                wsi_path=SLIDE_PATH,
+                zarr_path=ZARR_PATH,
+                zarr_group=output_group_name,
+                patch_size=patch_size,
+                stride=stride,
+                level=level,
+                chunk_size=chunk_size,
+            )
+            
+            print(f"[{NODE_NAME}] Tiling completed. Zarr saved at: {ZARR_PATH}")
+            progress_value = 30
+            
+        except Exception as e:
+            progress_value = 100
+            print(f"[{NODE_NAME}] Error during tiling: {e}")
+            import traceback
+            print(traceback.format_exc())
+            return {"status": "error", "message": f"Tiling failed: {str(e)}"}
+
+    # check if ZARR_PATH exists
     if ZARR_PATH is None or not os.path.exists(ZARR_PATH):
         progress_value = 100
         msg = f"[{NODE_NAME}] no Zarr => skip segmentation"
@@ -558,18 +882,19 @@ def execute_node():
         # store the result to 'output'
         if ZARR_PATH and os.path.exists(ZARR_PATH):
             zf = zarr.open_group(ZARR_PATH, mode='a')
-            node_out_path = f"{NODE_NAME}/output"
+            output_group_name = ACTUAL_ZARR_GROUP if ACTUAL_ZARR_GROUP else NODE_NAME
+            node_out_path = f"{output_group_name}/output"
             if node_out_path in zf:
                 del zf[node_out_path]
             out_str = json.dumps(out_val, ensure_ascii=False)
             out_bytes = out_str.encode("utf-8")
-            # 使用 create_array 创建标量数组（字符串数据）
-            # 将 bytes 转换为 numpy array
+            # use create_dataset to create scalar array (string data)
+            # convert bytes to numpy array
             out_array = np.frombuffer(out_bytes, dtype=f'S{len(out_bytes)}')
-            zf.create_array(node_out_path, data=out_array, dtype=f'S{len(out_bytes)}')
+            zf.create_dataset(node_out_path, data=out_array, dtype=f'S{len(out_bytes)}')
         return {"status": "ok", "output": out_val}
 
-    # 模型已在 /init 中加载，直接使用
+    # model is already loaded in /init, use it directly
     print(f"[{NODE_NAME}] Using pre-loaded PASeg model")
 
     try:
@@ -585,15 +910,16 @@ def execute_node():
     # store the result to 'output'
     if ZARR_PATH and os.path.exists(ZARR_PATH):
         zf = zarr.open_group(ZARR_PATH, mode='a')
-        node_out_path = f"{NODE_NAME}/output"
+        output_group_name = ACTUAL_ZARR_GROUP if ACTUAL_ZARR_GROUP else NODE_NAME
+        node_out_path = f"{output_group_name}/output"
         if node_out_path in zf:
             del zf[node_out_path]
         out_str = json.dumps(out, ensure_ascii=False)
         out_bytes = out_str.encode("utf-8")
-        # 使用 create_array 创建标量数组（字符串数据）
-        # 将 bytes 转换为 numpy array
+        # use create_dataset to create scalar array (string data)
+        # convert bytes to numpy array
         out_array = np.frombuffer(out_bytes, dtype=f'S{len(out_bytes)}')
-        zf.create_array(node_out_path, data=out_array, dtype=f'S{len(out_bytes)}')
+        zf.create_dataset(node_out_path, data=out_array, dtype=f'S{len(out_bytes)}')
 
     progress_value = 100
     return {"status": "ok", "output": out}
@@ -605,7 +931,7 @@ async def progress_options():
 @app.get("/progress")
 async def progress():
     """
-    SSE 进度接口，前端可以实时监听。
+    SSE progress interface, frontend can listen to it in real time.
     """
     async def event_generator():
         global progress_value
