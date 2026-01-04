@@ -541,6 +541,250 @@ class PatchDatasetZarr(Dataset):
 
 # ======================= Core runner =======================
 
+def run_segmentation_sequential(args) -> Dict[str, Any]:
+    """
+    Sequential tiling and inference: process each patch one by one
+    Simpler logic, easier to debug coordinate conversion
+    """
+    global progress_value, PASEG_MODEL, ACTUAL_ZARR_GROUP, total_patches, processed_patches, SLIDE_PATH
+    
+    if not SLIDE_PATH or not os.path.exists(SLIDE_PATH):
+        raise ValueError("SLIDE_PATH not set or file not found")
+    
+    if not HAS_TIFFSLIDE:
+        raise ImportError("tiffslide is required for WSI tiling")
+    
+    try:
+        # Open slide
+        print(f"[{NODE_NAME}] Opening WSI: {SLIDE_PATH}")
+        slide = tiffslide.open_slide(SLIDE_PATH)
+        
+        # Get parameters
+        patch_size = int(getattr(args, "patch_size", 512))
+        stride = int(getattr(args, "stride", 512))
+        level = int(getattr(args, "level", 0))
+        use_amp = bool(getattr(args, "amp", True))
+        
+        level_dims = slide.level_dimensions
+        if level < 0 or level >= slide.level_count:
+            raise ValueError(f"Invalid level={level}. Slide has {slide.level_count} levels.")
+        
+        level_width, level_height = level_dims[level]
+        print(f"[{NODE_NAME}] Level {level} size: width={level_width}, height={level_height}")
+        
+        # Calculate grid
+        xs, ys = compute_grid(level_width, level_height, patch_size, stride)
+        num_x = len(xs)
+        num_y = len(ys)
+        total_patches = num_x * num_y
+        processed_patches = 0
+        
+        print(f"[{NODE_NAME}] Total patches to process: {total_patches}")
+        
+        # Get downsample factor
+        downsample = slide.level_downsamples[level]
+        if isinstance(downsample, (list, tuple)):
+            downsample_x, downsample_y = downsample[0], downsample[1]
+        else:
+            downsample_x = downsample_y = downsample
+        
+        # Prepare model
+        PASEG_MODEL.model.eval()
+        num_classes = int(getattr(PASEG_MODEL, "num_classes", 2))
+        
+        # Accumulate results
+        all_centroids = []
+        all_contours = []
+        all_probabilities = []
+        
+        batch_size = int(getattr(args, "batch_size", 4))
+        batch_imgs = []
+        batch_coords = []  # store (x0, y0) for each image in batch
+        
+        progress_value = 30
+        
+        # Process patches
+        idx = 0
+        for yi, y0 in enumerate(ys):
+            for xi, x0 in enumerate(xs):
+                x1 = int(x0 + patch_size)
+                y1 = int(y0 + patch_size)
+                
+                # Read patch from slide
+                base_x = int(x0 * downsample_x)
+                base_y = int(y0 * downsample_y)
+                
+                patch_pil = slide.read_region(
+                    (base_x, base_y), level, (patch_size, patch_size)
+                )
+                patch_pil = patch_pil.convert("RGB")
+                
+                batch_imgs.append(patch_pil)
+                batch_coords.append((x0, y0))  # save patch position
+                
+                # Process batch when full or last patch
+                if len(batch_imgs) >= batch_size or idx == total_patches - 1:
+                    # Run inference
+                    with torch.no_grad():
+                        amp_ctx = torch.autocast(
+                            device_type=("cuda" if PASEG_MODEL.device == "cuda" else "cpu"),
+                            enabled=(use_amp and PASEG_MODEL.device == "cuda"),
+                            dtype=torch.float16 if PASEG_MODEL.device == "cuda" else torch.bfloat16,
+                        )
+                        with amp_ctx:
+                            logits = PASEG_MODEL.inference_forward(batch_imgs)  # (B,C,h,w)
+                            
+                            # Resize if needed
+                            _, _, h, w = logits.shape
+                            if (h, w) != (patch_size, patch_size):
+                                logits = torch.nn.functional.interpolate(
+                                    logits, size=(patch_size, patch_size), mode="bilinear", align_corners=False
+                                )
+                            
+                            # Convert to mask and probability
+                            prob_batch = torch.softmax(logits, dim=1)  # (B,C,H,W)
+                            mask_batch = torch.argmax(logits, dim=1)   # (B,H,W)
+                            
+                            # Convert to numpy
+                            mask_batch = mask_batch.cpu().numpy().astype(np.uint8)  # (B,H,W)
+                            prob_batch = prob_batch.cpu().numpy().astype(np.float32)  # (B,C,H,W)
+                    
+                    # Extract contours from each patch in batch
+                    for b_idx in range(len(batch_imgs)):
+                        mask = mask_batch[b_idx]  # (H, W)
+                        prob = prob_batch[b_idx]   # (C, H, W)
+                        patch_x0, patch_y0 = batch_coords[b_idx]
+                        
+                        # Find contours
+                        binary_mask = (mask > 0).astype(np.uint8)
+                        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        
+                        for contour in contours:
+                            if len(contour) < 3:
+                                continue
+                            
+                            # Calculate centroid (relative to patch)
+                            M = cv2.moments(contour)
+                            if M["m00"] != 0:
+                                cx = int(M["m10"] / M["m00"])
+                                cy = int(M["m01"] / M["m00"])
+                            else:
+                                cx = int(np.mean(contour[:, 0, 0]))
+                                cy = int(np.mean(contour[:, 0, 1]))
+                            
+                            # Convert to global coordinates: patch_position + relative_position
+                            global_cx = int(patch_x0 + cx)
+                            global_cy = int(patch_y0 + cy)
+                            
+                            # Convert contour to global coordinates
+                            contour_global = contour.copy()
+                            contour_global[:, 0, 0] += int(patch_x0)
+                            contour_global[:, 0, 1] += int(patch_y0)
+                            
+                            # Extract probability
+                            contour_mask = np.zeros((patch_size, patch_size), dtype=np.uint8)
+                            cv2.fillPoly(contour_mask, [contour], 1)
+                            
+                            if num_classes > 1:
+                                foreground_probs = prob[1:, :, :]
+                                max_prob = np.max(foreground_probs[:, contour_mask > 0])
+                            else:
+                                max_prob = np.max(prob[:, contour_mask > 0])
+                            
+                            all_centroids.append([global_cx, global_cy])
+                            all_contours.append(contour_global[:, 0, :])
+                            all_probabilities.append(float(max_prob))
+                    
+                    processed_patches += len(batch_imgs)
+                    
+                    # Update progress
+                    progress_value = int(30 + (processed_patches / total_patches) * 60)
+                    if processed_patches % 50 == 0 or processed_patches == total_patches:
+                        print(f"[{NODE_NAME}] Progress: {progress_value}%, processed {processed_patches}/{total_patches} patches")
+                    
+                    # Clear batch
+                    batch_imgs = []
+                    batch_coords = []
+                
+                idx += 1
+        
+        slide.close()
+        
+        progress_value = 90
+        print(f"[{NODE_NAME}] Processing complete, saving results...")
+        
+        # Save results to zarr
+        if ZARR_PATH and os.path.exists(ZARR_PATH):
+            zf = open_zarr(ZARR_PATH, "a")
+            output_group_name = ACTUAL_ZARR_GROUP if ACTUAL_ZARR_GROUP else NODE_NAME
+            out_grp, _ = recreate_group(zf, output_group_name, preserve_keys=[])
+            
+            # Save contours, centroids and probability
+            if len(all_centroids) > 0:
+                centroids_array = np.array(all_centroids, dtype=np.int32)
+                probability_array = np.array(all_probabilities, dtype=np.float32)
+                
+                out_grp.create_dataset("centroids", data=centroids_array, 
+                                    dtype="int32",
+                                    compressor=zarr.Blosc(cname='lz4', clevel=5, shuffle=zarr.Blosc.SHUFFLE))
+                
+                # Pad contours to same length
+                target_contour_len = 32
+                contours_padded = []
+                for c in all_contours:
+                    if len(c) < target_contour_len:
+                        n_pad = target_contour_len - len(c)
+                        padded = np.pad(c, ((0, n_pad), (0, 0)), mode='edge')
+                    elif len(c) > target_contour_len:
+                        indices = np.linspace(0, len(c) - 1, target_contour_len).astype(int)
+                        padded = c[indices]
+                    else:
+                        padded = c
+                    contours_padded.append(padded)
+                
+                contours_array = np.array(contours_padded, dtype=np.int32)
+                out_grp.create_dataset("contours", data=contours_array,
+                                    dtype="int32",
+                                    compressor=zarr.Blosc(cname='lz4', clevel=5, shuffle=zarr.Blosc.SHUFFLE))
+                
+                out_grp.create_dataset("probability", data=probability_array,
+                                    dtype="float32",
+                                    compressor=zarr.Blosc(cname='lz4', clevel=5, shuffle=zarr.Blosc.SHUFFLE))
+                
+                print(f"[{NODE_NAME}] Found {len(all_centroids)} objects")
+            else:
+                print(f"[{NODE_NAME}] No objects found")
+                out_grp.create_dataset("centroids", shape=(0, 2), dtype="int32")
+                out_grp.create_dataset("contours", shape=(0, 32, 2), dtype="int32")
+                out_grp.create_dataset("probability", shape=(0,), dtype="float32")
+            
+            # Create userData group
+            user_data_grp = out_grp.require_group("userData")
+            
+            if hasattr(args, "image_path") and args.image_path:
+                path_bytes = str(args.image_path).encode("utf-8")
+                if 'path' in user_data_grp:
+                    del user_data_grp['path']
+                path_array = np.frombuffer(path_bytes, dtype=f"S{len(path_bytes)}")
+                user_data_grp.create_dataset("path", data=path_array, dtype=f"S{len(path_bytes)}")
+        
+        progress_value = 100
+        print(f"[{NODE_NAME}] Sequential segmentation complete")
+        
+        result = {
+            "status": "ok",
+            "num_patches": total_patches,
+            "num_objects": len(all_centroids)
+        }
+        
+        return result
+        
+    except Exception as e:
+        print(f"[{NODE_NAME}] Error in sequential segmentation: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
 def run_segmentation_incremental(args, patch_queue: queue.Queue, stop_event: threading.Event) -> Dict[str, Any]:
     """
     incremental segmentation: process patches as they are tiled
@@ -621,9 +865,10 @@ def run_segmentation_incremental(args, patch_queue: queue.Queue, stop_event: thr
 
         # process patches as they arrive
         batch_imgs = []
-        batch_indices = []
+        batch_indices = []  # original patch indices from queue
         tiling_complete = False
         write_idx = 0
+        idx_mapping = []  # mapping from write_idx to original patch_idx
         
         while not tiling_complete or len(available_indices) > 0 or len(batch_imgs) > 0:
             if stop_event.is_set():
@@ -688,6 +933,9 @@ def run_segmentation_incremental(args, patch_queue: queue.Queue, stop_event: thr
                 z_mask[write_idx:write_idx+bsz] = mask_batch
                 z_prob[write_idx:write_idx+bsz] = prob_batch
                 
+                # save the mapping from write position to original patch index
+                idx_mapping.extend(batch_indices)
+                
                 processed_patches += bsz
                 write_idx += bsz
                 
@@ -729,19 +977,30 @@ def run_segmentation_incremental(args, patch_queue: queue.Queue, stop_event: thr
         ]
         
         has_coords = False
-        selected_coords = None
+        all_coords = None  # all coordinates, indexed by original patch index
         for cpath in coords_paths:
             if cpath and cpath in zf:
                 coords_arr = zf[cpath]
-                selected_coords = coords_arr[:K]
+                all_coords = coords_arr[:]  # read all coordinates
                 has_coords = True
-                print(f"[{NODE_NAME}] Found coordinates at: {cpath}")
+                print(f"[{NODE_NAME}] Found coordinates at: {cpath}, total: {len(all_coords)}")
                 break
         
         for i in range(K):
             mask = z_mask[i]  # (H, W) uint8
             prob_patch = z_prob[i]  # (C, H, W) float16 - need to convert to float32 for calculation
             prob_patch = prob_patch.astype(np.float32)
+            
+            # get the original patch index
+            original_patch_idx = idx_mapping[i]
+            
+            # debug: print first few mappings
+            if i < 5:
+                if has_coords:
+                    x0, y0, x1, y1 = all_coords[original_patch_idx]
+                    print(f"[{NODE_NAME}] Debug: write_idx={i}, original_patch_idx={original_patch_idx}, coords=({x0},{y0},{x1},{y1})")
+                else:
+                    print(f"[{NODE_NAME}] Debug: write_idx={i}, original_patch_idx={original_patch_idx}, no coords")
             
             # find all non-zero regions (assuming 0 is background, other values are foreground)
             binary_mask = (mask > 0).astype(np.uint8)
@@ -773,9 +1032,9 @@ def run_segmentation_incremental(args, patch_queue: queue.Queue, stop_event: thr
                 else:
                     max_foreground_prob = np.max(prob_patch[:, contour_mask > 0])
                 
-                # convert to global coordinates
+                # convert to global coordinates using the original patch index
                 if has_coords:
-                    x0, y0, x1, y1 = selected_coords[i]
+                    x0, y0, x1, y1 = all_coords[original_patch_idx]
                     global_cx = int(x0 + cx)
                     global_cy = int(y0 + cy)
                     contour_global = contour.copy()
@@ -1316,56 +1575,19 @@ def execute_node():
                 need_tiling = True
     
     if need_tiling and SLIDE_PATH:
-        print(f"[{NODE_NAME}] Starting parallel tiling and inference for slide: {SLIDE_PATH}")
+        print(f"[{NODE_NAME}] Starting sequential tiling and inference for slide: {SLIDE_PATH}")
         progress_value = 10
         
         try:
-            # if ZARR_PATH is provided (from /read), use it directly
-            # otherwise generate ZARR_PATH based on slide path
-            if not ZARR_PATH:
-                slide_dir = os.path.dirname(SLIDE_PATH)
-                slide_basename = os.path.basename(SLIDE_PATH)
-                zarr_filename = slide_basename + ".zarr"
-                ZARR_PATH = os.path.join(slide_dir, zarr_filename)
+            # Use sequential processing (simpler, no threading issues)
+            progress_value = 20
+            out = run_segmentation_sequential(ARGS)
             
-            # get slicing parameters from ARGS (if exists)
-            patch_size = int(getattr(ARGS, "patch_size", 512))
-            stride = int(getattr(ARGS, "stride", 512))
-            level = int(getattr(ARGS, "level", 0))
-            chunk_size = int(getattr(ARGS, "chunk_size", 1))
-            
-            print(f"[{NODE_NAME}] Tiling WSI: {SLIDE_PATH}")
-            print(f"[{NODE_NAME}] Output Zarr: {ZARR_PATH}")
-            print(f"[{NODE_NAME}] Parameters: patch_size={patch_size}, stride={stride}, level={level}")
-            
-            # use actual group name (like SegmentationNode), if not provided, use default ZARR_GROUP
-            output_group_name = ACTUAL_ZARR_GROUP if ACTUAL_ZARR_GROUP else ZARR_GROUP
-            print(f"[{NODE_NAME}] Using zarr group: {output_group_name}")
-            
-            # create queue and event for parallel processing
-            patch_queue = queue.Queue(maxsize=100)  # buffer for 100 patches
-            stop_event = threading.Event()
-            
-            # start tiling thread
-            tiling_thread = threading.Thread(
-                target=tile_slide_incrementally,
-                args=(SLIDE_PATH, ZARR_PATH, output_group_name, patch_size, stride, level, chunk_size, patch_queue, stop_event),
-                daemon=True
-            )
-            tiling_thread.start()
-            
-            # run inference in main thread (to use GPU)
-            progress_value = 30
-            out = run_segmentation_incremental(ARGS, patch_queue, stop_event)
-            
-            # wait for tiling thread to finish
-            tiling_thread.join(timeout=10)
-            
-            print(f"[{NODE_NAME}] Parallel tiling and inference completed")
+            print(f"[{NODE_NAME}] Sequential processing completed")
             
         except Exception as e:
             progress_value = 100
-            print(f"[{NODE_NAME}] Error during parallel processing: {e}")
+            print(f"[{NODE_NAME}] Error during sequential processing: {e}")
             import traceback
             print(traceback.format_exc())
             out = {"status": "error", "message": str(e), "num_patches": 0}
