@@ -1428,7 +1428,7 @@ def read_node(data: Dict[str, Any]):
           model_path, patch_ids, image_array_path, patch_id_path,
           tissue_classes, tissue_colors, batch_size, num_workers, amp, save_prob, default_text, ...
     """
-    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ZARR_GROUP, DEP_ZARR_GROUPS, ARGS, SLIDE_PATH, ACTUAL_ZARR_GROUP
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ZARR_GROUP, DEP_ZARR_GROUPS, ARGS, SLIDE_PATH, ACTUAL_ZARR_GROUP, TISSUE_CLASS
     import argparse
 
     NODE_NAME = data.get("node_name", "SegNode")
