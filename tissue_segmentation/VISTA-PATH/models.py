@@ -44,8 +44,8 @@ class PASeg:
         d_model: int = 512,
         nhead: int = 8,
         num_layers: int = 4,
-        bbx_random: float = 0.5,
-        default_text: str = "an image of tissue",
+        bbx_random: float = 1.0,
+        default_text: str = "an image of tumor",
         device: Optional[str] = None,
         checkpoint_dir: Optional[str] = None,
     ):
