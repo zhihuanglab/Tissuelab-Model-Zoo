@@ -860,7 +860,7 @@ def run_segmentation_incremental(args, patch_queue: queue.Queue, stop_event: thr
         # inference setup
         PASEG_MODEL.model.eval()
         use_amp = bool(getattr(args, "amp", True))
-        default_text = str(getattr(args, "default_text", "an image of tissue"))
+        default_text = str(getattr(args, "default_text", "an image of tumor"))
         batch_size = int(getattr(args, "batch_size", 4))
 
         # process patches as they arrive
@@ -1526,7 +1526,7 @@ def read_node(data: Dict[str, Any]):
     if not hasattr(ARGS, "image_array_path"):
         setattr(ARGS, "image_array_path", f"{ZARR_GROUP}/images")
     if not hasattr(ARGS, "default_text"):
-        setattr(ARGS, "default_text", "an image of tissue")
+        setattr(ARGS, "default_text", "an image of tumor")
 
     print(f"[{NODE_NAME}] /read done => SLIDE_PATH={SLIDE_PATH}")
     return {"status": "ok", "message": f"[{NODE_NAME}] read done"}

@@ -188,3 +188,6 @@ Scripts/
 tissue_segmentation/VISTA-PATH/patch_data
 
 tissue_segmentation/VISTA-PATH/Visium_Lung/
+
+tissue_segmentation/VISTA-PATH/SegNode_debug.py
+tissue_segmentation/VISTA-PATH/debug_output.png
