@@ -79,6 +79,7 @@ set_seed(42)
 
 ARGS = None  # argparse.Namespace-like（default settings）
 SLIDE_PATH = None
+TISSUE_CLASS = None
 IS_MODEL_INITED = False
 
 ZARR_PATH: Optional[str] = None
@@ -1445,13 +1446,15 @@ def read_node(data: Dict[str, Any]):
         return {"status": "ok", "message": "no Zarr store found."}
 
     if ARGS is None:
+        prompt = f"an image of {TISSUE_CLASS}" if TISSUE_CLASS else "an image of tumor"
+        print(f"segmenting prompt: {prompt}")
         ARGS = argparse.Namespace(
             model_path="",
             image_array_path=f"{ZARR_GROUP}/images",
             batch_size=4,
             num_workers=0,
             amp=True,
-            default_text="an image of tumor",
+            default_text=prompt,
             d_model=512,
             nhead=8,
             num_layers=4,
@@ -1519,6 +1522,9 @@ def read_node(data: Dict[str, Any]):
             
             if k == "path":
                 SLIDE_PATH = val_json
+            elif k == "tissue_class":
+                TISSUE_CLASS = val_json
+
             print(f"[{NODE_NAME}] user param {k} => {val_json}")
             setattr(ARGS, k, val_json)
 
