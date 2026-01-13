@@ -906,7 +906,7 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             traceback.print_exc()
         
         progress_value = 75
-        print(f"[{NODE_NAME}] 跳过contour提取（不需要），直接完成")
+        print(f"[{NODE_NAME}] skip contour extraction and centroids")
         
         # skip contour extraction and centroids, save empty results to zarr
         if ZARR_PATH and os.path.exists(ZARR_PATH):
