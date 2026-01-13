@@ -593,18 +593,19 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         PASEG_MODEL.model.eval()
         num_classes = int(getattr(PASEG_MODEL, "num_classes", 2))
         
-        # Accumulate results
-        all_centroids = []
-        all_contours = []
-        all_probabilities = []
-        
         batch_size = int(getattr(args, "batch_size", 4))
-        batch_imgs = []
-        batch_coords = []  # store (x0, y0) for each image in batch
         
         progress_value = 30
         
-        # Process patches
+        # Step 1: Create full-size mask and probability maps
+        print(f"[{NODE_NAME}] Creating full-size mask: {level_width}x{level_height}")
+        full_mask = np.zeros((level_height, level_width), dtype=np.uint8)
+        full_prob = np.zeros((num_classes, level_height, level_width), dtype=np.float32)
+        
+        # Step 2: Process all patches and stitch into full mask
+        batch_imgs = []
+        batch_coords = []  # store (x0, y0) for each image in batch
+        
         idx = 0
         for yi, y0 in enumerate(ys):
             for xi, x0 in enumerate(xs):
@@ -650,58 +651,26 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                             mask_batch = mask_batch.cpu().numpy().astype(np.uint8)  # (B,H,W)
                             prob_batch = prob_batch.cpu().numpy().astype(np.float32)  # (B,C,H,W)
                     
-                    # Extract contours from each patch in batch
+                    # Stitch masks into full image
                     for b_idx in range(len(batch_imgs)):
                         mask = mask_batch[b_idx]  # (H, W)
                         prob = prob_batch[b_idx]   # (C, H, W)
                         patch_x0, patch_y0 = batch_coords[b_idx]
                         
-                        # Find contours
-                        binary_mask = (mask > 0).astype(np.uint8)
-                        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        # Calculate actual patch size (handle edge cases)
+                        actual_h = min(patch_size, level_height - patch_y0)
+                        actual_w = min(patch_size, level_width - patch_x0)
                         
-                        for contour in contours:
-                            if len(contour) < 3:
-                                continue
-                            
-                            # Calculate centroid (relative to patch)
-                            M = cv2.moments(contour)
-                            if M["m00"] != 0:
-                                cx = int(M["m10"] / M["m00"])
-                                cy = int(M["m01"] / M["m00"])
-                            else:
-                                cx = int(np.mean(contour[:, 0, 0]))
-                                cy = int(np.mean(contour[:, 0, 1]))
-                            
-                            # Convert to global coordinates: patch_position + relative_position
-                            global_cx = int(patch_x0 + cx)
-                            global_cy = int(patch_y0 + cy)
-                            
-                            # Convert contour to global coordinates
-                            contour_global = contour.copy()
-                            contour_global[:, 0, 0] += int(patch_x0)
-                            contour_global[:, 0, 1] += int(patch_y0)
-                            
-                            # Extract probability
-                            contour_mask = np.zeros((patch_size, patch_size), dtype=np.uint8)
-                            cv2.fillPoly(contour_mask, [contour], 1)
-                            
-                            if num_classes > 1:
-                                foreground_probs = prob[1:, :, :]
-                                max_prob = np.max(foreground_probs[:, contour_mask > 0])
-                            else:
-                                max_prob = np.max(prob[:, contour_mask > 0])
-                            
-                            all_centroids.append([global_cx, global_cy])
-                            all_contours.append(contour_global[:, 0, :])
-                            all_probabilities.append(float(max_prob))
+                        # Stitch mask into full mask
+                        full_mask[patch_y0:patch_y0+actual_h, patch_x0:patch_x0+actual_w] = mask[:actual_h, :actual_w]
+                        full_prob[:, patch_y0:patch_y0+actual_h, patch_x0:patch_x0+actual_w] = prob[:, :actual_h, :actual_w]
                     
                     processed_patches += len(batch_imgs)
                     
-                    # Update progress
-                    progress_value = int(30 + (processed_patches / total_patches) * 60)
+                    # Update progress (0-60% for stitching)
+                    progress_value = int(30 + (processed_patches / total_patches) * 40)
                     if processed_patches % 50 == 0 or processed_patches == total_patches:
-                        print(f"[{NODE_NAME}] Progress: {progress_value}%, processed {processed_patches}/{total_patches} patches")
+                        print(f"[{NODE_NAME}] Stitching progress: {progress_value}%, processed {processed_patches}/{total_patches} patches")
                     
                     # Clear batch
                     batch_imgs = []
@@ -711,8 +680,129 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         
         slide.close()
         
+        progress_value = 70
+        print(f"[{NODE_NAME}] Stitching complete, saving mask as PNG...")
+        
+        # Save full mask as PNG to the same directory as SegNode.py
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # Get WSI filename without extension
+        wsi_basename = os.path.basename(SLIDE_PATH)
+        wsi_name_without_ext = os.path.splitext(wsi_basename)[0]
+        
+        # Add level info to filename if not level 0
+        if level == 0:
+            mask_png_path = os.path.join(current_dir, f"{wsi_name_without_ext}.png")
+        else:
+            mask_png_path = os.path.join(current_dir, f"{wsi_name_without_ext}_level{level}.png")
+        
+        # Print alignment information
+        level0_width, level0_height = slide.level_dimensions[0]
+        print(f"[{NODE_NAME}] WSI Level 0 (original) size: {level0_width} x {level0_height}")
+        print(f"[{NODE_NAME}] Mask Level {level} size: {level_width} x {level_height}")
+        if level > 0:
+            print(f"[{NODE_NAME}] Downsample factor: {downsample_x:.2f}x")
+            print(f"[{NODE_NAME}] To align with Level 0: scale mask by {downsample_x:.2f}x")
+        
+        # Create RGBA mask with transparent background
+        # For large images, we may need to downsample to save
+        max_save_size = 10000  # max dimension for saving
+        if level_height > max_save_size or level_width > max_save_size:
+            scale = max_save_size / max(level_height, level_width)
+            new_h = int(level_height * scale)
+            new_w = int(level_width * scale)
+            # Resize mask
+            mask_resized = cv2.resize(full_mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+            binary_mask_resized = (mask_resized > 0).astype(np.uint8)
+            
+            # Create RGBA image: white foreground (255,255,255,255), transparent background (0,0,0,0)
+            rgba = np.zeros((new_h, new_w, 4), dtype=np.uint8)
+            rgba[binary_mask_resized > 0] = [255, 255, 255, 255]  # white with full opacity
+            rgba[binary_mask_resized == 0] = [0, 0, 0, 0]  # transparent background
+            
+            # Save using PIL to preserve transparency
+            img_pil = Image.fromarray(rgba, mode='RGBA')
+            img_pil.save(mask_png_path, 'PNG')
+            print(f"[{NODE_NAME}] Saved downsampled mask ({new_w}x{new_h}) with transparent background to: {mask_png_path}")
+            print(f"[{NODE_NAME}] Note: Mask was downsampled from {level_width}x{level_height} for storage")
+        else:
+            binary_mask = (full_mask > 0).astype(np.uint8)
+            
+            # Create RGBA image: white foreground (255,255,255,255), transparent background (0,0,0,0)
+            rgba = np.zeros((level_height, level_width, 4), dtype=np.uint8)
+            rgba[binary_mask > 0] = [255, 255, 255, 255]  # white with full opacity
+            rgba[binary_mask == 0] = [0, 0, 0, 0]  # transparent background
+            
+            # Save using PIL to preserve transparency
+            img_pil = Image.fromarray(rgba, mode='RGBA')
+            img_pil.save(mask_png_path, 'PNG')
+            print(f"[{NODE_NAME}] Saved full mask ({level_width}x{level_height}) with transparent background to: {mask_png_path}")
+            if level == 0:
+                print(f"[{NODE_NAME}] Mask is at Level 0 (original resolution), can be directly overlaid on WSI")
+            else:
+                print(f"[{NODE_NAME}] Mask is at Level {level}, aligned with WSI Level {level} (downsampled by {downsample_x:.2f}x from Level 0)")
+        
+        progress_value = 75
+        print(f"[{NODE_NAME}] Extracting contours from full mask...")
+        
+        # Step 3: Extract contours from full mask
+        all_centroids = []
+        all_contours = []
+        all_probabilities = []
+        
+        binary_mask = (full_mask > 0).astype(np.uint8)
+        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        
+        total_contours = len(contours)
+        print(f"[{NODE_NAME}] Found {total_contours} contours in full mask, processing...")
+        
+        # Process contours with progress feedback
+        last_progress_print = 0
+        for contour_idx, contour in enumerate(contours):
+            if len(contour) < 3:
+                continue
+            
+            # Calculate centroid
+            M = cv2.moments(contour)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+            else:
+                cx = int(np.mean(contour[:, 0, 0]))
+                cy = int(np.mean(contour[:, 0, 1]))
+            
+            # Extract probability using bounding box (much faster than full image mask)
+            # Get bounding box of contour
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            # Create mask only in bounding box region
+            contour_mask_crop = np.zeros((h, w), dtype=np.uint8)
+            # Shift contour coordinates to bounding box
+            contour_shifted = contour.copy()
+            contour_shifted[:, 0, 0] -= x
+            contour_shifted[:, 0, 1] -= y
+            cv2.fillPoly(contour_mask_crop, [contour_shifted], 1)
+            
+            # Extract probability from bounding box region
+            if num_classes > 1:
+                foreground_probs = full_prob[1:, y:y+h, x:x+w]  # (C-1, h, w)
+                max_prob = np.max(foreground_probs[:, contour_mask_crop > 0])
+            else:
+                max_prob = np.max(full_prob[:, y:y+h, x:x+w][:, contour_mask_crop > 0])
+            
+            all_centroids.append([cx, cy])
+            all_contours.append(contour[:, 0, :])
+            all_probabilities.append(float(max_prob))
+            
+            # Update progress every 10% or every 100 contours
+            current_progress = int((contour_idx + 1) / total_contours * 100)
+            if current_progress >= last_progress_print + 10 or (contour_idx + 1) % 100 == 0:
+                progress_value = int(75 + (contour_idx + 1) / total_contours * 15)
+                print(f"[{NODE_NAME}] Contour extraction progress: {current_progress}% ({contour_idx + 1}/{total_contours})")
+                last_progress_print = current_progress
+        
         progress_value = 90
-        print(f"[{NODE_NAME}] Processing complete, saving results...")
+        print(f"[{NODE_NAME}] Contour extraction complete, found {len(all_centroids)} valid objects, saving results...")
         
         # Save results to zarr
         if ZARR_PATH and os.path.exists(ZARR_PATH):
@@ -729,8 +819,8 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                                     dtype="int32",
                                     compressor=zarr.Blosc(cname='lz4', clevel=5, shuffle=zarr.Blosc.SHUFFLE))
                 
-                # Pad contours to same length
-                target_contour_len = 32
+                # Pad contours to same length (increased to 128 for very smooth edges)
+                target_contour_len = 128
                 contours_padded = []
                 for c in all_contours:
                     if len(c) < target_contour_len:
@@ -756,7 +846,7 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             else:
                 print(f"[{NODE_NAME}] No objects found")
                 out_grp.create_dataset("centroids", shape=(0, 2), dtype="int32")
-                out_grp.create_dataset("contours", shape=(0, 32, 2), dtype="int32")
+                out_grp.create_dataset("contours", shape=(0, 128, 2), dtype="int32")
                 out_grp.create_dataset("probability", shape=(0,), dtype="float32")
             
             # Create userData group
@@ -1058,8 +1148,8 @@ def run_segmentation_incremental(args, patch_queue: queue.Queue, stop_event: thr
                                 dtype="int32",
                                 compressor=zarr.Blosc(cname='lz4', clevel=5, shuffle=zarr.Blosc.SHUFFLE))
             
-            # pad contours to same length
-            target_contour_len = 32
+            # pad contours to same length (increased to 128 for very smooth edges)
+            target_contour_len = 128
             contours_padded = []
             for c in all_contours:
                 if len(c) < target_contour_len:
@@ -1085,7 +1175,7 @@ def run_segmentation_incremental(args, patch_queue: queue.Queue, stop_event: thr
         else:
             print(f"[{NODE_NAME}] No objects found in masks")
             out_grp.create_dataset("centroids", shape=(0, 2), dtype="int32")
-            out_grp.create_dataset("contours", shape=(0, 32, 2), dtype="int32")
+            out_grp.create_dataset("contours", shape=(0, 128, 2), dtype="int32")
             out_grp.create_dataset("probability", shape=(0,), dtype="float32")
         
         # delete temporary arrays
@@ -1314,17 +1404,17 @@ def run_segmentation(args) -> Dict[str, Any]:
                               dtype="int32",
                               compressor=zarr.Blosc(cname='lz4', clevel=5, shuffle=zarr.Blosc.SHUFFLE))
         
-        # contours need to be padded to the same length (the reference format uses 32 points)
-        # if the contour points are less than 32, pad; if more than 32, downsample
-        target_contour_len = 32
+        # contours need to be padded to the same length (using 128 points for very smooth edges)
+        # if the contour points are less than 128, pad; if more than 128, downsample
+        target_contour_len = 128
         contours_padded = []
         for c in all_contours:
             if len(c) < target_contour_len:
-                # pad to 32 points (repeat the last point)
+                # pad to target_contour_len points (repeat the last point)
                 n_pad = target_contour_len - len(c)
                 padded = np.pad(c, ((0, n_pad), (0, 0)), mode='edge')
             elif len(c) > target_contour_len:
-                # downsample to 32 points
+                # downsample to target_contour_len points
                 indices = np.linspace(0, len(c) - 1, target_contour_len).astype(int)
                 padded = c[indices]
             else:
@@ -1349,7 +1439,7 @@ def run_segmentation(args) -> Dict[str, Any]:
         print(f"[{NODE_NAME}] No objects found in masks")
         # create empty arrays (matching format)
         out_grp.create_dataset("centroids", shape=(0, 2), dtype="int32")
-        out_grp.create_dataset("contours", shape=(0, 32, 2), dtype="int32")
+        out_grp.create_dataset("contours", shape=(0, 128, 2), dtype="int32")
         out_grp.create_dataset("probability", shape=(0,), dtype="float32")
     
     # delete the temporary mask and prob_patches (not present in the reference format)
