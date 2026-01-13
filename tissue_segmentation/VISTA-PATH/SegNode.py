@@ -432,6 +432,196 @@ def create_segnode_zarr(
     print(f"[INFO] Done. Total patches: {N}")
     print(f"[INFO] Zarr structure created at: {zarr_path}, group={zarr_group}")
 
+def generate_dzi_tiles_to_zarr(full_mask, zarr_path, zarr_group, slide_name, level, tile_size=1024):
+    """
+    generate DZI tiles from the full mask and save to zarr.
+    
+    Args:
+        full_mask: (H, W) numpy array, the full mask
+        zarr_path: zarr file path
+        zarr_group: zarr group name (e.g., "SegNode")
+        slide_name: WSI file name (without extension)
+        level: WSI level
+        tile_size: tile size, default 1024
+    
+    Returns:
+        dzi_group_path: zarr group path for DZI tiles
+    """
+    level_height, level_width = full_mask.shape
+    
+    print(f"[INFO] Generating DZI tiles to zarr: {zarr_path}")
+    print(f"[INFO] Original size: {level_width}x{level_height}")
+    print(f"[INFO] Tile size: {tile_size}x{tile_size}")
+    
+    # Open zarr
+    zf = zarr.open_group(zarr_path, mode='a')
+    
+    # Create DZI tiles group: {zarr_group}/dzi_tiles/
+    dzi_group_path = f"{zarr_group}/dzi_tiles"
+    if dzi_group_path in zf:
+        print(f"[WARN] DZI tiles group already exists, deleting: {dzi_group_path}")
+        del zf[dzi_group_path]
+    
+    dzi_grp = zf.create_group(dzi_group_path)
+    
+    # calculate the number of DZI levels needed
+    max_dimension = max(level_width, level_height)
+    max_dzi_level = int(np.ceil(np.log2(max_dimension / tile_size))) + 1
+    max_dzi_level = max(1, max_dzi_level)
+    
+    print(f"[INFO] Generating {max_dzi_level + 1} DZI levels (L0 to L{max_dzi_level})")
+    
+    # Calculate tile counts for each level (for progress bar and pre-allocation)
+    print(f"[INFO] Calculating tile layout...")
+    level_info = []
+    temp_w, temp_h = level_width, level_height
+    total_tiles = 0
+    for dzi_level in range(max_dzi_level, -1, -1):
+        num_tiles_x = int(np.ceil(temp_w / tile_size))
+        num_tiles_y = int(np.ceil(temp_h / tile_size))
+        num_tiles = num_tiles_x * num_tiles_y
+        level_info.append({
+            'level': dzi_level,
+            'width': temp_w,
+            'height': temp_h,
+            'num_tiles_x': num_tiles_x,
+            'num_tiles_y': num_tiles_y,
+            'num_tiles': num_tiles
+        })
+        total_tiles += num_tiles
+        temp_w = max(1, temp_w // 2)
+        temp_h = max(1, temp_h // 2)
+    
+    print(f"[INFO] Total tiles to generate: {total_tiles}")
+    
+    # generate binary mask
+    print(f"[INFO] Generating binary mask...")
+    current_binary = (full_mask > 0).astype(np.uint8)
+    del full_mask  # release original mask memory
+    
+    if HAS_TIFFSLIDE:
+        pbar = tqdm(total=total_tiles, desc="Generating DZI tiles", unit="tile")
+    
+    # Process each level
+    for level_idx, info in enumerate(level_info):
+        dzi_level = info['level']
+        num_tiles_x = info['num_tiles_x']
+        num_tiles_y = info['num_tiles_y']
+        num_tiles = info['num_tiles']
+        
+        print(f"[INFO] Level L{dzi_level}: {info['width']}x{info['height']}, tiles: {num_tiles_x}x{num_tiles_y}")
+        
+        # Create zarr dataset for this level
+        # Store as (num_tiles, tile_size, tile_size, 4) RGBA
+        level_grp = dzi_grp.create_group(f"L{dzi_level}")
+        tiles_ds = level_grp.create_dataset(
+            "tiles",
+            shape=(num_tiles, tile_size, tile_size, 4),
+            chunks=(1, tile_size, tile_size, 4),
+            dtype='uint8',
+            compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.SHUFFLE)
+        )
+        
+        # Create tile index mapping: stores (tile_x, tile_y) for each tile
+        tile_coords_ds = level_grp.create_dataset(
+            "tile_coords",
+            shape=(num_tiles, 2),
+            chunks=(min(1000, num_tiles), 2),
+            dtype='int32'
+        )
+        
+        # Save level metadata
+        level_meta = {
+            "level": dzi_level,
+            "width": info['width'],
+            "height": info['height'],
+            "num_tiles_x": num_tiles_x,
+            "num_tiles_y": num_tiles_y,
+            "num_tiles": num_tiles
+        }
+        meta_str = json.dumps(level_meta, ensure_ascii=False)
+        meta_bytes = meta_str.encode('utf-8')
+        level_grp.create_dataset(
+            "meta",
+            shape=(),
+            dtype=f'S{len(meta_bytes)}',
+            data=meta_bytes
+        )
+        
+        # Generate and save tiles
+        tile_idx = 0
+        for tile_y in range(num_tiles_y):
+            for tile_x in range(num_tiles_x):
+                # calculate tile coordinates (align with the original image)
+                x0 = tile_x * tile_size
+                y0 = tile_y * tile_size
+                x1 = min(x0 + tile_size, info['width'])
+                y1 = min(y0 + tile_size, info['height'])
+                
+                # extract binary mask tile
+                binary_tile = current_binary[y0:y1, x0:x1]
+                
+                # create RGBA tile
+                tile_h, tile_w = binary_tile.shape
+                rgba_tile = np.zeros((tile_h, tile_w, 4), dtype=np.uint8)
+                rgba_tile[binary_tile > 0] = [255, 255, 255, 255]  # white foreground
+                
+                # if the tile is not full size, need to fill transparent pixels
+                if tile_h < tile_size or tile_w < tile_size:
+                    padded_tile = np.zeros((tile_size, tile_size, 4), dtype=np.uint8)
+                    padded_tile[:tile_h, :tile_w] = rgba_tile
+                    rgba_tile = padded_tile
+                
+                # Save to zarr
+                tiles_ds[tile_idx] = rgba_tile
+                tile_coords_ds[tile_idx] = [tile_x, tile_y]
+                
+                tile_idx += 1
+                if HAS_TIFFSLIDE:
+                    pbar.update(1)
+        
+        print(f"[INFO] Level L{dzi_level}: {num_tiles} tiles saved to zarr")
+        
+        # generate smaller version for the next level (shrink 50%)
+        if level_idx < len(level_info) - 1:  # not the last level
+            new_w = max(1, info['width'] // 2)
+            new_h = max(1, info['height'] // 2)
+            print(f"[INFO] Shrinking to next level: {new_w}x{new_h}")
+            current_binary = cv2.resize(current_binary, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            # re-binarize (resize may produce intermediate values)
+            current_binary = (current_binary > 0).astype(np.uint8)
+    
+    if HAS_TIFFSLIDE:
+        pbar.close()
+    
+    # Save overall metadata
+    meta = {
+        "slide_name": slide_name,
+        "wsi_level": level,
+        "original_size": {
+            "width": level_width,
+            "height": level_height
+        },
+        "tile_size": tile_size,
+        "dzi_levels": max_dzi_level + 1,
+        "max_dzi_level": max_dzi_level,
+        "format": "rgba_uint8",
+        "overlap": 0
+    }
+    meta_str = json.dumps(meta, indent=2, ensure_ascii=False)
+    meta_bytes = meta_str.encode('utf-8')
+    dzi_grp.create_dataset(
+        "meta",
+        shape=(),
+        dtype=f'S{len(meta_bytes)}',
+        data=meta_bytes
+    )
+    
+    print(f"[INFO] DZI tiles metadata saved to zarr: {dzi_group_path}/meta")
+    print(f"[INFO] DZI tiles generation complete!")
+    
+    return dzi_group_path
+
 def recreate_group(zf, group_name: str, preserve_keys: List[str] = ()):
     """
     delete the old group and rebuild; can read out the specified key datasets first.
@@ -597,10 +787,9 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         
         progress_value = 30
         
-        # Step 1: Create full-size mask and probability maps
+        # Step 1: Create full-size mask (不需要probability maps)
         print(f"[{NODE_NAME}] Creating full-size mask: {level_width}x{level_height}")
         full_mask = np.zeros((level_height, level_width), dtype=np.uint8)
-        full_prob = np.zeros((num_classes, level_height, level_width), dtype=np.float32)
         
         # Step 2: Process all patches and stitch into full mask
         batch_imgs = []
@@ -643,18 +832,15 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                                     logits, size=(patch_size, patch_size), mode="bilinear", align_corners=False
                                 )
                             
-                            # Convert to mask and probability
-                            prob_batch = torch.softmax(logits, dim=1)  # (B,C,H,W)
+                            # Convert to mask (不需要probability)
                             mask_batch = torch.argmax(logits, dim=1)   # (B,H,W)
                             
                             # Convert to numpy
                             mask_batch = mask_batch.cpu().numpy().astype(np.uint8)  # (B,H,W)
-                            prob_batch = prob_batch.cpu().numpy().astype(np.float32)  # (B,C,H,W)
                     
                     # Stitch masks into full image
                     for b_idx in range(len(batch_imgs)):
                         mask = mask_batch[b_idx]  # (H, W)
-                        prob = prob_batch[b_idx]   # (C, H, W)
                         patch_x0, patch_y0 = batch_coords[b_idx]
                         
                         # Calculate actual patch size (handle edge cases)
@@ -663,7 +849,6 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                         
                         # Stitch mask into full mask
                         full_mask[patch_y0:patch_y0+actual_h, patch_x0:patch_x0+actual_w] = mask[:actual_h, :actual_w]
-                        full_prob[:, patch_y0:patch_y0+actual_h, patch_x0:patch_x0+actual_w] = prob[:, :actual_h, :actual_w]
                     
                     processed_patches += len(batch_imgs)
                     
@@ -681,173 +866,69 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         slide.close()
         
         progress_value = 70
-        print(f"[{NODE_NAME}] Stitching complete, saving mask as PNG...")
+        print(f"[{NODE_NAME}] Stitching complete, generating DZI tiles to zarr...")
         
-        # Save full mask as PNG to the same directory as SegNode.py
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        # Get WSI filename without extension
+        # 获取WSI文件名
         wsi_basename = os.path.basename(SLIDE_PATH)
         wsi_name_without_ext = os.path.splitext(wsi_basename)[0]
         
-        # Add level info to filename if not level 0
-        if level == 0:
-            mask_png_path = os.path.join(current_dir, f"{wsi_name_without_ext}.png")
+        # 如果不是Level 0，在slide_id后面添加level信息
+        if level != 0:
+            slide_id = f"{wsi_name_without_ext}_level{level}"
         else:
-            mask_png_path = os.path.join(current_dir, f"{wsi_name_without_ext}_level{level}.png")
+            slide_id = wsi_name_without_ext
         
-        # Print alignment information
+        # 打印对齐信息
         level0_width, level0_height = slide.level_dimensions[0]
         print(f"[{NODE_NAME}] WSI Level 0 (original) size: {level0_width} x {level0_height}")
         print(f"[{NODE_NAME}] Mask Level {level} size: {level_width} x {level_height}")
         if level > 0:
             print(f"[{NODE_NAME}] Downsample factor: {downsample_x:.2f}x")
-            print(f"[{NODE_NAME}] To align with Level 0: scale mask by {downsample_x:.2f}x")
         
-        # Create RGBA mask with transparent background
-        # For large images, we may need to downsample to save
-        max_save_size = 10000  # max dimension for saving
-        if level_height > max_save_size or level_width > max_save_size:
-            scale = max_save_size / max(level_height, level_width)
-            new_h = int(level_height * scale)
-            new_w = int(level_width * scale)
-            # Resize mask
-            mask_resized = cv2.resize(full_mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-            binary_mask_resized = (mask_resized > 0).astype(np.uint8)
-            
-            # Create RGBA image: white foreground (255,255,255,255), transparent background (0,0,0,0)
-            rgba = np.zeros((new_h, new_w, 4), dtype=np.uint8)
-            rgba[binary_mask_resized > 0] = [255, 255, 255, 255]  # white with full opacity
-            rgba[binary_mask_resized == 0] = [0, 0, 0, 0]  # transparent background
-            
-            # Save using PIL to preserve transparency
-            img_pil = Image.fromarray(rgba, mode='RGBA')
-            img_pil.save(mask_png_path, 'PNG')
-            print(f"[{NODE_NAME}] Saved downsampled mask ({new_w}x{new_h}) with transparent background to: {mask_png_path}")
-            print(f"[{NODE_NAME}] Note: Mask was downsampled from {level_width}x{level_height} for storage")
-        else:
-            binary_mask = (full_mask > 0).astype(np.uint8)
-            
-            # Create RGBA image: white foreground (255,255,255,255), transparent background (0,0,0,0)
-            rgba = np.zeros((level_height, level_width, 4), dtype=np.uint8)
-            rgba[binary_mask > 0] = [255, 255, 255, 255]  # white with full opacity
-            rgba[binary_mask == 0] = [0, 0, 0, 0]  # transparent background
-            
-            # Save using PIL to preserve transparency
-            img_pil = Image.fromarray(rgba, mode='RGBA')
-            img_pil.save(mask_png_path, 'PNG')
-            print(f"[{NODE_NAME}] Saved full mask ({level_width}x{level_height}) with transparent background to: {mask_png_path}")
-            if level == 0:
-                print(f"[{NODE_NAME}] Mask is at Level 0 (original resolution), can be directly overlaid on WSI")
+        # 生成DZI瓦片并保存到zarr（1024x1024瓦片，与原图对齐）
+        try:
+            if ZARR_PATH and os.path.exists(ZARR_PATH):
+                output_group_name = ACTUAL_ZARR_GROUP if ACTUAL_ZARR_GROUP else NODE_NAME
+                dzi_group = generate_dzi_tiles_to_zarr(
+                    full_mask=full_mask,
+                    zarr_path=ZARR_PATH,
+                    zarr_group=output_group_name,
+                    slide_name=slide_id,
+                    level=level,
+                    tile_size=1024
+                )
+                print(f"[{NODE_NAME}] DZI tiles saved to zarr group: {dzi_group}")
             else:
-                print(f"[{NODE_NAME}] Mask is at Level {level}, aligned with WSI Level {level} (downsampled by {downsample_x:.2f}x from Level 0)")
+                print(f"[{NODE_NAME}] ZARR_PATH not available, skipping DZI tile generation")
+        except Exception as e:
+            print(f"[{NODE_NAME}] Error generating DZI tiles: {e}")
+            import traceback
+            traceback.print_exc()
         
         progress_value = 75
-        print(f"[{NODE_NAME}] Extracting contours from full mask...")
+        print(f"[{NODE_NAME}] 跳过contour提取（不需要），直接完成")
         
-        # Step 3: Extract contours from full mask
-        all_centroids = []
-        all_contours = []
-        all_probabilities = []
-        
-        binary_mask = (full_mask > 0).astype(np.uint8)
-        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        
-        total_contours = len(contours)
-        print(f"[{NODE_NAME}] Found {total_contours} contours in full mask, processing...")
-        
-        # Process contours with progress feedback
-        last_progress_print = 0
-        for contour_idx, contour in enumerate(contours):
-            if len(contour) < 3:
-                continue
-            
-            # Calculate centroid
-            M = cv2.moments(contour)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-            else:
-                cx = int(np.mean(contour[:, 0, 0]))
-                cy = int(np.mean(contour[:, 0, 1]))
-            
-            # Extract probability using bounding box (much faster than full image mask)
-            # Get bounding box of contour
-            x, y, w, h = cv2.boundingRect(contour)
-            
-            # Create mask only in bounding box region
-            contour_mask_crop = np.zeros((h, w), dtype=np.uint8)
-            # Shift contour coordinates to bounding box
-            contour_shifted = contour.copy()
-            contour_shifted[:, 0, 0] -= x
-            contour_shifted[:, 0, 1] -= y
-            cv2.fillPoly(contour_mask_crop, [contour_shifted], 1)
-            
-            # Extract probability from bounding box region
-            if num_classes > 1:
-                foreground_probs = full_prob[1:, y:y+h, x:x+w]  # (C-1, h, w)
-                max_prob = np.max(foreground_probs[:, contour_mask_crop > 0])
-            else:
-                max_prob = np.max(full_prob[:, y:y+h, x:x+w][:, contour_mask_crop > 0])
-            
-            all_centroids.append([cx, cy])
-            all_contours.append(contour[:, 0, :])
-            all_probabilities.append(float(max_prob))
-            
-            # Update progress every 10% or every 100 contours
-            current_progress = int((contour_idx + 1) / total_contours * 100)
-            if current_progress >= last_progress_print + 10 or (contour_idx + 1) % 100 == 0:
-                progress_value = int(75 + (contour_idx + 1) / total_contours * 15)
-                print(f"[{NODE_NAME}] Contour extraction progress: {current_progress}% ({contour_idx + 1}/{total_contours})")
-                last_progress_print = current_progress
-        
-        progress_value = 90
-        print(f"[{NODE_NAME}] Contour extraction complete, found {len(all_centroids)} valid objects, saving results...")
-        
-        # Save results to zarr
+        # skip contour extraction and centroids, save empty results to zarr
         if ZARR_PATH and os.path.exists(ZARR_PATH):
             zf = open_zarr(ZARR_PATH, "a")
             output_group_name = ACTUAL_ZARR_GROUP if ACTUAL_ZARR_GROUP else NODE_NAME
-            out_grp, _ = recreate_group(zf, output_group_name, preserve_keys=[])
             
-            # Save contours, centroids and probability
-            if len(all_centroids) > 0:
-                centroids_array = np.array(all_centroids, dtype=np.int32)
-                probability_array = np.array(all_probabilities, dtype=np.float32)
-                
-                out_grp.create_dataset("centroids", data=centroids_array, 
-                                    dtype="int32",
-                                    compressor=zarr.Blosc(cname='lz4', clevel=5, shuffle=zarr.Blosc.SHUFFLE))
-                
-                # Pad contours to same length (increased to 128 for very smooth edges)
-                target_contour_len = 128
-                contours_padded = []
-                for c in all_contours:
-                    if len(c) < target_contour_len:
-                        n_pad = target_contour_len - len(c)
-                        padded = np.pad(c, ((0, n_pad), (0, 0)), mode='edge')
-                    elif len(c) > target_contour_len:
-                        indices = np.linspace(0, len(c) - 1, target_contour_len).astype(int)
-                        padded = c[indices]
-                    else:
-                        padded = c
-                    contours_padded.append(padded)
-                
-                contours_array = np.array(contours_padded, dtype=np.int32)
-                out_grp.create_dataset("contours", data=contours_array,
-                                    dtype="int32",
-                                    compressor=zarr.Blosc(cname='lz4', clevel=5, shuffle=zarr.Blosc.SHUFFLE))
-                
-                out_grp.create_dataset("probability", data=probability_array,
-                                    dtype="float32",
-                                    compressor=zarr.Blosc(cname='lz4', clevel=5, shuffle=zarr.Blosc.SHUFFLE))
-                
-                print(f"[{NODE_NAME}] Found {len(all_centroids)} objects")
+            # don't recreate group, use existing group (preserve dzi_tiles)
+            if output_group_name in zf:
+                out_grp = zf[output_group_name]
             else:
-                print(f"[{NODE_NAME}] No objects found")
-                out_grp.create_dataset("centroids", shape=(0, 2), dtype="int32")
-                out_grp.create_dataset("contours", shape=(0, 128, 2), dtype="int32")
-                out_grp.create_dataset("probability", shape=(0,), dtype="float32")
+                out_grp = zf.create_group(output_group_name)
+            
+            # delete old centroids/contours/probability (if exists)
+            for key in ['centroids', 'contours', 'probability']:
+                if key in out_grp:
+                    del out_grp[key]
+            
+            # create empty contours/centroids datasets (keep zarr structure intact)
+            print(f"[{NODE_NAME}] creating empty contours/centroids datasets")
+            out_grp.create_dataset("centroids", shape=(0, 2), dtype="int32")
+            out_grp.create_dataset("contours", shape=(0, 128, 2), dtype="int32")
+            out_grp.create_dataset("probability", shape=(0,), dtype="float32")
             
             # Create userData group
             user_data_grp = out_grp.require_group("userData")
@@ -860,12 +941,13 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                 user_data_grp.create_dataset("path", data=path_array, dtype=f"S{len(path_bytes)}")
         
         progress_value = 100
-        print(f"[{NODE_NAME}] Sequential segmentation complete")
+        print(f"[{NODE_NAME}] Sequential segmentation complete (contour extraction skipped)")
         
         result = {
             "status": "ok",
             "num_patches": total_patches,
-            "num_objects": len(all_centroids)
+            "num_objects": 0,  # skip contour extraction
+            "message": "DZI tiles generated successfully, contour extraction skipped"
         }
         
         return result
