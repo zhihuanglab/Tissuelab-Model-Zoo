@@ -770,7 +770,92 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         total_patches = num_x * num_y
         processed_patches = 0
         
-        print(f"[{NODE_NAME}] Total patches to process: {total_patches}")
+        print(f"[{NODE_NAME}] Total patches in grid: {total_patches}")
+        
+        # Check if MuskNode filtering is needed
+        patches_to_process = None  # None means process all patches
+        if ZARR_PATH and os.path.exists(ZARR_PATH) and TISSUE_CLASS:
+            try:
+                zf_check = open_zarr(ZARR_PATH, "r")
+                if "MuskNode" in zf_check:
+                    print(f"[{NODE_NAME}] Found MuskNode, checking for TISSUE_CLASS filter...")
+                    mask_node = zf_check["MuskNode"]
+                    
+                    # Read tissue_class_name to find the target class ID
+                    if "tissue_class_name" in mask_node:
+                        tissue_names = mask_node["tissue_class_name"][:]
+                        # Decode bytes to strings
+                        tissue_names_decoded = []
+                        for name_bytes in tissue_names:
+                            if isinstance(name_bytes, bytes):
+                                tissue_names_decoded.append(name_bytes.decode('utf-8'))
+                            else:
+                                tissue_names_decoded.append(str(name_bytes))
+                        
+                        print(f"[{NODE_NAME}] Available tissue classes: {tissue_names_decoded}")
+                        print(f"[{NODE_NAME}] Target TISSUE_CLASS: {TISSUE_CLASS}")
+                        
+                        # Find the class ID for TISSUE_CLASS (case-insensitive)
+                        target_class_id = None
+                        tissue_class_lower = TISSUE_CLASS.lower()
+                        for idx, name in enumerate(tissue_names_decoded):
+                            if name.lower() == tissue_class_lower:
+                                target_class_id = idx
+                                print(f"[{NODE_NAME}] Matched '{name}' with '{TISSUE_CLASS}' (case-insensitive)")
+                                break
+                        
+                        if target_class_id is not None:
+                            print(f"[{NODE_NAME}] Target class ID: {target_class_id}")
+                            
+                            # Read coordinates and tissue_class_id from MaskNode
+                            if "coordinates" in mask_node and "tissue_class_id" in mask_node:
+                                mask_coords = mask_node["coordinates"][:]  # (N, 4) [x0, y0, x1, y1]
+                                mask_class_ids = mask_node["tissue_class_id"][:]  # (N,)
+                                
+                                print(f"[{NODE_NAME}] MuskNode has {len(mask_coords)} patches")
+                                
+                                # Build a set of patches to process
+                                # Check which of our patches overlap with target class patches
+                                patches_to_process = set()
+                                
+                                for yi, y0 in enumerate(ys):
+                                    for xi, x0 in enumerate(xs):
+                                        x1 = int(x0 + patch_size)
+                                        y1 = int(y0 + patch_size)
+                                        
+                                        # Check overlap with any MuskNode patch of target class
+                                        for mask_idx in range(len(mask_coords)):
+                                            if mask_class_ids[mask_idx] != target_class_id:
+                                                continue
+                                            
+                                            mx0, my0, mx1, my1 = mask_coords[mask_idx]
+                                            
+                                            # Check if patches overlap
+                                            # Two rectangles overlap if they overlap in both x and y
+                                            x_overlap = not (x1 <= mx0 or x0 >= mx1)
+                                            y_overlap = not (y1 <= my0 or y0 >= my1)
+                                            
+                                            if x_overlap and y_overlap:
+                                                patch_id = yi * num_x + xi
+                                                patches_to_process.add(patch_id)
+                                                break  # Found overlap, no need to check other MuskNode patches
+                                
+                                print(f"[{NODE_NAME}] Filtered to {len(patches_to_process)} patches matching TISSUE_CLASS '{TISSUE_CLASS}'")
+                                total_patches = len(patches_to_process)
+                            else:
+                                print(f"[{NODE_NAME}] MuskNode missing coordinates or tissue_class_id, processing all patches")
+                        else:
+                            print(f"[{NODE_NAME}] TISSUE_CLASS '{TISSUE_CLASS}' not found in MaskNode, processing all patches")
+                    else:
+                        print(f"[{NODE_NAME}] MuskNode missing tissue_class_name, processing all patches")
+                else:
+                    print(f"[{NODE_NAME}] No MuskNode found, processing all patches")
+            except Exception as e:
+                print(f"[{NODE_NAME}] Error reading MuskNode: {e}, processing all patches")
+                import traceback
+                traceback.print_exc()
+        
+        print(f"[{NODE_NAME}] Will process {total_patches} patches")
         
         # Get downsample factor
         downsample = slide.level_downsamples[level]
@@ -798,6 +883,13 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         idx = 0
         for yi, y0 in enumerate(ys):
             for xi, x0 in enumerate(xs):
+                patch_id = yi * num_x + xi
+                
+                # Skip if this patch is not in the filter set
+                if patches_to_process is not None and patch_id not in patches_to_process:
+                    idx += 1
+                    continue
+                
                 x1 = int(x0 + patch_size)
                 y1 = int(y0 + patch_size)
                 
