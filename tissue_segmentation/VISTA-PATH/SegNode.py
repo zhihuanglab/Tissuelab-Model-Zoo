@@ -906,9 +906,9 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             traceback.print_exc()
         
         progress_value = 75
-        print(f"[{NODE_NAME}] skip contour extraction and centroids")
+        print(f"[{NODE_NAME}] Saving full mask and metadata to zarr...")
         
-        # skip contour extraction and centroids, save empty results to zarr
+        # Save full mask and empty metadata to zarr
         if ZARR_PATH and os.path.exists(ZARR_PATH):
             zf = open_zarr(ZARR_PATH, "a")
             output_group_name = ACTUAL_ZARR_GROUP if ACTUAL_ZARR_GROUP else NODE_NAME
@@ -919,16 +919,41 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             else:
                 out_grp = zf.create_group(output_group_name)
             
-            # delete old centroids/contours/probability (if exists)
-            for key in ['centroids', 'contours', 'probability']:
+            # delete old datasets (if exists)
+            for key in ['centroids', 'contours', 'probability', 'mask']:
                 if key in out_grp:
                     del out_grp[key]
             
+            # Save full mask as bool array
+            print(f"[{NODE_NAME}] Saving full mask as bool array: {level_width}x{level_height}")
+            print(f"[{NODE_NAME}] Converting to bool...")
+            binary_mask = (full_mask > 0).astype(bool)  # Convert to bool
+            
+            print(f"[{NODE_NAME}] Writing to zarr with compression...")
+            out_grp.create_dataset(
+                "mask",
+                data=binary_mask,
+                shape=(level_height, level_width),
+                chunks=(min(1024, level_height), min(1024, level_width)),
+                dtype=bool,
+                compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.BITSHUFFLE)
+            )
+            
+            # Calculate and print compression info
+            mask_size_mb = (level_height * level_width) / (8 * 1024 * 1024)  # bool = 1 bit ideally
+            print(f"[{NODE_NAME}] Full mask saved successfully")
+            print(f"[{NODE_NAME}] Mask dimensions: {level_height} x {level_width}")
+            print(f"[{NODE_NAME}] Uncompressed size: ~{mask_size_mb:.2f} MB (bool)")
+            
+            progress_value = 85
+            
             # create empty contours/centroids datasets (keep zarr structure intact)
-            print(f"[{NODE_NAME}] creating empty contours/centroids datasets")
+            print(f"[{NODE_NAME}] Creating empty contours/centroids datasets")
             out_grp.create_dataset("centroids", shape=(0, 2), dtype="int32")
             out_grp.create_dataset("contours", shape=(0, 128, 2), dtype="int32")
             out_grp.create_dataset("probability", shape=(0,), dtype="float32")
+            
+            progress_value = 90
             
             # Create userData group
             user_data_grp = out_grp.require_group("userData")
@@ -941,13 +966,13 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                 user_data_grp.create_dataset("path", data=path_array, dtype=f"S{len(path_bytes)}")
         
         progress_value = 100
-        print(f"[{NODE_NAME}] Sequential segmentation complete (contour extraction skipped)")
+        print(f"[{NODE_NAME}] Sequential segmentation complete")
         
         result = {
             "status": "ok",
             "num_patches": total_patches,
             "num_objects": 0,  # skip contour extraction
-            "message": "DZI tiles generated successfully, contour extraction skipped"
+            "message": f"Full mask saved as bool array ({level_width}x{level_height}), DZI tiles generated"
         }
         
         return result
