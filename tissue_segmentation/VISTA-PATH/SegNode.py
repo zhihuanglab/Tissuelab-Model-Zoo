@@ -852,10 +852,10 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                     
                     processed_patches += len(batch_imgs)
                     
-                    # Update progress (0-60% for stitching)
-                    progress_value = int(30 + (processed_patches / total_patches) * 40)
+                    # Update progress (10-90% for patch processing)
+                    progress_value = int(10 + (processed_patches / total_patches) * 80)
                     if processed_patches % 50 == 0 or processed_patches == total_patches:
-                        print(f"[{NODE_NAME}] Stitching progress: {progress_value}%, processed {processed_patches}/{total_patches} patches")
+                        print(f"[{NODE_NAME}] Progress: {progress_value}% ({processed_patches}/{total_patches} patches)")
                     
                     # Clear batch
                     batch_imgs = []
@@ -865,71 +865,27 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         
         slide.close()
         
-        progress_value = 70
-        print(f"[{NODE_NAME}] Stitching complete, generating DZI tiles to zarr...")
+        progress_value = 90
+        print(f"[{NODE_NAME}] Progress: 90% - All patches processed, saving mask to zarr...")
         
-        # 获取WSI文件名
-        wsi_basename = os.path.basename(SLIDE_PATH)
-        wsi_name_without_ext = os.path.splitext(wsi_basename)[0]
-        
-        # 如果不是Level 0，在slide_id后面添加level信息
-        if level != 0:
-            slide_id = f"{wsi_name_without_ext}_level{level}"
-        else:
-            slide_id = wsi_name_without_ext
-        
-        # 打印对齐信息
-        level0_width, level0_height = slide.level_dimensions[0]
-        print(f"[{NODE_NAME}] WSI Level 0 (original) size: {level0_width} x {level0_height}")
-        print(f"[{NODE_NAME}] Mask Level {level} size: {level_width} x {level_height}")
-        if level > 0:
-            print(f"[{NODE_NAME}] Downsample factor: {downsample_x:.2f}x")
-        
-        # 生成DZI瓦片并保存到zarr（1024x1024瓦片，与原图对齐）
-        try:
-            if ZARR_PATH and os.path.exists(ZARR_PATH):
-                output_group_name = ACTUAL_ZARR_GROUP if ACTUAL_ZARR_GROUP else NODE_NAME
-                dzi_group = generate_dzi_tiles_to_zarr(
-                    full_mask=full_mask,
-                    zarr_path=ZARR_PATH,
-                    zarr_group=output_group_name,
-                    slide_name=slide_id,
-                    level=level,
-                    tile_size=1024
-                )
-                print(f"[{NODE_NAME}] DZI tiles saved to zarr group: {dzi_group}")
-            else:
-                print(f"[{NODE_NAME}] ZARR_PATH not available, skipping DZI tile generation")
-        except Exception as e:
-            print(f"[{NODE_NAME}] Error generating DZI tiles: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        progress_value = 75
-        print(f"[{NODE_NAME}] Saving full mask and metadata to zarr...")
-        
-        # Save full mask and empty metadata to zarr
+        # Save full mask to zarr (preserve existing centroids/contours/probability)
         if ZARR_PATH and os.path.exists(ZARR_PATH):
             zf = open_zarr(ZARR_PATH, "a")
             output_group_name = ACTUAL_ZARR_GROUP if ACTUAL_ZARR_GROUP else NODE_NAME
             
-            # don't recreate group, use existing group (preserve dzi_tiles)
+            # don't recreate group, use existing group
             if output_group_name in zf:
                 out_grp = zf[output_group_name]
             else:
                 out_grp = zf.create_group(output_group_name)
             
-            # delete old datasets (if exists)
-            for key in ['centroids', 'contours', 'probability', 'mask']:
-                if key in out_grp:
-                    del out_grp[key]
+            # Only delete and recreate mask (preserve centroids/contours/probability)
+            if 'mask' in out_grp:
+                del out_grp['mask']
             
             # Save full mask as bool array
-            print(f"[{NODE_NAME}] Saving full mask as bool array: {level_width}x{level_height}")
-            print(f"[{NODE_NAME}] Converting to bool...")
-            binary_mask = (full_mask > 0).astype(bool)  # Convert to bool
+            binary_mask = (full_mask > 0).astype(bool)
             
-            print(f"[{NODE_NAME}] Writing to zarr with compression...")
             out_grp.create_dataset(
                 "mask",
                 data=binary_mask,
@@ -939,21 +895,19 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                 compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.BITSHUFFLE)
             )
             
-            # Calculate and print compression info
-            mask_size_mb = (level_height * level_width) / (8 * 1024 * 1024)  # bool = 1 bit ideally
-            print(f"[{NODE_NAME}] Full mask saved successfully")
-            print(f"[{NODE_NAME}] Mask dimensions: {level_height} x {level_width}")
-            print(f"[{NODE_NAME}] Uncompressed size: ~{mask_size_mb:.2f} MB (bool)")
+            print(f"[{NODE_NAME}] Mask saved: {level_height}x{level_width} (bool, compressed)")
             
-            progress_value = 85
+            # Check if centroids/contours/probability exist
+            existing = []
+            if 'centroids' in out_grp:
+                existing.append(f"centroids({len(out_grp['centroids'])})")
+            if 'contours' in out_grp:
+                existing.append(f"contours({len(out_grp['contours'])})")
+            if 'probability' in out_grp:
+                existing.append(f"probability({len(out_grp['probability'])})")
             
-            # create empty contours/centroids datasets (keep zarr structure intact)
-            print(f"[{NODE_NAME}] Creating empty contours/centroids datasets")
-            out_grp.create_dataset("centroids", shape=(0, 2), dtype="int32")
-            out_grp.create_dataset("contours", shape=(0, 128, 2), dtype="int32")
-            out_grp.create_dataset("probability", shape=(0,), dtype="float32")
-            
-            progress_value = 90
+            if existing:
+                print(f"[{NODE_NAME}] Preserved: {', '.join(existing)}")
             
             # Create userData group
             user_data_grp = out_grp.require_group("userData")
@@ -966,13 +920,13 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                 user_data_grp.create_dataset("path", data=path_array, dtype=f"S{len(path_bytes)}")
         
         progress_value = 100
-        print(f"[{NODE_NAME}] Sequential segmentation complete")
+        print(f"[{NODE_NAME}] Complete! Processed {total_patches} patches, mask saved to zarr")
         
         result = {
             "status": "ok",
             "num_patches": total_patches,
-            "num_objects": 0,  # skip contour extraction
-            "message": f"Full mask saved as bool array ({level_width}x{level_height}), DZI tiles generated"
+            "num_objects": 0,
+            "message": f"Mask saved: {level_width}x{level_height} (bool)"
         }
         
         return result
