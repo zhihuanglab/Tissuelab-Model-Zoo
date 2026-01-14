@@ -763,17 +763,10 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         level_width, level_height = level_dims[level]
         print(f"[{NODE_NAME}] Level {level} size: width={level_width}, height={level_height}")
         
-        # Calculate grid
-        xs, ys = compute_grid(level_width, level_height, patch_size, stride)
-        num_x = len(xs)
-        num_y = len(ys)
-        total_patches = num_x * num_y
         processed_patches = 0
         
-        print(f"[{NODE_NAME}] Total patches in grid: {total_patches}")
-        
-        # Check if MuskNode filtering is needed
-        patches_to_process = None  # None means process all patches
+        # Check if MuskNode filtering is needed - use MaskNode coordinates directly
+        mask_node_coords = None  # None means use grid patches, otherwise use MaskNode coordinates
         if ZARR_PATH and os.path.exists(ZARR_PATH) and TISSUE_CLASS:
             try:
                 zf_check = open_zarr(ZARR_PATH, "r")
@@ -814,46 +807,42 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                                 
                                 print(f"[{NODE_NAME}] MuskNode has {len(mask_coords)} patches")
                                 
-                                # Build a set of patches to process
-                                # Check which of our patches overlap with target class patches
-                                patches_to_process = set()
+                                # Filter coordinates by target class ID
+                                target_coords = []
+                                for mask_idx in range(len(mask_coords)):
+                                    if mask_class_ids[mask_idx] == target_class_id:
+                                        target_coords.append(mask_coords[mask_idx])
                                 
-                                for yi, y0 in enumerate(ys):
-                                    for xi, x0 in enumerate(xs):
-                                        x1 = int(x0 + patch_size)
-                                        y1 = int(y0 + patch_size)
-                                        
-                                        # Check overlap with any MuskNode patch of target class
-                                        for mask_idx in range(len(mask_coords)):
-                                            if mask_class_ids[mask_idx] != target_class_id:
-                                                continue
-                                            
-                                            mx0, my0, mx1, my1 = mask_coords[mask_idx]
-                                            
-                                            # Check if patches overlap
-                                            # Two rectangles overlap if they overlap in both x and y
-                                            x_overlap = not (x1 <= mx0 or x0 >= mx1)
-                                            y_overlap = not (y1 <= my0 or y0 >= my1)
-                                            
-                                            if x_overlap and y_overlap:
-                                                patch_id = yi * num_x + xi
-                                                patches_to_process.add(patch_id)
-                                                break  # Found overlap, no need to check other MuskNode patches
-                                
-                                print(f"[{NODE_NAME}] Filtered to {len(patches_to_process)} patches matching TISSUE_CLASS '{TISSUE_CLASS}'")
-                                total_patches = len(patches_to_process)
+                                if len(target_coords) > 0:
+                                    mask_node_coords = np.array(target_coords, dtype=np.int64)  # (K, 4)
+                                    total_patches = len(mask_node_coords)
+                                    print(f"[{NODE_NAME}] Using {total_patches} MaskNode patches matching TISSUE_CLASS '{TISSUE_CLASS}'")
+                                else:
+                                    print(f"[{NODE_NAME}] No patches found for TISSUE_CLASS '{TISSUE_CLASS}' in MaskNode, processing all grid patches")
                             else:
-                                print(f"[{NODE_NAME}] MuskNode missing coordinates or tissue_class_id, processing all patches")
+                                print(f"[{NODE_NAME}] MuskNode missing coordinates or tissue_class_id, processing all grid patches")
                         else:
-                            print(f"[{NODE_NAME}] TISSUE_CLASS '{TISSUE_CLASS}' not found in MaskNode, processing all patches")
+                            print(f"[{NODE_NAME}] TISSUE_CLASS '{TISSUE_CLASS}' not found in MaskNode, processing all grid patches")
                     else:
-                        print(f"[{NODE_NAME}] MuskNode missing tissue_class_name, processing all patches")
+                        print(f"[{NODE_NAME}] MuskNode missing tissue_class_name, processing all grid patches")
                 else:
-                    print(f"[{NODE_NAME}] No MuskNode found, processing all patches")
+                    print(f"[{NODE_NAME}] No MuskNode found, processing all grid patches")
             except Exception as e:
-                print(f"[{NODE_NAME}] Error reading MuskNode: {e}, processing all patches")
+                print(f"[{NODE_NAME}] Error reading MuskNode: {e}, processing all grid patches")
                 import traceback
                 traceback.print_exc()
+        
+        # If not using MaskNode coordinates, calculate grid
+        if mask_node_coords is None:
+            xs, ys = compute_grid(level_width, level_height, patch_size, stride)
+            num_x = len(xs)
+            num_y = len(ys)
+            total_patches = num_x * num_y
+            print(f"[{NODE_NAME}] Total patches in grid: {total_patches}")
+        else:
+            # Set dummy grid values (won't be used)
+            xs, ys = None, None
+            num_x, num_y = None, None
         
         print(f"[{NODE_NAME}] Will process {total_patches} patches")
         
@@ -878,32 +867,32 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         
         # Step 2: Process all patches and stitch into full mask
         batch_imgs = []
-        batch_coords = []  # store (x0, y0) for each image in batch
+        batch_coords = []  # store (x0, y0, x1, y1) for each image in batch
         
         idx = 0
-        for yi, y0 in enumerate(ys):
-            for xi, x0 in enumerate(xs):
-                patch_id = yi * num_x + xi
-                
-                # Skip if this patch is not in the filter set
-                if patches_to_process is not None and patch_id not in patches_to_process:
-                    idx += 1
-                    continue
-                
-                x1 = int(x0 + patch_size)
-                y1 = int(y0 + patch_size)
+        if mask_node_coords is not None:
+            # Use MaskNode coordinates directly
+            for coord in mask_node_coords:
+                x0, y0, x1, y1 = coord
+                # Calculate actual patch size from coordinates
+                actual_patch_w = int(x1 - x0)
+                actual_patch_h = int(y1 - y0)
                 
                 # Read patch from slide
                 base_x = int(x0 * downsample_x)
                 base_y = int(y0 * downsample_y)
                 
                 patch_pil = slide.read_region(
-                    (base_x, base_y), level, (patch_size, patch_size)
+                    (base_x, base_y), level, (actual_patch_w, actual_patch_h)
                 )
                 patch_pil = patch_pil.convert("RGB")
                 
+                # Resize to patch_size if needed (for consistent model input)
+                if actual_patch_w != patch_size or actual_patch_h != patch_size:
+                    patch_pil = patch_pil.resize((patch_size, patch_size), Image.LANCZOS)
+                
                 batch_imgs.append(patch_pil)
-                batch_coords.append((x0, y0))  # save patch position
+                batch_coords.append((x0, y0, x1, y1))  # save patch position
                 
                 # Process batch when full or last patch
                 if len(batch_imgs) >= batch_size or idx == total_patches - 1:
@@ -933,11 +922,17 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                     # Stitch masks into full image
                     for b_idx in range(len(batch_imgs)):
                         mask = mask_batch[b_idx]  # (H, W)
-                        patch_x0, patch_y0 = batch_coords[b_idx]
+                        patch_x0, patch_y0, patch_x1, patch_y1 = batch_coords[b_idx]
+                        
+                        # Resize mask back to original patch size if needed
+                        actual_patch_w = patch_x1 - patch_x0
+                        actual_patch_h = patch_y1 - patch_y0
+                        if actual_patch_w != patch_size or actual_patch_h != patch_size:
+                            mask = cv2.resize(mask, (actual_patch_w, actual_patch_h), interpolation=cv2.INTER_NEAREST)
                         
                         # Calculate actual patch size (handle edge cases)
-                        actual_h = min(patch_size, level_height - patch_y0)
-                        actual_w = min(patch_size, level_width - patch_x0)
+                        actual_h = min(actual_patch_h, level_height - patch_y0)
+                        actual_w = min(actual_patch_w, level_width - patch_x0)
                         
                         # Stitch mask into full mask
                         full_mask[patch_y0:patch_y0+actual_h, patch_x0:patch_x0+actual_w] = mask[:actual_h, :actual_w]
@@ -954,6 +949,74 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                     batch_coords = []
                 
                 idx += 1
+        else:
+            # Use grid patches
+            for yi, y0 in enumerate(ys):
+                for xi, x0 in enumerate(xs):
+                    x1 = int(x0 + patch_size)
+                    y1 = int(y0 + patch_size)
+                    
+                    # Read patch from slide
+                    base_x = int(x0 * downsample_x)
+                    base_y = int(y0 * downsample_y)
+                    
+                    patch_pil = slide.read_region(
+                        (base_x, base_y), level, (patch_size, patch_size)
+                    )
+                    patch_pil = patch_pil.convert("RGB")
+                    
+                    batch_imgs.append(patch_pil)
+                    batch_coords.append((x0, y0))  # save patch position
+                    
+                    # Process batch when full or last patch
+                    if len(batch_imgs) >= batch_size or idx == total_patches - 1:
+                        # Run inference
+                        with torch.no_grad():
+                            amp_ctx = torch.autocast(
+                                device_type=("cuda" if PASEG_MODEL.device == "cuda" else "cpu"),
+                                enabled=(use_amp and PASEG_MODEL.device == "cuda"),
+                                dtype=torch.float16 if PASEG_MODEL.device == "cuda" else torch.bfloat16,
+                            )
+                            with amp_ctx:
+                                logits = PASEG_MODEL.inference_forward(batch_imgs)  # (B,C,h,w)
+                                
+                                # Resize if needed
+                                _, _, h, w = logits.shape
+                                if (h, w) != (patch_size, patch_size):
+                                    logits = torch.nn.functional.interpolate(
+                                        logits, size=(patch_size, patch_size), mode="bilinear", align_corners=False
+                                    )
+                                
+                                # Convert to mask (不需要probability)
+                                mask_batch = torch.argmax(logits, dim=1)   # (B,H,W)
+                                
+                                # Convert to numpy
+                                mask_batch = mask_batch.cpu().numpy().astype(np.uint8)  # (B,H,W)
+                        
+                        # Stitch masks into full image
+                        for b_idx in range(len(batch_imgs)):
+                            mask = mask_batch[b_idx]  # (H, W)
+                            patch_x0, patch_y0 = batch_coords[b_idx]
+                            
+                            # Calculate actual patch size (handle edge cases)
+                            actual_h = min(patch_size, level_height - patch_y0)
+                            actual_w = min(patch_size, level_width - patch_x0)
+                            
+                            # Stitch mask into full mask
+                            full_mask[patch_y0:patch_y0+actual_h, patch_x0:patch_x0+actual_w] = mask[:actual_h, :actual_w]
+                        
+                        processed_patches += len(batch_imgs)
+                        
+                        # Update progress (10-90% for patch processing)
+                        progress_value = int(10 + (processed_patches / total_patches) * 80)
+                        if processed_patches % 50 == 0 or processed_patches == total_patches:
+                            print(f"[{NODE_NAME}] Progress: {progress_value}% ({processed_patches}/{total_patches} patches)")
+                        
+                        # Clear batch
+                        batch_imgs = []
+                        batch_coords = []
+                    
+                    idx += 1
         
         slide.close()
         
