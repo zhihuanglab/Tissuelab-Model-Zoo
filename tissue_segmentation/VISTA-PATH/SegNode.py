@@ -989,6 +989,19 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             
             print(f"[{NODE_NAME}] Mask saved: {level_height}x{level_width} (bool, compressed)")
             
+            # Save tissue_class dataset (user-provided tissue class name as a string)
+            # Delete existing tissue_class if exists
+            if 'tissue_class' in out_grp:
+                del out_grp['tissue_class']
+            
+            # Save user-provided TISSUE_CLASS as a string
+            if TISSUE_CLASS:
+                tissue_class_str = str(TISSUE_CLASS)
+                tissue_class_bytes = tissue_class_str.encode("utf-8")
+                tissue_class_array = np.frombuffer(tissue_class_bytes, dtype=f"S{len(tissue_class_bytes)}")
+                out_grp.create_dataset("tissue_class", data=tissue_class_array, dtype=f"S{len(tissue_class_bytes)}")
+                print(f"[{NODE_NAME}] Tissue class saved: '{tissue_class_str}'")
+            
             # Check if centroids/contours/probability exist
             existing = []
             if 'centroids' in out_grp:
