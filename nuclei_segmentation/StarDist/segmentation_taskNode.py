@@ -480,6 +480,51 @@ def run_segmentation(args):
 def get_status():
     return {"status": "segmentation_node with embedding running"}
 
+@app.get("/logs")
+def get_logs(lines: int = 200):
+    """
+    Return the last n lines of tasknode logs.
+    """
+    try:
+        import os
+        import glob
+
+        # Find the most recent log file for this tasknode
+        log_dir = "/tmp/tasknode_logs"
+        if not os.path.exists(log_dir):
+            return {"lines": 0, "content": ""}
+
+        # Look for log files with StarDist/segmentation patterns
+        log_patterns = [
+            os.path.join(log_dir, "*StarDist*.log"),
+            os.path.join(log_dir, "*segmentation*.log"),
+            os.path.join(log_dir, "*.log")
+        ]
+
+        matching_files = []
+        for pattern in log_patterns:
+            matching_files.extend(glob.glob(pattern))
+
+        if not matching_files:
+            return {"lines": 0, "content": ""}
+
+        # Use the most recent log file
+        log_file = max(matching_files, key=os.path.getmtime)
+
+        # Read the last n lines
+        with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+            all_lines = f.readlines()
+            last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+            content = ''.join(last_lines)
+
+        return {
+            "lines": len(last_lines),
+            "content": content,
+            "log_file": log_file
+        }
+
+    except Exception as e:
+        return {"lines": 0, "content": f"Error reading logs: {str(e)}"}
 
 @app.post("/init")
 def init_node():
