@@ -491,31 +491,62 @@ def get_logs(lines: int = 200):
 
         # First, check if log path is specified via environment variable (set by TaskNodeManager)
         tasknode_log_path = os.environ.get("TASKNODE_LOG_PATH", "")
-        if tasknode_log_path and os.path.exists(tasknode_log_path) and os.path.isfile(tasknode_log_path):
-            # Use the log file specified by TaskNodeManager
-            try:
-                with open(tasknode_log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    all_lines = f.readlines()
-                    last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
-                    content = ''.join(last_lines)
+        
+        if tasknode_log_path:
+            # TaskNodeManager passes absolute path, so we can use it directly
+            # Normalize path separators for cross-platform compatibility
+            if os.name == 'nt':  # Windows
+                tasknode_log_path = tasknode_log_path.replace("/", "\\")
+            # On Unix/Linux, keep as is (already uses /)
+            
+            if os.path.exists(tasknode_log_path) and os.path.isfile(tasknode_log_path):
+                # Use the log file specified by TaskNodeManager
+                try:
+                    with open(tasknode_log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        all_lines = f.readlines()
+                        last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+                        content = ''.join(last_lines)
 
-                return {
-                    "lines": len(last_lines),
-                    "content": content,
-                    "log_file": tasknode_log_path,
-                    "total_lines": len(all_lines)
-                }
-            except Exception as read_err:
-                return {
-                    "lines": 0, 
-                    "content": "", 
-                    "error": f"Failed to read log file {tasknode_log_path}: {str(read_err)}"
-                }
+                    return {
+                        "lines": len(last_lines),
+                        "content": content,
+                        "log_file": tasknode_log_path,
+                        "total_lines": len(all_lines)
+                    }
+                except Exception as read_err:
+                    return {
+                        "lines": 0, 
+                        "content": "", 
+                        "error": f"Failed to read log file {tasknode_log_path}: {str(read_err)}"
+                    }
 
         # Fallback: Find the most recent log file for this tasknode
-        log_dir = "/tmp/tasknode_logs"
-        if not os.path.exists(log_dir):
-            return {"lines": 0, "content": "", "error": f"Log directory does not exist: {log_dir} and TASKNODE_LOG_PATH not set"}
+        # Try multiple possible log directories
+        possible_log_dirs = [
+            "storage/tasknode_logs",  # TaskNodeManager's storage directory (relative to working dir)
+            os.path.join(os.getcwd(), "storage", "tasknode_logs"),  # Absolute path
+            "/tmp/tasknode_logs",  # Legacy location
+        ]
+        
+        log_dir = None
+        for possible_dir in possible_log_dirs:
+            if os.path.exists(possible_dir):
+                log_dir = possible_dir
+                break
+        
+        if not log_dir:
+            # Return detailed error with debug info
+            debug_info = {
+                "TASKNODE_LOG_PATH": os.environ.get("TASKNODE_LOG_PATH", "NOT SET"),
+                "current_working_dir": os.getcwd(),
+                "checked_directories": possible_log_dirs,
+                "node_name": NODE_NAME or os.environ.get("NODE_NAME", "NOT SET")
+            }
+            return {
+                "lines": 0, 
+                "content": "", 
+                "error": f"Log directory not found and TASKNODE_LOG_PATH not set. Debug info: {debug_info}"
+            }
 
         # Get node name if available (from global variable or environment)
         node_name = NODE_NAME or os.environ.get("NODE_NAME", "")

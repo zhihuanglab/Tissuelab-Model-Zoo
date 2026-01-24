@@ -1093,27 +1093,36 @@ def get_logs(lines: int = 200):
         import glob
 
         # First, check if log path is specified via environment variable (set by TaskNodeManager)
+        # TaskNodeManager passes absolute path, so we can use it directly
         tasknode_log_path = os.environ.get("TASKNODE_LOG_PATH", "")
-        if tasknode_log_path and os.path.exists(tasknode_log_path) and os.path.isfile(tasknode_log_path):
-            # Use the log file specified by TaskNodeManager
-            try:
-                with open(tasknode_log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    all_lines = f.readlines()
-                    last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
-                    content = ''.join(last_lines)
+        
+        if tasknode_log_path:
+            # TaskNodeManager passes absolute path, so we can use it directly
+            # Normalize path separators for cross-platform compatibility
+            if os.name == 'nt':  # Windows
+                tasknode_log_path = tasknode_log_path.replace("/", "\\")
+            # On Unix/Linux, keep as is (already uses /)
+            
+            if os.path.exists(tasknode_log_path) and os.path.isfile(tasknode_log_path):
+                # Use the log file specified by TaskNodeManager
+                try:
+                    with open(tasknode_log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        all_lines = f.readlines()
+                        last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+                        content = ''.join(last_lines)
 
-                return {
-                    "lines": len(last_lines),
-                    "content": content,
-                    "log_file": tasknode_log_path,
-                    "total_lines": len(all_lines)
-                }
-            except Exception as read_err:
-                return {
-                    "lines": 0, 
-                    "content": "", 
-                    "error": f"Failed to read log file {tasknode_log_path}: {str(read_err)}"
-                }
+                    return {
+                        "lines": len(last_lines),
+                        "content": content,
+                        "log_file": tasknode_log_path,
+                        "total_lines": len(all_lines)
+                    }
+                except Exception as read_err:
+                    return {
+                        "lines": 0, 
+                        "content": "", 
+                        "error": f"Failed to read log file {tasknode_log_path}: {str(read_err)}"
+                    }
 
         # Fallback: Find the most recent log file for this tasknode
         log_dir = "/tmp/tasknode_logs"
