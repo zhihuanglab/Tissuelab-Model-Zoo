@@ -20,8 +20,11 @@ import multiprocess
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from typing import Dict, Any
 from pathlib import Path
+import logging
 
 os.environ["TF_INTER_OP_PARALLELISM_THREADS"] = "2"
 os.environ["TF_INTRA_OP_PARALLELISM_THREADS"] = "16"
@@ -38,6 +41,23 @@ app.add_middleware(
     allow_methods=["*"],  # Allow all methods
     allow_headers=["*"],  # Allow all headers
 )
+
+# Suppress logging for /logs endpoint to reduce log noise
+class LogsEndpointFilter(logging.Filter):
+    """Filter to suppress access logs for /logs endpoint only"""
+    def filter(self, record):
+        # Check if this is an access log for /logs endpoint
+        message = record.getMessage() if hasattr(record, 'getMessage') else str(record.msg)
+        # Suppress logs that contain "GET /logs" or "POST /logs" etc.
+        if '/logs' in message and ('GET /logs' in message or 'POST /logs' in message or 'PUT /logs' in message or 'DELETE /logs' in message):
+            return False
+        # Also check path attribute if available
+        if hasattr(record, 'path') and record.path == '/logs':
+            return False
+        return True
+
+# Apply filter to uvicorn access logger after app is created
+# We'll apply it in the main function
 
 # Global variables
 ARGS = None
@@ -846,6 +866,11 @@ def main():
     print(f"Starting SegmentationNode at port={args.port}, name={args.name}")
 
     try:
+        # Apply log filter to suppress /logs endpoint access logs
+        uvicorn_access_logger = logging.getLogger("uvicorn.access")
+        logs_filter = LogsEndpointFilter()
+        uvicorn_access_logger.addFilter(logs_filter)
+        
         def run_uvicorn():
             uvicorn.run(app, host="0.0.0.0", port=args.port)
 

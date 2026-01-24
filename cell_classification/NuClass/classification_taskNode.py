@@ -36,8 +36,11 @@ from datetime import datetime
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from typing import Dict, Any
 from pathlib import Path
+import logging
 from sklearn.linear_model import LogisticRegression
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
 
@@ -51,6 +54,23 @@ app.add_middleware(
     allow_methods=["*"],  # Allow all methods
     allow_headers=["*"],  # Allow all headers
 )
+
+# Suppress logging for /logs endpoint to reduce log noise
+class LogsEndpointFilter(logging.Filter):
+    """Filter to suppress access logs for /logs endpoint only"""
+    def filter(self, record):
+        # Check if this is an access log for /logs endpoint
+        message = record.getMessage() if hasattr(record, 'getMessage') else str(record.msg)
+        # Suppress logs that contain "GET /logs" or "POST /logs" etc.
+        if '/logs' in message and ('GET /logs' in message or 'POST /logs' in message or 'PUT /logs' in message or 'DELETE /logs' in message):
+            return False
+        # Also check path attribute if available
+        if hasattr(record, 'path') and record.path == '/logs':
+            return False
+        return True
+
+# Apply filter to uvicorn access logger after app is created
+# We'll apply it in the main function
 
 # global variables
 ARGS = None
@@ -1397,6 +1417,11 @@ def main():
     NODE_NAME = args.name
     # Also set as environment variable for backup
     os.environ["NODE_NAME"] = args.name
+
+    # Apply log filter to suppress /logs endpoint access logs
+    uvicorn_access_logger = logging.getLogger("uvicorn.access")
+    logs_filter = LogsEndpointFilter()
+    uvicorn_access_logger.addFilter(logs_filter)
 
     print(f"Starting ClassificationNode at port={args.port}, name={args.name}")
 
