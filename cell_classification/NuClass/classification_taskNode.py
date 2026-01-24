@@ -1084,6 +1084,135 @@ app = FastAPI()
 def get_status():
     return {"status": "classification_node running"}
 
+@app.get("/logs")
+def get_logs(lines: int = 200):
+    """
+    Return the last n lines of tasknode logs.
+    """
+    try:
+        import glob
+
+        # First, check if log path is specified via environment variable (set by TaskNodeManager)
+        tasknode_log_path = os.environ.get("TASKNODE_LOG_PATH", "")
+        if tasknode_log_path and os.path.exists(tasknode_log_path) and os.path.isfile(tasknode_log_path):
+            # Use the log file specified by TaskNodeManager
+            try:
+                with open(tasknode_log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    all_lines = f.readlines()
+                    last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+                    content = ''.join(last_lines)
+
+                return {
+                    "lines": len(last_lines),
+                    "content": content,
+                    "log_file": tasknode_log_path,
+                    "total_lines": len(all_lines)
+                }
+            except Exception as read_err:
+                return {
+                    "lines": 0, 
+                    "content": "", 
+                    "error": f"Failed to read log file {tasknode_log_path}: {str(read_err)}"
+                }
+
+        # Fallback: Find the most recent log file for this tasknode
+        log_dir = "/tmp/tasknode_logs"
+        if not os.path.exists(log_dir):
+            return {"lines": 0, "content": "", "error": f"Log directory does not exist: {log_dir} and TASKNODE_LOG_PATH not set"}
+
+        # Get node name if available (from global variable or environment)
+        node_name = NODE_NAME or os.environ.get("NODE_NAME", "")
+        
+        # TaskNodeManager creates log files as: {ModelName}_{envName}_{timestamp}.log
+        # Example: ClassificationNode_stardist_environment_1234567890.log
+        
+        # First, try to find all log files
+        all_log_files = glob.glob(os.path.join(log_dir, "*.log"))
+        
+        if not all_log_files:
+            # Return more informative error message
+            all_files = glob.glob(os.path.join(log_dir, "*"))
+            return {
+                "lines": 0, 
+                "content": "", 
+                "error": f"No log files found in {log_dir}. Available files: {[os.path.basename(f) for f in all_files[:10]]}"
+            }
+        
+        # Filter and prioritize log files
+        matching_files = []
+        
+        if node_name:
+            # Priority 1: Files starting with node_name (TaskNodeManager format: ModelName_*.log)
+            for log_file in all_log_files:
+                basename = os.path.basename(log_file)
+                # Check if file starts with node_name followed by underscore
+                if basename.startswith(f"{node_name}_") or basename.startswith(f"{node_name.lower()}_"):
+                    matching_files.append(log_file)
+            
+            # Priority 2: Files containing node_name anywhere
+            if not matching_files:
+                for log_file in all_log_files:
+                    basename = os.path.basename(log_file)
+                    if node_name.lower() in basename.lower():
+                        matching_files.append(log_file)
+        
+        # Priority 3: Try common patterns if no matches found
+        if not matching_files:
+            patterns = [
+                "*Classification*.log",
+                "*classification*.log",
+                "*NuClass*.log",
+                "*nuclass*.log"
+            ]
+            for pattern in patterns:
+                files = glob.glob(os.path.join(log_dir, pattern))
+                matching_files.extend(files)
+                if matching_files:
+                    break
+        
+        # Priority 4: Fallback to all log files (most recent one)
+        if not matching_files:
+            matching_files = all_log_files
+
+        # Use the most recent log file
+        log_file = max(matching_files, key=os.path.getmtime)
+
+        # Check if file exists and is readable
+        if not os.path.exists(log_file):
+            return {"lines": 0, "content": "", "error": f"Log file does not exist: {log_file}"}
+        
+        if not os.path.isfile(log_file):
+            return {"lines": 0, "content": "", "error": f"Log path is not a file: {log_file}"}
+
+        # Read the last n lines
+        try:
+            with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                all_lines = f.readlines()
+                last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+                content = ''.join(last_lines)
+
+            return {
+                "lines": len(last_lines),
+                "content": content,
+                "log_file": log_file,
+                "total_lines": len(all_lines)
+            }
+        except Exception as read_err:
+            return {
+                "lines": 0, 
+                "content": "", 
+                "error": f"Failed to read log file {log_file}: {str(read_err)}"
+            }
+
+    except Exception as e:
+        import traceback
+        return {
+            "lines": 0, 
+            "content": "", 
+            "error": f"Error reading logs: {str(e)}",
+            "traceback": traceback.format_exc()
+        }
+
 @app.post("/init")
 def init_node():
     """
@@ -1254,7 +1383,13 @@ def main():
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args = parser.parse_args()
 
-    print(f"Starting ClassificationNode at port={args.port}")
+    # Set global NODE_NAME so /logs endpoint can use it
+    global NODE_NAME
+    NODE_NAME = args.name
+    # Also set as environment variable for backup
+    os.environ["NODE_NAME"] = args.name
+
+    print(f"Starting ClassificationNode at port={args.port}, name={args.name}")
 
     def run_uvicorn():
         uvicorn.run(app, host="0.0.0.0", port=args.port)

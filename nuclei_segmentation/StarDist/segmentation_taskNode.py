@@ -489,42 +489,126 @@ def get_logs(lines: int = 200):
         import os
         import glob
 
-        # Find the most recent log file for this tasknode
+        # First, check if log path is specified via environment variable (set by TaskNodeManager)
+        tasknode_log_path = os.environ.get("TASKNODE_LOG_PATH", "")
+        if tasknode_log_path and os.path.exists(tasknode_log_path) and os.path.isfile(tasknode_log_path):
+            # Use the log file specified by TaskNodeManager
+            try:
+                with open(tasknode_log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    all_lines = f.readlines()
+                    last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+                    content = ''.join(last_lines)
+
+                return {
+                    "lines": len(last_lines),
+                    "content": content,
+                    "log_file": tasknode_log_path,
+                    "total_lines": len(all_lines)
+                }
+            except Exception as read_err:
+                return {
+                    "lines": 0, 
+                    "content": "", 
+                    "error": f"Failed to read log file {tasknode_log_path}: {str(read_err)}"
+                }
+
+        # Fallback: Find the most recent log file for this tasknode
         log_dir = "/tmp/tasknode_logs"
         if not os.path.exists(log_dir):
-            return {"lines": 0, "content": ""}
+            return {"lines": 0, "content": "", "error": f"Log directory does not exist: {log_dir} and TASKNODE_LOG_PATH not set"}
 
-        # Look for log files with StarDist/segmentation patterns
-        log_patterns = [
-            os.path.join(log_dir, "*StarDist*.log"),
-            os.path.join(log_dir, "*segmentation*.log"),
-            os.path.join(log_dir, "*.log")
-        ]
-
+        # Get node name if available (from global variable or environment)
+        node_name = NODE_NAME or os.environ.get("NODE_NAME", "")
+        
+        # TaskNodeManager creates log files as: {ModelName}_{envName}_{timestamp}.log
+        # Example: SegmentationNode_stardist_environment_1234567890.log
+        
+        # First, try to find all log files
+        all_log_files = glob.glob(os.path.join(log_dir, "*.log"))
+        
+        if not all_log_files:
+            # Return more informative error message
+            all_files = glob.glob(os.path.join(log_dir, "*"))
+            return {
+                "lines": 0, 
+                "content": "", 
+                "error": f"No log files found in {log_dir}. Available files: {[os.path.basename(f) for f in all_files[:10]]}"
+            }
+        
+        # Filter and prioritize log files
         matching_files = []
-        for pattern in log_patterns:
-            matching_files.extend(glob.glob(pattern))
-
+        
+        if node_name:
+            # Priority 1: Files starting with node_name (TaskNodeManager format: ModelName_*.log)
+            for log_file in all_log_files:
+                basename = os.path.basename(log_file)
+                # Check if file starts with node_name followed by underscore
+                if basename.startswith(f"{node_name}_") or basename.startswith(f"{node_name.lower()}_"):
+                    matching_files.append(log_file)
+            
+            # Priority 2: Files containing node_name anywhere
+            if not matching_files:
+                for log_file in all_log_files:
+                    basename = os.path.basename(log_file)
+                    if node_name.lower() in basename.lower():
+                        matching_files.append(log_file)
+        
+        # Priority 3: Try common patterns if no matches found
         if not matching_files:
-            return {"lines": 0, "content": ""}
+            patterns = [
+                "*StarDist*.log",
+                "*stardist*.log",
+                "*Segmentation*.log",
+                "*segmentation*.log"
+            ]
+            for pattern in patterns:
+                files = glob.glob(os.path.join(log_dir, pattern))
+                matching_files.extend(files)
+                if matching_files:
+                    break
+        
+        # Priority 4: Fallback to all log files (most recent one)
+        if not matching_files:
+            matching_files = all_log_files
 
         # Use the most recent log file
         log_file = max(matching_files, key=os.path.getmtime)
 
-        # Read the last n lines
-        with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
-            all_lines = f.readlines()
-            last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
-            content = ''.join(last_lines)
+        # Check if file exists and is readable
+        if not os.path.exists(log_file):
+            return {"lines": 0, "content": "", "error": f"Log file does not exist: {log_file}"}
+        
+        if not os.path.isfile(log_file):
+            return {"lines": 0, "content": "", "error": f"Log path is not a file: {log_file}"}
 
-        return {
-            "lines": len(last_lines),
-            "content": content,
-            "log_file": log_file
-        }
+        # Read the last n lines
+        try:
+            with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                all_lines = f.readlines()
+                last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+                content = ''.join(last_lines)
+
+            return {
+                "lines": len(last_lines),
+                "content": content,
+                "log_file": log_file,
+                "total_lines": len(all_lines)
+            }
+        except Exception as read_err:
+            return {
+                "lines": 0, 
+                "content": "", 
+                "error": f"Failed to read log file {log_file}: {str(read_err)}"
+            }
 
     except Exception as e:
-        return {"lines": 0, "content": f"Error reading logs: {str(e)}"}
+        import traceback
+        return {
+            "lines": 0, 
+            "content": "", 
+            "error": f"Error reading logs: {str(e)}",
+            "traceback": traceback.format_exc()
+        }
 
 @app.post("/init")
 def init_node():
@@ -721,7 +805,14 @@ def main():
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args, unknown = parser.parse_known_args()
 
-    print(f"Starting SegmentationNode at port={args.port}")
+    # Set global NODE_NAME so /logs endpoint can use it
+    global NODE_NAME
+    NODE_NAME = args.name
+    # Also set as environment variable for backup
+    import os
+    os.environ["NODE_NAME"] = args.name
+
+    print(f"Starting SegmentationNode at port={args.port}, name={args.name}")
 
     try:
         def run_uvicorn():
