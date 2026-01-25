@@ -1143,11 +1143,45 @@ def get_logs(lines: int = 200):
                         "content": "", 
                         "error": f"Failed to read log file {tasknode_log_path}: {str(read_err)}"
                     }
-
-        # Fallback: Find the most recent log file for this tasknode
-        log_dir = "/tmp/tasknode_logs"
-        if not os.path.exists(log_dir):
-            return {"lines": 0, "content": "", "error": f"Log directory does not exist: {log_dir} and TASKNODE_LOG_PATH not set"}
+            # If TASKNODE_LOG_PATH is set but file doesn't exist yet, extract directory from it
+            # This happens when the log file hasn't been created yet but the path is known
+            log_dir_from_env = os.path.dirname(tasknode_log_path)
+            if log_dir_from_env and os.path.exists(log_dir_from_env):
+                log_dir = log_dir_from_env
+            else:
+                # Fallback: Try multiple possible log directories
+                possible_log_dirs = [
+                    log_dir_from_env if log_dir_from_env else None,  # Directory from TASKNODE_LOG_PATH
+                    "storage/tasknode_logs",  # TaskNodeManager's storage directory (relative to working dir)
+                    os.path.join(os.getcwd(), "storage", "tasknode_logs"),  # Absolute path
+                    "/tmp/tasknode_logs",  # Legacy location
+                ]
+                # Filter out None values and find first existing directory
+                log_dir = None
+                for possible_dir in possible_log_dirs:
+                    if possible_dir and os.path.exists(possible_dir):
+                        log_dir = possible_dir
+                        break
+                if not log_dir:
+                    return {
+                        "lines": 0, 
+                        "content": "", 
+                        "error": f"Log directory not found. TASKNODE_LOG_PATH={tasknode_log_path}, checked directories: {possible_log_dirs}"
+                    }
+        else:
+            # Fallback: Try multiple possible log directories
+            possible_log_dirs = [
+                "storage/tasknode_logs",  # TaskNodeManager's storage directory (relative to working dir)
+                os.path.join(os.getcwd(), "storage", "tasknode_logs"),  # Absolute path
+                "/tmp/tasknode_logs",  # Legacy location
+            ]
+            log_dir = None
+            for possible_dir in possible_log_dirs:
+                if os.path.exists(possible_dir):
+                    log_dir = possible_dir
+                    break
+            if not log_dir:
+                return {"lines": 0, "content": "", "error": f"Log directory does not exist. Checked directories: {possible_log_dirs} and TASKNODE_LOG_PATH not set"}
 
         # Get node name if available (from global variable or environment)
         node_name = NODE_NAME or os.environ.get("NODE_NAME", "")
