@@ -366,6 +366,8 @@ def run_segmentation(args):
         if cancel_event.is_set():
             print("[InstanSegNode] Task cancelled before starting")
             cancel_event.clear()
+            progress_value = 0
+            progress_complete = False
             return {
                 "status": "cancelled",
                 "message": "Task was cancelled",
@@ -463,6 +465,8 @@ def run_segmentation(args):
             if cancel_event.is_set():
                 print("[InstanSegNode] Task cancelled after segmentation")
                 cancel_event.clear()
+                progress_value = 0
+                progress_complete = False
                 return {
                     "status": "cancelled",
                     "message": "Task was cancelled",
@@ -494,6 +498,8 @@ def run_segmentation(args):
         if cancel_event.is_set():
             print("[InstanSegNode] Task cancelled before embedding")
             cancel_event.clear()
+            progress_value = 0
+            progress_complete = False
             return {
                 "status": "cancelled",
                 "message": "Task was cancelled",
@@ -549,6 +555,8 @@ def run_segmentation(args):
                 except CancellationException:
                     print("[InstanSegNode] Embedding cancelled by user")
                     cancel_event.clear()
+                    progress_value = 0
+                    progress_complete = False
                     return {
                         "status": "cancelled",
                         "message": "Task was cancelled during embedding",
@@ -559,6 +567,8 @@ def run_segmentation(args):
                 if cancel_event.is_set():
                     print("[InstanSegNode] Task cancelled after embedding")
                     cancel_event.clear()
+                    progress_value = 0
+                    progress_complete = False
                     return {
                         "status": "cancelled",
                         "message": "Task was cancelled",
@@ -956,10 +966,12 @@ def read_node(data: Dict[str, Any]):
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event, progress_value, progress_complete
     
-    # Reset cancel event when starting new execution
+    # Reset cancel event and progress state when starting new execution
     cancel_event.clear()
+    progress_value = 0
+    progress_complete = False
 
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
@@ -971,12 +983,17 @@ def execute_node():
             "message": "no path, skipping.",
             "nuclei_count": 0
         }
+        progress_value = 100
+        progress_complete = True
     else:
         print(f"[InstanSegNode] /execute => run_segmentation with slidepath={ARGS.slidepath}")
         out_val = run_segmentation(ARGS)
         
         # Check if task was cancelled
         if out_val.get("status") == "cancelled":
+            # Reset progress state on cancellation
+            progress_value = 0
+            progress_complete = False
             return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
 
     # store the result to 'output'

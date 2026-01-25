@@ -549,6 +549,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         if cancel_event.is_set():
                             print("[ClassificationNode] Task cancelled before retraining")
                             cancel_event.clear()
+                            progress_value = 0
                             return None
                         
                         # Must retrain from scratch when class count changes
@@ -559,6 +560,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         if cancel_event.is_set():
                             print("[ClassificationNode] Task cancelled after retraining")
                             cancel_event.clear()
+                            progress_value = 0
                             return None
                         
                         print("Classifier retrained with new classes")
@@ -591,6 +593,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         if cancel_event.is_set():
                             print("[ClassificationNode] Task cancelled before incremental training")
                             cancel_event.clear()
+                            progress_value = 0
                             return None
                         
                         # Use warm start: save the existing booster before fitting
@@ -602,6 +605,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         if cancel_event.is_set():
                             print("[ClassificationNode] Task cancelled after incremental training")
                             cancel_event.clear()
+                            progress_value = 0
                             return None
                         
                         print("Classifier updated with warm start (incremental training)")
@@ -630,6 +634,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     if cancel_event.is_set():
                         print(f"[ClassificationNode] Task cancelled during prediction (batch {batch_idx + 1}/{n_batches})")
                         cancel_event.clear()  # Reset for next execution
+                        progress_value = 0
                         return None
                     
                     end_idx = min(i + batch_size, n_cells)
@@ -749,6 +754,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     if cancel_event.is_set():
         print("[ClassificationNode] Task cancelled before training")
         cancel_event.clear()
+        progress_value = 0
         return None
     
     clf = xgb.XGBClassifier(**xgb_params)
@@ -759,6 +765,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     if cancel_event.is_set():
         print("[ClassificationNode] Task cancelled after training")
         cancel_event.clear()
+        progress_value = 0
         return None
     
     progress_value = 50
@@ -780,6 +787,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         if cancel_event.is_set():
             print(f"[ClassificationNode] Task cancelled during prediction (batch {batch_idx + 1}/{n_batches})")
             cancel_event.clear()  # Reset for next execution
+            progress_value = 0
             return None
         
         end_idx = min(i + batch_size, n_cells)
@@ -851,6 +859,7 @@ def run_classification(args) -> Dict[str, Any]:
         if cancel_event.is_set():
             print("[ClassificationNode] Task cancelled before starting")
             cancel_event.clear()  # Reset for next execution
+            progress_value = 0
             return {
                 "status": "cancelled",
                 "message": "Task was cancelled",
@@ -899,6 +908,7 @@ def run_classification(args) -> Dict[str, Any]:
             if classifier_result is None or cancel_event.is_set():
                 print("[ClassificationNode] Task cancelled during or after training")
                 cancel_event.clear()  # Reset for next execution
+                progress_value = 0
                 return {
                     "status": "cancelled",
                     "message": "Task was cancelled",
@@ -1075,6 +1085,7 @@ def run_classification(args) -> Dict[str, Any]:
         if cancel_event.is_set():
             print("[ClassificationNode] Task cancelled before saving results")
             cancel_event.clear()  # Reset for next execution
+            progress_value = 0
             return {
                 "status": "cancelled",
                 "message": "Task was cancelled",
@@ -1459,8 +1470,9 @@ def read_node(data: Dict[str, Any]):
 def execute_node():
     global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event, current_execution_thread
     
-    # Reset cancel event when starting new execution
+    # Reset cancel event and progress when starting new execution
     cancel_event.clear()
+    progress_value = 0
     
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
@@ -1486,6 +1498,8 @@ def execute_node():
         
         # Check if task was cancelled
         if out_val.get("status") == "cancelled":
+            # Reset progress on cancellation
+            progress_value = 0
             return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
 
     # write out to /ClassificationNode/output
