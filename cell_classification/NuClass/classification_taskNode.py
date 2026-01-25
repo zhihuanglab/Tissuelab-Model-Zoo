@@ -12,35 +12,39 @@ Memory Management:
 - Garbage collection is called periodically during batch processing
 - GPU operations are synchronized before cleanup to ensure all operations complete
 """
-
+# Standard library imports
 import argparse
+import asyncio
+import base64
+import colorsys
+import gc
+import glob
+import io
+import json
+import logging
 import os
 import sys
+import threading
 import time
-import json
-import gc
-import zarr
-import uvicorn
-import requests
+import traceback
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any
+
+# Third-party imports
 import numpy as np
 import pandas as pd
+import requests
 import torch
 import torch.nn as nn
-import colorsys
-import asyncio
-from sse_starlette.sse import EventSourceResponse
+import uvicorn
 import xgboost as xgb
-import io
-import base64
-from datetime import datetime
-
+import zarr
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from typing import Dict, Any
-from pathlib import Path
-import logging
 from sklearn.linear_model import LogisticRegression
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
 
@@ -194,7 +198,6 @@ def load_structured_nuclei_annotations(zf, annotation_path: str) -> pd.DataFrame
         
     except Exception as e:
         print(f"[load_structured_nuclei_annotations] Error loading annotations: {e}")
-        import traceback
         traceback.print_exc()
         return None
 
@@ -1061,7 +1064,6 @@ def run_classification(args) -> Dict[str, Any]:
         return result
 
     except Exception as e:
-        import traceback
         err_msg = f"{str(e)}\\n{traceback.format_exc()}"
         print("Error:", err_msg)
         return {
@@ -1110,8 +1112,6 @@ def get_logs(lines: int = 200):
     Return the last n lines of tasknode logs.
     """
     try:
-        import glob
-
         # First, check if log path is specified via environment variable (set by TaskNodeManager)
         # TaskNodeManager passes absolute path, so we can use it directly
         tasknode_log_path = os.environ.get("TASKNODE_LOG_PATH", "")
@@ -1292,7 +1292,6 @@ def get_logs(lines: int = 200):
             }
 
     except Exception as e:
-        import traceback
         return {
             "lines": 0, 
             "content": "", 
@@ -1462,8 +1461,6 @@ async def progress():
     )
 
 def main():
-    import threading
-    import time
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8006, help='port')
     parser.add_argument('--name', type=str, default='ClassificationNode', help='node name')

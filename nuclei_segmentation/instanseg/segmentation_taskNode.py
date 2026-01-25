@@ -3,31 +3,36 @@
 """
 InstanSeg Segmentation Node for nuclei segmentation
 """
+# Standard library imports
 import argparse
-import os
-import sys
-import time
-import json
-import zarr
-import uvicorn
-import requests
-import platform
-import numpy as np
-import cv2
-import torch
-from sse_starlette.sse import EventSourceResponse
 import asyncio
-import tempfile
-import shutil
-
+import glob
+import json
+import logging
 import multiprocessing
 import multiprocess
+import os
+import platform
+import shutil
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from pathlib import Path
+from typing import Dict, Any, Tuple, Optional
 
+# Third-party imports
+import cv2
+import numpy as np
+import requests
+import torch
+import uvicorn
+import zarr
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any, Tuple, Optional
-from pathlib import Path
-import logging
+from sse_starlette.sse import EventSourceResponse
+from tiffslide import TiffSlide
 
 # Add parent directory (nuclei_segmentation) to path so 'from instanseg.xxx' imports work
 # This mirrors how StarDist works when run from its directory
@@ -85,9 +90,6 @@ def _load_prediction_from_zarr(image_path: str, prediction_tag: str, channel: in
     """
     Load InstanSeg prediction stored as a zarr directory and return a 2D label array.
     """
-    from pathlib import Path
-    import zarr
-
     slide_path = Path(image_path)
     zarr_path = slide_path.parent / f"{slide_path.stem}{prediction_tag}.zarr"
 
@@ -112,7 +114,6 @@ def _load_prediction_from_zarr(image_path: str, prediction_tag: str, channel: in
     scale_x = 1.0
 
     try:
-        from tiffslide import TiffSlide
         slide = TiffSlide(str(slide_path))
         width, height = slide.dimensions  # (width, height)
         mask_h, mask_w = label_array.shape[-2:]
@@ -208,9 +209,6 @@ def extract_contours_and_centroids_from_labels(label_image):
         contours_list: list of contours, each as [M, 2] array (x, y format)
         probabilities: array of shape (N,) float32 probabilities
     """
-    import torch
-    import numpy as np
-
     if isinstance(label_image, torch.Tensor):
         label_image = label_image.cpu().numpy()
 
@@ -517,7 +515,6 @@ def run_segmentation(args):
         return result
 
     except Exception as e:
-        import traceback
         print(f"Error: {str(e)}")
         print(traceback.format_exc())
         return {"status": "error", "message": str(e), "nuclei_count": 0}
@@ -533,9 +530,6 @@ def get_logs(lines: int = 200):
     Return the last n lines of tasknode logs.
     """
     try:
-        import os
-        import glob
-
         # First, check if log path is specified via environment variable (set by TaskNodeManager)
         tasknode_log_path = os.environ.get("TASKNODE_LOG_PATH", "")
         
@@ -750,7 +744,6 @@ def init_node():
             return {"status": "ok", "message": "InstanSegNode init done"}
         except Exception as e:
             print(f"[InstanSegNode] Error during initialization: {str(e)}")
-            import traceback
             traceback.print_exc()
             return {"status": "error", "message": f"Initialization failed: {str(e)}"}
     else:
@@ -993,7 +986,6 @@ def main():
         def run_uvicorn():
             uvicorn.run(app, host="0.0.0.0", port=args.port)
 
-        import threading
         t = threading.Thread(target=run_uvicorn, daemon=True)
         t.start()
 

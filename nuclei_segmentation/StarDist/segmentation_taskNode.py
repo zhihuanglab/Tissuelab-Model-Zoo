@@ -3,31 +3,40 @@
 """
 Segmentation Node for nuclei segmentation + embedding generation
 """
+# Standard library imports
 import argparse
-import os
-import time
-import json
-import zarr
-import uvicorn
-import requests
-import numpy as np
-from matplotlib.path import Path as MplPath
-from sse_starlette.sse import EventSourceResponse
 import asyncio
-
+import glob
+import json
+import logging
 import multiprocessing
 import multiprocess
+import os
+import platform
+import threading
+import time
+import traceback
+from pathlib import Path
+from typing import Dict, Any
 
+# Third-party imports
+import cv2
+import numpy as np
+import requests
+import torch
+import uvicorn
+import zarr
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from typing import Dict, Any
-from pathlib import Path
-import logging
 
+# Set TensorFlow environment variables before importing TensorFlow-dependent modules
 os.environ["TF_INTER_OP_PARALLELISM_THREADS"] = "2"
 os.environ["TF_INTRA_OP_PARALLELISM_THREADS"] = "16"
+
+# Local imports
 from nuc_seg import SlideSegmentation
 from nuc_embedding import NucleiEmbedding
 
@@ -336,7 +345,6 @@ def run_segmentation(args):
             
             # Use higher n_tiles for better performance with GPUs
             # The SlideSegmentation class will auto-scale based on available resources
-            import torch
             if torch.cuda.is_available():
                 # With GPU: use more aggressive tiling for parallelization
                 n_tiles_config = (4, 4, 1)  # 16 workers - will be auto-adjusted by SlideSegmentation
@@ -490,7 +498,6 @@ def run_segmentation(args):
         return result
 
     except Exception as e:
-        import traceback
         print(f"Error: {str(e)}")
         print(traceback.format_exc())
         return {"status": "error", "message": str(e), "nuclei_count": 0}
@@ -506,9 +513,6 @@ def get_logs(lines: int = 200):
     Return the last n lines of tasknode logs.
     """
     try:
-        import os
-        import glob
-
         # First, check if log path is specified via environment variable (set by TaskNodeManager)
         tasknode_log_path = os.environ.get("TASKNODE_LOG_PATH", "")
         
@@ -684,7 +688,6 @@ def get_logs(lines: int = 200):
             }
 
     except Exception as e:
-        import traceback
         return {
             "lines": 0, 
             "content": "", 
@@ -891,7 +894,6 @@ def main():
     global NODE_NAME
     NODE_NAME = args.name
     # Also set as environment variable for backup
-    import os
     os.environ["NODE_NAME"] = args.name
 
     print(f"Starting SegmentationNode at port={args.port}, name={args.name}")
@@ -905,7 +907,6 @@ def main():
         def run_uvicorn():
             uvicorn.run(app, host="0.0.0.0", port=args.port)
 
-        import threading
         t = threading.Thread(target=run_uvicorn, daemon=True)
         t.start()
 
