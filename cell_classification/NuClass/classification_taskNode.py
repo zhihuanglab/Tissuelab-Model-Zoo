@@ -1100,8 +1100,6 @@ def run_classification(args) -> Dict[str, Any]:
 
 # ========== FastAPI  ==========
 
-app = FastAPI()
-
 @app.get("/status")
 def get_status():
     return {"status": "classification_node running"}
