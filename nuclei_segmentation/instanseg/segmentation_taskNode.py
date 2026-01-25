@@ -83,6 +83,14 @@ DEPENDENCIES = []
 progress_value = 0  # Global variable to track progress
 progress_complete = False  # New flag to indicate completion
 
+# global variable for cancellation flag - use threading.Event for thread safety
+cancel_event = threading.Event()  # Thread-safe cancellation event
+
+# Custom exception for cancellation
+class CancellationException(Exception):
+    """Exception raised when task is cancelled"""
+    pass
+
 MAX_CONTOUR_POINTS = 32
 
 
@@ -343,7 +351,7 @@ def run_segmentation(args):
     4) Write core data (centroids / contours / probability) to Zarr
     5) Generate embeddings if not cached already and append to Zarr
     """
-    global progress_complete, progress_value, MODEL
+    global progress_complete, progress_value, MODEL, cancel_event
     
     progress_value = 0
     progress_complete = False
@@ -354,6 +362,16 @@ def run_segmentation(args):
     result = {"status": "success", "message": "", "nuclei_count": 0}
 
     try:
+        # Check for cancellation before starting
+        if cancel_event.is_set():
+            print("[InstanSegNode] Task cancelled before starting")
+            cancel_event.clear()
+            return {
+                "status": "cancelled",
+                "message": "Task was cancelled",
+                "nuclei_count": 0
+            }
+        
         start_time = time.time()
 
         # ------------------------------------------------------------------
@@ -387,6 +405,16 @@ def run_segmentation(args):
         scale_x = 1.0
 
         if not ALREADY_HAVE_SEG:
+            # Check for cancellation before segmentation
+            if cancel_event.is_set():
+                print("[InstanSegNode] Task cancelled before segmentation")
+                cancel_event.clear()
+                return {
+                    "status": "cancelled",
+                    "message": "Task was cancelled",
+                    "nuclei_count": 0
+                }
+            
             print(f"[SEG LOG] Running InstanSeg on {args.slidepath}")
 
             if MODEL is None:
@@ -394,31 +422,52 @@ def run_segmentation(args):
 
             inference_start = time.time()
             
-            # Progress callback: pass 0-100, update_progress scales to 0-50
+            # Progress callback with cancellation check: pass 0-100, update_progress scales to 0-50
             def seg_progress_callback(pct):
+                if cancel_event.is_set():
+                    raise CancellationException("Task cancelled during segmentation")
                 update_progress(pct, "segmentation")
             
-            run_wsi(
-                model=MODEL,
-                image=args.slidepath,
-                pixel_size=args.pixel_size,
-                normalise=args.normalise,
-                normalisation_subsampling_factor=1,
-                tile_size=args.tile_size,
-                overlap=args.overlap,
-                detection_size=getattr(args, "detection_size", 20),
-                save_geojson=False,
-                use_tissue_mask=getattr(args, "use_tissue_mask", True),
-                batch_size=args.batch_size,
-                debug_tissue_mask=False,
-                min_area=getattr(args, "min_area_pixels", 50),
-                stardist_rays=getattr(args, "stardist_rays", 32),
-                zarr_path=ZARR_PATH,
-                node_name=NODE_NAME,
-                progress_callback=seg_progress_callback,
-            )
+            try:
+                run_wsi(
+                    model=MODEL,
+                    image=args.slidepath,
+                    pixel_size=args.pixel_size,
+                    normalise=args.normalise,
+                    normalisation_subsampling_factor=1,
+                    tile_size=args.tile_size,
+                    overlap=args.overlap,
+                    detection_size=getattr(args, "detection_size", 20),
+                    save_geojson=False,
+                    use_tissue_mask=getattr(args, "use_tissue_mask", True),
+                    batch_size=args.batch_size,
+                    debug_tissue_mask=False,
+                    min_area=getattr(args, "min_area_pixels", 50),
+                    stardist_rays=getattr(args, "stardist_rays", 32),
+                    zarr_path=ZARR_PATH,
+                    node_name=NODE_NAME,
+                    progress_callback=seg_progress_callback,
+                )
+            except CancellationException:
+                print("[InstanSegNode] Segmentation cancelled by user")
+                cancel_event.clear()
+                return {
+                    "status": "cancelled",
+                    "message": "Task was cancelled during segmentation",
+                    "nuclei_count": 0
+                }
             inference_time = time.time() - inference_start
             print(f"[SEG LOG] Streaming inference completed in {inference_time:.2f}s")
+            
+            # Check for cancellation after segmentation
+            if cancel_event.is_set():
+                print("[InstanSegNode] Task cancelled after segmentation")
+                cancel_event.clear()
+                return {
+                    "status": "cancelled",
+                    "message": "Task was cancelled",
+                    "nuclei_count": 0
+                }
 
             centroids, contours, probability = _read_streamed_vectors_from_zarr(ZARR_PATH, NODE_NAME)
             if centroids is None or centroids.size == 0:
@@ -441,6 +490,16 @@ def run_segmentation(args):
         # ------------------------------------------------------------------
         # Step D: generate / reuse embeddings (aligned with StarDist node)
         # ------------------------------------------------------------------
+        # Check for cancellation before embedding
+        if cancel_event.is_set():
+            print("[InstanSegNode] Task cancelled before embedding")
+            cancel_event.clear()
+            return {
+                "status": "cancelled",
+                "message": "Task was cancelled",
+                "nuclei_count": len(centroids) if centroids is not None else 0
+            }
+        
         if centroids is not None and len(centroids) > 0:
             zf = zarr.open_group(ZARR_PATH, mode='a')
             have_cached_embedding = False
@@ -470,16 +529,41 @@ def run_segmentation(args):
 
                 # Use StarDist's PLIP-based embedding generator
                 # Note: centroids are already in slide-space coordinates (from streaming pipeline)
+                # Embedding progress callback with cancellation check
+                def embed_progress_with_cancel(pct):
+                    if cancel_event.is_set():
+                        raise CancellationException("Task cancelled during embedding")
+                    update_progress(pct, "embedding")
+                
                 ne = NucleiEmbedding(
                     args,
                     centroids=centroids,
                     contours=contours_for_embedding,
-                    progress_callback=lambda x: update_progress(x, "embedding")
+                    progress_callback=embed_progress_with_cancel
                 )
-                ne.generate_embeddings(
-                    zarr_path=ZARR_PATH,
-                    dataset_path=f"{NODE_NAME}/embedding"
-                )
+                try:
+                    ne.generate_embeddings(
+                        zarr_path=ZARR_PATH,
+                        dataset_path=f"{NODE_NAME}/embedding"
+                    )
+                except CancellationException:
+                    print("[InstanSegNode] Embedding cancelled by user")
+                    cancel_event.clear()
+                    return {
+                        "status": "cancelled",
+                        "message": "Task was cancelled during embedding",
+                        "nuclei_count": len(centroids) if centroids is not None else 0
+                    }
+                
+                # Check for cancellation after embedding
+                if cancel_event.is_set():
+                    print("[InstanSegNode] Task cancelled after embedding")
+                    cancel_event.clear()
+                    return {
+                        "status": "cancelled",
+                        "message": "Task was cancelled",
+                        "nuclei_count": len(centroids) if centroids is not None else 0
+                    }
 
                 embedding_time = time.time() - embedding_start
                 print(f"[SEG LOG] Generated PLIP embeddings in {embedding_time:.2f}s")
@@ -514,6 +598,9 @@ def run_segmentation(args):
 
         return result
 
+    except CancellationException:
+        # Re-raise cancellation exceptions so they can be handled by the caller
+        raise
     except Exception as e:
         print(f"Error: {str(e)}")
         print(traceback.format_exc())
@@ -869,7 +956,10 @@ def read_node(data: Dict[str, Any]):
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event
+    
+    # Reset cancel event when starting new execution
+    cancel_event.clear()
 
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
@@ -884,6 +974,10 @@ def execute_node():
     else:
         print(f"[InstanSegNode] /execute => run_segmentation with slidepath={ARGS.slidepath}")
         out_val = run_segmentation(ARGS)
+        
+        # Check if task was cancelled
+        if out_val.get("status") == "cancelled":
+            return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
 
     # store the result to 'output'
     if ZARR_PATH and os.path.exists(ZARR_PATH):
@@ -917,6 +1011,19 @@ def update_progress(value, phase="segmentation"):
         progress_value = int(value)
     # print(f"Global progress updated: {progress_value}% (phase: {phase})")
 
+
+@app.post("/cancel")
+def cancel_task():
+    """
+    Cancel the currently running task.
+    Sets a cancellation event that will be checked during execution.
+    Note: This can only cancel at checkpoints between operations.
+    Long-running operations (like segmentation/embedding) cannot be interrupted mid-execution.
+    """
+    global cancel_event
+    cancel_event.set()
+    print("[InstanSegNode] Cancel requested - will stop at next checkpoint")
+    return {"status": "ok", "message": "Cancel request received. Task will stop at next checkpoint."}
 
 @app.get("/progress")
 async def progress():

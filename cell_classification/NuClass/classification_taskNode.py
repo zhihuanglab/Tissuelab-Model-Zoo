@@ -91,6 +91,11 @@ SAVE_CLASSIFIER_PATH = None
 # new global variable for progress
 progress_value = 0  # Global variable to store progress
 
+# global variable for cancellation flag - use threading.Event for thread safety
+import threading
+cancel_event = threading.Event()  # Thread-safe cancellation event
+current_execution_thread = None  # Track current execution thread for cancellation
+
 # --------------- utils functions ---------------
 
 def _int_color_to_hex(color_int: int) -> str:
@@ -444,7 +449,7 @@ def load_classifier_params(zarr_path):
 
         
 def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
-    global CLASSIFIER_PATH, progress_value
+    global CLASSIFIER_PATH, progress_value, cancel_event
     
     # update XGBoost parameter settings
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -540,9 +545,22 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_train = X_update
                             y_train = y_update
                         
+                        # Check for cancellation before retraining
+                        if cancel_event.is_set():
+                            print("[ClassificationNode] Task cancelled before retraining")
+                            cancel_event.clear()
+                            return None
+                        
                         # Must retrain from scratch when class count changes
                         clf = xgb.XGBClassifier(**xgb_params)
                         clf.fit(X_train, y_train)
+                        
+                        # Check for cancellation after retraining
+                        if cancel_event.is_set():
+                            print("[ClassificationNode] Task cancelled after retraining")
+                            cancel_event.clear()
+                            return None
+                        
                         print("Classifier retrained with new classes")
                         
                     else:
@@ -569,10 +587,23 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_train = X_update
                             y_train = y_update
                         
+                        # Check for cancellation before incremental training
+                        if cancel_event.is_set():
+                            print("[ClassificationNode] Task cancelled before incremental training")
+                            cancel_event.clear()
+                            return None
+                        
                         # Use warm start: save the existing booster before fitting
                         # This allows XGBoost to continue training from the existing model
                         existing_booster = clf.get_booster()
                         clf.fit(X_train, y_train, xgb_model=existing_booster)
+                        
+                        # Check for cancellation after incremental training
+                        if cancel_event.is_set():
+                            print("[ClassificationNode] Task cancelled after incremental training")
+                            cancel_event.clear()
+                            return None
+                        
                         print("Classifier updated with warm start (incremental training)")
                     
                     # Save updated classifier with new training data
@@ -595,6 +626,12 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 print(f"Starting prediction for {n_cells} cells in {n_batches} batches (batch_size={batch_size})...")
                 
                 for batch_idx, i in enumerate(range(0, n_cells, batch_size)):
+                    # Check for cancellation during prediction (before each batch)
+                    if cancel_event.is_set():
+                        print(f"[ClassificationNode] Task cancelled during prediction (batch {batch_idx + 1}/{n_batches})")
+                        cancel_event.clear()  # Reset for next execution
+                        return None
+                    
                     end_idx = min(i + batch_size, n_cells)
                     batch_embeddings = cell_embeddings[i:end_idx]
                     
@@ -708,9 +745,22 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         else:
             print("Proceeding without negative control vectors as they could not be loaded.")
 
+    # Check for cancellation before training (XGBoost fit cannot be interrupted)
+    if cancel_event.is_set():
+        print("[ClassificationNode] Task cancelled before training")
+        cancel_event.clear()
+        return None
+    
     clf = xgb.XGBClassifier(**xgb_params)
     print("Training new classifier...")
     clf.fit(X_train, y_train)
+    
+    # Check for cancellation after training
+    if cancel_event.is_set():
+        print("[ClassificationNode] Task cancelled after training")
+        cancel_event.clear()
+        return None
+    
     progress_value = 50
     print(f"Progress: 50% (Classifier trained)")
 
@@ -726,6 +776,12 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     print(f"Starting prediction for {n_cells} cells in {n_batches} batches (batch_size={batch_size})...")
     
     for batch_idx, i in enumerate(range(0, n_cells, batch_size)):
+        # Check for cancellation during prediction (before each batch)
+        if cancel_event.is_set():
+            print(f"[ClassificationNode] Task cancelled during prediction (batch {batch_idx + 1}/{n_batches})")
+            cancel_event.clear()  # Reset for next execution
+            return None
+        
         end_idx = min(i + batch_size, n_cells)
         batch_embeddings = cell_embeddings[i:end_idx]
         
@@ -779,7 +835,7 @@ def run_classification(args) -> Dict[str, Any]:
         raise ValueError("ZARR_PATH not set => please ensure /read is called first.")
 
     global PLIP_MODELS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH
-    global progress_value  # Declare the global variable
+    global progress_value, cancel_event  # Declare the global variables
 
     result = {"status": "success", "message": "", "classification_count": 0}
     cell_embeddings = None
@@ -791,6 +847,16 @@ def run_classification(args) -> Dict[str, Any]:
 
     zf = None
     try:
+        # Check for cancellation before starting
+        if cancel_event.is_set():
+            print("[ClassificationNode] Task cancelled before starting")
+            cancel_event.clear()  # Reset for next execution
+            return {
+                "status": "cancelled",
+                "message": "Task was cancelled",
+                "classification_count": 0
+            }
+        
         start_time = time.time()
 
         zf = zarr.open_group(ZARR_PATH, mode='a')  # Open in append mode for read/write
@@ -828,6 +894,16 @@ def run_classification(args) -> Dict[str, Any]:
         classifier_result = None
         if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
             classifier_result = train_linear_classifier(cell_embeddings, annotations_data)
+            
+            # Check for cancellation after training (train_linear_classifier returns None if cancelled)
+            if classifier_result is None or cancel_event.is_set():
+                print("[ClassificationNode] Task cancelled during or after training")
+                cancel_event.clear()  # Reset for next execution
+                return {
+                    "status": "cancelled",
+                    "message": "Task was cancelled",
+                    "classification_count": 0
+                }
         
         # Check if supervised classification succeeded
         if classifier_result is not None:
@@ -995,6 +1071,16 @@ def run_classification(args) -> Dict[str, Any]:
                     final_class_colors = generate_distinct_colors(nuclei_classes)
             final_class_names = nuclei_classes
 
+        # Check for cancellation before saving results
+        if cancel_event.is_set():
+            print("[ClassificationNode] Task cancelled before saving results")
+            cancel_event.clear()  # Reset for next execution
+            return {
+                "status": "cancelled",
+                "message": "Task was cancelled",
+                "classification_count": 0
+            }
+        
         # D) result => cell_classification (common for both supervised and zero-shot)
         progress_value = 95
         print(f"Progress: 95% (Saving results to zarr...)")
@@ -1371,7 +1457,10 @@ def read_node(data: Dict[str, Any]):
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event, current_execution_thread
+    
+    # Reset cancel event when starting new execution
+    cancel_event.clear()
     
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
@@ -1389,7 +1478,15 @@ def execute_node():
     else:
         print(f"[ClassificationNode] /execute => run_classification with h5={ZARR_PATH}")
         print(f"[ClassificationNode] ARGS: {ARGS}")
+        
+        # Run classification in current thread (synchronous execution)
+        # Note: For true cancellation of C extensions, we'd need to run in a separate process
+        # But for now, we check cancellation at strategic points
         out_val = run_classification(ARGS)
+        
+        # Check if task was cancelled
+        if out_val.get("status") == "cancelled":
+            return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
 
     # write out to /ClassificationNode/output
     zf = None
@@ -1418,6 +1515,19 @@ async def progress_options():
     Handle OPTIONS preflight request for CORS
     """
     return {"status": "ok"}
+
+@app.post("/cancel")
+def cancel_task():
+    """
+    Cancel the currently running task.
+    Sets a cancellation event that will be checked during execution.
+    Note: This can only cancel at checkpoints between operations.
+    Long-running C extensions (like XGBoost fit/predict) cannot be interrupted mid-execution.
+    """
+    global cancel_event
+    cancel_event.set()
+    print("[ClassificationNode] Cancel requested - will stop at next checkpoint")
+    return {"status": "ok", "message": "Cancel request received. Task will stop at next checkpoint."}
 
 @app.get("/progress")
 async def progress():
