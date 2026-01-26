@@ -90,6 +90,7 @@ SAVE_CLASSIFIER_PATH = None
 
 # new global variable for progress
 progress_value = 0  # Global variable to store progress
+progress_cancelled = False  # Flag to indicate cancellation
 
 # global variable for cancellation flag - use threading.Event for thread safety
 import threading
@@ -843,7 +844,7 @@ def run_classification(args) -> Dict[str, Any]:
         raise ValueError("ZARR_PATH not set => please ensure /read is called first.")
 
     global PLIP_MODELS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH
-    global progress_value, cancel_event  # Declare the global variables
+    global progress_value, cancel_event, progress_cancelled  # Declare the global variables
 
     result = {"status": "success", "message": "", "classification_count": 0}
     cell_embeddings = None
@@ -856,10 +857,13 @@ def run_classification(args) -> Dict[str, Any]:
     zf = None
     try:
         # Check for cancellation before starting
+        # Note: This check is defensive - cancel_event should already be cleared in execute_node
+        # but we check here in case it was set between execute_node and run_classification
         if cancel_event.is_set():
-            print("[ClassificationNode] Task cancelled before starting")
+            print(f"[ClassificationNode] WARNING: Cancel event is set at start of run_classification (unexpected). Clearing it.")
             cancel_event.clear()  # Reset for next execution
             progress_value = 0
+            progress_cancelled = True
             return {
                 "status": "cancelled",
                 "message": "Task was cancelled",
@@ -1086,6 +1090,7 @@ def run_classification(args) -> Dict[str, Any]:
             print("[ClassificationNode] Task cancelled before saving results")
             cancel_event.clear()  # Reset for next execution
             progress_value = 0
+            progress_cancelled = True
             return {
                 "status": "cancelled",
                 "message": "Task was cancelled",
@@ -1468,13 +1473,22 @@ def read_node(data: Dict[str, Any]):
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event, current_execution_thread
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event, current_execution_thread, progress_cancelled
+    
+    print(f"[ClassificationNode] /execute called - Cancel event state: {cancel_event.is_set()}")
     
     # Reset cancel event and progress when starting new execution
+    # Clear the cancel event first to ensure a clean start
+    was_set = cancel_event.is_set()
     cancel_event.clear()
+    if was_set:
+        print(f"[ClassificationNode] /execute: Cancel event was set, cleared it. Starting fresh execution.")
+    else:
+        print(f"[ClassificationNode] /execute: Cancel event was not set, starting fresh execution.")
     progress_value = 0
     
     if not IS_MODEL_INITED:
+        print(f"[ClassificationNode] /execute: Model not initialized, returning error.")
         return {"status": "error", "message": "Please /init first."}
 
     if not ZARR_PATH or not os.path.exists(ZARR_PATH):
@@ -1490,6 +1504,7 @@ def execute_node():
     else:
         print(f"[ClassificationNode] /execute => run_classification with h5={ZARR_PATH}")
         print(f"[ClassificationNode] ARGS: {ARGS}")
+        print(f"[ClassificationNode] /execute: Cancel event state before run_classification: {cancel_event.is_set()}")
         
         # Run classification in current thread (synchronous execution)
         # Note: For true cancellation of C extensions, we'd need to run in a separate process
@@ -1499,7 +1514,13 @@ def execute_node():
         # Check if task was cancelled
         if out_val.get("status") == "cancelled":
             # Reset progress on cancellation
+            # Force progress update by ensuring it's different from current value
+            current_progress = progress_value
             progress_value = 0
+            progress_cancelled = True  # Set cancellation flag
+            # Small delay to allow SSE to pick up the reset
+            if current_progress > 0:
+                time.sleep(0.2)  # Give SSE stream time to send reset signal
             return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
 
     # write out to /ClassificationNode/output
@@ -1539,8 +1560,9 @@ def cancel_task():
     Long-running C extensions (like XGBoost fit/predict) cannot be interrupted mid-execution.
     """
     global cancel_event
+    print(f"[ClassificationNode] /cancel called - Setting cancel event (was: {cancel_event.is_set()})")
     cancel_event.set()
-    print("[ClassificationNode] Cancel requested - will stop at next checkpoint")
+    print(f"[ClassificationNode] Cancel requested - will stop at next checkpoint (now: {cancel_event.is_set()})")
     return {"status": "ok", "message": "Cancel request received. Task will stop at next checkpoint."}
 
 @app.get("/progress")
@@ -1549,19 +1571,34 @@ async def progress():
     SSE endpoint to provide progress updates
     """
     async def event_generator():
-        global progress_value
+        global progress_value, progress_cancelled
         last_value = -1
         progress_value = 0  # Reset progress to 0 for each new connection
+        progress_cancelled = False  # Reset cancellation flag
         
-        while progress_value < 100:
-            if progress_value != last_value:
+        while progress_value < 100 and not progress_cancelled:
+            # Check if progress changed or if it was reset to 0 (cancellation case)
+            if progress_value != last_value or (progress_value == 0 and last_value > 0) or progress_cancelled:
+                if last_value > progress_value or progress_cancelled:
+                    # Progress decreased (likely reset/cancellation) - send reset signal
+                    if progress_cancelled:
+                        print(f"[SSE] Task cancelled, sending completion signal")
+                    else:
+                        print(f"[SSE] Progress reset detected: {last_value}% -> {progress_value}%")
+                    yield {"data": str(-1)}  # Send reset signal
                 print(f"[SSE] Progress: {progress_value}%")
                 yield {"data": str(progress_value)}
                 last_value = progress_value
+                
+                # If cancelled, break the loop
+                if progress_cancelled:
+                    print("Task cancelled, closing connection.")
+                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
+                    break
             await asyncio.sleep(0.1)  # Adjust the sleep time as needed
 
-        # Ensure the final progress update to 100 is sent
-        if last_value != 100:
+        # Ensure the final progress update to 100 is sent (only if not cancelled)
+        if not progress_cancelled and last_value != 100:
             yield {"data": "100"}
 
         # Keep the connection open for a short time to ensure the client receives the final update
