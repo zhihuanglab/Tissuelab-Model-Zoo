@@ -859,7 +859,7 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         
         batch_size = int(getattr(args, "batch_size", 4))
         
-        progress_value = 30
+        progress_value = 10
         
         # Step 1: Create full-size mask (不需要probability maps)
         print(f"[{NODE_NAME}] Creating full-size mask: {level_width}x{level_height}")
@@ -1456,8 +1456,8 @@ def run_segmentation(args) -> Dict[str, Any]:
     if ZARR_PATH is None:
         raise ValueError("ZARR_PATH not set. Call /read first.")
 
-    progress_value = 30
-    print(f"[{NODE_NAME}] Progress: 30%")
+    progress_value = 10
+    print(f"[{NODE_NAME}] Progress: 10%")
 
     zf = open_zarr(ZARR_PATH, "a")
 
@@ -1723,7 +1723,7 @@ def init_node():
     print(f"[/init => slide_path={SLIDE_PATH}") 
 
     global IS_MODEL_INITED, PASEG_MODEL, progress_value, NODE_NAME
-    progress_value = 10
+    progress_value = 0  # 归零，下一个人开始 init
     node_name = NODE_NAME if NODE_NAME else "SegNode"
     if not IS_MODEL_INITED:
         IS_MODEL_INITED = True
@@ -1955,7 +1955,7 @@ def execute_node():
         out_array = np.frombuffer(out_bytes, dtype=f'S{len(out_bytes)}')
         zf.create_dataset(node_out_path, data=out_array, dtype=f'S{len(out_bytes)}')
 
-    progress_value = 100
+    progress_value = 0  # 归零，上一个人 execute 结束
     return {"status": "ok", "output": out}
 
 @app.options("/progress")
@@ -1965,28 +1965,40 @@ async def progress_options():
 @app.get("/progress")
 async def progress():
     """
-    SSE progress interface, frontend can listen to it in real time.
+    SSE endpoint to provide progress updates
     """
     async def event_generator():
-        global progress_value
-        last_val = -1
+        global progress_value, progress_complete
+        last_value = -1
+        progress_value = 0  # Reset progress to 0 for each new connection
+        progress_complete = False  # Reset completion flag
+        
         while True:
-            if progress_value != last_val:
+            # Check if progress changed or if it's the final 100% update
+            if progress_value != last_value or (progress_value == 100 and progress_complete):
+                if last_value > progress_value:
+                    yield {"data": str(-1)}
+                print(f"[SSE] Progress: {progress_value}%")  # Add consistent debug output
                 yield {"data": str(progress_value)}
-                last_val = progress_value
-            await asyncio.sleep(0.1)
+                last_value = progress_value
 
-    return EventSourceResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-        },
-    )
+                # If progress reaches 100 and completion flag is set, wait a bit before breaking
+                if progress_value == 100 and progress_complete:
+                    print("Progress complete, closing connection.")  # Add debug output
+                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
+                    break
+
+            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+
+        # Keep the connection open for a short time to ensure the client receives the final update
+        await asyncio.sleep(1)
+
+        # Reset progress to 0 and completion flag after sending the final update
+        progress_value = 0
+        progress_complete = False
+        print("Progress reset to 0.")  # Add debug output
+
+    return EventSourceResponse(event_generator())
 
 # ======================= main =======================
 
