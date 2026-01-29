@@ -85,6 +85,8 @@ def print_zarr_structure(file_path):
 def load_checkpoint_at_init():
     """
     Download and load the model at /init stage, store in global MUSK_MODEL.
+    If checkpoint doesn't exist, skip loading (warning instead of error).
+    This allows the node to work in zero-shot mode without the checkpoint.
     """
     global MUSK_MODEL, NODE_NAME
     if MUSK_MODEL is not None:
@@ -95,16 +97,47 @@ def load_checkpoint_at_init():
     checkpoint_path = os.path.join(base_path, "checkpoints", "model.safetensors")
     
     print(f"[{NODE_NAME}] Looking for checkpoint at: {checkpoint_path}")
+    
+    # Check if checkpoint exists, try alternate locations if not found
+    if not os.path.exists(checkpoint_path):
+        print(f"[{NODE_NAME}] Warning: Checkpoint not found at {checkpoint_path}, trying alternate locations...")
+        alt_paths = [
+            "checkpoints/model.safetensors",
+            os.path.join(base_path, "model", "model.safetensors"),
+            "model/model.safetensors"
+        ]
+        
+        for alt_path in alt_paths:
+            if os.path.exists(alt_path):
+                checkpoint_path = alt_path
+                print(f"[{NODE_NAME}] Found checkpoint at: {checkpoint_path}")
+                break
+    
+    # If still not found, skip loading (allow zero-shot mode)
+    if not os.path.exists(checkpoint_path):
+        print(f"[{NODE_NAME}] Warning: Checkpoint not found at any location. Skipping model load.")
+        print(f"[{NODE_NAME}] Node will work in zero-shot mode without pre-trained checkpoint.")
+        MUSK_MODEL = None  # Explicitly set to None to indicate no model loaded
+        return
+    
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[{NODE_NAME}] Loading MUSK model at init stage..., device={device}")
     
-    MUSK_MODEL = MUSK(checkpoint_path)
-    
-    print(f"[{NODE_NAME}] MUSK model loaded successfully at /init stage.")
+    try:
+        MUSK_MODEL = MUSK(checkpoint_path)
+        print(f"[{NODE_NAME}] MUSK model loaded successfully at /init stage.")
+    except Exception as e:
+        print(f"[{NODE_NAME}] Error loading checkpoint: {e}")
+        print(f"[{NODE_NAME}] Warning: Failed to load checkpoint, continuing without pre-trained model.")
+        MUSK_MODEL = None  # Set to None to allow zero-shot mode
 
 def _generate_text_description(tissue_classes: list[str]) -> list[np.ndarray]:
     """Generate text prompts for each tissue_class and create their feature vectors."""
-
+    global MUSK_MODEL
+    
+    # Check if MUSK_MODEL is available (might be None if checkpoint not found)
+    if MUSK_MODEL is None:
+        raise ValueError("MUSK_MODEL not loaded => cannot generate text embeddings. Please ensure checkpoint exists or /init completed successfully.")
     
     # Build prompts
     prompts = []
@@ -894,17 +927,35 @@ def get_status():
 def init_node():
     """
     at this stage => download + load HF big model
+    CRITICAL: Only initialize if not already initialized to avoid redundant /init calls.
+    This prevents unnecessary checkpoint loading attempts and ensures proper lifecycle.
     """
-    global IS_MODEL_INITED, progress_value
-    progress_value = 10
-    print(f"[{NODE_NAME}] Progress: 10%")
+    global IS_MODEL_INITED, progress_value, MUSK_MODEL
+    
+    # CRITICAL: Reset progress to 0 at start of /init to ensure fresh tracking
+    progress_value = 0
+    print(f"[{NODE_NAME}] Progress reset to 0% at start of /init")
+    
     if not IS_MODEL_INITED:
         IS_MODEL_INITED = True
+        progress_value = 10
+        print(f"[{NODE_NAME}] Progress: 10%")
         print("[MuskNode] /init => let's load HF big model now ...")
-        load_checkpoint_at_init()
-        return {"status": "ok", "message": "NODE_NAME init done, big model loaded"}
+        try:
+            load_checkpoint_at_init()
+            # Check if model was actually loaded (might be None if checkpoint missing)
+            if MUSK_MODEL is not None:
+                return {"status": "ok", "message": "NODE_NAME init done, big model loaded"}
+            else:
+                # Model not loaded (checkpoint missing), but init succeeded
+                return {"status": "ok", "message": "NODE_NAME init done, but checkpoint not found (zero-shot mode)"}
+        except Exception as e:
+            # If load fails, still mark as initialized to prevent retry loops
+            print(f"[{NODE_NAME}] Warning: /init encountered error but continuing: {e}")
+            return {"status": "ok", "message": f"NODE_NAME init done with warning: {str(e)}"}
     else:
         print("[NODE_NAME] /init => already done => skip re-loading model.")
+        # Don't set progress here - let /execute handle progress tracking
         return {"status": "ok", "message": "Already init."}
 
 @app.post("/read")
@@ -971,6 +1022,11 @@ def read_node(data: Dict[str, Any]):
 def execute_node():
     global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value
     
+    # CRITICAL: Reset progress to 0 at the start of each /execute call
+    # This ensures SSE progress starts from 0% even if previous execution left it at 100%
+    progress_value = 0
+    print(f"[{NODE_NAME}] Progress reset to 0% at start of /execute")
+    
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
 
@@ -1014,27 +1070,41 @@ async def progress_options():
 async def progress():
     """
     SSE endpoint to provide progress updates
+    CRITICAL: Reset progress to 0 when a new SSE connection is established.
+    This ensures each new workflow execution starts with 0% progress.
     """
     async def event_generator():
         global progress_value
         last_value = -1
+        # CRITICAL: Reset progress to 0 when SSE connection is established
+        # This ensures fresh progress tracking for each workflow execution
         progress_value = 0
+        print(f"[SSE] Progress reset to 0% for new SSE connection")
+        
         while True:
             if progress_value != last_value:
                 print(f"[SSE] Progress: {progress_value}%")
                 yield {"data": str(progress_value)}
                 last_value = progress_value
+                
+                # If progress reaches 100, wait a bit then close connection
+                if progress_value == 100:
+                    await asyncio.sleep(0.5)  # Ensure client receives final update
+                    break
+                    
             await asyncio.sleep(0.1)  # Adjust the sleep time as needed
 
         # Ensure the final progress update to 100 is sent
         if last_value != 100:
             yield {"data": "100"}
+            await asyncio.sleep(0.5)
 
         # Keep the connection open for a short time to ensure the client receives the final update
         await asyncio.sleep(1)
 
         # Reset progress to 0 after sending the final update
         progress_value = 0
+        print(f"[SSE] Progress reset to 0% after closing connection")
 
     return EventSourceResponse(
         event_generator(),
