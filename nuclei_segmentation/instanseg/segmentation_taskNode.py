@@ -39,6 +39,9 @@ from instanseg.pipeline import run_wsi
 # Import StarDist's PLIP-based embedding generator
 from nuc_embedding import NucleiEmbedding
 
+# Log Python and torch at startup so we can verify the correct env is used (e.g. torch>=2.6 for PLIP)
+print(f"[InstanSegNode] Python: {sys.executable}, torch: {torch.__version__}")
+
 app = FastAPI()
 
 # Add CORS middleware to allow cross-origin requests
@@ -127,6 +130,34 @@ def _read_streamed_vectors_from_zarr(
     except Exception as exc:
         print(f"[SEG LOG] Error reading streamed vectors from {zarr_path}: {exc}")
         return None, None, None
+
+
+def _get_userdata_signature(zarr_path: Optional[str], node_name: str) -> str:
+    """
+    Read userData from zarr and return a canonical string for comparison.
+    Any change in userData (any key or value) yields a different signature → re-run.
+    """
+    if not zarr_path or not os.path.exists(zarr_path):
+        return ""
+    try:
+        zf = zarr.open_group(zarr_path, mode="r")
+        user_data_path = f"{node_name}/userData"
+        if user_data_path not in zf:
+            return ""
+        d = {}
+        for k in sorted(zf[user_data_path].keys()):
+            raw = zf[user_data_path][k][()]
+            s = raw.decode("utf-8")
+            try:
+                val = json.loads(s)
+            except Exception:
+                val = s
+            d[k] = val
+        return json.dumps(d, sort_keys=True, ensure_ascii=False)
+    except Exception as e:
+        print(f"[SEG LOG] Warning: could not read userData for signature: {e}")
+        return ""
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -342,25 +373,61 @@ def run_segmentation(args):
 
         # ------------------------------------------------------------------
         # Step A: check if we already have segmentation results in Zarr
+        # userData different → re-run: compare full userData signature (any param change → re-run)
         # ------------------------------------------------------------------
         ALREADY_HAVE_SEG = False
         centroids = None          # slide-space centroids (what we store)
         contours = None           # slide-space contours (fixed-length after formatting)
         probability = None
 
+        current_signature = _get_userdata_signature(ZARR_PATH, NODE_NAME)
+
         if os.path.exists(ZARR_PATH):
-            centroids, contours, probability = _read_streamed_vectors_from_zarr(ZARR_PATH, NODE_NAME)
-            if centroids is not None and centroids.size > 0:
-                ALREADY_HAVE_SEG = True
-                result["message"] = "Using existing nuclei segmentation"
-                result["nuclei_count"] = len(centroids)
-                print(f"[SEG LOG] Using existing segmentation with {len(centroids)} nuclei")
-                update_progress(100, "segmentation")
+            zf = zarr.open_group(ZARR_PATH, mode='r')
+            if NODE_NAME in zf:
+                try:
+                    centroids = zf[f"{NODE_NAME}/centroids"][()] if f"{NODE_NAME}/centroids" in zf else None
+                    contours = zf[f"{NODE_NAME}/contours"][()] if f"{NODE_NAME}/contours" in zf else None
+                    probability = zf[f"{NODE_NAME}/probability"][()] if f"{NODE_NAME}/probability" in zf else None
+
+                    if centroids is not None and centroids.size > 0:
+                        node_grp = zf[NODE_NAME]
+                        saved_signature = node_grp.attrs.get("userData_signature", "")
+                        if saved_signature == current_signature:
+                            ALREADY_HAVE_SEG = True
+                            result["message"] = "Using existing nuclei segmentation"
+                            result["nuclei_count"] = len(centroids)
+                            print(f"[SEG LOG] Using existing segmentation with {len(centroids)} nuclei (userData unchanged)")
+                            update_progress(100, "segmentation")
+                        else:
+                            ALREADY_HAVE_SEG = False
+                            centroids = None
+                            contours = None
+                            probability = None
+                            print("[SEG LOG] userData different from last run → re-run InstanSeg.")
+                    else:
+                        ALREADY_HAVE_SEG = False
+                        centroids = None
+                        contours = None
+                        probability = None
+                        print(f"[SEG LOG] No existing centroids for '{NODE_NAME}' → will re-run InstanSeg.")
+                except KeyError as e:
+                    print(f"Warning: Existing segmentation data missing key {e}. Will re-run InstanSeg.")
+                    ALREADY_HAVE_SEG = False
+                    centroids = None
+                    contours = None
+                    probability = None
+                except Exception as e:
+                    print(f"Warning: Error reading existing segmentation data: {e}. Will re-run InstanSeg.")
+                    ALREADY_HAVE_SEG = False
+                    centroids = None
+                    contours = None
+                    probability = None
             else:
-                centroids = None
-                contours = None
-                probability = None
-                print(f"[SEG LOG] No existing streamed vectors for '{NODE_NAME}', will re-run InstanSeg.")
+                print(f"Group '{NODE_NAME}' not found in Zarr store. Will run InstanSeg.")
+                ALREADY_HAVE_SEG = False
+        else:
+            ALREADY_HAVE_SEG = False
 
         # ------------------------------------------------------------------
         # Step B: run InstanSeg if needed to obtain a label image
@@ -375,6 +442,20 @@ def run_segmentation(args):
 
             if MODEL is None:
                 raise ValueError("InstanSeg model not initialized. Call /init first.")
+
+            # Clear this node's segmentation data in zarr before re-run so the pipeline writer
+            # creates fresh datasets instead of appending to old (wrong) data
+            if ZARR_PATH and os.path.exists(ZARR_PATH):
+                try:
+                    zf = zarr.open_group(ZARR_PATH, mode="a")
+                    if NODE_NAME in zf:
+                        node_grp = zf[NODE_NAME]
+                        for key in ("centroids", "contours", "probability", "embedding"):
+                            if key in node_grp:
+                                del node_grp[key]
+                                print(f"[SEG LOG] Cleared existing '{key}' for re-run.")
+                except Exception as e:
+                    print(f"[SEG LOG] Warning: could not clear node data before re-run: {e}")
 
             inference_start = time.time()
             
@@ -410,6 +491,12 @@ def run_segmentation(args):
             result["message"] = "Segmentation completed successfully"
             result["nuclei_count"] = len(centroids)
 
+            # Save userData signature so next run can detect "userData different" and re-run if needed
+            zf = zarr.open_group(ZARR_PATH, mode='a')
+            node_grp = zf.require_group(NODE_NAME)
+            node_grp.attrs["userData_signature"] = current_signature
+            print(f"[ZARR WRITE] Saved userData_signature for re-run detection (any userData change → re-run)")
+
         # ------------------------------------------------------------------
         # Step C: ensure streamed data exists (writer already handled Zarr IO)
         # ------------------------------------------------------------------
@@ -428,27 +515,37 @@ def run_segmentation(args):
         if centroids is not None and len(centroids) > 0:
             zf = zarr.open_group(ZARR_PATH, mode='a')
             have_cached_embedding = False
-
-            if NODE_NAME in zf and 'embedding' in zf[NODE_NAME]:
-                try:
-                    existing_len = zf[NODE_NAME]['embedding'].shape[0]
-                    if existing_len == len(centroids):
-                        have_cached_embedding = True
-                        print("[EMBED LOG] Found existing embeddings in store => skip embedding calculation.")
-                except Exception:
-                    have_cached_embedding = False
+            # If segmentation was just re-run (ALREADY_HAVE_SEG == False), we must regenerate embedding
+            # because centroids have changed even if count is the same (same as StarDist)
+            if not ALREADY_HAVE_SEG:
+                print("[EMBED LOG] Segmentation was re-run, will regenerate embedding even if count matches")
+                have_cached_embedding = False
+            else:
+                if NODE_NAME in zf and 'embedding' in zf[NODE_NAME]:
+                    try:
+                        existing_len = zf[NODE_NAME]['embedding'].shape[0]
+                        if existing_len == len(centroids):
+                            have_cached_embedding = True
+                            print("[EMBED LOG] Found existing embeddings in store => skip embedding calculation.")
+                    except Exception:
+                        have_cached_embedding = False
 
             if not have_cached_embedding:
                 print("[EMBED LOG] No cached embeddings or size mismatch => generate new embeddings using StarDist PLIP model.")
 
-                # Load contours for bounding box extraction (optional, improves patch quality)
-                contours_for_embedding = None
-                if NODE_NAME in zf and 'contours' in zf[NODE_NAME]:
-                    try:
-                        contours_for_embedding = zf[f"{NODE_NAME}/contours"][()]
-                        print(f"[EMBED LOG] Loaded contours for embedding: shape {contours_for_embedding.shape}")
-                    except Exception as e:
-                        print(f"[EMBED LOG] Warning: Could not load contours for embedding: {e}")
+                # Use contours from current segmentation (in memory), not from zarr - same as StarDist
+                # This ensures contours match centroids count
+                contours_for_embedding = contours
+                if contours_for_embedding is not None:
+                    # contours can be (N, 32, 2) array; check first dimension
+                    n_contours = contours_for_embedding.shape[0] if hasattr(contours_for_embedding, 'shape') else len(contours_for_embedding)
+                    if n_contours != len(centroids):
+                        print(f"[EMBED LOG] Warning: Contours count ({n_contours}) doesn't match centroids count ({len(centroids)}) from current segmentation. Using None for contours.")
+                        contours_for_embedding = None
+                    else:
+                        print(f"[EMBED LOG] Using contours for embedding: shape {contours_for_embedding.shape}, centroids count: {len(centroids)}")
+                else:
+                    print("[EMBED LOG] Contours are None, embedding will use centroid-based patch extraction.")
 
                 embedding_start = time.time()
 

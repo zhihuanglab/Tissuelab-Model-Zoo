@@ -39,7 +39,15 @@ def _centroids_and_areas(label_tile: torch.Tensor) -> Tuple[torch.Tensor, torch.
     sum_y = torch.bincount(labels, weights=ys, minlength=minlength)
     sum_x = torch.bincount(labels, weights=xs, minlength=minlength)
     first_idx = torch.full((minlength,), flat.numel(), device=device, dtype=torch.long)
-    first_idx.scatter_reduce_(0, labels, coords, reduce="amin", include_self=True)
+    # scatter_reduce_ is not implemented on MPS; run on CPU then move back
+    if device.type == "mps":
+        first_idx_cpu = first_idx.cpu()
+        labels_cpu = labels.cpu()
+        coords_cpu = coords.cpu()
+        first_idx_cpu.scatter_reduce_(0, labels_cpu, coords_cpu, reduce="amin", include_self=True)
+        first_idx = first_idx_cpu.to(device)
+    else:
+        first_idx.scatter_reduce_(0, labels, coords, reduce="amin", include_self=True)
     seed_y = (first_idx // width).to(torch.float32)
     seed_x = (first_idx % width).to(torch.float32)
 
