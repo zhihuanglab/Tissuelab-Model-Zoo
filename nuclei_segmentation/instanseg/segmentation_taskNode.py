@@ -132,18 +132,18 @@ def _read_streamed_vectors_from_zarr(
         return None, None, None
 
 
-def _get_userdata_signature(zarr_path: Optional[str], node_name: str) -> str:
+def _get_userdata_signature(zarr_path: Optional[str], node_name: str) -> Optional[str]:
     """
     Read userData from zarr and return a canonical string for comparison.
     Any change in userData (any key or value) yields a different signature → re-run.
     """
     if not zarr_path or not os.path.exists(zarr_path):
-        return ""
+        return None
     try:
         zf = zarr.open_group(zarr_path, mode="r")
         user_data_path = f"{node_name}/userData"
         if user_data_path not in zf:
-            return ""
+            return None
         d = {}
         for k in sorted(zf[user_data_path].keys()):
             raw = zf[user_data_path][k][()]
@@ -156,7 +156,7 @@ def _get_userdata_signature(zarr_path: Optional[str], node_name: str) -> str:
         return json.dumps(d, sort_keys=True, ensure_ascii=False)
     except Exception as e:
         print(f"[SEG LOG] Warning: could not read userData for signature: {e}")
-        return ""
+        return None
 
 
 def parse_args():
@@ -392,8 +392,24 @@ def run_segmentation(args):
 
                     if centroids is not None and centroids.size > 0:
                         node_grp = zf[NODE_NAME]
-                        saved_signature = node_grp.attrs.get("userData_signature", "")
-                        if saved_signature == current_signature:
+                        # Prefer new attr for last-run signature; fall back to legacy key
+                        saved_signature = node_grp.attrs.get("userData_signature_saved")
+                        if not saved_signature:
+                            saved_signature = node_grp.attrs.get("userData_signature", "")
+
+                        if not saved_signature:
+                            ALREADY_HAVE_SEG = False
+                            centroids = None
+                            contours = None
+                            probability = None
+                            print("[SEG LOG] Missing saved userData signature → re-run InstanSeg.")
+                        elif current_signature is None:
+                            ALREADY_HAVE_SEG = False
+                            centroids = None
+                            contours = None
+                            probability = None
+                            print("[SEG LOG] Could not read current userData signature → re-run InstanSeg.")
+                        elif saved_signature == current_signature:
                             ALREADY_HAVE_SEG = True
                             result["message"] = "Using existing nuclei segmentation"
                             result["nuclei_count"] = len(centroids)
@@ -491,11 +507,12 @@ def run_segmentation(args):
             result["message"] = "Segmentation completed successfully"
             result["nuclei_count"] = len(centroids)
 
-            # Save userData signature so next run can detect "userData different" and re-run if needed
-            zf = zarr.open_group(ZARR_PATH, mode='a')
-            node_grp = zf.require_group(NODE_NAME)
-            node_grp.attrs["userData_signature"] = current_signature
-            print(f"[ZARR WRITE] Saved userData_signature for re-run detection (any userData change → re-run)")
+            # Save last-run userData signature so next run can detect changes reliably
+            if current_signature is not None:
+                zf = zarr.open_group(ZARR_PATH, mode='a')
+                node_grp = zf.require_group(NODE_NAME)
+                node_grp.attrs["userData_signature_saved"] = current_signature
+                print("[ZARR WRITE] Saved userData_signature_saved for re-run detection (any userData change → re-run)")
 
         # ------------------------------------------------------------------
         # Step C: ensure streamed data exists (writer already handled Zarr IO)
@@ -766,6 +783,17 @@ def read_node(data: Dict[str, Any]):
                 else:
                     print(f"Warning: polygon_points value '{val_json}' is not in the expected [[x1,y1],[x2,y2],...] format.")
                     ARGS.polygon_points = None
+
+        # Persist the current userData signature so we can detect changes even if /execute runs later
+        current_signature = _get_userdata_signature(ZARR_PATH, NODE_NAME)
+        if current_signature is not None:
+            try:
+                zf_write = zarr.open_group(ZARR_PATH, mode='a')
+                node_grp = zf_write.require_group(NODE_NAME)
+                node_grp.attrs["userData_signature_current"] = current_signature
+                print("[ZARR WRITE] Saved userData_signature_current at /read")
+            except Exception as e:
+                print(f"[SEG LOG] Warning: could not save userData_signature_current at /read: {e}")
 
     return {"status": "ok", "message": "InstanSegNode read done"}
 
