@@ -55,6 +55,19 @@ Image.MAX_IMAGE_PIXELS = None
 logger = logging.getLogger("SegNode")
 logging.basicConfig(level=logging.INFO)
 
+class LogsEndpointFilter(logging.Filter):
+    """Filter to suppress access logs for /logs endpoint only"""
+    def filter(self, record):
+        # Check if this is an access log for /logs endpoint
+        message = record.getMessage() if hasattr(record, 'getMessage') else str(record.msg)
+        # Suppress logs that contain "GET /logs" or "POST /logs" etc.
+        if '/logs' in message and ('GET /logs' in message or 'POST /logs' in message or 'PUT /logs' in message or 'DELETE /logs' in message):
+            return False
+        # Also check path attribute if available
+        if hasattr(record, 'path') and record.path == '/logs':
+            return False
+        return True
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -2213,6 +2226,11 @@ def main():
         help="manager service URL",
     )
     cli_args = parser.parse_args()
+
+    # Apply log filter to suppress /logs endpoint access logs
+    uvicorn_access_logger = logging.getLogger("uvicorn.access")
+    logs_filter = LogsEndpointFilter()
+    uvicorn_access_logger.addFilter(logs_filter)
 
     def run_uvicorn():
         uvicorn.run(app, host="0.0.0.0", port=cli_args.port)

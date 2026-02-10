@@ -51,6 +51,19 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
 )
 
+class LogsEndpointFilter(logging.Filter):
+    """Filter to suppress access logs for /logs endpoint only"""
+    def filter(self, record):
+        # Check if this is an access log for /logs endpoint
+        message = record.getMessage() if hasattr(record, 'getMessage') else str(record.msg)
+        # Suppress logs that contain "GET /logs" or "POST /logs" etc.
+        if '/logs' in message and ('GET /logs' in message or 'POST /logs' in message or 'PUT /logs' in message or 'DELETE /logs' in message):
+            return False
+        # Also check path attribute if available
+        if hasattr(record, 'path') and record.path == '/logs':
+            return False
+        return True
+
 # Global variables
 ARGS = None
 IS_MODEL_INITED = False
@@ -766,7 +779,12 @@ def main():
     args = parse_args()
     global NODE_NAME
     NODE_NAME = args.name
-    
+
+    # Apply log filter to suppress /logs endpoint access logs
+    uvicorn_access_logger = logging.getLogger("uvicorn.access")
+    logs_filter = LogsEndpointFilter()
+    uvicorn_access_logger.addFilter(logs_filter)
+
     print(f"Starting {args.name} at port={args.port}")
     
     def run_uvicorn():
