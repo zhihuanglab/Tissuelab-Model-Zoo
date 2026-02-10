@@ -646,162 +646,26 @@ def get_logs(lines: int = 200):
     Return the last n lines of tasknode logs.
     """
     try:
-        # First, check if log path is specified via environment variable (set by TaskNodeManager)
+        # Check if log path is specified via environment variable (set by TaskNodeManager)
         tasknode_log_path = os.environ.get("TASKNODE_LOG_PATH", "")
         
-        if tasknode_log_path:
-            # TaskNodeManager passes absolute path, so we can use it directly
-            # Normalize path separators for cross-platform compatibility
-            if os.name == 'nt':  # Windows
-                tasknode_log_path = tasknode_log_path.replace("/", "\\")
-            # On Unix/Linux, keep as is (already uses /)
-            
-            if os.path.exists(tasknode_log_path) and os.path.isfile(tasknode_log_path):
-                # Use the log file specified by TaskNodeManager
-                try:
-                    with open(tasknode_log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        total_lines = sum(1 for line in f)
-                        f.seek(0)
-                        last_lines = collections.deque(f, maxlen=lines)
-                        content = ''.join(last_lines)
-
-                    return {
-                        "lines": len(last_lines),
-                        "content": content,
-                        "log_file": os.path.basename(tasknode_log_path),
-                        "total_lines": total_lines
-                    }
-                except Exception as read_err:
-                    return {
-                        "lines": 0, 
-                        "content": "", 
-                        "error": f"Failed to read log file {tasknode_log_path}: {str(read_err)}"
-                    }
-            # If TASKNODE_LOG_PATH is set but file doesn't exist yet, extract directory from it
-            # This happens when the log file hasn't been created yet but the path is known
-            log_dir_from_env = os.path.dirname(tasknode_log_path)
-            if log_dir_from_env:
-                # Try to create the directory if it doesn't exist (TaskNodeManager should have created it, but be safe)
-                try:
-                    os.makedirs(log_dir_from_env, exist_ok=True)
-                except Exception:
-                    pass  # If we can't create it, fall back to other directories
-                
-                if os.path.exists(log_dir_from_env):
-                    # Use the directory from TASKNODE_LOG_PATH
-                    possible_log_dirs = [log_dir_from_env]
-                else:
-                    # Fallback: Find the most recent log file for this tasknode
-                    # Try multiple possible log directories
-                    possible_log_dirs = [
-                        "storage/tasknode_logs",  # TaskNodeManager's storage directory (relative to working dir)
-                        os.path.join(os.getcwd(), "storage", "tasknode_logs"),  # Absolute path
-                        "/tmp/tasknode_logs",  # Legacy location
-                    ]
-            else:
-                # Fallback: Find the most recent log file for this tasknode
-                # Try multiple possible log directories
-                possible_log_dirs = [
-                    "storage/tasknode_logs",  # TaskNodeManager's storage directory (relative to working dir)
-                    os.path.join(os.getcwd(), "storage", "tasknode_logs"),  # Absolute path
-                    "/tmp/tasknode_logs",  # Legacy location
-                ]
-        else:
-            # Fallback: Find the most recent log file for this tasknode
-            # Try multiple possible log directories
-            possible_log_dirs = [
-                "storage/tasknode_logs",  # TaskNodeManager's storage directory (relative to working dir)
-                os.path.join(os.getcwd(), "storage", "tasknode_logs"),  # Absolute path
-                "/tmp/tasknode_logs",  # Legacy location
-            ]
-        
-        log_dir = None
-        for possible_dir in possible_log_dirs:
-            if possible_dir and os.path.exists(possible_dir):
-                log_dir = possible_dir
-                break
-        
-        if not log_dir:
-            # Return detailed error with debug info
-            debug_info = {
-                "TASKNODE_LOG_PATH": os.environ.get("TASKNODE_LOG_PATH", "NOT SET"),
-                "current_working_dir": os.getcwd(),
-                "checked_directories": possible_log_dirs,
-                "node_name": NODE_NAME or os.environ.get("NODE_NAME", "NOT SET")
-            }
+        if not tasknode_log_path:
             return {
                 "lines": 0, 
                 "content": "", 
-                "error": f"Log directory not found and TASKNODE_LOG_PATH not set. Debug info: {debug_info}"
+                "error": "TASKNODE_LOG_PATH environment variable not set"
             }
-
-        # Get node name if available (from global variable or environment)
-        node_name = NODE_NAME or os.environ.get("NODE_NAME", "")
         
-        # TaskNodeManager creates log files as: {ModelName}_{envName}_{timestamp}.log
-        # Example: SegmentationNode_instanseg_environment_1234567890.log
-        
-        # First, try to find all log files
-        all_log_files = glob.glob(os.path.join(log_dir, "*.log"))
-        
-        if not all_log_files:
-            # Return more informative error message
-            all_files = glob.glob(os.path.join(log_dir, "*"))
+        if not os.path.exists(tasknode_log_path) or not os.path.isfile(tasknode_log_path):
             return {
                 "lines": 0, 
                 "content": "", 
-                "error": f"No log files found in {log_dir}. Available files: {[os.path.basename(f) for f in all_files[:10]]}"
+                "error": f"Log file does not exist: {tasknode_log_path}"
             }
         
-        # Filter and prioritize log files
-        matching_files = []
-        
-        if node_name:
-            # Priority 1: Files starting with node_name (TaskNodeManager format: ModelName_*.log)
-            for log_file in all_log_files:
-                basename = os.path.basename(log_file)
-                # Check if file starts with node_name followed by underscore
-                if basename.startswith(f"{node_name}_") or basename.startswith(f"{node_name.lower()}_"):
-                    matching_files.append(log_file)
-            
-            # Priority 2: Files containing node_name anywhere
-            if not matching_files:
-                for log_file in all_log_files:
-                    basename = os.path.basename(log_file)
-                    if node_name.lower() in basename.lower():
-                        matching_files.append(log_file)
-        
-        # Priority 3: Try common patterns if no matches found
-        if not matching_files:
-            patterns = [
-                "*InstanSeg*.log",
-                "*instanseg*.log",
-                "*Segmentation*.log",
-                "*segmentation*.log"
-            ]
-            for pattern in patterns:
-                files = glob.glob(os.path.join(log_dir, pattern))
-                matching_files.extend(files)
-                if matching_files:
-                    break
-        
-        # Priority 4: Fallback to all log files (most recent one)
-        if not matching_files:
-            matching_files = all_log_files
-
-        # Use the most recent log file
-        log_file = max(matching_files, key=os.path.getmtime)
-
-        # Check if file exists and is readable
-        if not os.path.exists(log_file):
-            return {"lines": 0, "content": "", "error": f"Log file does not exist: {log_file}"}
-        
-        if not os.path.isfile(log_file):
-            return {"lines": 0, "content": "", "error": f"Log path is not a file: {log_file}"}
-
         # Read the last n lines
         try:
-            with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+            with open(tasknode_log_path, 'r', encoding='utf-8', errors='ignore') as f:
                 total_lines = sum(1 for line in f)
                 f.seek(0)
                 last_lines = collections.deque(f, maxlen=lines)
@@ -810,18 +674,22 @@ def get_logs(lines: int = 200):
             return {
                 "lines": len(last_lines),
                 "content": content,
-                "log_file": os.path.basename(log_file),
+                "log_file": os.path.basename(tasknode_log_path),
                 "total_lines": total_lines
             }
         except Exception as read_err:
             return {
                 "lines": 0, 
                 "content": "", 
-                "error": f"Failed to read log file {log_file}: {str(read_err)}"
+                "error": f"Failed to read log file {tasknode_log_path}: {str(read_err)}"
             }
 
     except Exception as e:
-        return {"lines": 0, "content": f"Error reading logs: {str(e)}"}
+        return {
+            "lines": 0, 
+            "content": "", 
+            "error": f"Error reading logs: {str(e)}"
+        }
 
 @app.post("/init")
 def init_node():
