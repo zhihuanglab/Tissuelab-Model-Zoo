@@ -12,32 +12,40 @@ Memory Management:
 - Garbage collection is called periodically during batch processing
 - GPU operations are synchronized before cleanup to ensure all operations complete
 """
-
+# Standard library imports
 import argparse
+import asyncio
+import base64
+import collections
+import colorsys
+import gc
+import glob
+import io
+import json
+import logging
 import os
 import sys
+import threading
 import time
-import json
-import gc
-import zarr
-import uvicorn
-import requests
+import traceback
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any
+
+# Third-party imports
 import numpy as np
 import pandas as pd
+import requests
 import torch
 import torch.nn as nn
-import colorsys
-import asyncio
-from sse_starlette.sse import EventSourceResponse
+import uvicorn
 import xgboost as xgb
-import io
-import base64
-from datetime import datetime
-
+import zarr
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any
-from pathlib import Path
+from sse_starlette.sse import EventSourceResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from sklearn.linear_model import LogisticRegression
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
 
@@ -51,6 +59,23 @@ app.add_middleware(
     allow_methods=["*"],  # Allow all methods
     allow_headers=["*"],  # Allow all headers
 )
+
+# Suppress logging for /logs endpoint to reduce log noise
+class LogsEndpointFilter(logging.Filter):
+    """Filter to suppress access logs for /logs endpoint only"""
+    def filter(self, record):
+        # Check if this is an access log for /logs endpoint
+        message = record.getMessage() if hasattr(record, 'getMessage') else str(record.msg)
+        # Suppress logs that contain "GET /logs" or "POST /logs" etc.
+        if '/logs' in message and ('GET /logs' in message or 'POST /logs' in message or 'PUT /logs' in message or 'DELETE /logs' in message):
+            return False
+        # Also check path attribute if available
+        if hasattr(record, 'path') and record.path == '/logs':
+            return False
+        return True
+
+# Apply filter to uvicorn access logger after app is created
+# We'll apply it in the main function
 
 # global variables
 ARGS = None
@@ -66,6 +91,12 @@ SAVE_CLASSIFIER_PATH = None
 
 # new global variable for progress
 progress_value = 0  # Global variable to store progress
+progress_cancelled = False  # Flag to indicate cancellation
+
+# global variable for cancellation flag - use threading.Event for thread safety
+import threading
+cancel_event = threading.Event()  # Thread-safe cancellation event
+current_execution_thread = None  # Track current execution thread for cancellation
 
 # --------------- utils functions ---------------
 
@@ -174,7 +205,6 @@ def load_structured_nuclei_annotations(zf, annotation_path: str) -> pd.DataFrame
         
     except Exception as e:
         print(f"[load_structured_nuclei_annotations] Error loading annotations: {e}")
-        import traceback
         traceback.print_exc()
         return None
 
@@ -421,7 +451,7 @@ def load_classifier_params(zarr_path):
 
         
 def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
-    global CLASSIFIER_PATH, progress_value
+    global CLASSIFIER_PATH, progress_value, cancel_event
     
     # update XGBoost parameter settings
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -517,9 +547,24 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_train = X_update
                             y_train = y_update
                         
+                        # Check for cancellation before retraining
+                        if cancel_event.is_set():
+                            print("[ClassificationNode] Task cancelled before retraining")
+                            cancel_event.clear()
+                            progress_value = 0
+                            return None
+                        
                         # Must retrain from scratch when class count changes
                         clf = xgb.XGBClassifier(**xgb_params)
                         clf.fit(X_train, y_train)
+                        
+                        # Check for cancellation after retraining
+                        if cancel_event.is_set():
+                            print("[ClassificationNode] Task cancelled after retraining")
+                            cancel_event.clear()
+                            progress_value = 0
+                            return None
+                        
                         print("Classifier retrained with new classes")
                         
                     else:
@@ -546,10 +591,25 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_train = X_update
                             y_train = y_update
                         
+                        # Check for cancellation before incremental training
+                        if cancel_event.is_set():
+                            print("[ClassificationNode] Task cancelled before incremental training")
+                            cancel_event.clear()
+                            progress_value = 0
+                            return None
+                        
                         # Use warm start: save the existing booster before fitting
                         # This allows XGBoost to continue training from the existing model
                         existing_booster = clf.get_booster()
                         clf.fit(X_train, y_train, xgb_model=existing_booster)
+                        
+                        # Check for cancellation after incremental training
+                        if cancel_event.is_set():
+                            print("[ClassificationNode] Task cancelled after incremental training")
+                            cancel_event.clear()
+                            progress_value = 0
+                            return None
+                        
                         print("Classifier updated with warm start (incremental training)")
                     
                     # Save updated classifier with new training data
@@ -572,6 +632,13 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 print(f"Starting prediction for {n_cells} cells in {n_batches} batches (batch_size={batch_size})...")
                 
                 for batch_idx, i in enumerate(range(0, n_cells, batch_size)):
+                    # Check for cancellation during prediction (before each batch)
+                    if cancel_event.is_set():
+                        print(f"[ClassificationNode] Task cancelled during prediction (batch {batch_idx + 1}/{n_batches})")
+                        cancel_event.clear()  # Reset for next execution
+                        progress_value = 0
+                        return None
+                    
                     end_idx = min(i + batch_size, n_cells)
                     batch_embeddings = cell_embeddings[i:end_idx]
                     
@@ -685,9 +752,24 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         else:
             print("Proceeding without negative control vectors as they could not be loaded.")
 
+    # Check for cancellation before training (XGBoost fit cannot be interrupted)
+    if cancel_event.is_set():
+        print("[ClassificationNode] Task cancelled before training")
+        cancel_event.clear()
+        progress_value = 0
+        return None
+    
     clf = xgb.XGBClassifier(**xgb_params)
     print("Training new classifier...")
     clf.fit(X_train, y_train)
+    
+    # Check for cancellation after training
+    if cancel_event.is_set():
+        print("[ClassificationNode] Task cancelled after training")
+        cancel_event.clear()
+        progress_value = 0
+        return None
+    
     progress_value = 50
     print(f"Progress: 50% (Classifier trained)")
 
@@ -703,6 +785,13 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     print(f"Starting prediction for {n_cells} cells in {n_batches} batches (batch_size={batch_size})...")
     
     for batch_idx, i in enumerate(range(0, n_cells, batch_size)):
+        # Check for cancellation during prediction (before each batch)
+        if cancel_event.is_set():
+            print(f"[ClassificationNode] Task cancelled during prediction (batch {batch_idx + 1}/{n_batches})")
+            cancel_event.clear()  # Reset for next execution
+            progress_value = 0
+            return None
+        
         end_idx = min(i + batch_size, n_cells)
         batch_embeddings = cell_embeddings[i:end_idx]
         
@@ -756,7 +845,7 @@ def run_classification(args) -> Dict[str, Any]:
         raise ValueError("ZARR_PATH not set => please ensure /read is called first.")
 
     global PLIP_MODELS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH
-    global progress_value  # Declare the global variable
+    global progress_value, cancel_event, progress_cancelled  # Declare the global variables
 
     result = {"status": "success", "message": "", "classification_count": 0}
     cell_embeddings = None
@@ -768,6 +857,20 @@ def run_classification(args) -> Dict[str, Any]:
 
     zf = None
     try:
+        # Check for cancellation before starting
+        # Note: This check is defensive - cancel_event should already be cleared in execute_node
+        # but we check here in case it was set between execute_node and run_classification
+        if cancel_event.is_set():
+            print(f"[ClassificationNode] WARNING: Cancel event is set at start of run_classification (unexpected). Clearing it.")
+            cancel_event.clear()  # Reset for next execution
+            progress_value = 0
+            progress_cancelled = True
+            return {
+                "status": "cancelled",
+                "message": "Task was cancelled",
+                "classification_count": 0
+            }
+        
         start_time = time.time()
 
         zf = zarr.open_group(ZARR_PATH, mode='a')  # Open in append mode for read/write
@@ -805,6 +908,17 @@ def run_classification(args) -> Dict[str, Any]:
         classifier_result = None
         if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
             classifier_result = train_linear_classifier(cell_embeddings, annotations_data)
+            
+            # Check for cancellation after training (train_linear_classifier returns None if cancelled)
+            if classifier_result is None or cancel_event.is_set():
+                print("[ClassificationNode] Task cancelled during or after training")
+                cancel_event.clear()  # Reset for next execution
+                progress_value = 0
+                return {
+                    "status": "cancelled",
+                    "message": "Task was cancelled",
+                    "classification_count": 0
+                }
         
         # Check if supervised classification succeeded
         if classifier_result is not None:
@@ -972,6 +1086,18 @@ def run_classification(args) -> Dict[str, Any]:
                     final_class_colors = generate_distinct_colors(nuclei_classes)
             final_class_names = nuclei_classes
 
+        # Check for cancellation before saving results
+        if cancel_event.is_set():
+            print("[ClassificationNode] Task cancelled before saving results")
+            cancel_event.clear()  # Reset for next execution
+            progress_value = 0
+            progress_cancelled = True
+            return {
+                "status": "cancelled",
+                "message": "Task was cancelled",
+                "classification_count": 0
+            }
+        
         # D) result => cell_classification (common for both supervised and zero-shot)
         progress_value = 95
         print(f"Progress: 95% (Saving results to zarr...)")
@@ -1041,7 +1167,6 @@ def run_classification(args) -> Dict[str, Any]:
         return result
 
     except Exception as e:
-        import traceback
         err_msg = f"{str(e)}\\n{traceback.format_exc()}"
         print("Error:", err_msg)
         return {
@@ -1078,11 +1203,60 @@ def run_classification(args) -> Dict[str, Any]:
 
 # ========== FastAPI  ==========
 
-app = FastAPI()
-
 @app.get("/status")
 def get_status():
     return {"status": "classification_node running"}
+
+@app.get("/logs")
+def get_logs(lines: int = 200):
+    """
+    Return the last n lines of tasknode logs.
+    """
+    try:
+        # Check if log path is specified via environment variable (set by TaskNodeManager)
+        tasknode_log_path = os.environ.get("TASKNODE_LOG_PATH", "")
+        
+        if not tasknode_log_path:
+            return {
+                "lines": 0, 
+                "content": "", 
+                "error": "TASKNODE_LOG_PATH environment variable not set"
+            }
+        
+        if not os.path.exists(tasknode_log_path) or not os.path.isfile(tasknode_log_path):
+            return {
+                "lines": 0, 
+                "content": "", 
+                "error": f"Log file does not exist: {tasknode_log_path}"
+            }
+        
+        # Read the last n lines
+        try:
+            with open(tasknode_log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                total_lines = sum(1 for line in f)
+                f.seek(0)
+                last_lines = collections.deque(f, maxlen=lines)
+                content = ''.join(last_lines)
+
+            return {
+                "lines": len(last_lines),
+                "content": content,
+                "log_file": os.path.basename(tasknode_log_path),
+                "total_lines": total_lines
+            }
+        except Exception as read_err:
+            return {
+                "lines": 0, 
+                "content": "", 
+                "error": f"Failed to read log file {tasknode_log_path}: {str(read_err)}"
+            }
+
+    except Exception as e:
+        return {
+            "lines": 0, 
+            "content": "", 
+            "error": f"Error reading logs: {str(e)}"
+        }
 
 @app.post("/init")
 def init_node():
@@ -1158,9 +1332,22 @@ def read_node(data: Dict[str, Any]):
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event, current_execution_thread, progress_cancelled
+    
+    print(f"[ClassificationNode] /execute called - Cancel event state: {cancel_event.is_set()}")
+    
+    # Reset cancel event and progress when starting new execution
+    # Clear the cancel event first to ensure a clean start
+    was_set = cancel_event.is_set()
+    cancel_event.clear()
+    if was_set:
+        print(f"[ClassificationNode] /execute: Cancel event was set, cleared it. Starting fresh execution.")
+    else:
+        print(f"[ClassificationNode] /execute: Cancel event was not set, starting fresh execution.")
+    progress_value = 0
     
     if not IS_MODEL_INITED:
+        print(f"[ClassificationNode] /execute: Model not initialized, returning error.")
         return {"status": "error", "message": "Please /init first."}
 
     if not ZARR_PATH or not os.path.exists(ZARR_PATH):
@@ -1176,7 +1363,24 @@ def execute_node():
     else:
         print(f"[ClassificationNode] /execute => run_classification with h5={ZARR_PATH}")
         print(f"[ClassificationNode] ARGS: {ARGS}")
+        print(f"[ClassificationNode] /execute: Cancel event state before run_classification: {cancel_event.is_set()}")
+        
+        # Run classification in current thread (synchronous execution)
+        # Note: For true cancellation of C extensions, we'd need to run in a separate process
+        # But for now, we check cancellation at strategic points
         out_val = run_classification(ARGS)
+        
+        # Check if task was cancelled
+        if out_val.get("status") == "cancelled":
+            # Reset progress on cancellation
+            # Force progress update by ensuring it's different from current value
+            current_progress = progress_value
+            progress_value = 0
+            progress_cancelled = True  # Set cancellation flag
+            # Small delay to allow SSE to pick up the reset
+            if current_progress > 0:
+                time.sleep(0.2)  # Give SSE stream time to send reset signal
+            return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
 
     # write out to /ClassificationNode/output
     zf = None
@@ -1206,25 +1410,54 @@ async def progress_options():
     """
     return {"status": "ok"}
 
+@app.post("/cancel")
+def cancel_task():
+    """
+    Cancel the currently running task.
+    Sets a cancellation event that will be checked during execution.
+    Note: This can only cancel at checkpoints between operations.
+    Long-running C extensions (like XGBoost fit/predict) cannot be interrupted mid-execution.
+    """
+    global cancel_event
+    print(f"[ClassificationNode] /cancel called - Setting cancel event (was: {cancel_event.is_set()})")
+    cancel_event.set()
+    print(f"[ClassificationNode] Cancel requested - will stop at next checkpoint (now: {cancel_event.is_set()})")
+    return {"status": "ok", "message": "Cancel request received. Task will stop at next checkpoint."}
+
 @app.get("/progress")
 async def progress():
     """
     SSE endpoint to provide progress updates
     """
     async def event_generator():
-        global progress_value
+        global progress_value, progress_cancelled
         last_value = -1
         progress_value = 0  # Reset progress to 0 for each new connection
+        progress_cancelled = False  # Reset cancellation flag
         
-        while progress_value < 100:
-            if progress_value != last_value:
+        while progress_value < 100 and not progress_cancelled:
+            # Check if progress changed or if it was reset to 0 (cancellation case)
+            if progress_value != last_value or (progress_value == 0 and last_value > 0) or progress_cancelled:
+                if last_value > progress_value or progress_cancelled:
+                    # Progress decreased (likely reset/cancellation) - send reset signal
+                    if progress_cancelled:
+                        print(f"[SSE] Task cancelled, sending completion signal")
+                    else:
+                        print(f"[SSE] Progress reset detected: {last_value}% -> {progress_value}%")
+                    yield {"data": str(-1)}  # Send reset signal
                 print(f"[SSE] Progress: {progress_value}%")
                 yield {"data": str(progress_value)}
                 last_value = progress_value
+                
+                # If cancelled, break the loop
+                if progress_cancelled:
+                    print("Task cancelled, closing connection.")
+                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
+                    break
             await asyncio.sleep(0.1)  # Adjust the sleep time as needed
 
-        # Ensure the final progress update to 100 is sent
-        if last_value != 100:
+        # Ensure the final progress update to 100 is sent (only if not cancelled)
+        if not progress_cancelled and last_value != 100:
             yield {"data": "100"}
 
         # Keep the connection open for a short time to ensure the client receives the final update
@@ -1246,15 +1479,24 @@ async def progress():
     )
 
 def main():
-    import threading
-    import time
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8006, help='port')
     parser.add_argument('--name', type=str, default='ClassificationNode', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args = parser.parse_args()
 
-    print(f"Starting ClassificationNode at port={args.port}")
+    # Set global NODE_NAME so /logs endpoint can use it
+    global NODE_NAME
+    NODE_NAME = args.name
+    # Also set as environment variable for backup
+    os.environ["NODE_NAME"] = args.name
+
+    # Apply log filter to suppress /logs endpoint access logs
+    uvicorn_access_logger = logging.getLogger("uvicorn.access")
+    logs_filter = LogsEndpointFilter()
+    uvicorn_access_logger.addFilter(logs_filter)
+
+    print(f"Starting ClassificationNode at port={args.port}, name={args.name}")
 
     def run_uvicorn():
         uvicorn.run(app, host="0.0.0.0", port=args.port)

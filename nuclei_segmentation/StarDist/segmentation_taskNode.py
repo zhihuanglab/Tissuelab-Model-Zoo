@@ -3,28 +3,41 @@
 """
 Segmentation Node for nuclei segmentation + embedding generation
 """
+# Standard library imports
 import argparse
-import os
-import time
-import json
-import zarr
-import uvicorn
-import requests
-import numpy as np
-from matplotlib.path import Path as MplPath
-from sse_starlette.sse import EventSourceResponse
 import asyncio
-
+import collections
+import glob
+import json
+import logging
 import multiprocessing
 import multiprocess
+import os
+import platform
+import threading
+import time
+import traceback
+from pathlib import Path
+from typing import Dict, Any
 
+# Third-party imports
+import cv2
+import numpy as np
+import requests
+import torch
+import uvicorn
+import zarr
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any
-from pathlib import Path
+from sse_starlette.sse import EventSourceResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 
+# Set TensorFlow environment variables before importing TensorFlow-dependent modules
 os.environ["TF_INTER_OP_PARALLELISM_THREADS"] = "2"
 os.environ["TF_INTRA_OP_PARALLELISM_THREADS"] = "16"
+
+# Local imports
 from nuc_seg import SlideSegmentation
 from nuc_embedding import NucleiEmbedding
 
@@ -39,6 +52,23 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
 )
 
+# Suppress logging for /logs endpoint to reduce log noise
+class LogsEndpointFilter(logging.Filter):
+    """Filter to suppress access logs for /logs endpoint only"""
+    def filter(self, record):
+        # Check if this is an access log for /logs endpoint
+        message = record.getMessage() if hasattr(record, 'getMessage') else str(record.msg)
+        # Suppress logs that contain "GET /logs" or "POST /logs" etc.
+        if '/logs' in message and ('GET /logs' in message or 'POST /logs' in message or 'PUT /logs' in message or 'DELETE /logs' in message):
+            return False
+        # Also check path attribute if available
+        if hasattr(record, 'path') and record.path == '/logs':
+            return False
+        return True
+
+# Apply filter to uvicorn access logger after app is created
+# We'll apply it in the main function
+
 # Global variables
 ARGS = None
 IS_MODEL_INITED = False
@@ -47,6 +77,15 @@ NODE_NAME = None
 DEPENDENCIES = []
 progress_value = 0  # Global variable to track progress
 progress_complete = False  # New flag to indicate completion
+progress_cancelled = False  # Flag to indicate cancellation
+
+# global variable for cancellation flag - use threading.Event for thread safety
+cancel_event = threading.Event()  # Thread-safe cancellation event
+
+# Custom exception for cancellation
+class CancellationException(Exception):
+    """Exception raised when task is cancelled"""
+    pass
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -75,7 +114,7 @@ def run_segmentation(args):
     3) according to segmentation, generate embedding
     4) write segmentation + embedding to zarr
     """
-    global progress_complete
+    global progress_complete, cancel_event, progress_value, progress_cancelled
 
     if ZARR_PATH is None or NODE_NAME is None:
         raise ValueError("ZARR_PATH and NODE_NAME must be set before running segmentation")
@@ -83,6 +122,21 @@ def run_segmentation(args):
     result = {"status": "success", "message": "", "nuclei_count": 0}
 
     try:
+        # Check for cancellation before starting
+        # Note: This check is defensive - cancel_event should already be cleared in execute_node
+        # but we check here in case it was set between execute_node and run_segmentation
+        if cancel_event.is_set():
+            print(f"[SegmentationNode] WARNING: Cancel event is set at start of run_segmentation (unexpected). Clearing it.")
+            cancel_event.clear()
+            progress_value = 0
+            progress_complete = False
+            progress_cancelled = True
+            return {
+                "status": "cancelled",
+                "message": "Task was cancelled",
+                "nuclei_count": 0
+            }
+        
         start_time = time.time()
 
         # Step A: check if already have segmentation
@@ -309,6 +363,19 @@ def run_segmentation(args):
 
         # Step B: if not have segmentation => run stardist
         if not ALREADY_HAVE_SEG:
+            # Check for cancellation before segmentation
+            if cancel_event.is_set():
+                print("[SegmentationNode] Task cancelled before segmentation")
+                cancel_event.clear()
+                progress_value = 0
+                progress_complete = False
+                progress_cancelled = True
+                return {
+                    "status": "cancelled",
+                    "message": "Task was cancelled",
+                    "nuclei_count": 0
+                }
+            
             print(f"Working on {args.slidepath} with stardist_pretrain={args.stardist_pretrain}, isIHC={args.isIHC}")
             # Add max_workers to args if not present
             if not hasattr(args, 'max_workers'):
@@ -316,7 +383,6 @@ def run_segmentation(args):
             
             # Use higher n_tiles for better performance with GPUs
             # The SlideSegmentation class will auto-scale based on available resources
-            import torch
             if torch.cuda.is_available():
                 # With GPU: use more aggressive tiling for parallelization
                 n_tiles_config = (4, 4, 1)  # 16 workers - will be auto-adjusted by SlideSegmentation
@@ -326,6 +392,12 @@ def run_segmentation(args):
                 n_tiles_config = (3, 3, 1)  # 9 workers
                 print(f"CPU mode: Using n_tiles={n_tiles_config} for StarDist (will auto-scale)")
                 
+            # Progress callback with cancellation check
+            def seg_progress_with_cancel(pct):
+                if cancel_event.is_set():
+                    raise CancellationException("Task cancelled during segmentation")
+                update_progress(pct, "segmentation")
+            
             ss = SlideSegmentation(args,
                                    tile_size=4096,
                                    overlap=256,
@@ -334,8 +406,37 @@ def run_segmentation(args):
                                    n_tiles=n_tiles_config,
                                    stardist_pretrain=args.stardist_pretrain,
                                    isIHC=args.isIHC,
-                                   progress_callback=lambda x: update_progress(x, "segmentation"))
-            ss.run_WSI_segmentation()
+                                   progress_callback=seg_progress_with_cancel)
+            try:
+                ss.run_WSI_segmentation()
+            except CancellationException:
+                print("[SegmentationNode] Segmentation cancelled by user")
+                cancel_event.clear()
+                # Reset progress immediately and send a reset signal
+                progress_value = 0
+                progress_complete = False
+                progress_cancelled = True  # Set cancellation flag
+                # Force a progress update by briefly setting to a different value then back to 0
+                # This ensures SSE stream picks up the reset
+                time.sleep(0.1)  # Small delay to ensure progress update is sent
+                return {
+                    "status": "cancelled",
+                    "message": "Task was cancelled during segmentation",
+                    "nuclei_count": 0
+                }
+            
+            # Check for cancellation after segmentation
+            if cancel_event.is_set():
+                print("[SegmentationNode] Task cancelled after segmentation")
+                cancel_event.clear()
+                progress_value = 0
+                progress_complete = False
+                progress_cancelled = True
+                return {
+                    "status": "cancelled",
+                    "message": "Task was cancelled",
+                    "nuclei_count": 0
+                }
             
             # Retrieve results from ss object, with checks
             if hasattr(ss, 'final_points') and ss.final_points is not None:
@@ -363,6 +464,19 @@ def run_segmentation(args):
             result["message"] = "Segmentation completed successfully"
 
         # Step C: generate embedding if not cached; write directly to Zarr
+        # Check for cancellation before embedding
+        if cancel_event.is_set():
+            print("[SegmentationNode] Task cancelled before embedding")
+            cancel_event.clear()
+            progress_value = 0
+            progress_complete = False
+            progress_cancelled = True
+            return {
+                "status": "cancelled",
+                "message": "Task was cancelled",
+                "nuclei_count": len(centroids) if centroids is not None else 0
+            }
+        
         if centroids is not None and len(centroids) > 0: # Ensure centroids exist and are not empty
             have_cached_embedding = False
             # If segmentation was just re-run (ALREADY_HAVE_SEG == False), we must regenerate embedding
@@ -398,8 +512,38 @@ def run_segmentation(args):
                         contours_for_embedding = None
                 else:
                     print("Contours are None, embedding will use centroid-based patch extraction")
-                ne = NucleiEmbedding(args, centroids, contours=contours_for_embedding, progress_callback=lambda x: update_progress(x, "embedding"))
-                ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{NODE_NAME}/embedding")
+                # Embedding progress callback with cancellation check
+                def embed_progress_with_cancel(pct):
+                    if cancel_event.is_set():
+                        raise CancellationException("Task cancelled during embedding")
+                    update_progress(pct, "embedding")
+                
+                ne = NucleiEmbedding(args, centroids, contours=contours_for_embedding, progress_callback=embed_progress_with_cancel)
+                try:
+                    ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{NODE_NAME}/embedding")
+                except CancellationException:
+                    print("[SegmentationNode] Embedding cancelled by user")
+                    cancel_event.clear()
+                    progress_value = 0
+                    progress_complete = False
+                    return {
+                        "status": "cancelled",
+                        "message": "Task was cancelled during embedding",
+                        "nuclei_count": len(centroids) if centroids is not None else 0
+                    }
+                
+                # Check for cancellation after embedding
+                if cancel_event.is_set():
+                    print("[SegmentationNode] Task cancelled after embedding")
+                    cancel_event.clear()
+                    progress_value = 0
+                    progress_complete = False
+                    progress_cancelled = True
+                    return {
+                        "status": "cancelled",
+                        "message": "Task was cancelled",
+                        "nuclei_count": len(centroids) if centroids is not None else 0
+                    }
         elif centroids is not None and len(centroids) == 0:
             print("[EMBED LOG] No centroids detected from segmentation, skipping embedding generation.")
         else: # centroids is None
@@ -469,8 +613,10 @@ def run_segmentation(args):
 
         return result
 
+    except CancellationException:
+        # Re-raise cancellation exceptions so they can be handled by the caller
+        raise
     except Exception as e:
-        import traceback
         print(f"Error: {str(e)}")
         print(traceback.format_exc())
         return {"status": "error", "message": str(e), "nuclei_count": 0}
@@ -480,10 +626,61 @@ def run_segmentation(args):
 def get_status():
     return {"status": "segmentation_node with embedding running"}
 
+@app.get("/logs")
+def get_logs(lines: int = 200):
+    """
+    Return the last n lines of tasknode logs.
+    """
+    try:
+        # Check if log path is specified via environment variable (set by TaskNodeManager)
+        tasknode_log_path = os.environ.get("TASKNODE_LOG_PATH", "")
+        
+        if not tasknode_log_path:
+            return {
+                "lines": 0, 
+                "content": "", 
+                "error": "TASKNODE_LOG_PATH environment variable not set"
+            }
+        
+        if not os.path.exists(tasknode_log_path) or not os.path.isfile(tasknode_log_path):
+            return {
+                "lines": 0, 
+                "content": "", 
+                "error": f"Log file does not exist: {tasknode_log_path}"
+            }
+        
+        # Read the last n lines
+        try:
+            with open(tasknode_log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                total_lines = sum(1 for line in f)
+                f.seek(0)
+                last_lines = collections.deque(f, maxlen=lines)
+                content = ''.join(last_lines)
+
+            return {
+                "lines": len(last_lines),
+                "content": content,
+                "log_file": os.path.basename(tasknode_log_path),
+                "total_lines": total_lines
+            }
+        except Exception as read_err:
+            return {
+                "lines": 0, 
+                "content": "", 
+                "error": f"Failed to read log file {tasknode_log_path}: {str(read_err)}"
+            }
+
+    except Exception as e:
+        return {
+            "lines": 0, 
+            "content": "", 
+            "error": f"Error reading logs: {str(e)}"
+        }
 
 @app.post("/init")
 def init_node():
-    global IS_MODEL_INITED
+    global IS_MODEL_INITED, cancel_event
+    print(f"[SegmentationNode] /init called - Cancel event state: {cancel_event.is_set()}")
     if not IS_MODEL_INITED:
         IS_MODEL_INITED = True
         print("[SegmentationNode] /init => inited model/resources (with embedding)")
@@ -495,7 +692,8 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, cancel_event
+    print(f"[SegmentationNode] /read called - Cancel event state: {cancel_event.is_set()}")
     NODE_NAME = data.get("node_name", "SegmentationNode")
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
@@ -570,14 +768,30 @@ def read_node(data: Dict[str, Any]):
                     print(f"Warning: polygon_points value '{val_json}' is not in the expected [[x1,y1],[x2,y2],...] format.")
                     ARGS.polygon_points = None
 
+    print(f"[SegmentationNode] /read completed - Cancel event state: {cancel_event.is_set()}")
     return {"status": "ok", "message": "SegmentationNode read done"}
 
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event, progress_value, progress_complete, progress_cancelled
+    
+    print(f"[SegmentationNode] /execute called - Cancel event state: {cancel_event.is_set()}")
+    
+    # Reset cancel event and progress state when starting new execution
+    # Clear the cancel event first to ensure a clean start
+    was_set = cancel_event.is_set()
+    cancel_event.clear()
+    if was_set:
+        print(f"[SegmentationNode] /execute: Cancel event was set, cleared it. Starting fresh execution.")
+    else:
+        print(f"[SegmentationNode] /execute: Cancel event was not set, starting fresh execution.")
+    progress_value = 0
+    progress_complete = False
+    progress_cancelled = False  # Reset cancellation flag
 
     if not IS_MODEL_INITED:
+        print(f"[SegmentationNode] /execute: Model not initialized, returning error.")
         return {"status": "error", "message": "Please /init first."}
 
     if not ARGS or not getattr(ARGS, "slidepath", None):
@@ -587,9 +801,25 @@ def execute_node():
             "message": "no path, skipping.",
             "nuclei_count": 0
         }
+        progress_value = 100
+        progress_complete = True
     else:
         print(f"[SegmentationNode] /execute => run_segmentation with slidepath={ARGS.slidepath}")
+        print(f"[SegmentationNode] /execute: Cancel event state before run_segmentation: {cancel_event.is_set()}")
         out_val = run_segmentation(ARGS)
+        
+        # Check if task was cancelled
+        if out_val.get("status") == "cancelled":
+            # Reset progress state on cancellation
+            # Force progress update by ensuring it's different from current value
+            current_progress = progress_value
+            progress_value = 0
+            progress_complete = False
+            progress_cancelled = True  # Set cancellation flag
+            # Small delay to allow SSE to pick up the reset
+            if current_progress > 0:
+                time.sleep(0.2)  # Give SSE stream time to send reset signal
+            return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
 
     # store the result to 'output'
     if ZARR_PATH and os.path.exists(ZARR_PATH):
@@ -625,29 +855,53 @@ def update_progress(value, phase="segmentation"):
     # print(f"Global progress updated: {progress_value}% (phase: {phase})")  # Add debug output
 
 
+@app.post("/cancel")
+def cancel_task():
+    """
+    Cancel the currently running task.
+    Sets a cancellation event that will be checked during execution.
+    Note: This can only cancel at checkpoints between operations.
+    Long-running operations (like segmentation/embedding) cannot be interrupted mid-execution.
+    """
+    global cancel_event
+    print(f"[SegmentationNode] /cancel called - Setting cancel event (was: {cancel_event.is_set()})")
+    cancel_event.set()
+    print(f"[SegmentationNode] Cancel requested - will stop at next checkpoint (now: {cancel_event.is_set()})")
+    return {"status": "ok", "message": "Cancel request received. Task will stop at next checkpoint."}
+
 @app.get("/progress")
 async def progress():
     """
     SSE endpoint to provide progress updates
     """
     async def event_generator():
-        global progress_value, progress_complete
+        global progress_value, progress_complete, progress_cancelled
         last_value = -1
         progress_value = 0  # Reset progress to 0 for each new connection
         progress_complete = False  # Reset completion flag
+        progress_cancelled = False  # Reset cancellation flag
         
         while True:
             # Check if progress changed or if it's the final 100% update
-            if progress_value != last_value or (progress_value == 100 and progress_complete):
-                if last_value > progress_value:
-                    yield {"data": str(-1)}
+            # Also check if progress was reset to 0 (cancellation case)
+            if progress_value != last_value or (progress_value == 100 and progress_complete) or (progress_value == 0 and last_value > 0) or progress_cancelled:
+                if last_value > progress_value or progress_cancelled:
+                    # Progress decreased (likely reset/cancellation) - send reset signal
+                    if progress_cancelled:
+                        print(f"[SSE] Task cancelled, sending completion signal")
+                    else:
+                        print(f"[SSE] Progress reset detected: {last_value}% -> {progress_value}%")
+                    yield {"data": str(-1)}  # Send reset signal
                 print(f"[SSE] Progress: {progress_value}%")  # Add consistent debug output
                 yield {"data": str(progress_value)}
                 last_value = progress_value
 
-                # If progress reaches 100 and completion flag is set, wait a bit before breaking
-                if progress_value == 100 and progress_complete:
-                    print("Progress complete, closing connection.")  # Add debug output
+                # If progress reaches 100 and completion flag is set, or if cancelled, wait a bit before breaking
+                if (progress_value == 100 and progress_complete) or progress_cancelled:
+                    if progress_cancelled:
+                        print("Task cancelled, closing connection.")  # Add debug output
+                    else:
+                        print("Progress complete, closing connection.")  # Add debug output
                     await asyncio.sleep(0.5)  # Ensure the client receives the final update
                     break
 
@@ -676,13 +930,25 @@ def main():
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args, unknown = parser.parse_known_args()
 
-    print(f"Starting SegmentationNode at port={args.port}")
+    # Set global NODE_NAME so /logs endpoint can use it
+    global NODE_NAME, cancel_event
+    NODE_NAME = args.name
+    # Also set as environment variable for backup
+    os.environ["NODE_NAME"] = args.name
+
+    # Log initial cancel_event state
+    print(f"Starting SegmentationNode at port={args.port}, name={args.name}")
+    print(f"[SegmentationNode] Initial cancel_event state: {cancel_event.is_set()} (should be False)")
 
     try:
+        # Apply log filter to suppress /logs endpoint access logs
+        uvicorn_access_logger = logging.getLogger("uvicorn.access")
+        logs_filter = LogsEndpointFilter()
+        uvicorn_access_logger.addFilter(logs_filter)
+        
         def run_uvicorn():
             uvicorn.run(app, host="0.0.0.0", port=args.port)
 
-        import threading
         t = threading.Thread(target=run_uvicorn, daemon=True)
         t.start()
 
