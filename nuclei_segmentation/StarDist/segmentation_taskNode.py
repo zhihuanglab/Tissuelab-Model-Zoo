@@ -6,6 +6,7 @@ Segmentation Node for nuclei segmentation + embedding generation
 # Standard library imports
 import argparse
 import asyncio
+import collections
 import glob
 import json
 import logging
@@ -645,15 +646,16 @@ def get_logs(lines: int = 200):
                 # Use the log file specified by TaskNodeManager
                 try:
                     with open(tasknode_log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        all_lines = f.readlines()
-                        last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+                        total_lines = sum(1 for line in f)
+                        f.seek(0)
+                        last_lines = collections.deque(f, maxlen=lines)
                         content = ''.join(last_lines)
 
                     return {
                         "lines": len(last_lines),
                         "content": content,
-                        "log_file": tasknode_log_path,
-                        "total_lines": len(all_lines)
+                        "log_file": os.path.basename(tasknode_log_path),
+                        "total_lines": total_lines
                     }
                 except Exception as read_err:
                     return {
@@ -788,15 +790,16 @@ def get_logs(lines: int = 200):
         # Read the last n lines
         try:
             with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
-                all_lines = f.readlines()
-                last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+                total_lines = sum(1 for line in f)
+                f.seek(0)
+                last_lines = collections.deque(f, maxlen=lines)
                 content = ''.join(last_lines)
 
             return {
                 "lines": len(last_lines),
                 "content": content,
-                "log_file": log_file,
-                "total_lines": len(all_lines)
+                "log_file": os.path.basename(log_file),
+                "total_lines": total_lines
             }
         except Exception as read_err:
             return {
