@@ -1724,8 +1724,7 @@ def get_logs(lines: int = 200):
     Return the last n lines of tasknode logs.
     """
     try:
-        # First, check if log path is specified via environment variable (set by TaskNodeManager)
-        # TaskNodeManager passes absolute path, so we can use it directly
+        # Check if log path is specified via environment variable (set by TaskNodeManager)
         tasknode_log_path = os.environ.get("TASKNODE_LOG_PATH", "")
         
         if tasknode_log_path:
