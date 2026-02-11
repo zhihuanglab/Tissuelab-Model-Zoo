@@ -60,17 +60,24 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
 )
 
-# Suppress logging for /logs endpoint to reduce log noise
+# Suppress logging for /logs, /status, and /health endpoints to reduce log noise
 class LogsEndpointFilter(logging.Filter):
-    """Filter to suppress access logs for /logs endpoint only"""
+    """Filter to suppress access logs for /logs, /status, and /health endpoints"""
     def filter(self, record):
-        # Check if this is an access log for /logs endpoint
+        # Check if this is an access log for /logs, /status, or /health endpoints
         message = record.getMessage() if hasattr(record, 'getMessage') else str(record.msg)
-        # Suppress logs that contain "GET /logs" or "POST /logs" etc.
-        if '/logs' in message and ('GET /logs' in message or 'POST /logs' in message or 'PUT /logs' in message or 'DELETE /logs' in message):
+
+        # List of endpoints and HTTP methods to filter
+        endpoints = ['/logs', '/status', '/health']
+        methods = ['GET', 'POST', 'PUT', 'DELETE']
+
+        # Check if message contains any endpoint-method combination
+        filtered_patterns = [f'{method} {endpoint}' for method in methods for endpoint in endpoints]
+        if any(pattern in message for pattern in filtered_patterns):
             return False
+
         # Also check path attribute if available
-        if hasattr(record, 'path') and record.path == '/logs':
+        if hasattr(record, 'path') and record.path in endpoints:
             return False
         return True
 
