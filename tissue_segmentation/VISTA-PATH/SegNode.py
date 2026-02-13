@@ -866,102 +866,28 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             idx = 0
             
             if mask_node_coords is not None:
-            # Use MaskNode coordinates directly
-            for coord in mask_node_coords:
-                x0, y0, x1, y1 = coord
-                # Calculate actual patch size from coordinates
-                actual_patch_w = int(x1 - x0)
-                actual_patch_h = int(y1 - y0)
-                
-                # Read patch from slide
-                base_x = int(x0 * downsample_x)
-                base_y = int(y0 * downsample_y)
-                
-                patch_pil = slide.read_region(
-                    (base_x, base_y), level, (actual_patch_w, actual_patch_h)
-                )
-                patch_pil = patch_pil.convert("RGB")
-                
-                # Resize to patch_size if needed (for consistent model input)
-                if actual_patch_w != patch_size or actual_patch_h != patch_size:
-                    patch_pil = patch_pil.resize((patch_size, patch_size), Image.LANCZOS)
-                
-                batch_imgs.append(patch_pil)
-                batch_coords.append((x0, y0, x1, y1))  # save patch position
-                
-                # Process batch when full or last patch
-                if len(batch_imgs) >= batch_size or idx == total_patches - 1:
-                    # Run inference
-                    with torch.no_grad():
-                        amp_ctx = torch.autocast(
-                            device_type=("cuda" if PASEG_MODEL.device == "cuda" else "cpu"),
-                            enabled=(use_amp and PASEG_MODEL.device == "cuda"),
-                            dtype=torch.float16 if PASEG_MODEL.device == "cuda" else torch.bfloat16,
-                        )
-                        with amp_ctx:
-                            logits = PASEG_MODEL.inference_forward(batch_imgs)  # (B,C,h,w)
-                            
-                            # Resize if needed
-                            _, _, h, w = logits.shape
-                            if (h, w) != (patch_size, patch_size):
-                                logits = torch.nn.functional.interpolate(
-                                    logits, size=(patch_size, patch_size), mode="bilinear", align_corners=False
-                                )
-                            
-                            # Convert to mask (不需要probability)
-                            mask_batch = torch.argmax(logits, dim=1)   # (B,H,W)
-                            
-                            # Convert to numpy
-                            mask_batch = mask_batch.cpu().numpy().astype(np.uint8)  # (B,H,W)
-                    
-                    # Stitch masks into full image
-                    for b_idx in range(len(batch_imgs)):
-                        mask = mask_batch[b_idx]  # (H, W)
-                        patch_x0, patch_y0, patch_x1, patch_y1 = batch_coords[b_idx]
-                        
-                        # Resize mask back to original patch size if needed
-                        actual_patch_w = patch_x1 - patch_x0
-                        actual_patch_h = patch_y1 - patch_y0
-                        if actual_patch_w != patch_size or actual_patch_h != patch_size:
-                            mask = cv2.resize(mask, (actual_patch_w, actual_patch_h), interpolation=cv2.INTER_NEAREST)
-                        
-                        # Calculate actual patch size (handle edge cases)
-                        actual_h = min(actual_patch_h, level_height - patch_y0)
-                        actual_w = min(actual_patch_w, level_width - patch_x0)
-                        
-                        # Stitch mask into full mask
-                        full_mask[patch_y0:patch_y0+actual_h, patch_x0:patch_x0+actual_w] = mask[:actual_h, :actual_w]
-                    
-                    processed_patches += len(batch_imgs)
-                    
-                    # Update progress (10-90% for patch processing)
-                    progress_value = int(10 + (processed_patches / total_patches) * 80)
-                    if processed_patches % 50 == 0 or processed_patches == total_patches:
-                        print(f"[{NODE_NAME}] Progress: {progress_value}% ({processed_patches}/{total_patches} patches)")
-                    
-                    # Clear batch
-                    batch_imgs = []
-                    batch_coords = []
-                
-                idx += 1
-        else:
-            # Use grid patches
-            for yi, y0 in enumerate(ys):
-                for xi, x0 in enumerate(xs):
-                    x1 = int(x0 + patch_size)
-                    y1 = int(y0 + patch_size)
+                # Use MaskNode coordinates directly
+                for coord in mask_node_coords:
+                    x0, y0, x1, y1 = coord
+                    # Calculate actual patch size from coordinates
+                    actual_patch_w = int(x1 - x0)
+                    actual_patch_h = int(y1 - y0)
                     
                     # Read patch from slide
                     base_x = int(x0 * downsample_x)
                     base_y = int(y0 * downsample_y)
                     
                     patch_pil = slide.read_region(
-                        (base_x, base_y), level, (patch_size, patch_size)
+                        (base_x, base_y), level, (actual_patch_w, actual_patch_h)
                     )
                     patch_pil = patch_pil.convert("RGB")
                     
+                    # Resize to patch_size if needed (for consistent model input)
+                    if actual_patch_w != patch_size or actual_patch_h != patch_size:
+                        patch_pil = patch_pil.resize((patch_size, patch_size), Image.LANCZOS)
+                    
                     batch_imgs.append(patch_pil)
-                    batch_coords.append((x0, y0))  # save patch position
+                    batch_coords.append((x0, y0, x1, y1))  # save patch position
                     
                     # Process batch when full or last patch
                     if len(batch_imgs) >= batch_size or idx == total_patches - 1:
@@ -991,11 +917,17 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                         # Stitch masks into full image
                         for b_idx in range(len(batch_imgs)):
                             mask = mask_batch[b_idx]  # (H, W)
-                            patch_x0, patch_y0 = batch_coords[b_idx]
+                            patch_x0, patch_y0, patch_x1, patch_y1 = batch_coords[b_idx]
+                            
+                            # Resize mask back to original patch size if needed
+                            actual_patch_w = patch_x1 - patch_x0
+                            actual_patch_h = patch_y1 - patch_y0
+                            if actual_patch_w != patch_size or actual_patch_h != patch_size:
+                                mask = cv2.resize(mask, (actual_patch_w, actual_patch_h), interpolation=cv2.INTER_NEAREST)
                             
                             # Calculate actual patch size (handle edge cases)
-                            actual_h = min(patch_size, level_height - patch_y0)
-                            actual_w = min(patch_size, level_width - patch_x0)
+                            actual_h = min(actual_patch_h, level_height - patch_y0)
+                            actual_w = min(actual_patch_w, level_width - patch_x0)
                             
                             # Stitch mask into full mask
                             full_mask[patch_y0:patch_y0+actual_h, patch_x0:patch_x0+actual_w] = mask[:actual_h, :actual_w]
@@ -1012,6 +944,74 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                         batch_coords = []
                     
                     idx += 1
+            else:
+                # Use grid patches
+                for yi, y0 in enumerate(ys):
+                    for xi, x0 in enumerate(xs):
+                        x1 = int(x0 + patch_size)
+                        y1 = int(y0 + patch_size)
+                        
+                        # Read patch from slide
+                        base_x = int(x0 * downsample_x)
+                        base_y = int(y0 * downsample_y)
+                        
+                        patch_pil = slide.read_region(
+                            (base_x, base_y), level, (patch_size, patch_size)
+                        )
+                        patch_pil = patch_pil.convert("RGB")
+                        
+                        batch_imgs.append(patch_pil)
+                        batch_coords.append((x0, y0))  # save patch position
+                        
+                        # Process batch when full or last patch
+                        if len(batch_imgs) >= batch_size or idx == total_patches - 1:
+                            # Run inference
+                            with torch.no_grad():
+                                amp_ctx = torch.autocast(
+                                    device_type=("cuda" if PASEG_MODEL.device == "cuda" else "cpu"),
+                                    enabled=(use_amp and PASEG_MODEL.device == "cuda"),
+                                    dtype=torch.float16 if PASEG_MODEL.device == "cuda" else torch.bfloat16,
+                                )
+                                with amp_ctx:
+                                    logits = PASEG_MODEL.inference_forward(batch_imgs)  # (B,C,h,w)
+                                    
+                                    # Resize if needed
+                                    _, _, h, w = logits.shape
+                                    if (h, w) != (patch_size, patch_size):
+                                        logits = torch.nn.functional.interpolate(
+                                            logits, size=(patch_size, patch_size), mode="bilinear", align_corners=False
+                                        )
+                                    
+                                    # Convert to mask (不需要probability)
+                                    mask_batch = torch.argmax(logits, dim=1)   # (B,H,W)
+                                    
+                                    # Convert to numpy
+                                    mask_batch = mask_batch.cpu().numpy().astype(np.uint8)  # (B,H,W)
+                            
+                            # Stitch masks into full image
+                            for b_idx in range(len(batch_imgs)):
+                                mask = mask_batch[b_idx]  # (H, W)
+                                patch_x0, patch_y0 = batch_coords[b_idx]
+                                
+                                # Calculate actual patch size (handle edge cases)
+                                actual_h = min(patch_size, level_height - patch_y0)
+                                actual_w = min(patch_size, level_width - patch_x0)
+                                
+                                # Stitch mask into full mask
+                                full_mask[patch_y0:patch_y0+actual_h, patch_x0:patch_x0+actual_w] = mask[:actual_h, :actual_w]
+                            
+                            processed_patches += len(batch_imgs)
+                            
+                            # Update progress (10-90% for patch processing)
+                            progress_value = int(10 + (processed_patches / total_patches) * 80)
+                            if processed_patches % 50 == 0 or processed_patches == total_patches:
+                                print(f"[{NODE_NAME}] Progress: {progress_value}% ({processed_patches}/{total_patches} patches)")
+                            
+                            # Clear batch
+                            batch_imgs = []
+                            batch_coords = []
+                        
+                        idx += 1
             
             # Always save as mask_{tissue_name}; no tissue_class => mask_default
             save_key = "mask_" + (current_tissue.replace(" ", "_") if current_tissue else "default")
