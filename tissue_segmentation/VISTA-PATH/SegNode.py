@@ -735,12 +735,56 @@ class PatchDatasetZarr(Dataset):
 
 # ======================= Core runner =======================
 
+def _get_mask_node_coords_for_tissue(zf, tissue_name: Optional[str]):
+    """
+    Get MaskNode coordinates for a single tissue name (case-insensitive).
+    Returns np.ndarray (K, 4) or None if MuskNode missing / tissue not found / no coords.
+    """
+    if not zf or not tissue_name:
+        return None
+    try:
+        if "MuskNode" not in zf:
+            return None
+        mask_node = zf["MuskNode"]
+        if "tissue_class_name" not in mask_node or "coordinates" not in mask_node or "tissue_class_id" not in mask_node:
+            return None
+        tissue_names = mask_node["tissue_class_name"][:]
+        tissue_names_decoded = []
+        for name_bytes in tissue_names:
+            if isinstance(name_bytes, bytes):
+                tissue_names_decoded.append(name_bytes.decode("utf-8"))
+            else:
+                tissue_names_decoded.append(str(name_bytes))
+        target_class_id = None
+        tissue_lower = tissue_name.lower()
+        for idx, name in enumerate(tissue_names_decoded):
+            if name.lower() == tissue_lower:
+                target_class_id = idx
+                break
+        if target_class_id is None:
+            return None
+        mask_coords = mask_node["coordinates"][:]
+        mask_class_ids = mask_node["tissue_class_id"][:]
+        target_coords = [
+            mask_coords[i] for i in range(len(mask_coords))
+            if mask_class_ids[i] == target_class_id
+        ]
+        if not target_coords:
+            return None
+        return np.array(target_coords, dtype=np.int64)
+    except Exception as e:
+        print(f"[{NODE_NAME}] _get_mask_node_coords_for_tissue({tissue_name!r}): {e}")
+        return None
+
+
 def run_segmentation_sequential(args) -> Dict[str, Any]:
     """
-    Sequential tiling and inference: process each patch one by one
-    Simpler logic, easier to debug coordinate conversion
+    Sequential tiling and inference: process each patch one by one.
+    If tissue_class contains commas, multiple tissues are run in sequence:
+    each tissue uses MuskNode patches if that tissue exists in MuskNode, else full grid;
+    each mask is saved as mask_{tissue_name}.
     """
-    global progress_value, PASEG_MODEL, ACTUAL_ZARR_GROUP, total_patches, processed_patches, SLIDE_PATH
+    global progress_value, PASEG_MODEL, ACTUAL_ZARR_GROUP, total_patches, processed_patches, SLIDE_PATH, TISSUE_CLASS
     
     if not SLIDE_PATH or not os.path.exists(SLIDE_PATH):
         raise ValueError("SLIDE_PATH not set or file not found")
@@ -766,88 +810,15 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         level_width, level_height = level_dims[level]
         print(f"[{NODE_NAME}] Level {level} size: width={level_width}, height={level_height}")
         
-        processed_patches = 0
-        
-        # Check if MuskNode filtering is needed - use MaskNode coordinates directly
-        mask_node_coords = None  # None means use grid patches, otherwise use MaskNode coordinates
-        if ZARR_PATH and os.path.exists(ZARR_PATH) and TISSUE_CLASS:
-            try:
-                zf_check = open_zarr(ZARR_PATH, "r")
-                if "MuskNode" in zf_check:
-                    print(f"[{NODE_NAME}] Found MuskNode, checking for TISSUE_CLASS filter...")
-                    mask_node = zf_check["MuskNode"]
-                    
-                    # Read tissue_class_name to find the target class ID
-                    if "tissue_class_name" in mask_node:
-                        tissue_names = mask_node["tissue_class_name"][:]
-                        # Decode bytes to strings
-                        tissue_names_decoded = []
-                        for name_bytes in tissue_names:
-                            if isinstance(name_bytes, bytes):
-                                tissue_names_decoded.append(name_bytes.decode('utf-8'))
-                            else:
-                                tissue_names_decoded.append(str(name_bytes))
-                        
-                        print(f"[{NODE_NAME}] Available tissue classes: {tissue_names_decoded}")
-                        print(f"[{NODE_NAME}] Target TISSUE_CLASS: {TISSUE_CLASS}")
-                        
-                        # Find the class ID for TISSUE_CLASS (case-insensitive)
-                        target_class_id = None
-                        tissue_class_lower = TISSUE_CLASS.lower()
-                        for idx, name in enumerate(tissue_names_decoded):
-                            if name.lower() == tissue_class_lower:
-                                target_class_id = idx
-                                print(f"[{NODE_NAME}] Matched '{name}' with '{TISSUE_CLASS}' (case-insensitive)")
-                                break
-                        
-                        if target_class_id is not None:
-                            print(f"[{NODE_NAME}] Target class ID: {target_class_id}")
-                            
-                            # Read coordinates and tissue_class_id from MaskNode
-                            if "coordinates" in mask_node and "tissue_class_id" in mask_node:
-                                mask_coords = mask_node["coordinates"][:]  # (N, 4) [x0, y0, x1, y1]
-                                mask_class_ids = mask_node["tissue_class_id"][:]  # (N,)
-                                
-                                print(f"[{NODE_NAME}] MuskNode has {len(mask_coords)} patches")
-                                
-                                # Filter coordinates by target class ID
-                                target_coords = []
-                                for mask_idx in range(len(mask_coords)):
-                                    if mask_class_ids[mask_idx] == target_class_id:
-                                        target_coords.append(mask_coords[mask_idx])
-                                
-                                if len(target_coords) > 0:
-                                    mask_node_coords = np.array(target_coords, dtype=np.int64)  # (K, 4)
-                                    total_patches = len(mask_node_coords)
-                                    print(f"[{NODE_NAME}] Using {total_patches} MaskNode patches matching TISSUE_CLASS '{TISSUE_CLASS}'")
-                                else:
-                                    print(f"[{NODE_NAME}] No patches found for TISSUE_CLASS '{TISSUE_CLASS}' in MaskNode, processing all grid patches")
-                            else:
-                                print(f"[{NODE_NAME}] MuskNode missing coordinates or tissue_class_id, processing all grid patches")
-                        else:
-                            print(f"[{NODE_NAME}] TISSUE_CLASS '{TISSUE_CLASS}' not found in MaskNode, processing all grid patches")
-                    else:
-                        print(f"[{NODE_NAME}] MuskNode missing tissue_class_name, processing all grid patches")
-                else:
-                    print(f"[{NODE_NAME}] No MuskNode found, processing all grid patches")
-            except Exception as e:
-                print(f"[{NODE_NAME}] Error reading MuskNode: {e}, processing all grid patches")
-                import traceback
-                traceback.print_exc()
-        
-        # If not using MaskNode coordinates, calculate grid
-        if mask_node_coords is None:
-            xs, ys = compute_grid(level_width, level_height, patch_size, stride)
-            num_x = len(xs)
-            num_y = len(ys)
-            total_patches = num_x * num_y
-            print(f"[{NODE_NAME}] Total patches in grid: {total_patches}")
+        # Parse tissue_class: comma-separated, strip spaces; empty => one run with save "mask"
+        _raw_tissue = (TISSUE_CLASS or "").strip()
+        tissue_run_list = [s.strip() for s in _raw_tissue.split(",") if s.strip()]
+        if not tissue_run_list:
+            tissue_run_list = [None]  # backward compat: one run, save "mask"
         else:
-            # Set dummy grid values (won't be used)
-            xs, ys = None, None
-            num_x, num_y = None, None
+            print(f"[{NODE_NAME}] Tissue list from tissue_class: {tissue_run_list}")
         
-        print(f"[{NODE_NAME}] Will process {total_patches} patches")
+        zf_check = open_zarr(ZARR_PATH, "r") if (ZARR_PATH and os.path.exists(ZARR_PATH)) else None
         
         # Get downsample factor
         downsample = slide.level_downsamples[level]
@@ -859,21 +830,42 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         # Prepare model
         PASEG_MODEL.model.eval()
         num_classes = int(getattr(PASEG_MODEL, "num_classes", 2))
-        
         batch_size = int(getattr(args, "batch_size", 4))
         
-        progress_value = 10
+        masks_to_save = []  # list of (save_key, full_mask)
+        total_patches_overall = 0
         
-        # Step 1: Create full-size mask (不需要probability maps)
-        print(f"[{NODE_NAME}] Creating full-size mask: {level_width}x{level_height}")
-        full_mask = np.zeros((level_height, level_width), dtype=np.uint8)
-        
-        # Step 2: Process all patches and stitch into full mask
-        batch_imgs = []
-        batch_coords = []  # store (x0, y0, x1, y1) for each image in batch
-        
-        idx = 0
-        if mask_node_coords is not None:
+        for current_tissue in tissue_run_list:
+            # Resolve coordinates for this tissue: MuskNode patches if present, else full grid
+            mask_node_coords = _get_mask_node_coords_for_tissue(zf_check, current_tissue) if current_tissue else None
+            if current_tissue:
+                if mask_node_coords is not None:
+                    print(f"[{NODE_NAME}] Tissue '{current_tissue}': using {len(mask_node_coords)} MuskNode patches")
+                else:
+                    print(f"[{NODE_NAME}] Tissue '{current_tissue}': not in MuskNode, using full grid")
+            
+            # If not using MaskNode coordinates, calculate grid
+            if mask_node_coords is None:
+                xs, ys = compute_grid(level_width, level_height, patch_size, stride)
+                num_x = len(xs)
+                num_y = len(ys)
+                total_patches = num_x * num_y
+                print(f"[{NODE_NAME}] Total patches in grid: {total_patches}")
+            else:
+                xs, ys = None, None
+                num_x, num_y = None, None
+                total_patches = len(mask_node_coords)
+            
+            print(f"[{NODE_NAME}] Will process {total_patches} patches for " + (f"tissue '{current_tissue}'" if current_tissue else "default (mask)"))
+            
+            progress_value = 10
+            full_mask = np.zeros((level_height, level_width), dtype=np.uint8)
+            batch_imgs = []
+            batch_coords = []  # store (x0, y0, x1, y1) for each image in batch
+            processed_patches = 0
+            idx = 0
+            
+            if mask_node_coords is not None:
             # Use MaskNode coordinates directly
             for coord in mask_node_coords:
                 x0, y0, x1, y1 = coord
@@ -1020,47 +1012,44 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                         batch_coords = []
                     
                     idx += 1
+            
+            # Always save as mask_{tissue_name}; no tissue_class => mask_default
+            save_key = "mask_" + (current_tissue.replace(" ", "_") if current_tissue else "default")
+            masks_to_save.append((save_key, full_mask.copy()))
+            total_patches_overall += total_patches
         
         slide.close()
         
         progress_value = 90
-        print(f"[{NODE_NAME}] Progress: 90% - All patches processed, saving mask to zarr...")
+        print(f"[{NODE_NAME}] Progress: 90% - All patches processed, saving masks to zarr...")
         
-        # Save full mask to zarr (preserve existing centroids/contours/probability)
-        if ZARR_PATH and os.path.exists(ZARR_PATH):
+        # Save all masks to zarr (preserve existing centroids/contours/probability)
+        if ZARR_PATH and os.path.exists(ZARR_PATH) and masks_to_save:
             zf = open_zarr(ZARR_PATH, "a")
             output_group_name = ACTUAL_ZARR_GROUP if ACTUAL_ZARR_GROUP else NODE_NAME
             
-            # don't recreate group, use existing group
             if output_group_name in zf:
                 out_grp = zf[output_group_name]
             else:
                 out_grp = zf.create_group(output_group_name)
             
-            # Only delete and recreate mask (preserve centroids/contours/probability)
-            if 'mask' in out_grp:
-                del out_grp['mask']
+            for save_key, full_mask in masks_to_save:
+                if save_key in out_grp:
+                    del out_grp[save_key]
+                binary_mask = (full_mask > 0).astype(bool)
+                out_grp.create_dataset(
+                    save_key,
+                    data=binary_mask,
+                    shape=(level_height, level_width),
+                    chunks=(min(1024, level_height), min(1024, level_width)),
+                    dtype=bool,
+                    compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.BITSHUFFLE)
+                )
+                print(f"[{NODE_NAME}] Mask saved: {save_key} {level_height}x{level_width} (bool, compressed)")
             
-            # Save full mask as bool array
-            binary_mask = (full_mask > 0).astype(bool)
-            
-            out_grp.create_dataset(
-                "mask",
-                data=binary_mask,
-                shape=(level_height, level_width),
-                chunks=(min(1024, level_height), min(1024, level_width)),
-                dtype=bool,
-                compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.BITSHUFFLE)
-            )
-            
-            print(f"[{NODE_NAME}] Mask saved: {level_height}x{level_width} (bool, compressed)")
-            
-            # Save tissue_class dataset (user-provided tissue class name as a string)
-            # Delete existing tissue_class if exists
+            # Save tissue_class dataset (user-provided string, unchanged; may contain comma-separated names)
             if 'tissue_class' in out_grp:
                 del out_grp['tissue_class']
-            
-            # Save user-provided TISSUE_CLASS as a string
             if TISSUE_CLASS:
                 tissue_class_str = str(TISSUE_CLASS)
                 tissue_class_bytes = tissue_class_str.encode("utf-8")
@@ -1091,13 +1080,14 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                 user_data_grp.create_dataset("path", data=path_array, dtype=f"S{len(path_bytes)}")
         
         progress_value = 100
-        print(f"[{NODE_NAME}] Complete! Processed {total_patches} patches, mask saved to zarr")
+        saved_keys = [k for k, _ in masks_to_save]
+        print(f"[{NODE_NAME}] Complete! Processed {total_patches_overall} patches, masks saved: {saved_keys}")
         
         result = {
             "status": "ok",
-            "num_patches": total_patches,
+            "num_patches": total_patches_overall,
             "num_objects": 0,
-            "message": f"Mask saved: {level_width}x{level_height} (bool)"
+            "message": f"Masks saved: {', '.join(saved_keys)} ({level_width}x{level_height} bool)"
         }
         
         return result
