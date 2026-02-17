@@ -138,7 +138,7 @@ def load_structured_nuclei_annotations(zf, annotation_path: str) -> pd.DataFrame
         if annotation_path not in zf:
             return None
         
-        # Get class_names from metadata
+        # Get class_names from metadata (optional: needed only for positive ID->name and for negative name output)
         class_names = None
         if 'user_annotation' in zf:
             user_anno_group = zf['user_annotation']
@@ -146,8 +146,7 @@ def load_structured_nuclei_annotations(zf, annotation_path: str) -> pd.DataFrame
                 class_names = user_anno_group.attrs.get('class_names', [])
         
         if not class_names:
-            print(f"[load_structured_nuclei_annotations] Warning: No class_names found in metadata, cannot convert IDs to names")
-            return None
+            print(f"[load_structured_nuclei_annotations] Warning: No class_names in metadata; will load negative annotations by computed exclude index only")
         
         # Read structured array (zarr supports direct path access)
         annotations_array = zf[annotation_path][()]
@@ -170,44 +169,46 @@ def load_structured_nuclei_annotations(zf, annotation_path: str) -> pd.DataFrame
         
         # Filter annotations into positive and negative examples
         # Positive: cell_class >= 0
-        # Negative: cell_class < -1 (where cell_class = -(2 + excluded_class_index))
+        # Negative: cell_class <= -2 (cell_class = -(2 + excluded_class_index)) -> excluded_class_index = -cell_class - 2
         # -1 = unclassified (skip)
-        # -2 = exclude class 0
-        # -3 = exclude class 1, etc.
-        
+        # -2 = exclude class 0, -3 = exclude class 1, etc. (computed from value, no class_names needed)
         positive_mask = (cell_class_ids >= 0) & (cell_color_data >= 0)
         negative_mask = (cell_class_ids <= -2) & (cell_color_data >= 0)
         
         positive_indices = np.where(positive_mask)[0]
         negative_indices = np.where(negative_mask)[0]
         
-        # Process positive annotations
+        # Process positive annotations: always store raw class ID (cell_class_index); optionally class name
         positive_data = []
         for idx in positive_indices:
             class_id = int(cell_class_ids[idx])
-            if 0 <= class_id < len(class_names):
-                positive_data.append({
-                    'cell_ID': idx,
-                    'cell_class': class_names[class_id],
-                    'cell_color': _int_color_to_hex(cell_color_data[idx])
-                })
+            if class_id < 0:
+                continue
+            row = {
+                'cell_ID': idx,
+                'cell_class_index': class_id,
+                'cell_color': _int_color_to_hex(cell_color_data[idx])
+            }
+            if class_names and class_id < len(class_names):
+                row['cell_class'] = class_names[class_id]
+            else:
+                row['cell_class'] = None
+            positive_data.append(row)
         
-        # Process negative annotations (exclude_classes)
+        # Process negative annotations: exclude class index is computed from value, no class_names required
         negative_data = []
         for idx in negative_indices:
             cell_class_value = int(cell_class_ids[idx])
-            # cell_class = -(2 + excluded_class_index)
-            # So: excluded_class_index = -cell_class - 2
-            excluded_class_idx = -cell_class_value - 2
-            
-            if 0 <= excluded_class_idx < len(class_names):
-                excluded_class_name = class_names[excluded_class_idx]
-                negative_data.append({
-                    'cell_ID': idx,
-                    'cell_class': None,  # No positive class assignment
-                    'exclude_classes': [excluded_class_name],
-                    'cell_color': _int_color_to_hex(cell_color_data[idx])
-                })
+            excluded_class_idx = -cell_class_value - 2  # -2 -> 0, -3 -> 1, ...
+            row = {
+                'cell_ID': idx,
+                'cell_class': None,
+                'exclude_class_indices': [excluded_class_idx],
+                'cell_color': _int_color_to_hex(cell_color_data[idx])
+            }
+            if class_names and 0 <= excluded_class_idx < len(class_names):
+                row['exclude_classes'] = [class_names[excluded_class_idx]]
+            negative_data.append(row)
         
         # Combine positive and negative annotations
         if not positive_data and not negative_data:
@@ -224,6 +225,113 @@ def load_structured_nuclei_annotations(zf, annotation_path: str) -> pd.DataFrame
         print(f"[load_structured_nuclei_annotations] Error loading annotations: {e}")
         traceback.print_exc()
         return None
+
+
+def _log_annotation_counts_per_class(class_names, positive_annotations, negative_annotations, nuclei_classes=None):
+    """Log per-class counts: positive annotations (marked as this class) and weak annotations (not this type)."""
+    pos_counts = {c: 0 for c in class_names}
+    if not positive_annotations.empty and 'cell_class' in positive_annotations.columns:
+        for c in class_names:
+            pos_counts[c] = int((positive_annotations['cell_class'] == c).sum())
+    weak_counts = {c: 0 for c in class_names}
+    if not negative_annotations.empty:
+        has_exclude = 'exclude_classes' in negative_annotations.columns or 'exclude_class_indices' in negative_annotations.columns
+        if has_exclude:
+            for idx, row in negative_annotations.iterrows():
+                exclude_indices = []
+                if 'exclude_class_indices' in row and pd.notna(row.get('exclude_class_indices')):
+                    inds = row['exclude_class_indices']
+                    if isinstance(inds, list):
+                        if nuclei_classes and len(nuclei_classes) > 0:
+                            for i in inds:
+                                i = int(i)
+                                if 0 <= i < len(nuclei_classes):
+                                    cn = nuclei_classes[i]
+                                    if cn in class_names:
+                                        exclude_indices.append(class_names.index(cn))
+                        else:
+                            exclude_indices = [int(i) for i in inds if 0 <= int(i) < len(class_names)]
+                if not exclude_indices and 'exclude_classes' in row:
+                    exclude_classes_list = row.get('exclude_classes', [])
+                    if isinstance(exclude_classes_list, list):
+                        for cls in exclude_classes_list:
+                            if cls in class_names:
+                                exclude_indices.append(class_names.index(cls))
+                for ci in exclude_indices:
+                    weak_counts[class_names[ci]] += 1
+    print("[ClassificationNode] Per-class annotation counts (positive = marked as this class, weak = 'not this type'):")
+    for c in class_names:
+        print(f"  {c}: positive={pos_counts[c]}, weak={weak_counts[c]}")
+
+
+def _build_negative_training_samples(cell_embeddings, negative_annotations, class_names, nuclei_classes=None):
+    """
+    Build negative (weak) training samples from "not this type" annotations: weight 0.3.
+    Returns (negative_X, negative_y, negative_weights) or (None, None, None) if none.
+    """
+    if negative_annotations.empty or not ('exclude_classes' in negative_annotations.columns or 'exclude_class_indices' in negative_annotations.columns):
+        return None, None, None
+    negative_X, negative_y, negative_weights = [], [], []
+    for idx, row in negative_annotations.iterrows():
+        cell_id = int(row['cell_ID'])
+        exclude_classes_list = row.get('exclude_classes', [])
+        if not isinstance(exclude_classes_list, list) or not exclude_classes_list:
+            inds = row.get('exclude_class_indices', [])
+            if isinstance(inds, list):
+                if nuclei_classes and len(nuclei_classes) > 0:
+                    exclude_classes_list = [nuclei_classes[int(i)] for i in inds if 0 <= int(i) < len(nuclei_classes)]
+                else:
+                    exclude_classes_list = [class_names[int(i)] for i in inds if 0 <= int(i) < len(class_names)]
+        if not exclude_classes_list:
+            continue
+        non_excluded = [c for c in class_names if c not in exclude_classes_list and c != "Negative control"]
+        if len(non_excluded) > 0:
+            emb = cell_embeddings[cell_id]
+            for cls in non_excluded:
+                cls_idx = class_names.index(cls)
+                negative_X.append(emb)
+                negative_y.append(cls_idx)
+                negative_weights.append(0.3)
+    if len(negative_X) == 0:
+        return None, None, None
+    return np.array(negative_X), np.array(negative_y), np.array(negative_weights)
+
+
+def _log_training_data_counts(class_names, y_train, n_positive):
+    """
+    Log actual training data: per class, how many positive (weight 1.0) vs weak (weight 0.3) samples.
+    y_train: full label array; first n_positive rows are positive, rest are weak.
+    """
+    if n_positive <= 0 or len(y_train) == 0:
+        return
+    y_pos = y_train[:n_positive]
+    y_weak = y_train[n_positive:] if len(y_train) > n_positive else np.array([], dtype=y_train.dtype)
+    print("[ClassificationNode] Training data (actual samples passed to classifier):")
+    for k, cname in enumerate(class_names):
+        pos_count = int((y_pos == k).sum())
+        weak_count = int((y_weak == k).sum()) if len(y_weak) > 0 else 0
+        print(f"  {cname}: positive={pos_count}, weak={weak_count}")
+
+
+def _annotation_labels_to_classifier_indices(annotations, class_names, nuclei_classes=None):
+    """
+    Map annotation rows to classifier class indices (0,1,2,...).
+    Uses stored ID (cell_class_index) + nuclei_classes when available, else class name (cell_class).
+    Returns 1D int array same length as annotations; -1 for invalid/unmapped.
+    """
+    n = len(annotations)
+    y = np.full(n, -1, dtype=np.int32)
+    for i, (_, row) in enumerate(annotations.iterrows()):
+        if 'cell_class_index' in row and pd.notna(row.get('cell_class_index')) and nuclei_classes and len(nuclei_classes) > 0:
+            ann_idx = int(row['cell_class_index'])
+            if 0 <= ann_idx < len(nuclei_classes):
+                class_name = nuclei_classes[ann_idx]
+                if class_name in class_names:
+                    y[i] = class_names.index(class_name)
+        if y[i] < 0 and pd.notna(row.get('cell_class')) and row['cell_class'] in class_names:
+            y[i] = class_names.index(row['cell_class'])
+    return y
+
 
 def print_h5_structure(file_path):
     """Print Zarr group structure"""
@@ -467,7 +575,12 @@ def load_classifier_params(zarr_path):
         return None
 
         
-def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
+def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame, nuclei_classes: list = None):
+    """
+    nuclei_classes: user-facing class order (e.g. from UI). When building exclude_map from
+    exclude_class_indices, these indices refer to nuclei_classes order; we map to classifier's
+    class_names order so the correct class is excluded.
+    """
     global CLASSIFIER_PATH, progress_value, cancel_event
     
     # update XGBoost parameter settings
@@ -486,12 +599,28 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         annotations = pd.DataFrame()
     
     # Separate positive and negative annotations early (for both new training and incremental)
-    positive_annotations = annotations[annotations['cell_class'].notna()].copy() if not annotations.empty else pd.DataFrame()
-    negative_annotations = annotations[annotations['cell_class'].isna()].copy() if not annotations.empty else pd.DataFrame()
-    has_negative_examples = len(negative_annotations) > 0 and 'exclude_classes' in negative_annotations.columns
+    # Positive: has cell_class (name) or has cell_class_index (ID from array: 0,1,2,...)
+    if annotations.empty:
+        positive_annotations = pd.DataFrame()
+        negative_annotations = pd.DataFrame()
+    else:
+        has_idx = 'cell_class_index' in annotations.columns
+        pos_mask = annotations['cell_class'].notna()
+        if has_idx:
+            # Avoid astype(int) on column with NA; use numeric comparison only where valid
+            ci = pd.to_numeric(annotations['cell_class_index'], errors='coerce')
+            pos_mask = pos_mask | (ci.notna() & (ci >= 0))
+        positive_annotations = annotations[pos_mask].copy()
+        negative_annotations = annotations[~pos_mask].copy()
+    has_negative_examples = (
+        len(negative_annotations) > 0
+        and ('exclude_classes' in negative_annotations.columns or 'exclude_class_indices' in negative_annotations.columns)
+    )
     
+    if not annotations.empty:
+        print(f"[ClassificationNode] Annotations: {len(positive_annotations)} positive, {len(negative_annotations)} negative (total {len(annotations)})")
     if has_negative_examples:
-        print(f"Found {len(negative_annotations)} negative annotations with exclude_classes")
+        print(f"[ClassificationNode] Negative annotations with exclude constraints: {len(negative_annotations)} cells ('not this type')")
     
     # try to load existing classifier parameters
     if CLASSIFIER_PATH is not None:
@@ -507,7 +636,11 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 
                 if not positive_annotations.empty:
                     existing_classes = set(class_names)
-                    annotated_classes = set(positive_annotations['cell_class'].unique())
+                    annotated_classes = set(positive_annotations['cell_class'].dropna().unique())
+                    if 'cell_class_index' in positive_annotations.columns and nuclei_classes and len(nuclei_classes) > 0:
+                        for ann_idx in positive_annotations['cell_class_index'].dropna().astype(int):
+                            if 0 <= ann_idx < len(nuclei_classes):
+                                annotated_classes.add(nuclei_classes[ann_idx])
                     new_classes = annotated_classes - existing_classes
                     
                     # Check if class count changed
@@ -548,13 +681,14 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         cell_indices = annotations['cell_ID'].astype(int).values
                         X_update = cell_embeddings[cell_indices]
                         
-                        # Re-encode all labels with new complete class list
-                        y_update = pd.Categorical(annotations['cell_class'], categories=class_names).codes
-                        
-                        # Check for invalid labels (shouldn't happen, but safety check)
+                        # Map to classifier indices by ID (cell_class_index + nuclei_classes) or by class name
+                        y_update = _annotation_labels_to_classifier_indices(annotations, class_names, nuclei_classes)
                         if np.any(y_update < 0):
                             invalid_mask = y_update < 0
-                            print(f"Warning: Found {np.sum(invalid_mask)} invalid labels, removing them")
+                            print(f"Warning: Found {np.sum(invalid_mask)} invalid labels (annotation ID/name not in classifier), removing them")
+                            if np.sum(invalid_mask) <= 20:
+                                invalid_classes = annotations.loc[invalid_mask, 'cell_class' if 'cell_class' in annotations.columns else 'cell_class_index'].value_counts()
+                                print(f"  Counts: {invalid_classes.to_dict()}")
                             X_update = X_update[~invalid_mask]
                             y_update = y_update[~invalid_mask]
                         
@@ -572,16 +706,21 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_train = X_update
                             y_train = y_update
                         
-                        # Check for cancellation before retraining
-                        if cancel_event.is_set():
-                            print("[ClassificationNode] Task cancelled before retraining")
-                            cancel_event.clear()
-                            progress_value = 0
-                            return None
-                        
-                        # Must retrain from scratch when class count changes
-                        clf = xgb.XGBClassifier(**xgb_params)
-                        clf.fit(X_train, y_train)
+                        # Add negative (weak) training samples with weight 0.3, same as from-scratch
+                        n_pos = X_train.shape[0]
+                        neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names, nuclei_classes)
+                        if neg_X is not None:
+                            print(f"Adding {len(neg_X)} negative training samples (weighted 0.3) for retrain")
+                            X_train = np.concatenate([X_train, neg_X], axis=0)
+                            y_train = np.concatenate([y_train, neg_y], axis=0)
+                            sample_weights_inc = np.concatenate([np.ones(n_pos), neg_w])
+                            _log_training_data_counts(class_names, y_train, n_pos)
+                            clf = xgb.XGBClassifier(**xgb_params)
+                            clf.fit(X_train, y_train, sample_weight=sample_weights_inc)
+                        else:
+                            _log_training_data_counts(class_names, y_train, n_pos)
+                            clf = xgb.XGBClassifier(**xgb_params)
+                            clf.fit(X_train, y_train)
                         
                         # Check for cancellation after retraining
                         if cancel_event.is_set():
@@ -599,12 +738,14 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         # Extract cell indices from the cell_ID column
                         cell_indices = annotations['cell_ID'].astype(int).values
                         X_update = cell_embeddings[cell_indices]
-                        y_update = pd.Categorical(annotations['cell_class'], categories=class_names).codes
-                        
-                        # Check for invalid labels
+                        # Map to classifier indices by ID (cell_class_index + nuclei_classes) or by class name
+                        y_update = _annotation_labels_to_classifier_indices(annotations, class_names, nuclei_classes)
                         if np.any(y_update < 0):
                             invalid_mask = y_update < 0
-                            print(f"Warning: Found {np.sum(invalid_mask)} invalid labels, removing them")
+                            print(f"Warning: Found {np.sum(invalid_mask)} invalid labels (annotation ID/name not in classifier), removing them")
+                            if np.sum(invalid_mask) <= 20:
+                                invalid_classes = annotations.loc[invalid_mask, 'cell_class' if 'cell_class' in annotations.columns else 'cell_class_index'].value_counts()
+                                print(f"  Counts: {invalid_classes.to_dict()}")
                             X_update = X_update[~invalid_mask]
                             y_update = y_update[~invalid_mask]
                         
@@ -616,17 +757,21 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_train = X_update
                             y_train = y_update
                         
-                        # Check for cancellation before incremental training
-                        if cancel_event.is_set():
-                            print("[ClassificationNode] Task cancelled before incremental training")
-                            cancel_event.clear()
-                            progress_value = 0
-                            return None
-                        
-                        # Use warm start: save the existing booster before fitting
-                        # This allows XGBoost to continue training from the existing model
-                        existing_booster = clf.get_booster()
-                        clf.fit(X_train, y_train, xgb_model=existing_booster)
+                        # Add negative (weak) training samples with weight 0.3, same as from-scratch
+                        n_pos = X_train.shape[0]
+                        neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names, nuclei_classes)
+                        if neg_X is not None:
+                            print(f"Adding {len(neg_X)} negative training samples (weighted 0.3) for incremental training")
+                            X_train = np.concatenate([X_train, neg_X], axis=0)
+                            y_train = np.concatenate([y_train, neg_y], axis=0)
+                            sample_weights_inc = np.concatenate([np.ones(n_pos), neg_w])
+                            _log_training_data_counts(class_names, y_train, n_pos)
+                            existing_booster = clf.get_booster()
+                            clf.fit(X_train, y_train, xgb_model=existing_booster, sample_weight=sample_weights_inc)
+                        else:
+                            _log_training_data_counts(class_names, y_train, n_pos)
+                            existing_booster = clf.get_booster()
+                            clf.fit(X_train, y_train, xgb_model=existing_booster)
                         
                         # Check for cancellation after incremental training
                         if cancel_event.is_set():
@@ -656,6 +801,40 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 n_batches = (n_cells + batch_size - 1) // batch_size
                 print(f"Starting prediction for {n_cells} cells in {n_batches} batches (batch_size={batch_size})...")
                 
+                # Build exclude_map from negative annotations when using loaded classifier (so "not class" marks take effect)
+                # exclude_class_indices are in user (nuclei_classes) order; map to classifier (class_names) order
+                exclude_map = {}
+                if has_negative_examples and not negative_annotations.empty:
+                    for idx, row in negative_annotations.iterrows():
+                        cell_id = int(row['cell_ID'])
+                        exclude_indices = []
+                        if 'exclude_class_indices' in row and pd.notna(row.get('exclude_class_indices')):
+                            inds = row['exclude_class_indices']
+                            if isinstance(inds, list):
+                                if nuclei_classes and len(nuclei_classes) > 0:
+                                    # Annotation indices are in user (nuclei_classes) order → map to classifier indices
+                                    for i in inds:
+                                        i = int(i)
+                                        if 0 <= i < len(nuclei_classes):
+                                            class_name = nuclei_classes[i]
+                                            if class_name in class_names:
+                                                exclude_indices.append(class_names.index(class_name))
+                                else:
+                                    # Fallback: treat as classifier indices (when orders match)
+                                    exclude_indices = [int(i) for i in inds if 0 <= int(i) < len(class_names)]
+                        if not exclude_indices and 'exclude_classes' in row:
+                            exclude_classes_list = row.get('exclude_classes', [])
+                            if isinstance(exclude_classes_list, list):
+                                for cls in exclude_classes_list:
+                                    if cls in class_names:
+                                        exclude_indices.append(class_names.index(cls))
+                        if exclude_indices:
+                            exclude_map[cell_id] = exclude_indices
+                    if exclude_map:
+                        print(f"[ClassificationNode] Will enforce exclusion for {len(exclude_map)} cells during prediction (classifier path)")
+                if not annotations.empty:
+                    _log_annotation_counts_per_class(class_names, positive_annotations, negative_annotations, nuclei_classes=nuclei_classes)
+                
                 for batch_idx, i in enumerate(range(0, n_cells, batch_size)):
                     # Check for cancellation during prediction (before each batch)
                     if cancel_event.is_set():
@@ -670,6 +849,16 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     # OPTIMIZATION: Only call predict_proba once, then extract predictions from probabilities
                     # This avoids duplicate forward passes through the model
                     batch_probs = clf.predict_proba(batch_embeddings)
+                    # Apply exclude_classes constraints from "not class" annotations
+                    if exclude_map:
+                        for local_idx in range(len(batch_probs)):
+                            global_idx = i + local_idx
+                            if global_idx in exclude_map:
+                                exclude_indices = exclude_map[global_idx]
+                                batch_probs[local_idx, exclude_indices] = 0.0
+                                prob_sum = batch_probs[local_idx].sum()
+                                if prob_sum > 0:
+                                    batch_probs[local_idx] /= prob_sum
                     batch_predictions = np.argmax(batch_probs, axis=1).astype(np.int32)
                     
                     # Store results
@@ -713,19 +902,24 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         print("Cannot create classifier: no annotations provided and failed to load existing classifier")
         return None  # Signal to caller to use zero-shot instead
     
-    # Separate positive and negative annotations
-    positive_annotations = annotations[annotations['cell_class'].notna()].copy()
-    negative_annotations = annotations[annotations['cell_class'].isna()].copy()
+    # Use same positive/negative split as at top of function (includes cell_class_index-only rows)
+    print(f"[ClassificationNode] Annotations: {len(positive_annotations)} positive, {len(negative_annotations)} negative (total {len(annotations)})")
     
-    print(f"Total annotations: {len(annotations)}, Positive: {len(positive_annotations)}, Negative: {len(negative_annotations)}")
-    
-    # Check if we have exclude_classes column for negative annotations
-    has_negative_examples = len(negative_annotations) > 0 and 'exclude_classes' in negative_annotations.columns
+    # Check if we have exclude_classes or exclude_class_indices for negative annotations
+    has_negative_examples = (
+        len(negative_annotations) > 0
+        and ('exclude_classes' in negative_annotations.columns or 'exclude_class_indices' in negative_annotations.columns)
+    )
     
     if has_negative_examples:
-        print(f"Found {len(negative_annotations)} negative annotations with exclude_classes")
+        print(f"[ClassificationNode] Negative annotations with exclude constraints: {len(negative_annotations)} cells ('not this type')")
     
-    unique_classes = positive_annotations['cell_class'].unique().tolist() if not positive_annotations.empty else []
+    unique_classes = list(positive_annotations['cell_class'].dropna().unique()) if not positive_annotations.empty else []
+    if not positive_annotations.empty and 'cell_class_index' in positive_annotations.columns and nuclei_classes and len(nuclei_classes) > 0:
+        for ann_idx in positive_annotations['cell_class_index'].dropna().astype(int):
+            if 0 <= ann_idx < len(nuclei_classes):
+                unique_classes.append(nuclei_classes[ann_idx])
+        unique_classes = list(dict.fromkeys(unique_classes))
     
     if len(unique_classes) < 1 and not has_negative_examples:
         raise ValueError("Need at least 1 class in annotation or negative examples => fallback to zero-shot")
@@ -762,60 +956,31 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     # Extract cell indices from the cell_ID column (sequential annotation structure)
     cell_indices = positive_annotations['cell_ID'].astype(int).values
     X_train = cell_embeddings[cell_indices]
-    # IMPORTANT: Now class_names always has "Negative control" at index 0
-    # So y_train codes will be: "Class1" -> 1, "Class2" -> 2, etc. (not 0 and 1)
-    # This is correct because we'll add negative control vectors with label 0 later
-    y_train = pd.Categorical(positive_annotations['cell_class'], categories=class_names).codes
+    # Map to class indices by ID (cell_class_index + nuclei_classes) or by class name
+    y_train = _annotation_labels_to_classifier_indices(positive_annotations, class_names, nuclei_classes)
+    if np.any(y_train < 0):
+        valid = y_train >= 0
+        X_train = X_train[valid]
+        y_train = y_train[valid]
     
-    # Process negative annotations (exclude_classes)
+    # Process negative annotations (exclude_classes): same weight 0.3 as incremental
+    sample_weights = None
     if has_negative_examples:
         print("Processing negative annotations...")
-        
-        negative_X = []
-        negative_y = []
-        negative_weights = []
-        
-        for idx, row in negative_annotations.iterrows():
-            cell_id = int(row['cell_ID'])
-            exclude_classes_list = row.get('exclude_classes', [])
-            
-            if not isinstance(exclude_classes_list, list):
-                continue
-            
-            # For each class NOT in exclude_list, add this as a potential training sample
-            non_excluded_classes = [c for c in class_names if c not in exclude_classes_list and c != "Negative control"]
-            
-            if len(non_excluded_classes) > 0:
-                embedding = cell_embeddings[cell_id]
-                
-                # Add this sample as a weak positive for each non-excluded class
-                for cls in non_excluded_classes:
-                    cls_idx = class_names.index(cls)
-                    negative_X.append(embedding)
-                    negative_y.append(cls_idx)
-                    negative_weights.append(0.3)  # Lower weight for negative examples
-        
-        if len(negative_X) > 0:
-            negative_X = np.array(negative_X)
-            negative_y = np.array(negative_y)
-            negative_weights = np.array(negative_weights)
-            
-            # Combine positive and negative samples
-            print(f"Adding {len(negative_X)} negative training samples (weighted 0.3)")
-            X_train = np.concatenate([X_train, negative_X], axis=0)
-            y_train = np.concatenate([y_train, negative_y], axis=0)
-            
-            # Create sample weights: 1.0 for positive, 0.3 for negative
-            sample_weights = np.concatenate([
-                np.ones(len(cell_indices)),  # Positive samples
-                negative_weights              # Negative samples
-            ])
-        else:
-            sample_weights = None
-    else:
-        sample_weights = None
+        neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names, nuclei_classes)
+        if neg_X is not None:
+            n_pos = X_train.shape[0]
+            print(f"Adding {len(neg_X)} negative training samples (weighted 0.3)")
+            X_train = np.concatenate([X_train, neg_X], axis=0)
+            y_train = np.concatenate([y_train, neg_y], axis=0)
+            sample_weights = np.concatenate([np.ones(n_pos), neg_w])
 
-    if "Negative control" not in positive_annotations["cell_class"].values.astype(str):
+    _pos_class_names = list(positive_annotations["cell_class"].dropna().astype(str)) if not positive_annotations.empty else []
+    if "cell_class_index" in positive_annotations.columns and nuclei_classes and len(nuclei_classes) > 0:
+        for i in positive_annotations["cell_class_index"].dropna().astype(int):
+            if 0 <= i < len(nuclei_classes):
+                _pos_class_names.append(nuclei_classes[i])
+    if "Negative control" not in _pos_class_names:
         print("Found annotations, but there is no 'Negative control' class, we will use negative_control_example_vectors.npy as negative control")
         # Cache negative control vectors in memory
         if not hasattr(train_linear_classifier, '_negative_control_vectors'):
@@ -848,6 +1013,9 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         cancel_event.clear()
         progress_value = 0
         return None
+    
+    n_positive = int((sample_weights == 1.0).sum()) if sample_weights is not None else len(y_train)
+    _log_training_data_counts(class_names, y_train, n_positive)
     
     clf = xgb.XGBClassifier(**xgb_params)
     print("Training new classifier...")
@@ -885,22 +1053,24 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     if has_negative_examples and not negative_annotations.empty:
         for idx, row in negative_annotations.iterrows():
             cell_id = int(row['cell_ID'])
-            exclude_classes_list = row.get('exclude_classes', [])
-            
-            if not isinstance(exclude_classes_list, list):
-                continue
-            
-            # Convert class names to indices
             exclude_indices = []
-            for cls in exclude_classes_list:
-                if cls in class_names:
-                    exclude_indices.append(class_names.index(cls))
-            
+            if 'exclude_class_indices' in row and pd.notna(row.get('exclude_class_indices')):
+                inds = row['exclude_class_indices']
+                if isinstance(inds, list):
+                    exclude_indices = [int(i) for i in inds if 0 <= int(i) < len(class_names)]
+            if not exclude_indices and 'exclude_classes' in row:
+                exclude_classes_list = row.get('exclude_classes', [])
+                if isinstance(exclude_classes_list, list):
+                    for cls in exclude_classes_list:
+                        if cls in class_names:
+                            exclude_indices.append(class_names.index(cls))
             if exclude_indices:
                 exclude_map[cell_id] = exclude_indices
         
         if exclude_map:
-            print(f"Will enforce exclusion constraints for {len(exclude_map)} cells during prediction")
+            print(f"[ClassificationNode] Will enforce exclusion for {len(exclude_map)} cells during prediction")
+    if not annotations.empty:
+        _log_annotation_counts_per_class(class_names, positive_annotations, negative_annotations, nuclei_classes=None)
     
     for batch_idx, i in enumerate(range(0, n_cells, batch_size)):
         # Check for cancellation during prediction (before each batch)
@@ -1039,7 +1209,7 @@ def run_classification(args) -> Dict[str, Any]:
         # Try supervised classification if we have classifier path or annotations
         classifier_result = None
         if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
-            classifier_result = train_linear_classifier(cell_embeddings, annotations_data)
+            classifier_result = train_linear_classifier(cell_embeddings, annotations_data, nuclei_classes=nuclei_classes)
             
             # Check for cancellation after training (train_linear_classifier returns None if cancelled)
             if classifier_result is None or cancel_event.is_set():
