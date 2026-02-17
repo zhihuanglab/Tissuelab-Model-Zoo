@@ -255,17 +255,18 @@ def load_classifier_params():
             train_embeddings = train_data['embeddings']
             train_labels = train_data['labels']
             
-            # print the number of samples for each class
-            print("\nloaded training data:")
+            # print the number of samples for each class (same as cell classification)
+            node_tag = NODE_NAME or "MuskNode"
+            print(f"\n[{node_tag}] loaded training data:")
             print(f"total samples: {len(train_labels)}")
             for i, class_name in enumerate(class_names):
-                class_count = np.sum(train_labels == i)
+                class_count = int(np.sum(train_labels == i))
                 print(f"class '{class_name}': {class_count} samples")
             print()
         else:
             train_embeddings = None
             train_labels = None
-            print("No saved training data found")
+            print(f"[{NODE_NAME or 'MuskNode'}] No saved training data found")
         
         return clf, class_names, class_colors, train_embeddings, train_labels
     except Exception as e:
@@ -304,6 +305,67 @@ def save_patch_image(slide_path, coords, output_dir, index, label):
         print(f"Error saving patch image: {e}")
         return None
 
+def _parse_exclude_list(row, class_names):
+    """Parse exclude_classes from a row (string, list, or exclude_class_indices). Return list of class names to exclude."""
+    exclude_list = []
+    if 'exclude_class_indices' in row and pd.notna(row.get('exclude_class_indices')):
+        inds = row['exclude_class_indices']
+        if isinstance(inds, list):
+            exclude_list = [class_names[int(i)] for i in inds if 0 <= int(i) < len(class_names)]
+    if exclude_list:
+        return exclude_list
+    raw = row.get('exclude_classes', '')
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str) and raw:
+        try:
+            return json.loads(raw) if raw.startswith('[') else [raw]
+        except Exception:
+            return [raw]
+    return []
+
+
+def _build_negative_training_samples(patch_embeddings, negative_annotations, class_names):
+    """
+    Build negative (weak) training samples from "not this type" annotations: weight 0.3.
+    Returns (negative_X, negative_y, negative_weights) or (None, None, None) if none.
+    """
+    if negative_annotations.empty:
+        return None, None, None
+    if 'exclude_classes' not in negative_annotations.columns and 'exclude_class_indices' not in negative_annotations.columns:
+        return None, None, None
+    negative_X, negative_y, negative_weights = [], [], []
+    for idx, row in negative_annotations.iterrows():
+        patch_id = int(row['patch_ID'])
+        exclude_list = _parse_exclude_list(row, class_names)
+        if not exclude_list:
+            continue
+        non_excluded = [c for c in class_names if c not in exclude_list and c != "Negative control"]
+        if len(non_excluded) > 0:
+            emb = patch_embeddings[patch_id]
+            for cls in non_excluded:
+                cls_idx = class_names.index(cls)
+                negative_X.append(emb)
+                negative_y.append(cls_idx)
+                negative_weights.append(0.3)
+    if len(negative_X) == 0:
+        return None, None, None
+    return np.array(negative_X), np.array(negative_y), np.array(negative_weights)
+
+
+def _log_training_data_counts(class_names, y_train, n_positive):
+    """Log actual training data: per class, positive (weight 1.0) vs weak (weight 0.3) samples."""
+    if n_positive <= 0 or len(y_train) == 0:
+        return
+    y_pos = y_train[:n_positive]
+    y_weak = y_train[n_positive:] if len(y_train) > n_positive else np.array([], dtype=y_train.dtype)
+    print(f"[{NODE_NAME}] Training data (actual samples passed to classifier):")
+    for k, cname in enumerate(class_names):
+        pos_count = int((y_pos == k).sum())
+        weak_count = int((y_weak == k).sum()) if len(y_weak) > 0 else 0
+        print(f"  {cname}: positive={pos_count}, weak={weak_count}")
+
+
 def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
     global CLASSIFIER_PATH, ZARR_PATH, ARGS
     
@@ -325,10 +387,13 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     # Separate positive and negative annotations early (for both new training and incremental)
     positive_annotations = annotations[annotations['tissue_class'].notna()].copy() if not annotations.empty else pd.DataFrame()
     negative_annotations = annotations[annotations['tissue_class'].isna()].copy() if not annotations.empty else pd.DataFrame()
-    has_negative_examples = len(negative_annotations) > 0 and 'exclude_classes' in negative_annotations.columns
+    has_negative_examples = (
+        len(negative_annotations) > 0
+        and ('exclude_classes' in negative_annotations.columns or 'exclude_class_indices' in negative_annotations.columns)
+    )
     
     if has_negative_examples:
-        print(f"Found {len(negative_annotations)} negative annotations with exclude_classes")
+        print(f"Found {len(negative_annotations)} negative annotations (exclude_classes or exclude_class_indices)")
     
     # try to load existing classifier parameters
     loaded_classifier_colors = None  # Store classifier colors for fallback
@@ -407,9 +472,21 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_train = X_update
                             y_train = y_update
                         
-                        # Must retrain from scratch when class count changes
-                        clf = xgb.XGBClassifier(**xgb_params)
-                        clf.fit(X_train, y_train)
+                        # Add negative (weak) training samples with weight 0.3, same as from-scratch
+                        n_pos = X_train.shape[0]
+                        neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names)
+                        if neg_X is not None:
+                            print(f"Adding {len(neg_X)} negative training samples (weighted 0.3) for retrain")
+                            X_train = np.concatenate([X_train, neg_X], axis=0)
+                            y_train = np.concatenate([y_train, neg_y], axis=0)
+                            sample_weights_inc = np.concatenate([np.ones(n_pos), neg_w])
+                            _log_training_data_counts(class_names, y_train, n_pos)
+                            clf = xgb.XGBClassifier(**xgb_params)
+                            clf.fit(X_train, y_train, sample_weight=sample_weights_inc)
+                        else:
+                            _log_training_data_counts(class_names, y_train, n_pos)
+                            clf = xgb.XGBClassifier(**xgb_params)
+                            clf.fit(X_train, y_train)
                         print("Classifier retrained with new classes")
                         
                     else:
@@ -436,10 +513,21 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_train = X_update
                             y_train = y_update
                         
-                        # Use warm start: save the existing booster before fitting
-                        # This allows XGBoost to continue training from the existing model
-                        existing_booster = clf.get_booster()
-                        clf.fit(X_train, y_train, xgb_model=existing_booster)
+                        # Add negative (weak) training samples with weight 0.3, same as from-scratch
+                        n_pos = X_train.shape[0]
+                        neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names)
+                        if neg_X is not None:
+                            print(f"Adding {len(neg_X)} negative training samples (weighted 0.3) for incremental training")
+                            X_train = np.concatenate([X_train, neg_X], axis=0)
+                            y_train = np.concatenate([y_train, neg_y], axis=0)
+                            sample_weights_inc = np.concatenate([np.ones(n_pos), neg_w])
+                            _log_training_data_counts(class_names, y_train, n_pos)
+                            existing_booster = clf.get_booster()
+                            clf.fit(X_train, y_train, xgb_model=existing_booster, sample_weight=sample_weights_inc)
+                        else:
+                            _log_training_data_counts(class_names, y_train, n_pos)
+                            existing_booster = clf.get_booster()
+                            clf.fit(X_train, y_train, xgb_model=existing_booster)
                         print("Classifier updated with warm start (incremental training)")
                     
                     # Save updated classifier with new training data
@@ -468,28 +556,12 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 if has_negative_examples and not negative_annotations.empty:
                     for idx, row in negative_annotations.iterrows():
                         patch_id = int(row['patch_ID'])
-                        exclude_classes_str = row.get('exclude_classes', '')
-                        
-                        if isinstance(exclude_classes_str, str) and exclude_classes_str:
-                            try:
-                                import json
-                                exclude_list = json.loads(exclude_classes_str) if exclude_classes_str.startswith('[') else [exclude_classes_str]
-                            except:
-                                exclude_list = [exclude_classes_str]
-                        elif isinstance(exclude_classes_str, list):
-                            exclude_list = exclude_classes_str
-                        else:
+                        exclude_list = _parse_exclude_list(row, class_names)
+                        if not exclude_list:
                             continue
-                        
-                        # Convert class names to indices
-                        exclude_indices = []
-                        for cls in exclude_list:
-                            if cls in class_names:
-                                exclude_indices.append(class_names.index(cls))
-                        
+                        exclude_indices = [class_names.index(cls) for cls in exclude_list if cls in class_names]
                         if exclude_indices:
                             exclude_map[patch_id] = exclude_indices
-                    
                     if exclude_map:
                         print(f"Will enforce exclusion constraints for {len(exclude_map)} patches during prediction")
                 
@@ -561,11 +633,14 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     
     print(f"Total annotations: {len(annotations)}, Positive: {len(positive_annotations)}, Negative: {len(negative_annotations)}")
     
-    # Check if we have exclude_classes column for negative annotations
-    has_negative_examples = len(negative_annotations) > 0 and 'exclude_classes' in negative_annotations.columns
+    # Check if we have exclude_classes or exclude_class_indices for negative annotations
+    has_negative_examples = (
+        len(negative_annotations) > 0
+        and ('exclude_classes' in negative_annotations.columns or 'exclude_class_indices' in negative_annotations.columns)
+    )
     
     if has_negative_examples:
-        print(f"Found {len(negative_annotations)} negative annotations with exclude_classes")
+        print(f"Found {len(negative_annotations)} negative annotations (exclude_classes or exclude_class_indices)")
     
     # Get unique classes from positive annotations
     unique_classes = positive_annotations['tissue_class'].unique().tolist() if not positive_annotations.empty else []
@@ -621,67 +696,17 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     # This is correct because we'll add negative control vectors with label 0 later
     y_train = pd.Categorical(positive_annotations['tissue_class'], categories=class_names).codes
     
-    # Process negative annotations (exclude_classes)
+    # Process negative annotations (exclude_classes): same weight 0.3 as incremental
+    sample_weights = None
     if has_negative_examples:
         print("Processing negative annotations...")
-        
-        # For each negative annotation, we'll create training samples
-        # Strategy: Use as "hard negative" samples for the excluded classes
-        # We'll use sample weighting to give these less importance than positive examples
-        negative_X = []
-        negative_y = []
-        negative_weights = []
-        
-        for idx, row in negative_annotations.iterrows():
-            patch_id = int(row['patch_ID'])
-            exclude_classes_str = row.get('exclude_classes', '')
-            
-            # Parse exclude_classes (could be JSON string or list)
-            if isinstance(exclude_classes_str, str) and exclude_classes_str:
-                try:
-                    import json
-                    exclude_list = json.loads(exclude_classes_str) if exclude_classes_str.startswith('[') else [exclude_classes_str]
-                except:
-                    exclude_list = [exclude_classes_str]
-            elif isinstance(exclude_classes_str, list):
-                exclude_list = exclude_classes_str
-            else:
-                continue
-            
-            # For each class NOT in exclude_list, add this as a potential training sample
-            # Strategy: Add as training sample for each non-excluded class with reduced weight
-            non_excluded_classes = [c for c in class_names if c not in exclude_list and c != "Negative control"]
-            
-            if len(non_excluded_classes) > 0:
-                embedding = cell_embeddings[patch_id]
-                
-                # Add this sample as a weak positive for each non-excluded class
-                for cls in non_excluded_classes:
-                    cls_idx = class_names.index(cls)
-                    negative_X.append(embedding)
-                    negative_y.append(cls_idx)
-                    # Use lower weight (0.3) for negative examples vs positive examples (1.0)
-                    negative_weights.append(0.3)
-        
-        if len(negative_X) > 0:
-            negative_X = np.array(negative_X)
-            negative_y = np.array(negative_y)
-            negative_weights = np.array(negative_weights)
-            
-            # Combine positive and negative samples
-            print(f"Adding {len(negative_X)} negative training samples (weighted 0.3)")
-            X_train = np.concatenate([X_train, negative_X], axis=0)
-            y_train = np.concatenate([y_train, negative_y], axis=0)
-            
-            # Create sample weights: 1.0 for positive, 0.3 for negative
-            sample_weights = np.concatenate([
-                np.ones(len(cell_indices)),  # Positive samples
-                negative_weights              # Negative samples
-            ])
-        else:
-            sample_weights = None
-    else:
-        sample_weights = None
+        neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names)
+        if neg_X is not None:
+            n_pos = X_train.shape[0]
+            print(f"Adding {len(neg_X)} negative training samples (weighted 0.3)")
+            X_train = np.concatenate([X_train, neg_X], axis=0)
+            y_train = np.concatenate([y_train, neg_y], axis=0)
+            sample_weights = np.concatenate([np.ones(n_pos), neg_w])
     
     if "Negative control" not in positive_annotations["tissue_class"].values.astype(str):
         # Cache negative control vectors in memory
@@ -708,6 +733,9 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 sample_weights = np.concatenate([np.ones(negative_control_vectors.shape[0]), sample_weights])
         else:
             print("Proceeding without negative control vectors as they could not be loaded.")
+
+    n_positive = int((sample_weights == 1.0).sum()) if sample_weights is not None else len(y_train)
+    _log_training_data_counts(class_names, y_train, n_positive)
 
     # train new classifier
     clf = xgb.XGBClassifier(**xgb_params)
@@ -737,28 +765,12 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     if has_negative_examples and not negative_annotations.empty:
         for idx, row in negative_annotations.iterrows():
             patch_id = int(row['patch_ID'])
-            exclude_classes_str = row.get('exclude_classes', '')
-            
-            if isinstance(exclude_classes_str, str) and exclude_classes_str:
-                try:
-                    import json
-                    exclude_list = json.loads(exclude_classes_str) if exclude_classes_str.startswith('[') else [exclude_classes_str]
-                except:
-                    exclude_list = [exclude_classes_str]
-            elif isinstance(exclude_classes_str, list):
-                exclude_list = exclude_classes_str
-            else:
+            exclude_list = _parse_exclude_list(row, class_names)
+            if not exclude_list:
                 continue
-            
-            # Convert class names to indices
-            exclude_indices = []
-            for cls in exclude_list:
-                if cls in class_names:
-                    exclude_indices.append(class_names.index(cls))
-            
+            exclude_indices = [class_names.index(cls) for cls in exclude_list if cls in class_names]
             if exclude_indices:
                 exclude_map[patch_id] = exclude_indices
-        
         if exclude_map:
             print(f"Will enforce exclusion constraints for {len(exclude_map)} patches during prediction")
     
