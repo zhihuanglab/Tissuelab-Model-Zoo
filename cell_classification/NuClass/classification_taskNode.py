@@ -575,6 +575,7 @@ def load_classifier_params(zarr_path):
         return None
 
         
+<<<<<<< Updated upstream
 def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame, nuclei_classes: list = None):
     """
     nuclei_classes: user-facing class order (e.g. from UI). When building exclude_map from
@@ -582,6 +583,10 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     class_names order so the correct class is excluded.
     """
     global CLASSIFIER_PATH, progress_value, cancel_event
+=======
+def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame, nuclei_colors: list[str] = None):
+    global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, progress_value, cancel_event
+>>>>>>> Stashed changes
     
     # update XGBoost parameter settings
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -660,21 +665,33 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         old_class_names = class_names.copy()
                         class_names = all_unique_classes
                         
-                        # Update class_colors: keep existing colors, add default for new classes
-                        class_colors_map = annotations.groupby('cell_class')['cell_color'].first().to_dict()
+                        # Update class_colors: prioritize frontend-provided colors, then classifier colors, then annotations
                         new_class_colors = []
-                        for cn in class_names:
-                            if cn in class_colors_map:
-                                new_class_colors.append(class_colors_map[cn])
-                            elif cn in old_class_names:
-                                # Keep existing color for old classes
-                                old_idx = old_class_names.index(cn)
-                                if old_idx < len(class_colors):
-                                    new_class_colors.append(class_colors[old_idx])
+                        if nuclei_colors and len(nuclei_colors) == len(class_names):
+                            # Use frontend-provided colors (user's current selection) - highest priority
+                            new_class_colors = nuclei_colors
+                            print(f"Using frontend-provided colors for updated classifier: {new_class_colors}")
+                        else:
+                            # Fallback: Build color mapping prioritizing classifier colors, then annotations
+                            # This ensures we use saved colors from classifier (e.g., red) instead of old annotation colors (e.g., blue)
+                            for cn in class_names:
+                                if cn in old_class_names:
+                                    # Keep existing color from classifier for old classes (e.g., red from saved classifier)
+                                    old_idx = old_class_names.index(cn)
+                                    if old_idx < len(class_colors):
+                                        new_class_colors.append(class_colors[old_idx])
+                                    else:
+                                        new_class_colors.append("#aaaaaa")
+                                elif not annotations.empty:
+                                    # For new classes, try to get color from annotations
+                                    class_colors_map = annotations.groupby('cell_class')['cell_color'].first().to_dict()
+                                    if cn in class_colors_map:
+                                        new_class_colors.append(class_colors_map[cn])
+                                    else:
+                                        new_class_colors.append("#aaaaaa")
                                 else:
                                     new_class_colors.append("#aaaaaa")
-                            else:
-                                new_class_colors.append("#aaaaaa")
+                            print(f"Using colors from classifier/annotations for updated classifier: {new_class_colors}")
                         class_colors = new_class_colors
                         
                         # Extract cell indices from the cell_ID column
@@ -734,6 +751,16 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     else:
                         # Class count unchanged, can use warm start for faster training
                         print(f"Class count unchanged, using warm start for incremental training...")
+                        
+                        # Update class_colors: prioritize frontend-provided colors, then keep existing colors
+                        # This ensures user's color changes are saved to classifier even when class count doesn't change
+                        if nuclei_colors and len(nuclei_colors) == len(class_names):
+                            # Use frontend-provided colors (user's current selection)
+                            class_colors = nuclei_colors
+                            print(f"Using frontend-provided colors for updated classifier (warm start): {class_colors}")
+                        else:
+                            # Keep existing colors from classifier if frontend didn't provide new colors
+                            print(f"Keeping existing colors from classifier: {class_colors}")
                         
                         # Extract cell indices from the cell_ID column
                         cell_indices = annotations['cell_ID'].astype(int).values
@@ -892,6 +919,30 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 progress_value = 90
                 print(f"Progress: 90% (Completed prediction for {n_cells} cells)")
                 
+                # Update class_colors: prioritize frontend-provided colors, then keep existing colors
+                # This ensures user's color changes are saved even when only predicting (no annotations)
+                old_class_colors = class_colors.copy() if isinstance(class_colors, list) else list(class_colors)
+                if nuclei_colors and len(nuclei_colors) == len(class_names):
+                    # Use frontend-provided colors (user's current selection)
+                    class_colors = nuclei_colors
+                    print(f"Using frontend-provided colors for prediction-only classifier: {class_colors}")
+                else:
+                    # Keep existing colors from classifier if frontend didn't provide new colors
+                    print(f"Keeping existing colors from classifier for prediction: {class_colors}")
+                
+                # If colors changed and SAVE_CLASSIFIER_PATH is set, save the updated classifier with new colors
+                # This ensures color changes are persisted even when only predicting (no new annotations)
+                if class_colors != old_class_colors and SAVE_CLASSIFIER_PATH is not None:
+                    # Prepare training data from previous embeddings if available
+                    train_data = {
+                        'embeddings': X_train if 'X_train' in locals() else (prev_embeddings if prev_embeddings is not None else np.array([])),
+                        'labels': y_train if 'y_train' in locals() else (prev_labels if prev_labels is not None else np.array([]))
+                    }
+                    # Only save if we have training data
+                    if train_data['embeddings'].size > 0:
+                        save_classifier_params(clf, class_names, class_colors, train_data)
+                        print(f"Saved classifier with updated colors (prediction-only): {class_colors}")
+                
                 return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
         except Exception as e:
             print(f"Error loading or updating classifier: {e}")
@@ -941,17 +992,29 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         class_names = ["Negative control"] + class_names
         print(f"Added 'Negative control' to class_names (not in annotations): {class_names}")
 
+<<<<<<< Updated upstream
     class_colors_map = positive_annotations.groupby('cell_class')['cell_color'].first().to_dict() if not positive_annotations.empty else {}
+=======
+    # Build class_colors: prioritize frontend-provided colors, then fallback to annotations
+>>>>>>> Stashed changes
     class_colors = []
-    for cn in class_names:
-        if cn in class_colors_map:
-            class_colors.append(class_colors_map[cn])
-        else:
-            # Default color for "Negative control" if not in annotations
-            if cn == "Negative control":
-                class_colors.append("#aaaaaa")
+    if nuclei_colors and len(nuclei_colors) == len(class_names):
+        # Use frontend-provided colors (user's current selection)
+        class_colors = nuclei_colors
+        print(f"Using frontend-provided colors for classifier: {class_colors}")
+    else:
+        # Fallback: Extract colors from annotations
+        class_colors_map = annotations.groupby('cell_class')['cell_color'].first().to_dict()
+        for cn in class_names:
+            if cn in class_colors_map:
+                class_colors.append(class_colors_map[cn])
             else:
-                class_colors.append("#aaaaaa")
+                # Default color for "Negative control" if not in annotations
+                if cn == "Negative control":
+                    class_colors.append("#aaaaaa")
+                else:
+                    class_colors.append("#aaaaaa")
+        print(f"Using colors from annotations for classifier: {class_colors}")
 
     # Extract cell indices from the cell_ID column (sequential annotation structure)
     cell_indices = positive_annotations['cell_ID'].astype(int).values
@@ -1206,10 +1269,40 @@ def run_classification(args) -> Dict[str, Any]:
         nuclei_classes = getattr(args, "nuclei_classes", [])
         nuclei_colors = getattr(args, "nuclei_colors", [])
 
+        # Determine final_class_colors early (before training) to pass to train_linear_classifier
+        # This ensures saved classifier uses user's current color selection
+        # Priority: frontend colors (if length matches) > classifier colors (loaded in train_linear_classifier) > zarr colors
+        final_class_colors_for_training = None
+        if nuclei_colors and len(nuclei_colors) == len(nuclei_classes):
+            # Use frontend-provided colors (user's current selection) - highest priority
+            # Only use if length matches to avoid using incomplete color arrays (e.g., after reset)
+            final_class_colors_for_training = nuclei_colors
+            print(f"Using frontend-provided colors for training: {final_class_colors_for_training}")
+        elif CLASSIFIER_PATH is not None:
+            # If CLASSIFIER_PATH is set but no frontend colors (or length mismatch), pass None
+            # train_linear_classifier will load colors from classifier file (e.g., red from saved classifier)
+            # This ensures we use saved colors from classifier instead of old zarr colors (e.g., blue)
+            # This is especially important after reset when frontend state is cleared
+            final_class_colors_for_training = None
+            if nuclei_colors and len(nuclei_colors) != len(nuclei_classes):
+                print(f"Frontend colors length mismatch ({len(nuclei_colors)} vs {len(nuclei_classes)}), will use colors from classifier file")
+            else:
+                print(f"Will use colors from classifier file (CLASSIFIER_PATH is set, no frontend colors)")
+        elif NODE_NAME in zf and 'nuclei_class_HEX_color' in zf[NODE_NAME]:
+            # Last fallback: Use existing colors from zarr (only if no classifier path)
+            old_colors = zf[NODE_NAME]['nuclei_class_HEX_color'][()]
+            if len(old_colors) == len(nuclei_classes):
+                final_class_colors_for_training = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
+                print(f"Using colors from zarr for training: {final_class_colors_for_training}")
+        
         # Try supervised classification if we have classifier path or annotations
         classifier_result = None
         if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
+<<<<<<< Updated upstream
             classifier_result = train_linear_classifier(cell_embeddings, annotations_data, nuclei_classes=nuclei_classes)
+=======
+            classifier_result = train_linear_classifier(cell_embeddings, annotations_data, final_class_colors_for_training)
+>>>>>>> Stashed changes
             
             # Check for cancellation after training (train_linear_classifier returns None if cancelled)
             if classifier_result is None or cancel_event.is_set():
@@ -1307,11 +1400,14 @@ def run_classification(args) -> Dict[str, Any]:
                 # Use user input order for final output
                 final_class_names = nuclei_classes
                 
-                # Use user input colors if provided, otherwise keep classifier colors
+                # Use user input colors if provided and length matches, otherwise use classifier colors
+                # This ensures we use saved colors from classifier (e.g., red) if frontend colors are incomplete (e.g., after reset)
                 if nuclei_colors and len(nuclei_colors) == len(nuclei_classes):
                     final_class_colors = nuclei_colors
+                    print(f"Using frontend-provided colors for output: {final_class_colors}")
                 else:
                     # Map classifier colors to user input order
+                    # This ensures we use saved colors from classifier (e.g., red) instead of incomplete frontend colors
                     classifier_color_map = {name: color for name, color in zip(class_names, class_colors)}
                     final_class_colors = []
                     for cls_name in nuclei_classes:
@@ -1320,6 +1416,10 @@ def run_classification(args) -> Dict[str, Any]:
                         else:
                             # Default color for classes not in classifier
                             final_class_colors.append("#aaaaaa")
+                    if nuclei_colors and len(nuclei_colors) != len(nuclei_classes):
+                        print(f"Frontend colors length mismatch ({len(nuclei_colors)} vs {len(nuclei_classes)}), using classifier colors: {final_class_colors}")
+                    else:
+                        print(f"Using classifier colors mapped to user input order: {final_class_colors}")
                 
                 # Create mapping from classifier internal indices to user input indices
                 classifier_name_to_idx = {name: idx for idx, name in enumerate(class_names)}
@@ -1345,9 +1445,21 @@ def run_classification(args) -> Dict[str, Any]:
                             remapped_probs[:, user_idx] = 0.0
                     prediction_probs = remapped_probs
             else:
-                # No user input, use classifier output as-is
+                # No user input, but still prioritize frontend-provided colors if available (and length matches)
                 final_class_names = class_names
-                final_class_colors = class_colors
+                if nuclei_colors and len(nuclei_colors) == len(class_names):
+                    # Use frontend-provided colors (user's current selection) even if no user input classes
+                    # Only use if length matches to avoid using incomplete color arrays (e.g., after reset)
+                    final_class_colors = nuclei_colors
+                    print(f"Using frontend-provided colors (no user input classes): {final_class_colors}")
+                else:
+                    # Use classifier colors if frontend didn't provide colors or length mismatch
+                    # This ensures we use saved colors from classifier (e.g., red) instead of incomplete frontend colors
+                    final_class_colors = class_colors
+                    if nuclei_colors and len(nuclei_colors) != len(class_names):
+                        print(f"Frontend colors length mismatch ({len(nuclei_colors)} vs {len(class_names)}), using classifier colors: {final_class_colors}")
+                    else:
+                        print(f"Using classifier colors (no user input): {final_class_colors}")
         else:
             classification_method = "zero-shot"
             print(f"Zero-shot classification completed using {classification_method}")
@@ -1374,18 +1486,22 @@ def run_classification(args) -> Dict[str, Any]:
             progress_value = 100
             print("Progress: 100% (Similarities computed for zero-shot)")
 
+            # Priority: Use nuclei_colors from frontend (user's current color selection)
+            # Only fallback to zarr colors if frontend didn't provide colors
+            # This ensures user's color changes are saved when they click Update
             final_class_colors = None
-            # Check for existing colors within the same zf handle
-            if NODE_NAME in zf and 'nuclei_class_HEX_color' in zf[NODE_NAME]:
+            if nuclei_colors and len(nuclei_colors) == len(nuclei_classes):
+                # Frontend provided colors (user's current selection) - use them
+                final_class_colors = nuclei_colors
+            elif NODE_NAME in zf and 'nuclei_class_HEX_color' in zf[NODE_NAME]:
+                # Fallback: Use existing colors from zarr if frontend didn't provide
                 old_colors = zf[NODE_NAME]['nuclei_class_HEX_color'][()]
                 if len(old_colors) == len(nuclei_classes):
                     final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
 
             if final_class_colors is None:
-                if nuclei_colors:
-                    final_class_colors = nuclei_colors
-                else:
-                    final_class_colors = generate_distinct_colors(nuclei_classes)
+                # Last resort: Generate distinct colors
+                final_class_colors = generate_distinct_colors(nuclei_classes)
             final_class_names = nuclei_classes
 
         # Check for cancellation before saving results
@@ -1415,6 +1531,69 @@ def run_classification(args) -> Dict[str, Any]:
 
         colors_ascii = np.array([c.encode('utf-8') for c in final_class_colors], dtype='S256')
         grp_cls.create_dataset('nuclei_class_HEX_color', data=colors_ascii)
+
+        # Update all annotation colors to match new class colors
+        # This ensures that when user changes a class color and clicks Update,
+        # all annotations using that class get the new color
+        try:
+            if 'user_annotation' in zf and 'nuclei_annotations' in zf['user_annotation']:
+                annotations_dataset = zf['user_annotation/nuclei_annotations']
+                if 'cell_class' in annotations_dataset.dtype.names and 'cell_color' in annotations_dataset.dtype.names:
+                    # Build mapping from class_name to new color
+                    class_name_to_color = dict(zip(final_class_names, final_class_colors))
+                    
+                    # Helper function to convert hex color to int (0xRRGGBB format)
+                    def hex_to_int(hex_color):
+                        hex_color = hex_color.lstrip('#')
+                        if len(hex_color) == 6:
+                            return int(hex_color, 16)
+                        return -1
+                    
+                    # Read all annotations
+                    all_annotations = annotations_dataset[:]
+                    updated_count = 0
+                    
+                    # Update colors for annotations matching each class
+                    # Note: cell_class stores class index (0, 1, 2, ...), not class name
+                    for class_idx, class_name in enumerate(final_class_names):
+                        if class_name in class_name_to_color:
+                            new_color_hex = class_name_to_color[class_name]
+                            new_color_int = hex_to_int(new_color_hex)
+                            
+                            # Find annotations with this class index
+                            # cell_class stores the index into final_class_names array
+                            class_mask = (all_annotations['cell_class'] == class_idx)
+                            if np.any(class_mask):
+                                # Update colors in-place
+                                all_annotations['cell_color'][class_mask] = new_color_int
+                                updated_count += np.sum(class_mask)
+                                print(f"Updated {np.sum(class_mask)} annotations for class '{class_name}' (index {class_idx}) to color {new_color_hex}")
+                    
+                    if updated_count > 0:
+                        # Write updated annotations back
+                        # Note: We need to delete and recreate the dataset to update it
+                        del zf['user_annotation/nuclei_annotations']
+                        zf['user_annotation'].create_dataset('nuclei_annotations', data=all_annotations, 
+                                                             dtype=annotations_dataset.dtype, 
+                                                             shape=annotations_dataset.shape)
+                        print(f"Updated {updated_count} annotation colors to match new class colors")
+        except Exception as e:
+            # If update fails, log but don't fail the workflow
+            print(f"Warning: Could not update annotation colors: {e}")
+        
+        # Update user_annotation.attrs colormap to match new class colors
+        # This ensures the colormap (used by frontend) reflects the new colors
+        try:
+            if 'user_annotation' in zf:
+                user_anno_group = zf['user_annotation']
+                if hasattr(user_anno_group, 'attrs'):
+                    # Update class_names and class_colors in user_annotation.attrs
+                    user_anno_group.attrs['class_names'] = final_class_names
+                    user_anno_group.attrs['class_colors'] = final_class_colors
+                    print(f"Updated user_annotation.attrs colormap: {len(final_class_names)} classes with new colors")
+        except Exception as e:
+            # If update fails, log but don't fail the workflow
+            print(f"Warning: Could not update user_annotation.attrs colormap: {e}")
 
         # Save probability scores for active learning
         if prediction_probs is not None:
