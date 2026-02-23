@@ -1,91 +1,184 @@
+"""
+Standalone script: same logic as musk_embedding_taskNode.run_patch_classification.
+Process WSI(s) and save MuskNode embedding/coordinates to zarr (one .zarr dir per WSI).
+"""
 from musk_for_embedding import MUSK
 import time
 import os
-import h5py
-from safe_h5_utils import safe_h5_open
+import sys
+import argparse
+import glob
+import json
+import zarr
 import numpy as np
 from PIL import Image
 import tiffslide
 
-patch_size = 128
+# Same defaults as musk_embedding_taskNode.parse_args
+PATCH_SIZE = 224
+LEVEL = 0
+BATCH_SIZE = 4
+TISSUE_THRESHOLD = 0.1
+WSI_EXTENSIONS = (".svs", ".tif", ".tiff", ".ndpi", ".vms", ".vmu", ".scn", ".mrxs", ".bif")
 
-# Initialize MUSK model
-model_path = "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\checkpoints\\model.safetensors"
-musk = MUSK(model_path=model_path)
 
-# WSI file path
-wsi_path = "C:\\Users\\lsoho\\Git\\penn\\TissueLab-Agent-Experiments\\experiments\\pathology\\LAMINA-base\\q1\\TCGA-AN-A0FY-01Z-00-DX1.25F5E2A1-F92C-4FE1-BD90-0CDDE50DC066\\TCGA-AN-A0FY-01Z-00-DX1.25F5E2A1-F92C-4FE1-BD90-0CDDE50DC066.svs"
-output_dir = "C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\result_h5"
+def _resolve_model_path():
+    """Same model resolution as musk_embedding_taskNode.load_model_at_init."""
+    base_path = getattr(sys, "_MEIPASS", os.path.abspath(os.path.dirname(__file__)))
+    model_path = os.path.join(base_path, "checkpoints", "model.safetensors")
+    if not os.path.exists(model_path):
+        for alt in [
+            "checkpoints/model.safetensors",
+            os.path.join(base_path, "model", "model.safetensors"),
+            "model/model.safetensors",
+        ]:
+            if os.path.exists(alt):
+                model_path = alt
+                break
+    return model_path
 
-# Open WSI and get mask
-slide = tiffslide.TiffSlide(wsi_path)
-mask = musk.get_tissue_mask(slide)
 
-if mask is not None:
-    # Get WSI filename without extension
-    wsi_filename = os.path.splitext(os.path.basename(wsi_path))[0]
-    # Save mask image for viewing
-    mask_image = Image.fromarray(mask * 255)  # Convert to 0-255 range
-    mask_path = os.path.join(output_dir, f"{wsi_filename}_tissue_mask.png")
-    mask_image.save(mask_path)
-    print(f"Tissue mask saved to: {mask_path}")
-    
-    # Display basic mask information
-    tissue_percentage = (mask.sum() / mask.size) * 100
-    print(f"Mask size: {mask.shape}")
-    print(f"Tissue area percentage: {tissue_percentage:.2f}%")
-else:
-    print("Unable to generate tissue mask")
+def get_wsi_paths(wsi_input):
+    """Return list of WSI file paths. wsi_input can be a single file or a directory."""
+    if os.path.isfile(wsi_input):
+        return [wsi_input]
+    if os.path.isdir(wsi_input):
+        paths = []
+        for ext in WSI_EXTENSIONS:
+            paths.extend(glob.glob(os.path.join(wsi_input, "*" + ext)))
+        return sorted(paths)
+    return []
 
-print(f"Starting to process entire WSI with patch size {patch_size}x{patch_size}, results will be saved to {output_dir}...")
-start_time = time.time()
 
-# process the entire WSI
-patch_embeddings, patch_coordinates = musk.process_whole_wsi(
-    wsi_path=wsi_path,
-    patch_size=patch_size,
-    level=0,
-    batch_size=8,
-    use_tiffslide=True,
-    tissue_threshold=0.1
-)
+def _stored_patch_size_from_coordinates(coordinates):
+    """Infer patch_size from coordinate spacing (same as taskNode)."""
+    if coordinates is None or len(coordinates) < 2:
+        return None
+    coords_array = np.array(coordinates)
+    unique_x = np.unique(coords_array[:, 0])
+    unique_y = np.unique(coords_array[:, 1])
+    if len(unique_x) >= 2:
+        return int(np.min(np.diff(np.sort(unique_x))))
+    if len(unique_y) >= 2:
+        return int(np.min(np.diff(np.sort(unique_y))))
+    return None
 
-end_time = time.time()
-print(f"WSI processing complete, time elapsed: {end_time - start_time:.2f} seconds")
-print(f"Processed {len(patch_coordinates)} tissue patches")
-print(f"Feature vector shape: {patch_embeddings.shape}")
 
-# save embeddings and coordinates to h5 file
-if patch_embeddings is not None and len(patch_coordinates) > 0:
-    # get the WSI file name and build the h5 file path
-    wsi_filename = os.path.basename(wsi_path)
-    h5_path = os.path.join("C:\\Users\\lsoho\\Git\\penn\\Tissuelab-Model-Zoo\\patch_classification\\MUSK\\result_h5", f"{wsi_filename}.h5")
-    print(f"Saving embeddings to {h5_path}")
-    
-    with safe_h5_open(h5_path, 'w') as f:
-        # create MuskNode group
-        musk_node = f.create_group('MuskNode')
-        
-        # save embeddings
-        musk_node.create_dataset('embedding', data=patch_embeddings.cpu().numpy())
-        
-        # save coordinates
-        coord_data = np.array(patch_coordinates)
-        musk_node.create_dataset('coordinates', data=coord_data)
-        
-        # create empty output dataset
-        musk_node.create_dataset('output', shape=(), dtype=h5py.string_dtype())
-        
-        # create probability dataset
-        musk_node.create_dataset('probability', data=np.ones(len(patch_coordinates), dtype=np.float32))
-        
-        # save metadata
-        musk_node.attrs['wsi_path'] = wsi_path
-        musk_node.attrs['patch_size'] = patch_size
-        musk_node.attrs['level'] = 0
-        musk_node.attrs['embedding_dim'] = patch_embeddings.shape[1]
-        musk_node.attrs['num_patches'] = len(patch_coordinates)
+def run_patch_classification_one(musk, wsi_path, output_dir, patch_size=224, level=0,
+                                 batch_size=4, tissue_threshold=0.1, zarr_group="MuskNode"):
+    """
+    One-WSI processing: same logic as musk_embedding_taskNode.run_patch_classification.
+    If zarr already exists and patch_size matches => skip. Otherwise process and save.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    wsi_basename = os.path.basename(wsi_path)
+    zarr_path = os.path.join(output_dir, f"{wsi_basename}.zarr")
 
-    print(f"Successfully saved embeddings with shape {patch_embeddings.shape} to {h5_path}")
-else:
-    print("No embeddings to save - either no patches were found or processing failed")
+    # Step 1: Check if zarr exists and patch_size matches => skip (same as taskNode)
+    if os.path.exists(zarr_path):
+        try:
+            zf = zarr.open_group(zarr_path, "r")
+            if zarr_group in zf:
+                coordinates = zf[f"{zarr_group}/coordinates"][()]
+                embeddings = zf[f"{zarr_group}/embedding"][()]
+                stored_patch_size = _stored_patch_size_from_coordinates(coordinates)
+                if stored_patch_size is not None and stored_patch_size == patch_size:
+                    print(f"Using existing embeddings {zarr_path} (patch_size={stored_patch_size}) => skip")
+                    return True
+                if stored_patch_size is not None:
+                    print(f"Patch size mismatch: stored={stored_patch_size}, current={patch_size} => re-process")
+        except Exception as e:
+            print(f"Existing zarr invalid or missing data: {e} => re-process")
+
+    start_time = time.time()
+
+    def progress_callback(stage, payload):
+        if stage == "encode":
+            try:
+                percent = int(payload)
+                if percent % 10 == 0 or percent == 100:
+                    print(f"  encode progress: {percent}%")
+            except Exception:
+                pass
+
+    # Same call as taskNode (save_patches=False, output_mask_path=None, progress_callback)
+    patch_embeddings, patch_coordinates = musk.process_whole_wsi(
+        wsi_path=wsi_path,
+        patch_size=patch_size,
+        level=level,
+        batch_size=batch_size,
+        tissue_threshold=tissue_threshold,
+        save_patches=False,
+        output_mask_path=None,
+        progress_callback=progress_callback,
+    )
+
+    if patch_embeddings is None or len(patch_coordinates) == 0:
+        print(f"No patches for {wsi_path}, skip.")
+        return False
+
+    embeddings = patch_embeddings.cpu().numpy()
+    coordinates = np.array(patch_coordinates)
+
+    # Same structure as taskNode: root group -> MuskNode with embedding, coordinates, probability, output, metadata
+    zf = zarr.open_group(zarr_path, "w")
+    if zarr_group in zf:
+        del zf[zarr_group]
+    node_grp = zf.create_group(zarr_group)
+    node_grp.create_dataset("embedding", data=embeddings)
+    node_grp.create_dataset("coordinates", data=coordinates)
+    node_grp.create_dataset("probability", data=np.ones(len(coordinates), dtype=np.float32))
+    node_grp.create_dataset("output", shape=(), dtype="S1", data=b"")
+    meta = json.dumps({"patch_size": patch_size, "level": level}).encode("utf-8")
+    node_grp.create_dataset("metadata", shape=(), dtype=f"S{len(meta)}", data=meta)
+
+    elapsed = time.time() - start_time
+    print(f"Saved {embeddings.shape} -> {zarr_path} ({elapsed:.1f}s)")
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MUSK embedding (same logic as musk_embedding_taskNode)")
+    parser.add_argument("--wsi_dir", type=str, default=r"E:\experiments\UPENN-GBM\training_WSI",
+                        help="Single WSI file or directory of WSI files")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="Output dir for .zarr (default: <wsi_dir>/result_zarr or script dir result_zarr)")
+    parser.add_argument("--model_path", type=str, default=None)
+    parser.add_argument("--patch_size", type=int, default=PATCH_SIZE)
+    parser.add_argument("--level", type=int, default=LEVEL)
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--tissue_threshold", type=float, default=TISSUE_THRESHOLD)
+    args = parser.parse_args()
+
+    script_dir = os.path.abspath(os.path.dirname(__file__))
+    model_path = args.model_path or _resolve_model_path()
+    if not os.path.isfile(model_path):
+        print(f"Model not found: {model_path}")
+        return
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    musk = MUSK(model_path=model_path)
+
+    wsi_list = get_wsi_paths(args.wsi_dir)
+    if not wsi_list:
+        print(f"No WSI files under: {args.wsi_dir}")
+        return
+
+    if args.output_dir is None:
+        args.output_dir = (
+            os.path.join(os.path.abspath(args.wsi_dir), "result_zarr")
+            if os.path.isdir(args.wsi_dir)
+            else os.path.join(script_dir, "result_zarr")
+        )
+
+    print(f"WSI count: {len(wsi_list)}, output_dir: {args.output_dir}")
+    print(f"patch_size={args.patch_size}, level={args.level}, batch_size={args.batch_size}, tissue_threshold={args.tissue_threshold}")
+    for wsi_path in wsi_list:
+        run_patch_classification_one(
+            musk, wsi_path, args.output_dir,
+            patch_size=args.patch_size, level=args.level,
+            batch_size=args.batch_size, tissue_threshold=args.tissue_threshold,
+        )
+
+
+if __name__ == "__main__":
+    main()
