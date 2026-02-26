@@ -366,7 +366,7 @@ def _log_training_data_counts(class_names, y_train, n_positive):
         print(f"  {cname}: positive={pos_count}, weak={weak_count}")
 
 
-def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame):
+def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame, tissue_colors: list[str] = None):
     global CLASSIFIER_PATH, ZARR_PATH, ARGS
     
     # update XGBoost parameter settings
@@ -427,21 +427,33 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         old_class_names = class_names.copy()
                         class_names = all_unique_classes
                         
-                        # Update class_colors: keep existing colors, add default for new classes
-                        class_colors_map = annotations.groupby('tissue_class')['tissue_color'].first().to_dict()
+                        # Update class_colors: prioritize frontend-provided colors, then classifier colors, then annotations
                         new_class_colors = []
-                        for cn in class_names:
-                            if cn in class_colors_map:
-                                new_class_colors.append(class_colors_map[cn])
-                            elif cn in old_class_names:
-                                # Keep existing color for old classes
-                                old_idx = old_class_names.index(cn)
-                                if old_idx < len(class_colors):
-                                    new_class_colors.append(class_colors[old_idx])
+                        if tissue_colors and len(tissue_colors) == len(class_names):
+                            # Use frontend-provided colors (user's current selection) - highest priority
+                            new_class_colors = tissue_colors
+                            print(f"Using frontend-provided colors for updated classifier: {new_class_colors}")
+                        else:
+                            # Fallback: Build color mapping prioritizing classifier colors, then annotations
+                            # This ensures we use saved colors from classifier (e.g., red) instead of old annotation colors (e.g., blue)
+                            for cn in class_names:
+                                if cn in old_class_names:
+                                    # Keep existing color from classifier for old classes (e.g., red from saved classifier)
+                                    old_idx = old_class_names.index(cn)
+                                    if old_idx < len(class_colors):
+                                        new_class_colors.append(class_colors[old_idx])
+                                    else:
+                                        new_class_colors.append("#aaaaaa")
+                                elif not positive_annotations.empty:
+                                    # For new classes, try to get color from annotations
+                                    class_colors_map = positive_annotations.groupby('tissue_class')['tissue_color'].first().to_dict()
+                                    if cn in class_colors_map:
+                                        new_class_colors.append(class_colors_map[cn])
+                                    else:
+                                        new_class_colors.append("#aaaaaa")
                                 else:
                                     new_class_colors.append("#aaaaaa")
-                            else:
-                                new_class_colors.append("#aaaaaa")
+                            print(f"Using colors from classifier/annotations for updated classifier: {new_class_colors}")
                         class_colors = new_class_colors
                         
                         # Extract cell indices from the patch_ID column
@@ -492,6 +504,16 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     else:
                         # Class count unchanged, can use warm start for faster training
                         print(f"Class count unchanged, using warm start for incremental training...")
+                        
+                        # Update class_colors: prioritize frontend-provided colors, then keep existing colors
+                        # This ensures user's color changes are saved to classifier even when class count doesn't change
+                        if tissue_colors and len(tissue_colors) == len(class_names):
+                            # Use frontend-provided colors (user's current selection)
+                            class_colors = tissue_colors
+                            print(f"Using frontend-provided colors for updated classifier (warm start): {class_colors}")
+                        else:
+                            # Keep existing colors from classifier if frontend didn't provide new colors
+                            print(f"Keeping existing colors from classifier: {class_colors}")
                         
                         # Extract cell indices from the patch_ID column
                         cell_indices = annotations['patch_ID'].astype(int).values
@@ -615,6 +637,16 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 
                 print("Prediction completed")
                 
+                # Update class_colors: prioritize frontend-provided colors, then keep existing colors
+                # This ensures user's color changes are saved even when only predicting (no annotations)
+                if tissue_colors and len(tissue_colors) == len(class_names):
+                    # Use frontend-provided colors (user's current selection)
+                    class_colors = tissue_colors
+                    print(f"Using frontend-provided colors for prediction-only classifier: {class_colors}")
+                else:
+                    # Keep existing colors from classifier if frontend didn't provide new colors
+                    print(f"Keeping existing colors from classifier for prediction: {class_colors}")
+                
                 return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
         except Exception as e:
             print(f"Error loading or updating classifier: {e}")
@@ -665,29 +697,43 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         class_names = ["Negative control"] + class_names
         print(f"Added 'Negative control' to class_names (not in annotations): {class_names}")
 
-    # Create class_colors_map: first from ARGS, then fallback to classifier colors
-    class_colors_map = {}
-    tissue_classes = getattr(ARGS, "tissue_classes", [])
-    tissue_colors = getattr(ARGS, "tissue_colors", [])
-    if tissue_classes and tissue_colors and len(tissue_classes) == len(tissue_colors):
-        class_colors_map = dict(zip(tissue_classes, tissue_colors))
-        print(f"Using colors from ARGS: {class_colors_map}")
-    
-    # Fallback to classifier colors if ARGS doesn't have colors
-    if not class_colors_map and loaded_classifier_colors is not None:
-        class_colors_map = loaded_classifier_colors
-        print(f"Fallback to classifier colors: {class_colors_map}")
-    
+    # Build class_colors: prioritize function parameter, then ARGS, then classifier colors, then annotations
     class_colors = []
-    for cn in class_names:
-        if cn in class_colors_map and str(class_colors_map[cn]).strip() != "":
-            class_colors.append(class_colors_map[cn])
-        else:
-            # Default colors when not provided by user annotations or classifier
-            if str(cn).lower() == "negative control":
-                class_colors.append("#aaaaaa")
+    if tissue_colors and len(tissue_colors) == len(class_names):
+        # Use frontend-provided colors (user's current selection) - highest priority
+        class_colors = tissue_colors
+        print(f"Using frontend-provided colors for new classifier: {class_colors}")
+    else:
+        # Fallback: Build color mapping from ARGS, classifier, or annotations
+        class_colors_map = {}
+        tissue_classes_from_args = getattr(ARGS, "tissue_classes", [])
+        tissue_colors_from_args = getattr(ARGS, "tissue_colors", [])
+        if tissue_classes_from_args and tissue_colors_from_args and len(tissue_classes_from_args) == len(tissue_colors_from_args):
+            class_colors_map = dict(zip(tissue_classes_from_args, tissue_colors_from_args))
+            print(f"Using colors from ARGS: {class_colors_map}")
+        
+        # Fallback to classifier colors if ARGS doesn't have colors
+        if not class_colors_map and loaded_classifier_colors is not None:
+            class_colors_map = loaded_classifier_colors
+            print(f"Fallback to classifier colors: {class_colors_map}")
+        
+        # Fallback to annotations if still no colors
+        if not class_colors_map:
+            annotations_colors_map = positive_annotations.groupby('tissue_class')['tissue_color'].first().to_dict()
+            if annotations_colors_map:
+                class_colors_map = annotations_colors_map
+                print(f"Fallback to colors from annotations: {class_colors_map}")
+        
+        for cn in class_names:
+            if cn in class_colors_map and str(class_colors_map[cn]).strip() != "":
+                class_colors.append(class_colors_map[cn])
             else:
-                class_colors.append("#aaaaaa")
+                # Default colors when not provided
+                if str(cn).lower() == "negative control":
+                    class_colors.append("#aaaaaa")
+                else:
+                    class_colors.append("#aaaaaa")
+        print(f"Using colors from ARGS/classifier/annotations for new classifier: {class_colors}")
 
     cell_indices = positive_annotations['patch_ID'].astype(int).values
     X_train = cell_embeddings[cell_indices]
@@ -905,10 +951,36 @@ def run_classification(args) -> Dict[str, Any]:
         print(f"[{NODE_NAME}] Using tissue_classes: {tissue_classes}")
         print(f"[{NODE_NAME}] tissue_classes type: {type(tissue_classes)}, length: {len(tissue_classes) if tissue_classes else 0}")
 
+        # Determine final_class_colors early (before training) to pass to train_linear_classifier
+        # This ensures saved classifier uses user's current color selection
+        # Priority: frontend colors (if length matches) > classifier colors (loaded in train_linear_classifier) > zarr colors
+        final_class_colors_for_training = None
+        if tissue_colors and len(tissue_colors) == len(tissue_classes):
+            # Use frontend-provided colors (user's current selection) - highest priority
+            # Only use if length matches to avoid using incomplete color arrays (e.g., after reset)
+            final_class_colors_for_training = tissue_colors
+            print(f"[{NODE_NAME}] Using frontend-provided colors for training: {final_class_colors_for_training}")
+        elif CLASSIFIER_PATH is not None:
+            # If CLASSIFIER_PATH is set but no frontend colors (or length mismatch), pass None
+            # train_linear_classifier will load colors from classifier file (e.g., red from saved classifier)
+            # This ensures we use saved colors from classifier instead of old zarr colors (e.g., blue)
+            # This is especially important after reset when frontend state is cleared
+            final_class_colors_for_training = None
+            if tissue_colors and len(tissue_colors) != len(tissue_classes):
+                print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(tissue_classes)}), will use colors from classifier file")
+            else:
+                print(f"[{NODE_NAME}] Will use colors from classifier file (CLASSIFIER_PATH is set, no frontend colors)")
+        elif ZARR_GROUP in zf and 'tissue_class_HEX_color' in zf[ZARR_GROUP]:
+            # Last fallback: Use existing colors from zarr (only if no classifier path)
+            old_colors = zf[ZARR_GROUP]['tissue_class_HEX_color'][()]
+            if len(old_colors) == len(tissue_classes):
+                final_class_colors_for_training = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
+                print(f"[{NODE_NAME}] Using colors from zarr for training: {final_class_colors_for_training}")
+        
         # Try supervised classification if we have classifier path or annotations
         classifier_result = None
         if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
-            classifier_result = train_linear_classifier(cell_embeddings, annotations_data)
+            classifier_result = train_linear_classifier(cell_embeddings, annotations_data, final_class_colors_for_training)
             
         # Check if supervised classification succeeded
         if classifier_result is not None:
@@ -939,11 +1011,15 @@ def run_classification(args) -> Dict[str, Any]:
                 classifier_color_map = {name: color for name, color in zip(class_names, class_colors)}
                 final_class_colors = []
                 
-                # Use user colors if provided, otherwise use classifier colors
+                # Use user colors if provided and length matches, otherwise use classifier colors
+                # This ensures we use saved colors from classifier (e.g., red) if frontend colors are incomplete (e.g., after reset)
                 if tissue_colors and len(tissue_colors) == len(tissue_classes):
                     user_color_map = dict(zip(tissue_classes, tissue_colors))
+                    print(f"[{NODE_NAME}] Using frontend-provided colors for merged output: {tissue_colors}")
                 else:
                     user_color_map = {}
+                    if tissue_colors and len(tissue_colors) != len(tissue_classes):
+                        print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(tissue_classes)}), will use classifier colors")
                 
                 for cls_name in final_class_names:
                     if cls_name in user_color_map:
@@ -984,15 +1060,36 @@ def run_classification(args) -> Dict[str, Any]:
                 
                 print(f"[{NODE_NAME}] Mapped predictions to merged order. Final class names: {final_class_names}")
             elif CLASSIFIER_PATH is not None:
-                # CLASSIFIER_PATH is set but no user input, use classifier's class_names and class_colors directly
-                # These are already updated with new classes if user annotations had new classes
+                # CLASSIFIER_PATH is set but no user input, still prioritize frontend-provided colors if available (and length matches)
                 final_class_names = class_names
-                final_class_colors = class_colors
-                print(f"[{NODE_NAME}] Using classifier's classes and colors (CLASSIFIER_PATH is set, no user input): {final_class_names}")
+                if tissue_colors and len(tissue_colors) == len(class_names):
+                    # Use frontend-provided colors (user's current selection) even if no user input classes
+                    # Only use if length matches to avoid using incomplete color arrays (e.g., after reset)
+                    final_class_colors = tissue_colors
+                    print(f"[{NODE_NAME}] Using frontend-provided colors (CLASSIFIER_PATH set, no user input classes): {final_class_colors}")
+                else:
+                    # Use classifier colors if frontend didn't provide colors or length mismatch
+                    # This ensures we use saved colors from classifier (e.g., red) instead of incomplete frontend colors
+                    final_class_colors = class_colors
+                    if tissue_colors and len(tissue_colors) != len(class_names):
+                        print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(class_names)}), using classifier colors: {final_class_colors}")
+                    else:
+                        print(f"[{NODE_NAME}] Using classifier's colors (CLASSIFIER_PATH is set, no user input): {final_class_names}")
             else:
-                # No classifier path, use classifier output as-is (from annotations)
+                # No classifier path, but still prioritize frontend-provided colors if available (and length matches)
                 final_class_names = class_names
-                final_class_colors = class_colors
+                if tissue_colors and len(tissue_colors) == len(class_names):
+                    # Use frontend-provided colors (user's current selection)
+                    # Only use if length matches to avoid using incomplete color arrays (e.g., after reset)
+                    final_class_colors = tissue_colors
+                    print(f"[{NODE_NAME}] Using frontend-provided colors (no classifier path): {final_class_colors}")
+                else:
+                    # Use classifier colors if frontend didn't provide colors or length mismatch
+                    final_class_colors = class_colors
+                    if tissue_colors and len(tissue_colors) != len(class_names):
+                        print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(class_names)}), using classifier colors: {final_class_colors}")
+                    else:
+                        print(f"[{NODE_NAME}] Using classifier output colors (no classifier path): {final_class_colors}")
         else:
             classification_method = "zero-shot"
             print(f"Zero-shot classification completed using {classification_method}")
@@ -1022,17 +1119,22 @@ def run_classification(args) -> Dict[str, Any]:
             predictions = np.argmax(sims_arr, axis=1)
             prediction_probs = None # For zero-shot
 
+            # Priority: Use tissue_colors from frontend (user's current color selection)
+            # Only fallback to zarr colors if frontend didn't provide colors
+            # This ensures user's color changes are saved when they click Update
             final_class_colors = None
-            if ZARR_GROUP in zf and 'tissue_class_HEX_color' in zf[ZARR_GROUP]:
+            if tissue_colors and len(tissue_colors) == len(tissue_classes):
+                # Frontend provided colors (user's current selection) - use them
+                final_class_colors = tissue_colors
+            elif ZARR_GROUP in zf and 'tissue_class_HEX_color' in zf[ZARR_GROUP]:
+                # Fallback: Use existing colors from zarr if frontend didn't provide
                 old_colors = zf[ZARR_GROUP]['tissue_class_HEX_color'][()]
                 if len(old_colors) == len(tissue_classes):
                     final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
-                
+            
             if final_class_colors is None:
-                if tissue_colors:
-                    final_class_colors = tissue_colors
-                else:
-                    final_class_colors = generate_distinct_colors(tissue_classes)
+                # Last resort: Generate distinct colors
+                final_class_colors = generate_distinct_colors(tissue_classes)
             final_class_names = tissue_classes
 
         # D) result => cell_classification
@@ -1054,6 +1156,57 @@ def run_classification(args) -> Dict[str, Any]:
 
         colors_ascii = [c.encode('utf-8') for c in final_class_colors]
         grp_cls.create_dataset('tissue_class_HEX_color', shape=(len(colors_ascii),), dtype='S256', data=colors_ascii)
+
+        # Update all annotation colors to match new class colors
+        # This ensures that when user changes a class color and clicks Update,
+        # all annotations using that class get the new color
+        try:
+            if 'user_annotation' in zf and 'tissue_annotations' in zf['user_annotation']:
+                tissue_annotations_path = 'user_annotation/tissue_annotations'
+                dataset = zf[tissue_annotations_path]
+                
+                # Only update if dataset is reasonably small (performance consideration)
+                if hasattr(dataset, 'size') and dataset.size < 100000:
+                    raw_bytes = dataset[()]
+                    manual_tissue_annotations = json.loads(raw_bytes.decode("utf-8"))
+                    
+                    # Build mapping from class_name to new color
+                    class_name_to_color = dict(zip(final_class_names, final_class_colors))
+                    
+                    updated_count = 0
+                    for patch_id, annotation in manual_tissue_annotations.items():
+                        tissue_class = annotation.get("tissue_class")
+                        if tissue_class and tissue_class in class_name_to_color:
+                            new_color = class_name_to_color[tissue_class]
+                            if annotation.get("tissue_color") != new_color:
+                                annotation["tissue_color"] = new_color
+                                updated_count += 1
+                    
+                    if updated_count > 0:
+                        # Write updated annotations back
+                        del zf[tissue_annotations_path]
+                        zf['user_annotation'].create_dataset('tissue_annotations', 
+                                                             data=json.dumps(manual_tissue_annotations).encode('utf-8'))
+                        print(f"Updated {updated_count} patch annotation colors to match new class colors")
+                else:
+                    print(f"Info: Skipped annotation color update (dataset too large: {dataset.size})")
+        except Exception as e:
+            # If update fails, log but don't fail the workflow
+            print(f"Warning: Could not update patch annotation colors: {e}")
+        
+        # Update user_annotation.attrs colormap to match new class colors
+        # This ensures the colormap (used by frontend) reflects the new colors
+        try:
+            if 'user_annotation' in zf:
+                user_anno_group = zf['user_annotation']
+                if hasattr(user_anno_group, 'attrs'):
+                    # Update tissue_class_names and tissue_class_colors in user_annotation.attrs
+                    user_anno_group.attrs['tissue_class_names'] = final_class_names
+                    user_anno_group.attrs['tissue_class_colors'] = final_class_colors
+                    print(f"[{NODE_NAME}] Updated user_annotation.attrs colormap: {len(final_class_names)} classes with new colors")
+        except Exception as e:
+            # If update fails, log but don't fail the workflow
+            print(f"[{NODE_NAME}] Warning: Could not update user_annotation.attrs colormap: {e}")
 
         print("================")
         # Filter tissue_classes to only include classes that are actually predicted
