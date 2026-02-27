@@ -142,7 +142,7 @@ def main():
     if init_result['status'] != 'ok':
         print(f"[TEST] ERROR: Initialization failed: {init_result['message']}")
         return
-    print(f"[TEST] ✓ Model initialized: {init_result['message']}")
+    print(f"[TEST] [OK] Model initialized: {init_result['message']}")
     print()
     
     # Step 2: /read - Set up Zarr path and node name
@@ -161,8 +161,8 @@ def main():
     tasknode.ZARR_PATH = expected_zarr_path
     tasknode.NODE_NAME = "SegmentationNode"  # This is what run_wsi uses by default
     
-    print(f"[TEST] ✓ Expected Zarr path: {tasknode.ZARR_PATH}")
-    print(f"[TEST] ✓ Node name: {tasknode.NODE_NAME}")
+    print(f"[TEST] [OK] Expected Zarr path: {tasknode.ZARR_PATH}")
+    print(f"[TEST] [OK] Node name: {tasknode.NODE_NAME}")
     print()
     
     # Step 3: /execute - Run segmentation + embedding generation
@@ -192,41 +192,41 @@ def main():
         zarr_path = tasknode.ZARR_PATH
         node_name = tasknode.NODE_NAME
         if not os.path.exists(zarr_path):
-            print(f"  ✗ Zarr path does not exist: {zarr_path}")
+            print(f"  [FAIL] Zarr path does not exist: {zarr_path}")
         else:
             zf = zarr.open_group(zarr_path, mode='r')
             
             if node_name in zf:
-                print(f"  ✓ Node '{node_name}' found in Zarr")
+                print(f"  [OK] Node '{node_name}' found in Zarr")
                 
                 if 'centroids' in zf[node_name]:
                     centroids = zf[f"{node_name}/centroids"]
-                    print(f"  ✓ Centroids: shape={centroids.shape}, dtype={centroids.dtype}")
+                    print(f"  [OK] Centroids: shape={centroids.shape}, dtype={centroids.dtype}")
                 
                 if 'contours' in zf[node_name]:
                     contours = zf[f"{node_name}/contours"]
-                    print(f"  ✓ Contours: shape={contours.shape}, dtype={contours.dtype}")
+                    print(f"  [OK] Contours: shape={contours.shape}, dtype={contours.dtype}")
                 
                 if 'probability' in zf[node_name]:
                     prob = zf[f"{node_name}/probability"]
-                    print(f"  ✓ Probability: shape={prob.shape}, dtype={prob.dtype}")
+                    print(f"  [OK] Probability: shape={prob.shape}, dtype={prob.dtype}")
                 
                 if 'embedding' in zf[node_name]:
                     embedding = zf[f"{node_name}/embedding"]
-                    print(f"  ✓ Embedding: shape={embedding.shape}, dtype={embedding.dtype}")
-                    print(f"    → PLIP embeddings: {embedding.shape[1]} dimensions per nucleus")
-                    print(f"    → Total nuclei with embeddings: {embedding.shape[0]}")
+                    print(f"  [OK] Embedding: shape={embedding.shape}, dtype={embedding.dtype}")
+                    print(f"    [INFO] PLIP embeddings: {embedding.shape[1]} dimensions per nucleus")
+                    print(f"    [INFO] Total nuclei with embeddings: {embedding.shape[0]}")
                 else:
-                    print("  ✗ Embedding: NOT FOUND (embedding generation may have failed)")
+                    print("  [FAIL] Embedding: NOT FOUND (embedding generation may have failed)")
             else:
-                print(f"  ✗ Node '{node_name}' not found in Zarr")
+                print(f"  [FAIL] Node '{node_name}' not found in Zarr")
     except Exception as e:
-        print(f"  ✗ Error verifying outputs: {e}")
+        print(f"  [FAIL] Error verifying outputs: {e}")
         import traceback
         traceback.print_exc()
     
     print()
-    print(f"[TEST] ✓ End-to-end pipeline test complete!")
+    print(f"[TEST] [OK] End-to-end pipeline test complete!")
     print(f"[TEST] Output Zarr: {tasknode.ZARR_PATH}")
     print(f"[TEST] You can inspect the Zarr with: zarr.open('{tasknode.ZARR_PATH}', mode='r')")
 

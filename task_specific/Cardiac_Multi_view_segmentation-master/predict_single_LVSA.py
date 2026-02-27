@@ -47,7 +47,7 @@ def predict(model_path, input_image_path,
     print(f'Image dimension: {image_dimension}D')
     
     if image_dimension == 4:
-        print('⚠️  Detected 4D image (time series). Extracting first time point...')
+        print('[WARNING] Detected 4D image (time series). Extracting first time point...')
         # Extract first time point
         size = list(origin_image.GetSize())
         size[3] = 0  # Set time dimension to 0

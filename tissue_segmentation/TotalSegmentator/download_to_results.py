@@ -22,8 +22,8 @@ def setup_environment():
     os.environ['TOTALSEG_HOME_DIR'] = str(local_models)
     os.environ['nnUNet_results'] = str(results_dir)
     
-    print(f"✓ Models directory: {local_models}")
-    print(f"✓ Results directory: {results_dir}")
+    print(f"[OK] Models directory: {local_models}")
+    print(f"[OK] Results directory: {results_dir}")
     
     return local_models, results_dir
 
@@ -39,9 +39,9 @@ def download_weights_for_task(task_name, task_ids):
         try:
             print(f"\n[Task {task_id}] Downloading...")
             download_pretrained_weights(task_id)
-            print(f"✓ Task {task_id} downloaded successfully")
+            print(f"[OK] Task {task_id} downloaded successfully")
         except Exception as e:
-            print(f"⚠️  Task {task_id} failed: {e}")
+            print(f"[WARNING] Task {task_id} failed: {e}")
             continue
 
 def main():
@@ -57,15 +57,15 @@ def main():
     # Import after setting environment
     try:
         from totalsegmentator.libs import download_pretrained_weights
-        print("✓ TotalSegmentator imported successfully")
+        print("[OK] TotalSegmentator imported successfully")
     except ImportError as e:
-        print(f"❌ Failed to import TotalSegmentator: {e}")
+        print(f"[ERROR] Failed to import TotalSegmentator: {e}")
         print("Please run setup_selfcontained.bat first")
         return False
     
     print()
     print("Select which weights to download:")
-    print("1. Total (full body) - Task 297 [~1.5 GB] ⭐ Recommended")
+    print("1. Total (full body) - Task 297 [~1.5 GB] (Recommended)")
     print("2. Total (6mm, faster) - Task 298 [~500 MB]")
     print("3. Body composition - Task 299 [~200 MB]")
     print("4. All parts separately - Tasks 291-295 [~2 GB]")
@@ -109,12 +109,12 @@ def main():
         if item.is_dir() and item.name.startswith("Dataset"):
             size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
             size_mb = size / (1024 * 1024)
-            print(f"✓ {item.name} ({size_mb:.0f} MB)")
+            print(f"[OK] {item.name} ({size_mb:.0f} MB)")
             downloaded.append(item.name)
     
     print()
     print("=" * 60)
-    print(f"✅ Downloaded {len(downloaded)} model(s)")
+    print(f"[SUCCESS] Downloaded {len(downloaded)} model(s)")
     print("=" * 60)
     print()
     print("Folder structure:")
@@ -134,10 +134,10 @@ if __name__ == "__main__":
         success = main()
         sys.exit(0 if success else 1)
     except KeyboardInterrupt:
-        print("\n\n⚠️  Download cancelled by user")
+        print("\n\n[WARNING] Download cancelled by user")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\n[ERROR] Error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
