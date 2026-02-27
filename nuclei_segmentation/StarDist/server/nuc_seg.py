@@ -12,7 +12,7 @@ os.environ['MKL_NUM_THREADS'] = '16'      # Limit MKL threads
 try:
     import intel_extension_for_tensorflow as itex
     # Just importing ITEX is enough - it automatically optimizes TensorFlow
-    print("✓ Intel Extension for TensorFlow loaded")
+    print("[OK] Intel Extension for TensorFlow loaded")
 except ImportError:
     print("Intel Extension for TensorFlow not available, using standard TensorFlow")
 

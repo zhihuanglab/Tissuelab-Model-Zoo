@@ -65,7 +65,7 @@ def optimize_model_prediction(model):
         # Monkey patch the predict method
         model.keras_model.predict = fast_predict
         
-        print("✓ Model prediction optimized with tf.function")
+        print("[OK] Model prediction optimized with tf.function")
         
     except Exception as e:
         print(f"Warning: Could not optimize model with tf.function: {e}")
@@ -83,7 +83,7 @@ def configure_tensorflow_optimizations():
     # CRITICAL: Disable oneDNN which conflicts with AVX512 instructions
     # This is likely why 256 CPUs are slower than 32 CPUs!
     os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-    print("✓ Disabled oneDNN to enable AVX512 optimizations")
+    print("[OK] Disabled oneDNN to enable AVX512 optimizations")
     
     # Limit thread count to avoid over-parallelization overhead
     # Too many threads can actually slow things down due to context switching
@@ -98,7 +98,7 @@ def configure_tensorflow_optimizations():
         tf.config.threading.set_inter_op_parallelism_threads(2)
         tf.config.threading.set_intra_op_parallelism_threads(16)
         
-        print("✓ TensorFlow thread configuration set: inter_op=2, intra_op=16")
+        print("[OK] TensorFlow thread configuration set: inter_op=2, intra_op=16")
         
     except Exception as e:
         print(f"Warning: Could not configure TensorFlow threading: {e}")

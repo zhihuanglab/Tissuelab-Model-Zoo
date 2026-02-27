@@ -26,7 +26,7 @@ else:
 try:
     import intel_extension_for_tensorflow as itex
     # Just importing ITEX is enough - it automatically optimizes TensorFlow
-    print("✓ Intel Extension for TensorFlow loaded")
+    print("[OK] Intel Extension for TensorFlow loaded")
 except ImportError:
     print("Intel Extension for TensorFlow not available, using standard TensorFlow")
 
@@ -683,9 +683,9 @@ class SlideSegmentation():
             print(f"Boundary duplicated nuclei:          {len(boundary_duplicated)}")
 
             if len(duplicated)==0 and len(boundary_duplicated)==0:
-                print("✔ PASS — dedup and boundary consistency validated.")
+                print("[PASS] dedup and boundary consistency validated.")
             else:
-                print("❌ FAIL — inconsistencies detected.")
+                print("[FAIL] inconsistencies detected.")
 
             print("====================================================\n")
 
