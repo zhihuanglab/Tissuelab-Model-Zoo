@@ -48,6 +48,26 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
 )
 
+class LogsEndpointFilter(logging.Filter):
+    """Filter to suppress access logs for /logs, /status, and /health endpoints"""
+    def filter(self, record):
+        # Check if this is an access log for /logs, /status, or /health endpoints
+        message = record.getMessage() if hasattr(record, 'getMessage') else str(record.msg)
+
+        # List of endpoints and HTTP methods to filter
+        endpoints = ['/logs', '/status', '/health']
+        methods = ['GET', 'POST', 'PUT', 'DELETE']
+
+        # Check if message contains any endpoint-method combination
+        filtered_patterns = [f'{method} {endpoint}' for method in methods for endpoint in endpoints]
+        if any(pattern in message for pattern in filtered_patterns):
+            return False
+
+        # Also check path attribute if available
+        if hasattr(record, 'path') and record.path in endpoints:
+            return False
+        return True
+
 # global variables
 ARGS = None
 IS_MODEL_INITED = False
@@ -1674,6 +1694,11 @@ def main():
     parser.add_argument('--name', type=str, default='MuskNode', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args = parser.parse_args()
+
+    # Apply log filter to suppress /logs endpoint access logs
+    uvicorn_access_logger = logging.getLogger("uvicorn.access")
+    logs_filter = LogsEndpointFilter()
+    uvicorn_access_logger.addFilter(logs_filter)
 
     print(f"Starting {args.name} at port={args.port}")
 
