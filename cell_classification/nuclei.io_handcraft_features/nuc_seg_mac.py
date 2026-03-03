@@ -896,10 +896,10 @@ class SlideSegmentation():
         # Final statistics
         total_removed = original_count - len(self.final_points)
         
-        print(f"\n✅ Deduplication complete in {time.time() - start_time:.2f}s")
+        print(f"\n[OK] Deduplication complete in {time.time() - start_time:.2f}s")
         print(f"   Original nuclei count: {original_count:,}")
         #print(f"  ️  Total removed: {total_removed:,} (boundary: {boundary_removed:,}, global: {total_global_removed:,})")
-        print(f"✨ Final nuclei count: {len(self.final_points):,}")
+        print(f"[FINAL] Final nuclei count: {len(self.final_points):,}")
         print(f"   Total reduction: {total_removed/original_count*100:.2f}%")
         
         return total_removed
@@ -1045,7 +1045,7 @@ class SlideSegmentation():
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
         
-        print(f"✅ Visualization saved to: {output_path}")
+        print(f"[OK] Visualization saved to: {output_path}")
 
     def diagnose_overlap_parameters(self):
         """诊断 overlap 参数和去重效果"""

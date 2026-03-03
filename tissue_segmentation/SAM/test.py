@@ -81,7 +81,7 @@ if __name__ == "__main__":
     try:
         mask_generator, predictor = load_sam_model(model_type, checkpoint_path)
     except Exception as e:
-        print(f"❌ 加载 SAM 模型出错: {e}")
+        print(f"[ERROR] 加载 SAM 模型出错: {e}")
         exit(1)
 
     input_points = None  # 示例: [(300, 400), (500, 600)]
@@ -91,10 +91,10 @@ if __name__ == "__main__":
         image, masks, input_points, input_labels = segment_image(
             image_path, mask_generator, predictor, input_points, input_labels, target_size=(1024, 1024))
     except Exception as e:
-        print(f"❌ 处理图片出错: {e}")
+        print(f"[ERROR] 处理图片出错: {e}")
         exit(1)
 
     try:
         visualize_masks(image, masks, input_points, input_labels, area_threshold=1000)
     except Exception as e:
-        print(f"❌ 可视化出错: {e}")
+        print(f"[ERROR] 可视化出错: {e}")

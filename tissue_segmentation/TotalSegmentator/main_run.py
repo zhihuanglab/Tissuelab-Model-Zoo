@@ -193,22 +193,22 @@ def process_input(input_path, input_type, model_config, output_path, device="gpu
         end_time = time.time()
         processing_time = end_time - start_time
         
-        print(f"\n✅ Segmentation completed!")
-        print(f"⏱️  Processing time: {processing_time:.1f} seconds")
-        print(f"📁 Results saved to: {output_path}")
+        print(f"\n[SUCCESS] Segmentation completed!")
+        print(f"[TIME] Processing time: {processing_time:.1f} seconds")
+        print(f"[OUTPUT] Results saved to: {output_path}")
         
         # Display result information
         if os.path.exists(output_path):
             if os.path.isfile(output_path):
                 file_size = os.path.getsize(output_path) / (1024*1024)
-                print(f"📊 File size: {file_size:.1f} MB")
+                print(f"[INFO] File size: {file_size:.1f} MB")
             else:
                 # If it's a folder, count the number of files
                 files = list(Path(output_path).glob('*.nii.gz'))
-                print(f"📊 Generated {len(files)} segmentation files")
+                print(f"[INFO] Generated {len(files)} segmentation files")
         
     except Exception as e:
-        print(f"❌ Segmentation failed: {e}")
+        print(f"[ERROR] Segmentation failed: {e}")
         raise
 
 
@@ -267,16 +267,16 @@ Example usage:
     
     # Validate required parameters
     if not args.model:
-        print("❌ Error: Must specify model (-m/--model)")
+        print("[ERROR] Error: Must specify model (-m/--model)")
         print("Use --list-models to see available models")
         return
     
     if not args.input:
-        print("❌ Error: Must specify input path (-i/--input)")
+        print("[ERROR] Error: Must specify input path (-i/--input)")
         return
     
     if not args.output:
-        print("❌ Error: Must specify output path (-o/--output)")
+        print("[ERROR] Error: Must specify output path (-o/--output)")
         return
     
     # Get model configuration
@@ -290,10 +290,10 @@ Example usage:
     # Validate input
     is_valid, input_type, message = validate_input(args.input)
     if not is_valid:
-        print(f"❌ Input validation failed: {message}")
+        print(f"[ERROR] Input validation failed: {message}")
         return
     
-    print(f"✅ Input validation passed: {message}")
+    print(f"[OK] Input validation passed: {message}")
     
     # Process ROI subset
     roi_subset = None
@@ -312,11 +312,11 @@ Example usage:
             roi_subset=roi_subset
         )
         
-        print("\n🎉 Processing completed!")
+        print("\n[SUCCESS] Processing completed!")
         print(f"Results saved to: {args.output}")
         
     except Exception as e:
-        print(f"\n❌ Processing failed: {e}")
+        print(f"\n[ERROR] Processing failed: {e}")
         import traceback
         traceback.print_exc()
         return 1

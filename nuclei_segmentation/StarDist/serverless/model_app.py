@@ -372,7 +372,7 @@ def process_segmentation(patch_data):
         
         seg_throughput = len(adj_centroids) / seg_time if seg_time > 0 else 0
         
-        print(f"✅ {patch_id}: {len(adj_centroids)} nuclei in {seg_time:.1f}s")
+        print(f"[OK] {patch_id}: {len(adj_centroids)} nuclei in {seg_time:.1f}s")
         
         result = {
             'status': 'success',
@@ -632,11 +632,11 @@ def test_with_url():
     
     print("="*70)
     if result['status'] == 'success':
-        print("✅ Success!")
+        print("[SUCCESS] Success!")
         print(f"  Nuclei: {result['nuclei_count']:,}")
         print(f"  Time: {result['timing']['total']:.2f}s")
     else:
-        print("❌ Failed!")
+        print("[FAIL] Failed!")
         print(f"  Error: {result.get('message')}")
     print("="*70)
     

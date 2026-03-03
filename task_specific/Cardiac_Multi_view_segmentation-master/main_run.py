@@ -144,12 +144,12 @@ def convert_dicom_to_nifti(dicom_folder):
         
         # Write NIfTI file
         sitk.WriteImage(image, str(temp_nifti))
-        print(f"✅ Converted to: {temp_nifti}")
+        print(f"[OK] Converted to: {temp_nifti}")
         
         return str(temp_nifti)
         
     except Exception as e:
-        print(f"❌ DICOM conversion failed: {e}")
+        print(f"[ERROR] DICOM conversion failed: {e}")
         raise
 
 def process_input(input_path, input_type, view_config, output_path, 
@@ -224,19 +224,19 @@ def process_input(input_path, input_type, view_config, output_path,
         end_time = time.time()
         processing_time = end_time - start_time
         
-        print(f"\n✅ Segmentation completed!")
-        print(f"⏱️  Processing time: {processing_time:.1f} seconds")
-        print(f"📁 Result saved to: {output_path}")
+        print(f"\n[SUCCESS] Segmentation completed!")
+        print(f"[TIME] Processing time: {processing_time:.1f} seconds")
+        print(f"[OUTPUT] Result saved to: {output_path}")
         
         # Display result information
         if os.path.exists(output_path):
             file_size = os.path.getsize(output_path) / (1024*1024)
-            print(f"📊 File size: {file_size:.1f} MB")
-            print(f"📊 Output shape: {prediction.shape}")
+            print(f"[INFO] File size: {file_size:.1f} MB")
+            print(f"[INFO] Output shape: {prediction.shape}")
             
             # Display class statistics
             unique_labels = np.unique(prediction)
-            print(f"📊 Segmented classes:")
+            print(f"[INFO] Segmented classes:")
             for label in unique_labels:
                 if label < len(view_config['class_names']):
                     class_name = view_config['class_names'][label]
@@ -247,7 +247,7 @@ def process_input(input_path, input_type, view_config, output_path,
         return True
         
     except Exception as e:
-        print(f"❌ Segmentation failed: {e}")
+        print(f"[ERROR] Segmentation failed: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -335,21 +335,21 @@ Notes:
     
     # Validate required parameters
     if not args.view:
-        print("❌ Error: Must specify view (-v/--view)")
+        print("[ERROR] Error: Must specify view (-v/--view)")
         print("Use --list-views to see available views")
         return 1
     
     if not args.input:
-        print("❌ Error: Must specify input path (-i/--input)")
+        print("[ERROR] Error: Must specify input path (-i/--input)")
         return 1
     
     if not args.output:
-        print("❌ Error: Must specify output path (-o/--output)")
+        print("[ERROR] Error: Must specify output path (-o/--output)")
         return 1
     
     # Validate crop size
     if args.crop_size % 16 != 0 and args.crop_size != -1:
-        print(f"❌ Error: Crop size must be divisible by 16 (got {args.crop_size})")
+        print(f"[ERROR] Error: Crop size must be divisible by 16 (got {args.crop_size})")
         return 1
     
     # Get view configuration
@@ -364,10 +364,10 @@ Notes:
     # Validate input
     is_valid, input_type, converted_path, message = validate_input(args.input)
     if not is_valid:
-        print(f"❌ Input validation failed: {message}")
+        print(f"[ERROR] Input validation failed: {message}")
         return 1
     
-    print(f"✅ Input validation passed: {message}")
+    print(f"[OK] Input validation passed: {message}")
     
     # Convert DICOM to NIfTI if needed
     temp_file = None
@@ -396,19 +396,19 @@ Notes:
         )
         
         if success:
-            print("\n🎉 Processing completed successfully!")
+            print("\n[SUCCESS] Processing completed successfully!")
             print(f"Results saved to: {args.output}")
             return 0
         else:
-            print("\n❌ Processing failed")
+            print("\n[FAIL] Processing failed")
             return 1
             
     except KeyboardInterrupt:
-        print("\n⚠️  Process interrupted by user")
+        print("\n[WARNING] Process interrupted by user")
         return 1
         
     except Exception as e:
-        print(f"\n❌ Processing failed: {e}")
+        print(f"\n[ERROR] Processing failed: {e}")
         import traceback
         traceback.print_exc()
         return 1

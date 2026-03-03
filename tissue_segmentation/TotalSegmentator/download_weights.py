@@ -63,7 +63,7 @@ def download_weights():
         
         if default_weights.exists():
             print()
-            print("✓ Models downloaded to default location")
+            print("[OK] Models downloaded to default location")
             print(f"  {default_weights}")
             print()
             
@@ -87,7 +87,7 @@ def download_weights():
                         shutil.copy2(item, dest)
                         copied_count += 1
             
-            print(f"✓ Copied {copied_count} items to {local_models}")
+            print(f"[OK] Copied {copied_count} items to {local_models}")
             
             # List what we have
             print()
@@ -96,22 +96,22 @@ def download_weights():
                 if item.is_dir():
                     size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
                     size_mb = size / (1024 * 1024)
-                    print(f"  📦 {item.name} (~{size_mb:.0f} MB)")
+                    print(f"  [MODEL] {item.name} (~{size_mb:.0f} MB)")
         else:
             print()
-            print("⚠️  Default weights location not found")
+            print("[WARNING] Default weights location not found")
             print(f"   Expected at: {default_weights}")
             print()
             print("Models will be downloaded on first actual use.")
         
         print()
         print("=" * 60)
-        print("✅ Setup complete!")
+        print("[SUCCESS] Setup complete!")
         print("=" * 60)
         print()
         print("Your TotalSegmentator folder now contains:")
-        print(f"  ✓ Source code: {script_dir / 'TotalSegmentator-src'}")
-        print(f"  ✓ Model weights: {local_models}")
+        print(f"  [OK] Source code: {script_dir / 'TotalSegmentator-src'}")
+        print(f"  [OK] Model weights: {local_models}")
         print()
         print("You can now:")
         print("  1. Test: python totalsegmentator_tasknode.py --port 8010")
@@ -121,7 +121,7 @@ def download_weights():
         return True
         
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"[ERROR] Error: {e}")
         import traceback
         traceback.print_exc()
         return False

@@ -816,9 +816,9 @@ class SlideSegmentation():
         # Final statistics
         total_removed = original_count - len(self.final_points)
         
-        print(f"\n✅ Deduplication complete in {time.time() - start_time:.2f}s")
+        print(f"\n[OK] Deduplication complete in {time.time() - start_time:.2f}s")
         print(f"  Original nuclei count: {original_count:,}")
-        print(f"✨ Final nuclei count: {len(self.final_points):,}")
+        print(f"[FINAL] Final nuclei count: {len(self.final_points):,}")
         print(f"  Total reduction: {total_removed/original_count*100:.2f}%")
         
         return total_removed
