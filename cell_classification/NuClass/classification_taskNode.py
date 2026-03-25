@@ -128,14 +128,29 @@ def _int_color_to_hex(color_int: int) -> str:
     hex_str = f"{color_int:06x}"
     return f"#{hex_str}"
 
-def load_structured_nuclei_annotations(zf, annotation_path: str) -> pd.DataFrame:
+def _decode_class_name_at_index(name_list, idx: int):
+    """Return string name at idx or None if out of range / missing."""
+    if not name_list or idx < 0 or idx >= len(name_list):
+        return None
+    n = name_list[idx]
+    if n is None:
+        return None
+    if hasattr(n, "decode"):
+        return n.decode("utf-8")
+    return str(n)
+
+
+def load_structured_nuclei_annotations(zf, annotation_path: str, ui_class_names=None) -> pd.DataFrame:
     """
     Load structured array nuclei annotations and convert to DataFrame.
-    
+
     Args:
         zf: Zarr group object
         annotation_path: Path to annotation dataset (e.g., 'user_annotation/nuclei_annotations')
-        
+        ui_class_names: Optional list from frontend (same order as class indices). When set, positive
+            rows use these names for cell_class strings so they stay aligned after renames even if
+            user_annotation.attrs class_names is stale.
+
     Returns:
         DataFrame with columns: cell_ID, cell_class, cell_color
         Returns None if no annotations found or error occurs
@@ -196,8 +211,12 @@ def load_structured_nuclei_annotations(zf, annotation_path: str) -> pd.DataFrame
                 'cell_class_index': class_id,
                 'cell_color': _int_color_to_hex(cell_color_data[idx])
             }
-            if class_names and class_id < len(class_names):
-                row['cell_class'] = class_names[class_id]
+            ui_name = _decode_class_name_at_index(ui_class_names, class_id)
+            if ui_name is not None:
+                row['cell_class'] = ui_name
+            elif class_names and class_id < len(class_names):
+                cn = class_names[class_id]
+                row['cell_class'] = cn.decode('utf-8') if hasattr(cn, 'decode') else cn
             else:
                 row['cell_class'] = None
             positive_data.append(row)
@@ -213,8 +232,12 @@ def load_structured_nuclei_annotations(zf, annotation_path: str) -> pd.DataFrame
                 'exclude_class_indices': [excluded_class_idx],
                 'cell_color': _int_color_to_hex(cell_color_data[idx])
             }
-            if class_names and 0 <= excluded_class_idx < len(class_names):
-                row['exclude_classes'] = [class_names[excluded_class_idx]]
+            ex_ui = _decode_class_name_at_index(ui_class_names, excluded_class_idx)
+            if ex_ui is not None:
+                row['exclude_classes'] = [ex_ui]
+            elif class_names and 0 <= excluded_class_idx < len(class_names):
+                cn = class_names[excluded_class_idx]
+                row['exclude_classes'] = [cn.decode('utf-8') if hasattr(cn, 'decode') else cn]
             negative_data.append(row)
         
         # Combine positive and negative annotations
@@ -329,15 +352,52 @@ def _annotation_labels_to_classifier_indices(annotations, class_names, nuclei_cl
     n = len(annotations)
     y = np.full(n, -1, dtype=np.int32)
     for i, (_, row) in enumerate(annotations.iterrows()):
+        # Index-only path: cell_class_index → nuclei_classes[index] (name bridge) → classifier index
+        # Name fallback removed: class identity is determined solely by integer index
         if 'cell_class_index' in row and pd.notna(row.get('cell_class_index')) and nuclei_classes and len(nuclei_classes) > 0:
             ann_idx = int(row['cell_class_index'])
             if 0 <= ann_idx < len(nuclei_classes):
                 class_name = nuclei_classes[ann_idx]
                 if class_name in class_names:
                     y[i] = class_names.index(class_name)
-        if y[i] < 0 and pd.notna(row.get('cell_class')) and row['cell_class'] in class_names:
-            y[i] = class_names.index(row['cell_class'])
     return y
+
+
+def _xgb_params_for_class_count(base_params: dict, n_classes: int) -> dict:
+    """
+    When K>2, force multi:softprob + num_class=K. Otherwise sklearn-xgboost infers binary
+    from y containing only {0,1} and predict_proba is (N,2) while the UI has K classes
+    (e.g. Lymphocytes has no samples yet) → broadcast error into (N,K) buffers.
+    """
+    p = dict(base_params)
+    if n_classes > 2:
+        p["objective"] = "multi:softprob"
+        p["num_class"] = int(n_classes)
+        p.pop("base_score", None)
+    return p
+
+
+def _expand_predict_proba_to_n_classes(batch_probs: np.ndarray, n_classes: int, clf) -> np.ndarray:
+    """Map predict_proba (N, K') to (N, n_classes) using clf.classes_; pad missing columns."""
+    batch_probs = np.asarray(batch_probs, dtype=np.float64)
+    if batch_probs.ndim != 2:
+        return np.zeros((0, n_classes), dtype=np.float32)
+    if batch_probs.shape[1] == n_classes:
+        return batch_probs.astype(np.float32, copy=False)
+    out = np.zeros((batch_probs.shape[0], n_classes), dtype=np.float32)
+    classes_ = getattr(clf, "classes_", None)
+    if classes_ is not None and len(classes_) == batch_probs.shape[1]:
+        for j, c in enumerate(np.ravel(np.asarray(classes_))):
+            ci = int(c)
+            if 0 <= ci < n_classes and j < batch_probs.shape[1]:
+                out[:, ci] = batch_probs[:, j].astype(np.float32, copy=False)
+    else:
+        k = min(batch_probs.shape[1], n_classes)
+        out[:, :k] = batch_probs[:, :k].astype(np.float32, copy=False)
+    rs = out.sum(axis=1, keepdims=True)
+    rs[rs == 0] = 1.0
+    out = out / rs
+    return out
 
 
 def print_h5_structure(file_path):
@@ -648,25 +708,49 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 # Update progress after loading classifier
                 progress_value = 40
                 print(f"Progress: 40% (Classifier loaded)")
-                
+
+                # Detect rename: nuclei_classes has same count as classifier's class_names but different names.
+                # Treat as rename (not new class addition) — update class_names to new names so GT
+                # annotations (stored with new names after rename) match the classifier slots by index.
+                if nuclei_classes and len(nuclei_classes) == len(class_names) and list(nuclei_classes) != list(class_names):
+                    print(f"[ClassificationNode] Rename detected: {class_names} -> {nuclei_classes}. Applying rename.")
+                    # Build old→new name mapping by index position (only for positions that changed)
+                    old_to_new = {old: new for old, new in zip(class_names, nuclei_classes) if old != new}
+                    class_names = list(nuclei_classes)
+                    # prev_labels remain valid — they are class indices, not names
+                    # Also update annotation cell_class names so new_classes computation doesn't see old
+                    # names (e.g. "Lymphocytes") as brand-new classes and trigger a false classes_changed.
+                    if old_to_new and not positive_annotations.empty and 'cell_class' in positive_annotations.columns:
+                        positive_annotations = positive_annotations.copy()
+                        positive_annotations['cell_class'] = positive_annotations['cell_class'].replace(old_to_new)
+                    if old_to_new and not annotations.empty and 'cell_class' in annotations.columns:
+                        annotations = annotations.copy()
+                        annotations['cell_class'] = annotations['cell_class'].replace(old_to_new)
+
                 if not positive_annotations.empty:
-                    existing_classes = set(class_names)
-                    annotated_classes = set(positive_annotations['cell_class'].dropna().unique())
-                    if 'cell_class_index' in positive_annotations.columns and nuclei_classes and len(nuclei_classes) > 0:
-                        for ann_idx in positive_annotations['cell_class_index'].dropna().astype(int):
-                            if 0 <= ann_idx < len(nuclei_classes):
-                                annotated_classes.add(nuclei_classes[ann_idx])
-                    new_classes = annotated_classes - existing_classes
-                    
+                    # Detect new classes purely by index: any cell_class_index >= len(class_names)
+                    # means the annotation refers to a class the classifier doesn't know yet.
+                    # Name-based comparison removed — class identity is determined by integer index only.
+                    existing_count = len(class_names)
+                    annotated_indices = set()
+                    if 'cell_class_index' in positive_annotations.columns:
+                        annotated_indices = {
+                            int(idx) for idx in positive_annotations['cell_class_index'].dropna()
+                            if 0 <= int(idx) < len(nuclei_classes)
+                        }
+                    new_indices = {idx for idx in annotated_indices if idx >= existing_count}
+
                     # Check if class count changed
-                    classes_changed = len(new_classes) > 0
-                    
+                    classes_changed = len(new_indices) > 0
+
                     if classes_changed:
-                        print(f"Found new classes: {new_classes}, class count changed. Retraining with all data...")
-                        
+                        # Resolve new class names via nuclei_classes (index → name bridge)
+                        new_class_names = [nuclei_classes[idx] for idx in sorted(new_indices)]
+                        print(f"Found new class indices: {new_indices} ({new_class_names}), retraining with all data...")
+
                         # Merge all classes: existing + new
                         # Ensure "Negative control" is first if it exists
-                        all_unique_classes = list(existing_classes) + list(new_classes)
+                        all_unique_classes = list(class_names) + new_class_names
                         if "Negative control" in all_unique_classes:
                             all_unique_classes.remove("Negative control")
                             all_unique_classes = ["Negative control"] + all_unique_classes
@@ -719,19 +803,11 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_update = X_update[~invalid_mask]
                             y_update = y_update[~invalid_mask]
                         
-                        # Re-encode previous labels with new class list
-                        if prev_embeddings is not None and prev_labels is not None:
-                            # Convert previous labels (indices) back to class names using old class_names
-                            prev_labels_as_names = [old_class_names[i] for i in prev_labels]
-                            # Re-encode with new complete class list
-                            prev_labels_reencoded = pd.Categorical(prev_labels_as_names, categories=class_names).codes
-                            
-                            # Combine all data
-                            X_train = np.vstack([prev_embeddings, X_update])
-                            y_train = np.concatenate([prev_labels_reencoded, y_update])
-                        else:
-                            X_train = X_update
-                            y_train = y_update
+                        # Use only current zarr GT (X_update) for retraining.
+                        # zarr GT is cumulative, so X_update already contains all previously-confirmed cells.
+                        # Combining with prev_embeddings would double-count old GT and dilute new annotations.
+                        X_train = X_update
+                        y_train = y_update
                         
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
@@ -742,11 +818,11 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             y_train = np.concatenate([y_train, neg_y], axis=0)
                             sample_weights_inc = np.concatenate([np.ones(n_pos), neg_w])
                             _log_training_data_counts(class_names, y_train, n_pos)
-                            clf = xgb.XGBClassifier(**xgb_params)
+                            clf = xgb.XGBClassifier(**_xgb_params_for_class_count(xgb_params, len(class_names)))
                             clf.fit(X_train, y_train, sample_weight=sample_weights_inc)
                         else:
                             _log_training_data_counts(class_names, y_train, n_pos)
-                            clf = xgb.XGBClassifier(**xgb_params)
+                            clf = xgb.XGBClassifier(**_xgb_params_for_class_count(xgb_params, len(class_names)))
                             clf.fit(X_train, y_train)
                         
                         # Check for cancellation after retraining
@@ -786,13 +862,11 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_update = X_update[~invalid_mask]
                             y_update = y_update[~invalid_mask]
                         
-                        # Combine new and previous training data
-                        if prev_embeddings is not None and prev_labels is not None:
-                            X_train = np.vstack([prev_embeddings, X_update])
-                            y_train = np.concatenate([prev_labels, y_update])
-                        else:
-                            X_train = X_update
-                            y_train = y_update
+                        # Use only current zarr GT (X_update) for incremental training.
+                        # zarr GT is cumulative, so X_update already contains all previously-confirmed cells.
+                        # Combining with prev_embeddings would double-count old GT and dilute new annotations.
+                        X_train = X_update
+                        y_train = y_update
                         
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
@@ -886,6 +960,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     # OPTIMIZATION: Only call predict_proba once, then extract predictions from probabilities
                     # This avoids duplicate forward passes through the model
                     batch_probs = clf.predict_proba(batch_embeddings)
+                    batch_probs = _expand_predict_proba_to_n_classes(batch_probs, len(class_names), clf)
                     # Apply exclude_classes constraints from "not class" annotations
                     if exclude_map:
                         for local_idx in range(len(batch_probs)):
@@ -975,32 +1050,45 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     if has_negative_examples:
         print(f"[ClassificationNode] Negative annotations with exclude constraints: {len(negative_annotations)} cells ('not this type')")
     
-    unique_classes = list(positive_annotations['cell_class'].dropna().unique()) if not positive_annotations.empty else []
-    if not positive_annotations.empty and 'cell_class_index' in positive_annotations.columns and nuclei_classes and len(nuclei_classes) > 0:
-        for ann_idx in positive_annotations['cell_class_index'].dropna().astype(int):
-            if 0 <= ann_idx < len(nuclei_classes):
-                unique_classes.append(nuclei_classes[ann_idx])
-        unique_classes = list(dict.fromkeys(unique_classes))
-    
-    if len(unique_classes) < 1 and not has_negative_examples:
-        raise ValueError("Need at least 1 class in annotation or negative examples => fallback to zero-shot")
+    # Prefer frontend nuclei_classes as the authoritative class list. Otherwise, merging unique
+    # annotation *strings* (decoded with stale user_annotation.attrs class_names, e.g. "Adipocytes")
+    # with names from nuclei_classes via cell_class_index (e.g. "Tumor") produces duplicate slots
+    # for the same class index → class_names length 4 while y uses indices 0,2,3 → XGBoost error:
+    # "Expected: [0 1 2], got [0 2 3]".
+    if nuclei_classes and len(nuclei_classes) > 0:
+        class_names = list(nuclei_classes)
+        if "Negative control" in class_names and class_names[0] != "Negative control":
+            class_names = ["Negative control"] + [c for c in class_names if c != "Negative control"]
+        elif "Negative control" not in class_names:
+            class_names = ["Negative control"] + class_names
+            print(f"Added 'Negative control' to class_names (prepended; not in nuclei_classes): {class_names}")
+        print(
+            f"[ClassificationNode] Using frontend nuclei_classes as classifier class_names "
+            f"(avoids stale Zarr label duplicates): {class_names}"
+        )
+        if positive_annotations.empty and not has_negative_examples:
+            raise ValueError("Need at least 1 class in annotation or negative examples => fallback to zero-shot")
+    else:
+        unique_classes = list(positive_annotations['cell_class'].dropna().unique()) if not positive_annotations.empty else []
+        if not positive_annotations.empty and 'cell_class_index' in positive_annotations.columns and nuclei_classes and len(nuclei_classes) > 0:
+            for ann_idx in positive_annotations['cell_class_index'].dropna().astype(int):
+                if 0 <= ann_idx < len(nuclei_classes):
+                    unique_classes.append(nuclei_classes[ann_idx])
+            unique_classes = list(dict.fromkeys(unique_classes))
 
-    # Build class_names: ensure "Negative control" is first
-    # IMPORTANT: Even if annotations don't have "Negative control", we need to add it to class_names
-    # BEFORE encoding y_train, so that class indices are consistent
-    class_names = []
-    has_negative_control = "Negative control" in unique_classes
-    if has_negative_control:
-        class_names.append("Negative control")
-        unique_classes.remove("Negative control")
-    class_names.extend(unique_classes)
-    
-    # If "Negative control" is not in annotations, we need to add it to class_names now
-    # (before encoding y_train) so that when we add negative control vectors later,
-    # the class indices will be correct (0 = "Negative control", 1 = "Class1", 2 = "Class2", etc.)
-    if not has_negative_control:
-        class_names = ["Negative control"] + class_names
-        print(f"Added 'Negative control' to class_names (not in annotations): {class_names}")
+        if len(unique_classes) < 1 and not has_negative_examples:
+            raise ValueError("Need at least 1 class in annotation or negative examples => fallback to zero-shot")
+
+        class_names = []
+        has_negative_control = "Negative control" in unique_classes
+        if has_negative_control:
+            class_names.append("Negative control")
+            unique_classes.remove("Negative control")
+        class_names.extend(unique_classes)
+
+        if not has_negative_control:
+            class_names = ["Negative control"] + class_names
+            print(f"Added 'Negative control' to class_names (not in annotations): {class_names}")
 
     # Build class_colors: prioritize frontend-provided colors, then fallback to annotations
     class_colors = []
@@ -1086,7 +1174,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     n_positive = int((sample_weights == 1.0).sum()) if sample_weights is not None else len(y_train)
     _log_training_data_counts(class_names, y_train, n_positive)
     
-    clf = xgb.XGBClassifier(**xgb_params)
+    clf = xgb.XGBClassifier(**_xgb_params_for_class_count(xgb_params, len(class_names)))
     print("Training new classifier...")
     
     # Use sample_weights if available (for negative examples)
@@ -1155,6 +1243,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         # OPTIMIZATION: Only call predict_proba once, then extract predictions from probabilities
         # This avoids duplicate forward passes through the model
         batch_probs = clf.predict_proba(batch_embeddings)
+        batch_probs = _expand_predict_proba_to_n_classes(batch_probs, len(class_names), clf)
         
         # Apply exclude_classes constraints: set probability to 0 for excluded classes
         if exclude_map:
@@ -1245,11 +1334,19 @@ def run_classification(args) -> Dict[str, Any]:
         start_time = time.time()
 
         zf = zarr.open_group(ZARR_PATH, mode='a')  # Open in append mode for read/write
-        # A) check annotation
+        nuclei_classes = getattr(args, "nuclei_classes", None) or []
+        if not isinstance(nuclei_classes, list):
+            nuclei_classes = list(nuclei_classes) if nuclei_classes else []
+
+        # A) check annotation (UI class list decodes indices -> names; avoids stale attrs after renames)
         annotations_data = None
         use_supervised = False
         if 'user_annotation' in zf and 'nuclei_annotations' in zf['user_annotation']:
-            annotations_data = load_structured_nuclei_annotations(zf, 'user_annotation/nuclei_annotations')
+            annotations_data = load_structured_nuclei_annotations(
+                zf,
+                'user_annotation/nuclei_annotations',
+                ui_class_names=nuclei_classes if nuclei_classes else None,
+            )
             if annotations_data is not None and not annotations_data.empty:
                 use_supervised = True
             else:
@@ -1272,7 +1369,6 @@ def run_classification(args) -> Dict[str, Any]:
     
         # C) supervised or zero-shot
         organ = getattr(args, "organ", None)
-        nuclei_classes = getattr(args, "nuclei_classes", [])
         nuclei_colors = getattr(args, "nuclei_colors", [])
 
         # Determine final_class_colors early (before training) to pass to train_linear_classifier
@@ -1601,6 +1697,31 @@ def run_classification(args) -> Dict[str, Any]:
         except Exception as e:
             # If update fails, log but don't fail the workflow
             print(f"Warning: Could not update user_annotation.attrs colormap: {e}")
+
+        # Keep user_annotation/class_counts JSON keys aligned with final_class_names (panel uses this;
+        # stale keys after rename caused Tumor=0 while indices still pointed at old names).
+        try:
+            if 'user_annotation' in zf and 'nuclei_annotations' in zf['user_annotation'] and final_class_names:
+                ua = zf['user_annotation']
+                ann_ds = ua['nuclei_annotations']
+                full = ann_ds[:]
+                if 'cell_class' in full.dtype.names:
+                    cc = full['cell_class']
+                    n = len(final_class_names)
+                    valid = (cc >= 0) & (cc < n)
+                    bc = (
+                        np.bincount(cc[valid].astype(np.int64), minlength=n)
+                        if np.any(valid)
+                        else np.zeros(n, dtype=np.int64)
+                    )
+                    counts_dict = {str(final_class_names[i]): int(bc[i]) for i in range(n)}
+                    counts_bytes = json.dumps(counts_dict, ensure_ascii=False).encode("utf-8")
+                    if 'class_counts' in ua:
+                        del ua['class_counts']
+                    ua.create_dataset('class_counts', data=counts_bytes)
+                    print(f"[ClassificationNode] Updated user_annotation/class_counts for {n} classes")
+        except Exception as e:
+            print(f"Warning: Could not update user_annotation class_counts: {e}")
 
         # Save probability scores for active learning
         if prediction_probs is not None:

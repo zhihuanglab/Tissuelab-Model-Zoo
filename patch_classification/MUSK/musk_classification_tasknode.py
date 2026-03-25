@@ -198,6 +198,117 @@ def generate_distinct_colors(tissue_classes: list[str]) -> list[str]:
         colors.append(color)
     return colors
 
+
+def _decode_zarr_label(x):
+    if x is None:
+        return None
+    if isinstance(x, bytes):
+        return x.decode("utf-8")
+    return str(x)
+
+
+def _build_tissue_slot_remap_to_ui(ui_class_names, *canonical_lists):
+    """
+    Map annotation strings that used an older class list (same length, same slot order) to the
+    current UI tissue_classes list — same idea as nuclei cell_class index + UI names, but for
+    JSON-stored tissue strings after renames.
+    """
+    if not ui_class_names:
+        return {}
+    ui = [_decode_zarr_label(n) for n in ui_class_names]
+    out = {}
+    for src in canonical_lists:
+        if not src:
+            continue
+        old = [_decode_zarr_label(n) for n in src]
+        if len(old) != len(ui):
+            continue
+        for i in range(len(ui)):
+            if old[i] != ui[i]:
+                out[old[i]] = ui[i]
+    return out
+
+
+def _apply_tissue_slot_remap_df(df: pd.DataFrame, remap: dict) -> pd.DataFrame:
+    if df is None or df.empty or not remap:
+        return df
+    df = df.copy()
+
+    def _map_label(val):
+        if pd.isna(val):
+            return val
+        s = _decode_zarr_label(val)
+        return remap.get(s, s)
+
+    if "tissue_class" in df.columns:
+        df["tissue_class"] = df["tissue_class"].map(_map_label)
+
+    if "exclude_classes" in df.columns:
+
+        def _map_exc_cell(v):
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return v
+            if isinstance(v, list):
+                return [remap.get(_decode_zarr_label(x), _decode_zarr_label(x)) for x in v]
+            if isinstance(v, str) and v.startswith("["):
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        return [remap.get(_decode_zarr_label(x), _decode_zarr_label(x)) for x in parsed]
+                except Exception:
+                    pass
+            return _map_label(v)
+
+        df["exclude_classes"] = df["exclude_classes"].map(_map_exc_cell)
+
+    return df
+
+
+def _read_prev_musk_tissue_class_names(zf):
+    if ZARR_GROUP not in zf or "tissue_class_name" not in zf[ZARR_GROUP]:
+        return None
+    raw = zf[ZARR_GROUP]["tissue_class_name"][:]
+    return [_decode_zarr_label(x) for x in raw]
+
+
+def _remap_tissue_json_annotations_inplace(manual_dict: dict, remap: dict) -> int:
+    """Apply old_name->new_name to tissue_class and exclude_classes. Returns number of fields touched."""
+    if not remap or not manual_dict:
+        return 0
+    changed = 0
+    for _pid, ann in manual_dict.items():
+        if not isinstance(ann, dict):
+            continue
+        tc = ann.get("tissue_class")
+        if tc is not None:
+            s = _decode_zarr_label(tc)
+            if s in remap:
+                ann["tissue_class"] = remap[s]
+                changed += 1
+        exc = ann.get("exclude_classes")
+        if isinstance(exc, list) and exc:
+            new_exc = [_decode_zarr_label(x) for x in exc]
+            new_exc = [remap.get(x, x) for x in new_exc]
+            if new_exc != exc:
+                ann["exclude_classes"] = new_exc
+                changed += 1
+    return changed
+
+
+def _recompute_patch_class_counts_bytes(final_class_names, manual_tissue_annotations: dict) -> bytes:
+    counts = {str(_decode_zarr_label(n)): 0 for n in final_class_names}
+    for ann in manual_tissue_annotations.values():
+        if not isinstance(ann, dict):
+            continue
+        tc = ann.get("tissue_class")
+        if tc is None:
+            continue
+        k = _decode_zarr_label(tc)
+        if k in counts:
+            counts[k] += 1
+    return json.dumps(counts, ensure_ascii=False).encode("utf-8")
+
+
 def save_classifier_params(clf, class_names, class_colors, train_data, max_samples_per_class=100000000000000):
     """Save classifier parameters and training data to XGBoost model file"""
     global SAVE_CLASSIFIER_PATH
@@ -920,7 +1031,20 @@ def run_classification(args) -> Dict[str, Any]:
 
         # Open Zarr store once for all operations
         zf = zarr.open_group(zarr_path, 'a')
-        # A) check annotation
+
+        tissue_classes = getattr(args, "tissue_classes", None) or []
+        if not isinstance(tissue_classes, list):
+            tissue_classes = list(tissue_classes) if tissue_classes else []
+
+        attrs_tissue_names = None
+        if 'user_annotation' in zf and hasattr(zf['user_annotation'], 'attrs'):
+            raw_attr = zf['user_annotation'].attrs.get('tissue_class_names', [])
+            if raw_attr is not None and len(raw_attr) > 0:
+                attrs_tissue_names = [_decode_zarr_label(x) for x in list(raw_attr)]
+
+        prev_musk_at_load = _read_prev_musk_tissue_class_names(zf)
+
+        # A) check annotation (remap stale class strings to UI list by slot, like nuclei index + UI names)
         annotations_data = None
         use_supervised = False
         if 'user_annotation' in zf and 'tissue_annotations' in zf['user_annotation']:
@@ -928,6 +1052,11 @@ def run_classification(args) -> Dict[str, Any]:
             ann_dict = json.loads(raw_bytes.decode("utf-8"))
             annotations_data = pd.DataFrame(ann_dict).T
             use_supervised = True
+            if tissue_classes and annotations_data is not None and not annotations_data.empty:
+                _rmap = _build_tissue_slot_remap_to_ui(tissue_classes, attrs_tissue_names, prev_musk_at_load)
+                if _rmap:
+                    annotations_data = _apply_tissue_slot_remap_df(annotations_data, _rmap)
+                    print(f"[{NODE_NAME}] Remapped tissue annotation strings to match UI class list: {_rmap}")
         else:
             annotations_data = None
             use_supervised = False
@@ -962,7 +1091,6 @@ def run_classification(args) -> Dict[str, Any]:
             raise ValueError(error_msg + " => no cell_embeddings")
 
         # C) supervised or zero-shot
-        tissue_classes = getattr(args, "tissue_classes", [])
         tissue_colors = getattr(args, "tissue_colors", [])
         progress_value = 80
         print(f"[{NODE_NAME}] Progress: 80%")
@@ -1158,6 +1286,14 @@ def run_classification(args) -> Dict[str, Any]:
             final_class_names = tissue_classes
 
         # D) result => cell_classification
+        old_attrs_tissue_names = None
+        if 'user_annotation' in zf and hasattr(zf['user_annotation'], 'attrs'):
+            o = zf['user_annotation'].attrs.get('tissue_class_names', [])
+            if o is not None and len(o) > 0:
+                old_attrs_tissue_names = [_decode_zarr_label(x) for x in list(o)]
+
+        prev_musk_tissue_names = _read_prev_musk_tissue_class_names(zf)
+
         saved_datasets = {}
         if ZARR_GROUP in zf:
             for name in ['coordinates', 'embedding']:
@@ -1189,7 +1325,14 @@ def run_classification(args) -> Dict[str, Any]:
                 if hasattr(dataset, 'size') and dataset.size < 100000:
                     raw_bytes = dataset[()]
                     manual_tissue_annotations = json.loads(raw_bytes.decode("utf-8"))
-                    
+
+                    slot_remap = _build_tissue_slot_remap_to_ui(
+                        final_class_names, prev_musk_tissue_names, old_attrs_tissue_names
+                    )
+                    renamed = _remap_tissue_json_annotations_inplace(manual_tissue_annotations, slot_remap)
+                    if renamed:
+                        print(f"[{NODE_NAME}] Renamed {renamed} tissue annotation field(s) to match final_class_names")
+
                     # Build mapping from class_name to new color
                     class_name_to_color = dict(zip(final_class_names, final_class_colors))
                     
@@ -1202,12 +1345,13 @@ def run_classification(args) -> Dict[str, Any]:
                                 annotation["tissue_color"] = new_color
                                 updated_count += 1
                     
-                    if updated_count > 0:
+                    if updated_count > 0 or renamed > 0:
                         # Write updated annotations back
                         del zf[tissue_annotations_path]
                         zf['user_annotation'].create_dataset('tissue_annotations', 
                                                              data=json.dumps(manual_tissue_annotations).encode('utf-8'))
-                        print(f"Updated {updated_count} patch annotation colors to match new class colors")
+                        if updated_count > 0:
+                            print(f"Updated {updated_count} patch annotation colors to match new class colors")
                 else:
                     print(f"Info: Skipped annotation color update (dataset too large: {dataset.size})")
         except Exception as e:
@@ -1227,6 +1371,22 @@ def run_classification(args) -> Dict[str, Any]:
         except Exception as e:
             # If update fails, log but don't fail the workflow
             print(f"[{NODE_NAME}] Warning: Could not update user_annotation.attrs colormap: {e}")
+
+        # Align patch_class_counts JSON with final_class_names + current tissue_annotations (same as nuclei class_counts)
+        try:
+            if 'user_annotation' in zf and 'tissue_annotations' in zf['user_annotation'] and final_class_names:
+                ua = zf['user_annotation']
+                tds = ua['tissue_annotations']
+                traw = tds[()]
+                if traw:
+                    tdict = json.loads(traw.decode("utf-8"))
+                    counts_bytes = _recompute_patch_class_counts_bytes(final_class_names, tdict)
+                    if 'patch_class_counts' in ua:
+                        del ua['patch_class_counts']
+                    ua.create_dataset('patch_class_counts', data=counts_bytes)
+                    print(f"[{NODE_NAME}] Updated user_annotation/patch_class_counts for {len(final_class_names)} classes")
+        except Exception as e:
+            print(f"[{NODE_NAME}] Warning: Could not update patch_class_counts: {e}")
 
         print("================")
         # Filter tissue_classes to only include classes that are actually predicted
