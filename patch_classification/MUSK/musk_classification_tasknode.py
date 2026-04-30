@@ -1641,7 +1641,7 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_GROUP, DEP_ZARR_GROUPS, LAST_TRAINED_CLF_BUNDLE
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_GROUP, DEP_ZARR_GROUPS, LAST_TRAINED_CLF_BUNDLE, CLASS_OPERATIONS
     LAST_TRAINED_CLF_BUNDLE = None
     NODE_NAME = data.get("node_name", "MuskNode")
     DEPENDENCIES = data.get("dependencies", [])
@@ -1651,6 +1651,7 @@ def read_node(data: Dict[str, Any]):
 
     CLASSIFIER_PATH = None
     SAVE_CLASSIFIER_PATH = None
+    CLASS_OPERATIONS = {}
 
     print(f"[NODE_NAME] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
     if not ZARR_PATH or not os.path.exists(ZARR_PATH):
@@ -1693,6 +1694,12 @@ def read_node(data: Dict[str, Any]):
                 if isinstance(val_json, list) and len(val_json) > 0:
                     ARGS.tissue_colors = val_json
                     print(f"[{NODE_NAME}] tissue_colors: {ARGS.tissue_colors}")
+            elif k == "class_operations":
+                CLASS_OPERATIONS = _normalize_class_operations(val_json)
+                if _has_rename_cycle(CLASS_OPERATIONS.get("renames", [])):
+                    print(f"[{NODE_NAME}] Detected rename cycle, ignoring rename operations.")
+                    CLASS_OPERATIONS["renames"] = []
+                print(f"[{NODE_NAME}] class_operations => {CLASS_OPERATIONS}")
         
         # Debug: Print final classifier path values
         print(f"[{NODE_NAME}] Final CLASSIFIER_PATH: {CLASSIFIER_PATH}")
