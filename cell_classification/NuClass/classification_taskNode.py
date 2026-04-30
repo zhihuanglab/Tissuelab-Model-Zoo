@@ -95,6 +95,7 @@ DEPENDENCIES = []
 PLIP_MODELS = None  # tuple: (processor, model, text_projection, device)
 CLASSIFIER_PATH = None
 SAVE_CLASSIFIER_PATH = None
+CLASS_OPERATIONS = {}
 
 # new global variable for progress
 progress_value = 0  # Global variable to store progress
@@ -106,6 +107,178 @@ cancel_event = threading.Event()  # Thread-safe cancellation event
 current_execution_thread = None  # Track current execution thread for cancellation
 
 # --------------- utils functions ---------------
+
+def _normalize_class_operations(raw_ops):
+    ops = {"renames": [], "adds": []}
+    if not isinstance(raw_ops, dict):
+        return ops
+
+    renames = raw_ops.get("renames", [])
+    if isinstance(renames, list):
+        for item in renames:
+            if not isinstance(item, dict):
+                continue
+            src = str(item.get("from", "")).strip()
+            dst = str(item.get("to", "")).strip()
+            if src and dst and src != dst:
+                ops["renames"].append({"from": src, "to": dst})
+
+    adds = raw_ops.get("adds", [])
+    if isinstance(adds, list):
+        for item in adds:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            color = item.get("color")
+            if name:
+                ops["adds"].append({"name": name, "color": color})
+    return ops
+
+def _has_rename_cycle(renames):
+    if not renames:
+        return False
+    graph = {}
+    for op in renames:
+        src = op.get("from")
+        dst = op.get("to")
+        if src and dst:
+            graph[src] = dst
+
+    visited = set()
+    in_stack = set()
+
+    def visit(node):
+        if node in in_stack:
+            return True
+        if node in visited:
+            return False
+        visited.add(node)
+        in_stack.add(node)
+        nxt = graph.get(node)
+        if nxt is not None and visit(nxt):
+            return True
+        in_stack.remove(node)
+        return False
+
+    for node in list(graph.keys()):
+        if visit(node):
+            return True
+    return False
+
+
+def _decode_attr_str_list(val):
+    if val is None:
+        return []
+    if isinstance(val, np.ndarray):
+        val = val.tolist()
+    out = []
+    for x in val:
+        if isinstance(x, (bytes, bytearray)):
+            out.append(x.decode("utf-8"))
+        else:
+            out.append(str(x))
+    return out
+
+
+def _resolve_rename_terminal(name: str, rename_graph: dict) -> str:
+    """Follow single-step renames until a fixed point (caller must ensure no cycles)."""
+    seen = set()
+    n = name
+    while n in rename_graph and n not in seen:
+        seen.add(n)
+        n = rename_graph[n]
+    return n
+
+
+def _build_frontend_color_map(nuclei_classes, nuclei_colors):
+    """Build class_name -> color map from current UI payload."""
+    if not nuclei_classes or not nuclei_colors:
+        return {}
+    if len(nuclei_classes) != len(nuclei_colors):
+        return {}
+    return {str(name): str(color) for name, color in zip(nuclei_classes, nuclei_colors)}
+
+
+def _ordered_annotation_classes(positive_annotations: pd.DataFrame, nuclei_classes=None):
+    """
+    Build deterministic class order from annotations:
+    - first-seen class names in annotation rows
+    - then class names resolved from cell_class_index using current nuclei_classes
+    """
+    ordered = []
+    if positive_annotations is not None and not positive_annotations.empty:
+        for v in positive_annotations.get("cell_class", pd.Series(dtype=object)).dropna().tolist():
+            sv = str(v)
+            if sv and sv not in ordered:
+                ordered.append(sv)
+        if nuclei_classes and len(nuclei_classes) > 0 and 'cell_class_index' in positive_annotations.columns:
+            for ann_idx in positive_annotations['cell_class_index'].dropna().astype(int):
+                if 0 <= ann_idx < len(nuclei_classes):
+                    sv = str(nuclei_classes[ann_idx])
+                    if sv and sv not in ordered:
+                        ordered.append(sv)
+    return ordered
+
+
+def _persist_nuclei_rename_to_user_annotation(zf, effective_renames, nuclei_classes, nuclei_colors):
+    """
+    Keep user_annotation/class_counts and attrs class_names consistent with panel renames.
+
+    class_counts is stored as JSON keyed by class *name*. After A->C, keys must move to C
+    or seg_service will append orphan names to dynamic_class_names (stale rows in the UI).
+    """
+    if not effective_renames or "user_annotation" not in zf:
+        return
+    ua = zf["user_annotation"]
+    rename_graph = {op["from"]: op["to"] for op in effective_renames}
+
+    # 1) Remap persisted class_counts (name -> count)
+    if "class_counts" in ua:
+        try:
+            raw = ua["class_counts"][()]
+            if isinstance(raw, bytes):
+                counts_dict = json.loads(raw.decode("utf-8"))
+            else:
+                counts_dict = json.loads(raw)
+        except Exception as e:
+            print(f"[ClassificationNode] Warning: could not parse class_counts for rename remap: {e}")
+            counts_dict = {}
+        if isinstance(counts_dict, dict) and counts_dict:
+            new_counts = {}
+            for k, v in counts_dict.items():
+                nk = _resolve_rename_terminal(str(k), rename_graph)
+                try:
+                    iv = int(v)
+                except Exception:
+                    iv = 0
+                new_counts[nk] = new_counts.get(nk, 0) + iv
+            out_bytes = json.dumps(new_counts, ensure_ascii=False).encode("utf-8")
+            try:
+                del ua["class_counts"]
+            except KeyError:
+                pass
+            ua.create_dataset("class_counts", data=out_bytes)
+            print(f"[ClassificationNode] Remapped user_annotation/class_counts after rename: {new_counts}")
+
+    # 2) Sync attrs class_names / class_colors with workflow (preferred) or apply rename chain
+    if hasattr(ua, "attrs"):
+        nc = [str(x) for x in (nuclei_classes or [])]
+        old_names = _decode_attr_str_list(ua.attrs.get("class_names", []))
+        if nc and old_names and len(old_names) == len(nc):
+            ua.attrs["class_names"] = nc
+            if nuclei_colors and len(nuclei_colors) == len(nc):
+                ua.attrs["class_colors"] = [str(c) for c in nuclei_colors]
+            print(f"[ClassificationNode] user_annotation.attrs class_names synced to workflow list ({len(nc)} classes)")
+        elif nc and not old_names:
+            ua.attrs["class_names"] = nc
+            if nuclei_colors and len(nuclei_colors) == len(nc):
+                ua.attrs["class_colors"] = [str(c) for c in nuclei_colors]
+            print(f"[ClassificationNode] user_annotation.attrs class_names initialized from workflow")
+        elif old_names:
+            mapped = [_resolve_rename_terminal(nm, rename_graph) for nm in old_names]
+            ua.attrs["class_names"] = mapped
+            print(f"[ClassificationNode] user_annotation.attrs class_names remapped by rename ops: {mapped}")
+
 
 def _int_color_to_hex(color_int: int) -> str:
     """Convert integer RGB value to hex color string.
@@ -596,7 +769,9 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
             If provided and length matches class_names, these colors will be used instead of
             extracting from annotations.
     """
-    global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, progress_value, cancel_event
+    global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS, progress_value, cancel_event
+    class_ops = _normalize_class_operations(CLASS_OPERATIONS)
+    effective_renames = [] if _has_rename_cycle(class_ops.get("renames", [])) else class_ops.get("renames", [])
     
     # update XGBoost parameter settings
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -644,19 +819,16 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
             loaded_params = load_classifier_params(CLASSIFIER_PATH)
             if loaded_params is not None:
                 clf, class_names, class_colors, prev_embeddings, prev_labels = loaded_params
+                old_class_names = class_names.copy()
                 print(f"Loaded existing classifier parameters, classes: {class_names}")
                 # Update progress after loading classifier
                 progress_value = 40
                 print(f"Progress: 40% (Classifier loaded)")
                 
                 if not positive_annotations.empty:
-                    existing_classes = set(class_names)
-                    annotated_classes = set(positive_annotations['cell_class'].dropna().unique())
-                    if 'cell_class_index' in positive_annotations.columns and nuclei_classes and len(nuclei_classes) > 0:
-                        for ann_idx in positive_annotations['cell_class_index'].dropna().astype(int):
-                            if 0 <= ann_idx < len(nuclei_classes):
-                                annotated_classes.add(nuclei_classes[ann_idx])
-                    new_classes = annotated_classes - existing_classes
+                    existing_classes = list(class_names)
+                    annotated_classes_ordered = _ordered_annotation_classes(positive_annotations, nuclei_classes)
+                    new_classes = [cn for cn in annotated_classes_ordered if cn not in existing_classes]
                     
                     # Check if class count changed
                     classes_changed = len(new_classes) > 0
@@ -672,36 +844,28 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             all_unique_classes = ["Negative control"] + all_unique_classes
                         
                         # Update class_names
-                        old_class_names = class_names.copy()
                         class_names = all_unique_classes
                         
                         # Update class_colors: prioritize frontend-provided colors, then classifier colors, then annotations
+                        # Build color mapping prioritizing frontend payload by class name,
+                        # then existing classifier colors, then annotations.
+                        frontend_color_map = _build_frontend_color_map(nuclei_classes, nuclei_colors)
+                        ann_color_map = annotations.groupby('cell_class')['cell_color'].first().to_dict() if not annotations.empty else {}
                         new_class_colors = []
-                        if nuclei_colors and len(nuclei_colors) == len(class_names):
-                            # Use frontend-provided colors (user's current selection) - highest priority
-                            new_class_colors = nuclei_colors
-                            print(f"Using frontend-provided colors for updated classifier: {new_class_colors}")
-                        else:
-                            # Fallback: Build color mapping prioritizing classifier colors, then annotations
-                            # This ensures we use saved colors from classifier (e.g., red) instead of old annotation colors (e.g., blue)
-                            for cn in class_names:
-                                if cn in old_class_names:
-                                    # Keep existing color from classifier for old classes (e.g., red from saved classifier)
-                                    old_idx = old_class_names.index(cn)
-                                    if old_idx < len(class_colors):
-                                        new_class_colors.append(class_colors[old_idx])
-                                    else:
-                                        new_class_colors.append("#aaaaaa")
-                                elif not annotations.empty:
-                                    # For new classes, try to get color from annotations
-                                    class_colors_map = annotations.groupby('cell_class')['cell_color'].first().to_dict()
-                                    if cn in class_colors_map:
-                                        new_class_colors.append(class_colors_map[cn])
-                                    else:
-                                        new_class_colors.append("#aaaaaa")
+                        for cn in class_names:
+                            if cn in frontend_color_map:
+                                new_class_colors.append(frontend_color_map[cn])
+                            elif cn in old_class_names:
+                                old_idx = old_class_names.index(cn)
+                                if old_idx < len(class_colors):
+                                    new_class_colors.append(class_colors[old_idx])
                                 else:
                                     new_class_colors.append("#aaaaaa")
-                            print(f"Using colors from classifier/annotations for updated classifier: {new_class_colors}")
+                            elif cn in ann_color_map:
+                                new_class_colors.append(ann_color_map[cn])
+                            else:
+                                new_class_colors.append("#aaaaaa")
+                        print(f"Using merged frontend/classifier/annotation colors for updated classifier: {new_class_colors}")
                         class_colors = new_class_colors
                         
                         # Extract cell indices from the cell_ID column
@@ -732,6 +896,25 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         else:
                             X_train = X_update
                             y_train = y_update
+
+                        # Append-only rename behavior for classifier models:
+                        # when A -> B, keep A data and clone A's historical samples to B.
+                        if prev_embeddings is not None and prev_labels is not None and effective_renames:
+                            alias_x = []
+                            alias_y = []
+                            for op in effective_renames:
+                                src = op["from"]
+                                dst = op["to"]
+                                if src in old_class_names and dst in class_names:
+                                    src_idx = old_class_names.index(src)
+                                    dst_idx = class_names.index(dst)
+                                    src_mask = np.asarray(prev_labels) == src_idx
+                                    if np.any(src_mask):
+                                        alias_x.append(prev_embeddings[src_mask])
+                                        alias_y.append(np.full(int(np.sum(src_mask)), dst_idx, dtype=np.int32))
+                            if alias_x:
+                                X_train = np.vstack([X_train] + alias_x)
+                                y_train = np.concatenate([y_train] + alias_y)
                         
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
@@ -764,12 +947,12 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         
                         # Update class_colors: prioritize frontend-provided colors, then keep existing colors
                         # This ensures user's color changes are saved to classifier even when class count doesn't change
-                        if nuclei_colors and len(nuclei_colors) == len(class_names):
-                            # Use frontend-provided colors (user's current selection)
-                            class_colors = nuclei_colors
-                            print(f"Using frontend-provided colors for updated classifier (warm start): {class_colors}")
+                        frontend_color_map = _build_frontend_color_map(nuclei_classes, nuclei_colors)
+                        if frontend_color_map:
+                            class_colors = [frontend_color_map.get(cn, class_colors[i] if i < len(class_colors) else "#aaaaaa")
+                                            for i, cn in enumerate(class_names)]
+                            print(f"Using frontend-mapped colors for updated classifier (warm start): {class_colors}")
                         else:
-                            # Keep existing colors from classifier if frontend didn't provide new colors
                             print(f"Keeping existing colors from classifier: {class_colors}")
                         
                         # Extract cell indices from the cell_ID column
@@ -793,6 +976,24 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         else:
                             X_train = X_update
                             y_train = y_update
+
+                        # Append-only rename behavior for classifier models.
+                        if prev_embeddings is not None and prev_labels is not None and effective_renames:
+                            alias_x = []
+                            alias_y = []
+                            for op in effective_renames:
+                                src = op["from"]
+                                dst = op["to"]
+                                if src in old_class_names and dst in class_names:
+                                    src_idx = old_class_names.index(src)
+                                    dst_idx = class_names.index(dst)
+                                    src_mask = np.asarray(prev_labels) == src_idx
+                                    if np.any(src_mask):
+                                        alias_x.append(prev_embeddings[src_mask])
+                                        alias_y.append(np.full(int(np.sum(src_mask)), dst_idx, dtype=np.int32))
+                            if alias_x:
+                                X_train = np.vstack([X_train] + alias_x)
+                                y_train = np.concatenate([y_train] + alias_y)
                         
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
@@ -932,12 +1133,12 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 # Update class_colors: prioritize frontend-provided colors, then keep existing colors
                 # This ensures user's color changes are saved even when only predicting (no annotations)
                 old_class_colors = class_colors.copy() if isinstance(class_colors, list) else list(class_colors)
-                if nuclei_colors and len(nuclei_colors) == len(class_names):
-                    # Use frontend-provided colors (user's current selection)
-                    class_colors = nuclei_colors
-                    print(f"Using frontend-provided colors for prediction-only classifier: {class_colors}")
+                frontend_color_map = _build_frontend_color_map(nuclei_classes, nuclei_colors)
+                if frontend_color_map:
+                    class_colors = [frontend_color_map.get(cn, class_colors[i] if i < len(class_colors) else "#aaaaaa")
+                                    for i, cn in enumerate(class_names)]
+                    print(f"Using frontend-mapped colors for prediction-only classifier: {class_colors}")
                 else:
-                    # Keep existing colors from classifier if frontend didn't provide new colors
                     print(f"Keeping existing colors from classifier for prediction: {class_colors}")
                 
                 # If colors changed and SAVE_CLASSIFIER_PATH is set, save the updated classifier with new colors
@@ -1003,24 +1204,18 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         print(f"Added 'Negative control' to class_names (not in annotations): {class_names}")
 
     # Build class_colors: prioritize frontend-provided colors, then fallback to annotations
+    frontend_color_map = _build_frontend_color_map(nuclei_classes, nuclei_colors)
     class_colors = []
-    if nuclei_colors and len(nuclei_colors) == len(class_names):
-        # Use frontend-provided colors (user's current selection)
-        class_colors = nuclei_colors
-        print(f"Using frontend-provided colors for classifier: {class_colors}")
-    else:
-        # Fallback: Extract colors from annotations
-        class_colors_map = positive_annotations.groupby('cell_class')['cell_color'].first().to_dict() if not positive_annotations.empty else {}
-        for cn in class_names:
-            if cn in class_colors_map:
-                class_colors.append(class_colors_map[cn])
-            else:
-                # Default color for "Negative control" if not in annotations
-                if cn == "Negative control":
-                    class_colors.append("#aaaaaa")
-                else:
-                    class_colors.append("#aaaaaa")
-        print(f"Using colors from annotations for classifier: {class_colors}")
+    # Fallback: Extract colors from annotations
+    class_colors_map = positive_annotations.groupby('cell_class')['cell_color'].first().to_dict() if not positive_annotations.empty else {}
+    for cn in class_names:
+        if cn in frontend_color_map:
+            class_colors.append(frontend_color_map[cn])
+        elif cn in class_colors_map:
+            class_colors.append(class_colors_map[cn])
+        else:
+            class_colors.append("#aaaaaa")
+    print(f"Using frontend/annotation mapped colors for classifier: {class_colors}")
 
     # Extract cell indices from the cell_ID column (sequential annotation structure)
     cell_indices = positive_annotations['cell_ID'].astype(int).values
@@ -1215,7 +1410,7 @@ def run_classification(args) -> Dict[str, Any]:
     if ZARR_PATH is None:
         raise ValueError("ZARR_PATH not set => please ensure /read is called first.")
 
-    global PLIP_MODELS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH
+    global PLIP_MODELS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS
     global progress_value, cancel_event, progress_cancelled  # Declare the global variables
 
     result = {"status": "success", "message": "", "classification_count": 0}
@@ -1245,6 +1440,19 @@ def run_classification(args) -> Dict[str, Any]:
         start_time = time.time()
 
         zf = zarr.open_group(ZARR_PATH, mode='a')  # Open in append mode for read/write
+
+        organ = getattr(args, "organ", None)
+        nuclei_classes = getattr(args, "nuclei_classes", []) or []
+        nuclei_colors = getattr(args, "nuclei_colors", []) or []
+
+        # Persist rename side-effects before loading annotations so cell_class / counts align with UI.
+        class_ops_run = _normalize_class_operations(CLASS_OPERATIONS)
+        eff_renames_run = (
+            [] if _has_rename_cycle(class_ops_run.get("renames", [])) else class_ops_run.get("renames", [])
+        )
+        if eff_renames_run:
+            _persist_nuclei_rename_to_user_annotation(zf, eff_renames_run, nuclei_classes, nuclei_colors)
+
         # A) check annotation
         annotations_data = None
         use_supervised = False
@@ -1271,10 +1479,6 @@ def run_classification(args) -> Dict[str, Any]:
         print(f"Progress: 35% (Embeddings loaded, shape: {cell_embeddings.shape})")
     
         # C) supervised or zero-shot
-        organ = getattr(args, "organ", None)
-        nuclei_classes = getattr(args, "nuclei_classes", [])
-        nuclei_colors = getattr(args, "nuclei_colors", [])
-
         # Determine final_class_colors early (before training) to pass to train_linear_classifier
         # This ensures saved classifier uses user's current color selection
         # Priority: frontend colors (if length matches) > classifier colors (loaded in train_linear_classifier) > zarr colors
@@ -1763,7 +1967,7 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS
     NODE_NAME = data.get("node_name", "ClassificationNode")
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
@@ -1771,6 +1975,7 @@ def read_node(data: Dict[str, Any]):
     # CLASS_COLORS = data.get("class_colors", [])
 
     print(f"[ClassificationNode] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, ZARR_PATH={ZARR_PATH}")
+    CLASS_OPERATIONS = {"renames": [], "adds": []}
     if not ZARR_PATH or not os.path.exists(ZARR_PATH):
         print("[ClassificationNode] no h5 => skip read.")
         return {"status": "ok", "message": "no H5 file found."}
@@ -1810,6 +2015,12 @@ def read_node(data: Dict[str, Any]):
                 elif k == "nuclei_colors":
                     if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.nuclei_colors = val_json
+                elif k == "class_operations":
+                    CLASS_OPERATIONS = _normalize_class_operations(val_json)
+                    if _has_rename_cycle(CLASS_OPERATIONS.get("renames", [])):
+                        print(f"[{NODE_NAME}] Detected rename cycle, ignoring rename operations.")
+                        CLASS_OPERATIONS["renames"] = []
+                    print(f"[{NODE_NAME}] class_operations => {CLASS_OPERATIONS}")
     finally:
         # Clean up zarr file handle
         if zf is not None:

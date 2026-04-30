@@ -84,6 +84,7 @@ progress_value = 0  # Global variable to store progress
 # Add new global variable
 CLASSIFIER_PATH = None
 SAVE_CLASSIFIER_PATH = None
+CLASS_OPERATIONS = {}
 
 # ZARR group controls (populated in /read)
 ZARR_GROUP = None
@@ -386,8 +387,55 @@ def _log_training_data_counts(class_names, y_train, n_positive):
         print(f"  {cname}: positive={pos_count}, weak={weak_count}")
 
 
+def _normalize_class_operations(raw_ops):
+    if not isinstance(raw_ops, dict):
+        return {"renames": [], "adds": []}
+    renames = []
+    for item in raw_ops.get("renames", []) if isinstance(raw_ops.get("renames", []), list) else []:
+        if not isinstance(item, dict):
+            continue
+        old = str(item.get("from", "")).strip()
+        new = str(item.get("to", "")).strip()
+        if old and new and old != new:
+            renames.append({"from": old, "to": new})
+    adds = []
+    for item in raw_ops.get("adds", []) if isinstance(raw_ops.get("adds", []), list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        color = item.get("color")
+        if name:
+            adds.append({"name": name, "color": color})
+    return {"renames": renames, "adds": adds}
+
+
+def _has_rename_cycle(renames):
+    graph = {}
+    for op in renames:
+        graph[op["from"]] = op["to"]
+    for start in graph.keys():
+        seen = set()
+        cur = start
+        while cur in graph:
+            if cur in seen:
+                return True
+            seen.add(cur)
+            cur = graph[cur]
+    return False
+
+def _build_frontend_color_map(tissue_colors):
+    """Build class_name -> color map from current UI payload."""
+    global ARGS
+    tissue_classes = getattr(ARGS, "tissue_classes", []) if ARGS is not None else []
+    if not tissue_classes or not tissue_colors:
+        return {}
+    if len(tissue_classes) != len(tissue_colors):
+        return {}
+    return {str(name): str(color) for name, color in zip(tissue_classes, tissue_colors)}
+
+
 def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame, tissue_colors: list[str] = None):
-    global CLASSIFIER_PATH, ZARR_PATH, ARGS
+    global CLASSIFIER_PATH, ZARR_PATH, ARGS, CLASS_OPERATIONS
     
     # update XGBoost parameter settings
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -411,6 +459,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         len(negative_annotations) > 0
         and ('exclude_classes' in negative_annotations.columns or 'exclude_class_indices' in negative_annotations.columns)
     )
+    class_ops = _normalize_class_operations(CLASS_OPERATIONS)
+    effective_renames = [] if _has_rename_cycle(class_ops["renames"]) else class_ops["renames"]
     
     if has_negative_examples:
         print(f"Found {len(negative_annotations)} negative annotations (exclude_classes or exclude_class_indices)")
@@ -447,33 +497,25 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         old_class_names = class_names.copy()
                         class_names = all_unique_classes
                         
-                        # Update class_colors: prioritize frontend-provided colors, then classifier colors, then annotations
+                        # Update class_colors by class name:
+                        # frontend payload > existing classifier > annotations.
                         new_class_colors = []
-                        if tissue_colors and len(tissue_colors) == len(class_names):
-                            # Use frontend-provided colors (user's current selection) - highest priority
-                            new_class_colors = tissue_colors
-                            print(f"Using frontend-provided colors for updated classifier: {new_class_colors}")
-                        else:
-                            # Fallback: Build color mapping prioritizing classifier colors, then annotations
-                            # This ensures we use saved colors from classifier (e.g., red) instead of old annotation colors (e.g., blue)
-                            for cn in class_names:
-                                if cn in old_class_names:
-                                    # Keep existing color from classifier for old classes (e.g., red from saved classifier)
-                                    old_idx = old_class_names.index(cn)
-                                    if old_idx < len(class_colors):
-                                        new_class_colors.append(class_colors[old_idx])
-                                    else:
-                                        new_class_colors.append("#aaaaaa")
-                                elif not positive_annotations.empty:
-                                    # For new classes, try to get color from annotations
-                                    class_colors_map = positive_annotations.groupby('tissue_class')['tissue_color'].first().to_dict()
-                                    if cn in class_colors_map:
-                                        new_class_colors.append(class_colors_map[cn])
-                                    else:
-                                        new_class_colors.append("#aaaaaa")
+                        frontend_color_map = _build_frontend_color_map(tissue_colors)
+                        ann_color_map = positive_annotations.groupby('tissue_class')['tissue_color'].first().to_dict() if not positive_annotations.empty else {}
+                        for cn in class_names:
+                            if cn in frontend_color_map:
+                                new_class_colors.append(frontend_color_map[cn])
+                            elif cn in old_class_names:
+                                old_idx = old_class_names.index(cn)
+                                if old_idx < len(class_colors):
+                                    new_class_colors.append(class_colors[old_idx])
                                 else:
                                     new_class_colors.append("#aaaaaa")
-                            print(f"Using colors from classifier/annotations for updated classifier: {new_class_colors}")
+                            elif cn in ann_color_map:
+                                new_class_colors.append(ann_color_map[cn])
+                            else:
+                                new_class_colors.append("#aaaaaa")
+                        print(f"Using merged frontend/classifier/annotation colors for updated classifier: {new_class_colors}")
                         class_colors = new_class_colors
                         
                         # Extract cell indices from the patch_ID column
@@ -503,6 +545,25 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         else:
                             X_train = X_update
                             y_train = y_update
+
+                        # Append-only classifier behavior for rename:
+                        # if old class A is renamed to B, keep A data and clone it to B.
+                        if prev_embeddings is not None and prev_labels is not None and effective_renames:
+                            alias_x = []
+                            alias_y = []
+                            for op in effective_renames:
+                                src = op["from"]
+                                dst = op["to"]
+                                if src in old_class_names and dst in class_names:
+                                    src_idx = old_class_names.index(src)
+                                    dst_idx = class_names.index(dst)
+                                    src_mask = np.asarray(prev_labels) == src_idx
+                                    if np.any(src_mask):
+                                        alias_x.append(prev_embeddings[src_mask])
+                                        alias_y.append(np.full(int(np.sum(src_mask)), dst_idx, dtype=np.int32))
+                            if alias_x:
+                                X_train = np.vstack([X_train] + alias_x)
+                                y_train = np.concatenate([y_train] + alias_y)
                         
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
@@ -525,14 +586,21 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         # Class count unchanged, can use warm start for faster training
                         print(f"Class count unchanged, using warm start for incremental training...")
                         
-                        # Update class_colors: prioritize frontend-provided colors, then keep existing colors
-                        # This ensures user's color changes are saved to classifier even when class count doesn't change
-                        if tissue_colors and len(tissue_colors) == len(class_names):
-                            # Use frontend-provided colors (user's current selection)
-                            class_colors = tissue_colors
-                            print(f"Using frontend-provided colors for updated classifier (warm start): {class_colors}")
+                        # Update class_colors by class name so partial frontend class lists
+                        # (e.g. after reset/apply) do not break color assignment.
+                        frontend_color_map = _build_frontend_color_map(tissue_colors)
+                        if frontend_color_map:
+                            merged_colors = []
+                            for i, cn in enumerate(class_names):
+                                if cn in frontend_color_map:
+                                    merged_colors.append(frontend_color_map[cn])
+                                elif i < len(class_colors):
+                                    merged_colors.append(class_colors[i])
+                                else:
+                                    merged_colors.append("#aaaaaa")
+                            class_colors = merged_colors
+                            print(f"Using frontend/classifier merged colors for updated classifier (warm start): {class_colors}")
                         else:
-                            # Keep existing colors from classifier if frontend didn't provide new colors
                             print(f"Keeping existing colors from classifier: {class_colors}")
                         
                         # Extract cell indices from the patch_ID column
@@ -657,14 +725,20 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 
                 print("Prediction completed")
                 
-                # Update class_colors: prioritize frontend-provided colors, then keep existing colors
-                # This ensures user's color changes are saved even when only predicting (no annotations)
-                if tissue_colors and len(tissue_colors) == len(class_names):
-                    # Use frontend-provided colors (user's current selection)
-                    class_colors = tissue_colors
-                    print(f"Using frontend-provided colors for prediction-only classifier: {class_colors}")
+                # Keep color assignment name-based in prediction-only path too.
+                frontend_color_map = _build_frontend_color_map(tissue_colors)
+                if frontend_color_map:
+                    merged_colors = []
+                    for i, cn in enumerate(class_names):
+                        if cn in frontend_color_map:
+                            merged_colors.append(frontend_color_map[cn])
+                        elif i < len(class_colors):
+                            merged_colors.append(class_colors[i])
+                        else:
+                            merged_colors.append("#aaaaaa")
+                    class_colors = merged_colors
+                    print(f"Using frontend-mapped colors for prediction-only classifier: {class_colors}")
                 else:
-                    # Keep existing colors from classifier if frontend didn't provide new colors
                     print(f"Keeping existing colors from classifier for prediction: {class_colors}")
                 
                 return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
@@ -903,7 +977,7 @@ def run_classification(args) -> Dict[str, Any]:
     if ZARR_PATH is None:
         raise ValueError("ZARR_PATH not set => please ensure /read is called first.")
 
-    global MUSK_MODEL, NODE_NAME, CLASSIFIER_PATH
+    global MUSK_MODEL, NODE_NAME, CLASSIFIER_PATH, CLASS_OPERATIONS
     global progress_value
 
     result = {"status": "success", "message": "", "classification_count": 0}
@@ -923,6 +997,11 @@ def run_classification(args) -> Dict[str, Any]:
         # A) check annotation
         annotations_data = None
         use_supervised = False
+        class_ops = _normalize_class_operations(CLASS_OPERATIONS)
+        effective_renames = class_ops["renames"]
+        if _has_rename_cycle(effective_renames):
+            print(f"[{NODE_NAME}] Rename cycle detected, ignoring all renames for this run.")
+            effective_renames = []
         if 'user_annotation' in zf and 'tissue_annotations' in zf['user_annotation']:
             raw_bytes = zf['user_annotation/tissue_annotations'][()]
             ann_dict = json.loads(raw_bytes.decode("utf-8"))
@@ -931,6 +1010,47 @@ def run_classification(args) -> Dict[str, Any]:
         else:
             annotations_data = None
             use_supervised = False
+
+        # Apply rename operations to annotation track so non-classifier flows inherit correctly.
+        # For classifier flows, this keeps annotation semantics consistent while classifier remains append-only.
+        if annotations_data is not None and not annotations_data.empty and effective_renames:
+            rename_map = {op["from"]: op["to"] for op in effective_renames}
+            if "tissue_class" in annotations_data.columns:
+                annotations_data["tissue_class"] = annotations_data["tissue_class"].map(
+                    lambda v: rename_map.get(v, v) if pd.notna(v) else v
+                )
+            if "exclude_classes" in annotations_data.columns:
+                def _rename_excludes(excludes):
+                    if isinstance(excludes, list):
+                        return [rename_map.get(str(x), str(x)) for x in excludes]
+                    return excludes
+                annotations_data["exclude_classes"] = annotations_data["exclude_classes"].map(_rename_excludes)
+
+            # Persist renamed annotations back to zarr
+            try:
+                ann_out = {}
+                for row_key, row in annotations_data.iterrows():
+                    item = row.to_dict()
+                    if isinstance(item.get("exclude_classes"), float) and np.isnan(item["exclude_classes"]):
+                        item.pop("exclude_classes", None)
+                    ann_out[str(row_key)] = item
+                out_bytes = json.dumps(ann_out, ensure_ascii=False).encode("utf-8")
+                if "tissue_annotations" in zf["user_annotation"]:
+                    del zf["user_annotation/tissue_annotations"]
+                zf["user_annotation"].create_dataset("tissue_annotations", data=out_bytes)
+
+                # Rebuild patch class counts from positive annotations after rename.
+                positive = annotations_data[annotations_data["tissue_class"].notna()] if "tissue_class" in annotations_data.columns else pd.DataFrame()
+                counts = {}
+                if not positive.empty:
+                    grouped = positive.groupby("tissue_class").size().to_dict()
+                    counts = {str(k): int(v) for k, v in grouped.items() if str(k).strip()}
+                counts_bytes = json.dumps(counts, ensure_ascii=False).encode("utf-8")
+                if "patch_class_counts" in zf["user_annotation"]:
+                    del zf["user_annotation/patch_class_counts"]
+                zf["user_annotation"].create_dataset("patch_class_counts", data=counts_bytes)
+            except Exception as e:
+                print(f"[{NODE_NAME}] Warning: Failed to persist renamed tissue annotations: {e}")
         
         # B) read embedding - Try dependency first, then self
         embedding_source_group = None
@@ -1528,7 +1648,7 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_GROUP, DEP_ZARR_GROUPS
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_GROUP, DEP_ZARR_GROUPS, CLASS_OPERATIONS
     NODE_NAME = data.get("node_name", "MuskNode")
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
@@ -1537,6 +1657,7 @@ def read_node(data: Dict[str, Any]):
 
     CLASSIFIER_PATH = None
     SAVE_CLASSIFIER_PATH = None
+    CLASS_OPERATIONS = {}
 
     print(f"[NODE_NAME] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
     if not ZARR_PATH or not os.path.exists(ZARR_PATH):
@@ -1579,6 +1700,12 @@ def read_node(data: Dict[str, Any]):
                 if isinstance(val_json, list) and len(val_json) > 0:
                     ARGS.tissue_colors = val_json
                     print(f"[{NODE_NAME}] tissue_colors: {ARGS.tissue_colors}")
+            elif k == "class_operations":
+                CLASS_OPERATIONS = _normalize_class_operations(val_json)
+                if _has_rename_cycle(CLASS_OPERATIONS.get("renames", [])):
+                    print(f"[{NODE_NAME}] Detected rename cycle, ignoring rename operations.")
+                    CLASS_OPERATIONS["renames"] = []
+                print(f"[{NODE_NAME}] class_operations => {CLASS_OPERATIONS}")
         
         # Debug: Print final classifier path values
         print(f"[{NODE_NAME}] Final CLASSIFIER_PATH: {CLASSIFIER_PATH}")
