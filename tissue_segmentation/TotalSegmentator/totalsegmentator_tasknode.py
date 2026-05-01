@@ -64,6 +64,10 @@ except ImportError as e:
 # Import safe storage utilities
 sys.path.append(str(SCRIPT_DIR.parent.parent))
 
+
+class CooperativeCancel(Exception):
+    """Cooperative stop requested via POST /cancel; raise at explicit checkpoints."""
+
 # FastAPI app
 app = FastAPI(title="TotalSegmentator TaskNode")
 
@@ -132,6 +136,7 @@ CURRENT_PROGRESS = 0
 PROGRESS_MESSAGE = ""
 IS_PROCESSING = False
 progress_complete = False  # Flag to indicate completion
+cancel_event = threading.Event()
 
 # Event-driven progress updates
 progress_event = asyncio.Event()
@@ -704,6 +709,8 @@ def validate_input(input_path: str) -> tuple[bool, Optional[str], str]:
 def update_progress(progress: int, message: str = ""):
     """Update global progress variables and notify SSE clients"""
     global CURRENT_PROGRESS, PROGRESS_MESSAGE, progress_complete
+    if cancel_event.is_set():
+        raise CooperativeCancel("cancelled")
     CURRENT_PROGRESS = progress
     PROGRESS_MESSAGE = message
     if progress >= 100:
@@ -1202,6 +1209,15 @@ def read_node(data: Dict[str, Any]):
     
     return {"status": "ok", "message": f"[{NODE_NAME}] read done"}
 
+
+@app.post("/cancel")
+def cancel_task():
+    global cancel_event
+    cancel_event.set()
+    print("[TotalSegmentator] /cancel")
+    return {"status": "ok", "message": "Cancel request received; pipeline will stop at next progress checkpoint."}
+
+
 @app.post("/execute")
 def execute_model():
     """
@@ -1234,6 +1250,8 @@ def execute_model():
     try:
         result = process_segmentation_sync(INPUT_PATH, ROI_SUBSET)
         return {"status": "ok", "output": result}
+    except CooperativeCancel:
+        return {"status": "cancelled", "message": "Task was cancelled"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -1241,8 +1259,9 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
     """
     Main processing function (synchronous)
     """
-    global IS_PROCESSING, CURRENT_PROGRESS, PROGRESS_MESSAGE, progress_complete
-    
+    global IS_PROCESSING, CURRENT_PROGRESS, PROGRESS_MESSAGE, progress_complete, cancel_event
+
+    cancel_event.clear()
     IS_PROCESSING = True
     CURRENT_PROGRESS = 0
     PROGRESS_MESSAGE = "Starting segmentation"
@@ -1407,6 +1426,8 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             
             # Monitor progress based on actual events, not time
             while seg_thread.is_alive():
+                if cancel_event.is_set():
+                    raise CooperativeCancel("cancelled")
                 elapsed = time.time() - start_time
                 
                 # Update progress based on elapsed time and phases
@@ -1548,6 +1569,12 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
             progress_complete = True  # Mark completion
             return {"status": "success", "message": "Processing completed successfully"}
             
+    except CooperativeCancel:
+        print("[Process] Cancelled by user")
+        CURRENT_PROGRESS = 0
+        PROGRESS_MESSAGE = "Cancelled"
+        progress_complete = True
+        return {"status": "cancelled", "message": "Task was cancelled"}
     except Exception as e:
         print(f"[Process] Error: {e}")
         update_progress(100, f"Processing failed: {e}")

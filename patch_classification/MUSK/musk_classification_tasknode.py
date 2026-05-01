@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import colorsys
 import asyncio
+import threading
 import gc
 import logging
 import collections
@@ -35,6 +36,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from pathlib import Path
+
+
+class CooperativeCancel(Exception):
+    """Cooperative stop requested via POST /cancel; raise at explicit checkpoints."""
+
 from musk_for_train import MUSK
 
 app = FastAPI()
@@ -80,6 +86,13 @@ MUSK_MODEL = None
 
 # new global variable for progress
 progress_value = 0  # Global variable to store progress
+cancel_event = threading.Event()
+
+
+def _check_cancel():
+    if cancel_event.is_set():
+        raise CooperativeCancel("cancelled")
+
 
 # Add new global variable
 CLASSIFIER_PATH = None
@@ -608,6 +621,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         print(f"Will enforce exclusion constraints for {len(exclude_map)} patches during prediction")
                 
                 for batch_idx, i in enumerate(range(0, n_samples, batch_size)):
+                    _check_cancel()
                     end_idx = min(i + batch_size, n_samples)
                     batch_embeddings = cell_embeddings[i:end_idx]
                     
@@ -841,6 +855,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
             print(f"Will enforce exclusion constraints for {len(exclude_map)} patches during prediction")
     
     for batch_idx, i in enumerate(range(0, n_samples, batch_size)):
+        _check_cancel()
         end_idx = min(i + batch_size, n_samples)
         batch_embeddings = cell_embeddings[i:end_idx]
         
@@ -1267,6 +1282,13 @@ def run_classification(args) -> Dict[str, Any]:
 
         return result
 
+    except CooperativeCancel:
+        print(f"[{NODE_NAME}] Classification cancelled by user")
+        return {
+            "status": "cancelled",
+            "message": "Task was cancelled",
+            "classification_count": 0,
+        }
     except Exception as e:
         import traceback
         err_msg = f"{str(e)}\n{traceback.format_exc()}"
@@ -1586,14 +1608,25 @@ def read_node(data: Dict[str, Any]):
 
     return {"status": "ok", "message": f"[{NODE_NAME}] read done"}
 
+
+@app.post("/cancel")
+def cancel_task():
+    global cancel_event
+    cancel_event.set()
+    print(f"[{NODE_NAME}] /cancel")
+    return {"status": "ok", "message": "Cancel request received."}
+
+
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event
     
     # CRITICAL: Reset progress to 0 at the start of each /execute call
     # This ensures SSE progress starts from 0% even if previous execution left it at 100%
     progress_value = 0
     print(f"[{NODE_NAME}] Progress reset to 0% at start of /execute")
+
+    cancel_event.clear()
     
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}

@@ -33,6 +33,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any, List, Union, Tuple
 from pathlib import Path
 from PIL import Image
+
+
+class CooperativeCancel(Exception):
+    """Cooperative stop requested via POST /cancel; raise at explicit checkpoints."""
+
 from timm.data.constants import IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from timm.models import create_model
 import tiffslide
@@ -83,6 +88,12 @@ progress_complete = False  # Flag to indicate completion
 last_printed_progress = -1  # Added for the new update_progress function
 ZARR_GROUP = None
 DEP_ZARR_GROUPS = {}
+cancel_event = threading.Event()
+
+
+def _check_cancel():
+    if cancel_event.is_set():
+        raise CooperativeCancel("cancelled")
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -122,7 +133,8 @@ def update_progress(value):
     if 'last_printed_progress' not in globals():
         global last_printed_progress
         last_printed_progress = -1
-    
+
+    _check_cancel()
     progress_value = value
     
     # Only print when progress changes by at least 2% or reaches 100%
@@ -337,7 +349,10 @@ def run_patch_classification(args):
         print(f"[{NODE_NAME}] Time taken: {end_time - start_time:.2f}s")
         
         return result
-        
+
+    except CooperativeCancel:
+        print(f"[{NODE_NAME}] Cancelled by user")
+        return {"status": "cancelled", "message": "Task was cancelled", "patch_count": 0}
     except Exception as e:
         import traceback
         print(f"[{NODE_NAME}] Error: {str(e)}")
@@ -702,12 +717,23 @@ def _set_string_param(param_name: str, value):
     if isinstance(value, str) and value:
         setattr(ARGS, param_name, value)
 
+
+@app.post("/cancel")
+def cancel_task():
+    global cancel_event
+    cancel_event.set()
+    print(f"[{NODE_NAME}] /cancel")
+    return {"status": "ok", "message": "Cancel request received."}
+
+
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event
     
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
+
+    cancel_event.clear()
     
     # Validate slide path
     if (not ARGS) or (not getattr(ARGS, "slidepath", None)) or (not os.path.isfile(ARGS.slidepath)):

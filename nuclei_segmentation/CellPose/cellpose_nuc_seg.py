@@ -35,7 +35,8 @@ class SlideSegmentation():
                  n_tiles=(2,2,1),
                  cellpose_model='nuclei',  # Changed from stardist_pretrain
                  isIHC=False,
-                 progress_callback=None
+                 progress_callback=None,
+                 cancel_checker=None,
                  ):
         
         super(SlideSegmentation, self).__init__()
@@ -99,6 +100,7 @@ class SlideSegmentation():
         self.isIHC = isIHC
         
         self.progress_callback = progress_callback
+        self._cancel_checker = cancel_checker
 
         # Pre-define feature names (same as before)
         self.feature_names = [
@@ -123,6 +125,10 @@ class SlideSegmentation():
         self.preload_cache = {}
         self.preload_queue = Queue()
         self.max_cache_size = 4
+
+    def _maybe_cancel(self):
+        if self._cancel_checker:
+            self._cancel_checker()
 
     def read_data(self):
         print("Reading data ...", datetime.now().strftime("%H:%M:%S"))
@@ -461,6 +467,7 @@ class SlideSegmentation():
             
             if self.progress_callback:
                 self.progress_callback(10)
+            self._maybe_cancel()
                 
             try:
                 # Directly load the entire image
@@ -469,6 +476,7 @@ class SlideSegmentation():
                 
                 if self.progress_callback:
                     self.progress_callback(30)
+                self._maybe_cancel()
                 
                 # Run Cellpose prediction
                 points, coord, prob = self.predict_cellpose(img_np)
@@ -504,6 +512,7 @@ class SlideSegmentation():
                 
                 if self.progress_callback:
                     self.progress_callback(80)
+                self._maybe_cancel()
                     
                 # Set final results
                 self.final_points = points.astype(np.int32)
@@ -519,6 +528,7 @@ class SlideSegmentation():
                 
                 if self.progress_callback:
                     self.progress_callback(100)
+                self._maybe_cancel()
                 
                 # Record overall end time and duration
                 overall_end_time = time.time()
@@ -564,6 +574,7 @@ class SlideSegmentation():
                 progress = int((processed_tiles / total_tiles) * 100)
                 if self.progress_callback:
                     self.progress_callback(progress)
+                self._maybe_cancel()
                 
                 # Calculate current tile position
                 x_0 = ic*(self.tile_size-self.overlap)
@@ -761,6 +772,7 @@ class SlideSegmentation():
         # Ensure progress is set to 100%
         if self.progress_callback:
             self.progress_callback(100)
+        self._maybe_cancel()
 
         pbar.close()
 
