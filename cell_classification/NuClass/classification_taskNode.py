@@ -20,6 +20,7 @@ import collections
 import colorsys
 import gc
 import glob
+import shutil
 import io
 import json
 import logging
@@ -1817,6 +1818,133 @@ def read_node(data: Dict[str, Any]):
             gc.collect()
 
     return {"status": "ok", "message": "ClassificationNode read done"}
+
+
+def _user_data_write_json(zarr_path: str, node_name: str, key: str, payload: Any) -> None:
+    """Persist one key under {node_name}/userData (JSON bytes), matching tasks_service /read layout."""
+    with zarr.open_group(zarr_path, mode="a") as zf:
+        grp_path = f"{node_name}/userData"
+        grp = zf.require_group(grp_path)
+        if key in grp:
+            del grp[key]
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        grp.create_dataset(key, shape=(), dtype=f"S{len(raw)}", data=raw)
+
+
+@app.post("/classifier/load")
+def classifier_load_endpoint(data: Dict[str, Any]):
+    """
+    Step API: validate classifier file, set process globals CLASSIFIER_PATH (and optional SAVE path),
+    optionally persist paths into zarr userData. Does not run full /execute.
+
+    Body JSON:
+      - classifier_path (str, required): absolute path to .tlcls / XGBoost model file
+      - save_classifier_path (str, optional): register destination for later training save
+      - zarr_path (str, optional): current slide zarr; used with persist_to_zarr
+      - node_name (str, optional): defaults to ClassificationNode or existing NODE_NAME
+      - persist_to_zarr (bool, optional): write classifier_path (+ save if set) into zarr userData
+    """
+    global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_PATH, NODE_NAME
+    path = (data.get("classifier_path") or "").strip()
+    if not path:
+        return {"status": "error", "message": "classifier_path is required"}
+    if not os.path.isfile(path):
+        return {"status": "error", "message": f"Classifier file not found: {path}"}
+
+    CLASSIFIER_PATH = path
+    if data.get("save_classifier_path"):
+        SAVE_CLASSIFIER_PATH = str(data.get("save_classifier_path")).strip() or None
+    if data.get("zarr_path"):
+        ZARR_PATH = str(data.get("zarr_path")).strip() or ZARR_PATH
+    if data.get("node_name"):
+        NODE_NAME = str(data.get("node_name")).strip() or NODE_NAME
+
+    node_nm = NODE_NAME or "ClassificationNode"
+    zpath = data.get("zarr_path")
+    if data.get("persist_to_zarr") and zpath and os.path.exists(zpath):
+        try:
+            _user_data_write_json(zpath, node_nm, "classifier_path", path)
+            if SAVE_CLASSIFIER_PATH:
+                _user_data_write_json(zpath, node_nm, "save_classifier_path", SAVE_CLASSIFIER_PATH)
+        except Exception as e:
+            return {"status": "error", "message": f"Classifier validated but zarr persist failed: {e}"}
+
+    try:
+        loaded = load_classifier_params(CLASSIFIER_PATH)
+        if loaded is None:
+            return {"status": "error", "message": "Could not parse XGBoost model at classifier_path"}
+        _clf, class_names, class_colors, _emb, _labels = loaded
+        return {
+            "status": "ok",
+            "classifier_path": path,
+            "class_names": [str(x) for x in class_names],
+            "class_colors": [str(x) for x in class_colors],
+            "save_classifier_path": SAVE_CLASSIFIER_PATH,
+            "zarr_path": ZARR_PATH,
+            "node_name": node_nm,
+            "message": "Classifier loaded into process; use /read then /execute for full slide run, or /classifier/save to export copy",
+        }
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/classifier/save")
+def classifier_save_endpoint(data: Dict[str, Any]):
+    """
+    Step API: export classifier file without running /execute.
+
+    Body JSON:
+      - mode: "copy" (default) | "register_save_path"
+      - For mode=copy:
+          - source_path (optional) or classifier_path: defaults to global CLASSIFIER_PATH
+          - dest_path (optional) or save_classifier_path: target file path
+          - persist_to_zarr (bool), zarr_path (str), node_name (str): optional userData update
+      - For mode=register_save_path:
+          - save_classifier_path (str): only sets global SAVE_CLASSIFIER_PATH (+ optional zarr persist)
+    """
+    global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_PATH, NODE_NAME
+    mode = (data.get("mode") or "copy").strip().lower()
+    node_nm = (data.get("node_name") or NODE_NAME or "ClassificationNode").strip()
+
+    if mode == "register_save_path":
+        sp = (data.get("save_classifier_path") or "").strip()
+        if not sp:
+            return {"status": "error", "message": "save_classifier_path is required"}
+        SAVE_CLASSIFIER_PATH = sp
+        if data.get("persist_to_zarr") and data.get("zarr_path") and os.path.exists(str(data["zarr_path"])):
+            try:
+                _user_data_write_json(str(data["zarr_path"]), node_nm, "save_classifier_path", sp)
+            except Exception as e:
+                return {"status": "error", "message": f"Registered path but zarr persist failed: {e}"}
+        return {"status": "ok", "save_classifier_path": sp, "message": "SAVE_CLASSIFIER_PATH registered"}
+
+    if mode != "copy":
+        return {"status": "error", "message": f"Unknown mode {mode!r}; use 'copy' or 'register_save_path'"}
+
+    src = (data.get("source_path") or data.get("classifier_path") or CLASSIFIER_PATH or "").strip()
+    dst = (data.get("dest_path") or data.get("save_classifier_path") or "").strip()
+    if not src:
+        return {"status": "error", "message": "source_path or classifier_path (or loaded CLASSIFIER_PATH) required"}
+    if not os.path.isfile(src):
+        return {"status": "error", "message": f"Source file not found: {src}"}
+    if not dst:
+        return {"status": "error", "message": "dest_path or save_classifier_path required"}
+
+    parent = os.path.dirname(os.path.abspath(dst))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    shutil.copy2(src, dst)
+    SAVE_CLASSIFIER_PATH = dst
+
+    if data.get("persist_to_zarr") and data.get("zarr_path") and os.path.exists(str(data["zarr_path"])):
+        try:
+            _user_data_write_json(str(data["zarr_path"]), node_nm, "save_classifier_path", dst)
+        except Exception as e:
+            return {"status": "error", "message": f"File copied but zarr persist failed: {e}"}
+
+    return {"status": "ok", "dest_path": dst, "message": f"Copied classifier to {dst}"}
+
 
 @app.post("/execute")
 def execute_node():
