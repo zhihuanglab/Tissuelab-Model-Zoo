@@ -96,6 +96,8 @@ DEPENDENCIES = []
 PLIP_MODELS = None  # tuple: (processor, model, text_projection, device)
 CLASSIFIER_PATH = None
 SAVE_CLASSIFIER_PATH = None
+# Last supervised-training bundle in this process (for Save → persist without prior on-disk path).
+LAST_TRAINED_CLF_BUNDLE = None
 
 # new global variable for progress
 progress_value = 0  # Global variable to store progress
@@ -489,12 +491,9 @@ def generate_distinct_colors(nuclei_classes: list[str]) -> list[str]:
     return colors
 
 def save_classifier_params(clf, class_names, class_colors, train_data, max_samples_per_class=100000000000000):
-    """Save classifier parameters and training data to XGBoost model file"""
-    global SAVE_CLASSIFIER_PATH
-    if SAVE_CLASSIFIER_PATH is None:
-        print("No SAVE_CLASSIFIER_PATH specified, skipping saving classifier parameters")
-        return
-        
+    """Embed training metadata into the booster; optionally write XGBoost model to SAVE_CLASSIFIER_PATH."""
+    global SAVE_CLASSIFIER_PATH, LAST_TRAINED_CLF_BUNDLE
+
     # limit the number of samples per class
     embeddings = train_data['embeddings']
     labels = train_data['labels']
@@ -531,10 +530,33 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
                        labels=final_labels)
     train_data_str = base64.b64encode(train_data_bytes.getvalue()).decode('utf-8')
     booster.set_attr(train_data=train_data_str)
-    
-    # save XGBoost model
-    clf.save_model(SAVE_CLASSIFIER_PATH)
-    print(f"Saved classifier with parameters and training data to: {SAVE_CLASSIFIER_PATH}")
+
+    LAST_TRAINED_CLF_BUNDLE = (clf, class_names, class_colors, train_data)
+
+    if SAVE_CLASSIFIER_PATH:
+        clf.save_model(SAVE_CLASSIFIER_PATH)
+        print(f"Saved classifier with parameters and training data to: {SAVE_CLASSIFIER_PATH}")
+    else:
+        print("No SAVE_CLASSIFIER_PATH; classifier metadata embedded in memory only (use POST /classifier/save mode=save_trained to write a file).")
+
+
+def remember_classifier_bundle_for_save(clf, class_names, class_colors, embeddings, labels):
+    """Remember (clf, class_names, class_colors, train_data) for POST /classifier/save mode=save_trained."""
+    global LAST_TRAINED_CLF_BUNDLE
+    if embeddings is None or labels is None:
+        return
+    try:
+        if getattr(embeddings, "size", 0) <= 0 or len(labels) == 0:
+            return
+    except Exception:
+        return
+    LAST_TRAINED_CLF_BUNDLE = (
+        clf,
+        class_names,
+        class_colors,
+        {"embeddings": embeddings, "labels": labels},
+    )
+
 
 def load_classifier_params(zarr_path):
     """Load classifier parameters and training data from XGBoost model file"""
@@ -941,19 +963,22 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     # Keep existing colors from classifier if frontend didn't provide new colors
                     print(f"Keeping existing colors from classifier for prediction: {class_colors}")
                 
-                # If colors changed and SAVE_CLASSIFIER_PATH is set, save the updated classifier with new colors
-                # This ensures color changes are persisted even when only predicting (no new annotations)
-                if class_colors != old_class_colors and SAVE_CLASSIFIER_PATH is not None:
-                    # Prepare training data from previous embeddings if available
+                # If UI colors changed, refresh booster + LAST (even without SAVE_CLASSIFIER_PATH) so Save can export.
+                if class_colors != old_class_colors:
                     train_data = {
                         'embeddings': X_train if 'X_train' in locals() else (prev_embeddings if prev_embeddings is not None else np.array([])),
-                        'labels': y_train if 'y_train' in locals() else (prev_labels if prev_labels is not None else np.array([]))
+                        'labels': y_train if 'y_train' in locals() else (prev_labels if prev_labels is not None else np.array([])),
                     }
-                    # Only save if we have training data
                     if train_data['embeddings'].size > 0:
                         save_classifier_params(clf, class_names, class_colors, train_data)
-                        print(f"Saved classifier with updated colors (prediction-only): {class_colors}")
-                
+                        print(f"Updated classifier colors in memory (prediction path): {class_colors}")
+
+                td_emb = prev_embeddings
+                td_lbl = prev_labels
+                if 'X_train' in locals() and getattr(X_train, "size", 0) > 0:
+                    td_emb, td_lbl = X_train, y_train
+                remember_classifier_bundle_for_save(clf, class_names, class_colors, td_emb, td_lbl)
+
                 return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
         except Exception as e:
             print(f"Error loading or updating classifier: {e}")
@@ -1764,7 +1789,8 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, LAST_TRAINED_CLF_BUNDLE
+    LAST_TRAINED_CLF_BUNDLE = None
     NODE_NAME = data.get("node_name", "ClassificationNode")
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
@@ -1895,7 +1921,9 @@ def classifier_save_endpoint(data: Dict[str, Any]):
     Step API: export classifier file without running /execute.
 
     Body JSON:
-      - mode: "copy" (default) | "register_save_path"
+      - mode: "copy" (default) | "register_save_path" | "save_trained"
+      - For mode=save_trained:
+          - dest_path or save_classifier_path: write the last in-memory trained model (save_classifier_params)
       - For mode=copy:
           - source_path (optional) or classifier_path: defaults to global CLASSIFIER_PATH
           - dest_path (optional) or save_classifier_path: target file path
@@ -1903,9 +1931,32 @@ def classifier_save_endpoint(data: Dict[str, Any]):
       - For mode=register_save_path:
           - save_classifier_path (str): only sets global SAVE_CLASSIFIER_PATH (+ optional zarr persist)
     """
-    global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_PATH, NODE_NAME
+    global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_PATH, NODE_NAME, LAST_TRAINED_CLF_BUNDLE
     mode = (data.get("mode") or "copy").strip().lower()
     node_nm = (data.get("node_name") or NODE_NAME or "ClassificationNode").strip()
+
+    if mode == "save_trained":
+        dest = (data.get("save_classifier_path") or data.get("dest_path") or "").strip()
+        if not dest:
+            return {"status": "error", "message": "save_classifier_path or dest_path is required"}
+        if not LAST_TRAINED_CLF_BUNDLE:
+            return {
+                "status": "error",
+                "message": "No trained classifier in this process; run supervised training in /execute first.",
+            }
+        clf, class_names, class_colors, train_data = LAST_TRAINED_CLF_BUNDLE
+        old_save = SAVE_CLASSIFIER_PATH
+        try:
+            SAVE_CLASSIFIER_PATH = dest
+            save_classifier_params(clf, class_names, class_colors, train_data)
+        except Exception as e:
+            traceback.print_exc()
+            return {"status": "error", "message": str(e)}
+        finally:
+            SAVE_CLASSIFIER_PATH = old_save
+        if not os.path.isfile(dest):
+            return {"status": "error", "message": "Expected model file was not created after save."}
+        return {"status": "ok", "dest_path": dest, "message": f"Saved trained classifier to {dest}"}
 
     if mode == "register_save_path":
         sp = (data.get("save_classifier_path") or "").strip()
@@ -1920,7 +1971,7 @@ def classifier_save_endpoint(data: Dict[str, Any]):
         return {"status": "ok", "save_classifier_path": sp, "message": "SAVE_CLASSIFIER_PATH registered"}
 
     if mode != "copy":
-        return {"status": "error", "message": f"Unknown mode {mode!r}; use 'copy' or 'register_save_path'"}
+        return {"status": "error", "message": f"Unknown mode {mode!r}; use 'copy', 'register_save_path', or 'save_trained'"}
 
     src = (data.get("source_path") or data.get("classifier_path") or CLASSIFIER_PATH or "").strip()
     dst = (data.get("dest_path") or data.get("save_classifier_path") or "").strip()
