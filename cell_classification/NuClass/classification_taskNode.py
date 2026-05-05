@@ -31,7 +31,7 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict, List, Optional
 
 # Third-party imports
 import numpy as np
@@ -321,6 +321,37 @@ def _log_training_data_counts(class_names, y_train, n_positive):
         pos_count = int((y_pos == k).sum())
         weak_count = int((y_weak == k).sum()) if len(y_weak) > 0 else 0
         print(f"  {cname}: positive={pos_count}, weak={weak_count}")
+
+
+def _resolve_colors_for_class_names(
+    class_names: List[str],
+    nuclei_classes: Optional[List[str]],
+    nuclei_colors: Optional[List[str]],
+    existing_colors: Optional[List[str]] = None,
+) -> Optional[List[str]]:
+    """
+    Map UI colors onto classifier class_names order using nuclei_classes[i] -> nuclei_colors[i].
+    Cell embeddings / labels follow class_names; colors must not be applied by index against
+    nuclei_colors when UI class order differs from class_names.
+    """
+    if not class_names:
+        return None
+    existing_colors = existing_colors or []
+    if nuclei_classes and nuclei_colors and len(nuclei_classes) == len(nuclei_colors):
+        m = {str(nc): col for nc, col in zip(nuclei_classes, nuclei_colors)}
+        out = []
+        for i, cn in enumerate(class_names):
+            col = m.get(str(cn))
+            if col is not None and str(col).strip() != "":
+                out.append(col)
+            elif i < len(existing_colors) and existing_colors[i] is not None and str(existing_colors[i]).strip() != "":
+                out.append(existing_colors[i])
+            else:
+                out.append("#aaaaaa")
+        return out
+    if nuclei_colors and (not nuclei_classes or len(nuclei_classes) == 0) and len(nuclei_colors) == len(class_names):
+        return list(nuclei_colors)
+    return None
 
 
 def _annotation_labels_to_classifier_indices(annotations, class_names, nuclei_classes=None):
@@ -615,9 +646,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         nuclei_classes: user-facing class order (e.g. from UI). When building exclude_map from
             exclude_class_indices, these indices refer to nuclei_classes order; we map to classifier's
             class_names order so the correct class is excluded.
-        nuclei_colors: Frontend-provided colors for each class (user's current selection).
-            If provided and length matches class_names, these colors will be used instead of
-            extracting from annotations.
+        nuclei_colors: Frontend-provided colors parallel to nuclei_classes (user selection).
+            Mapped onto classifier class_names by class name, not by index vs class_names.
     """
     global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, progress_value, cancel_event
     
@@ -698,12 +728,17 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         old_class_names = class_names.copy()
                         class_names = all_unique_classes
                         
-                        # Update class_colors: prioritize frontend-provided colors, then classifier colors, then annotations
+                        # Update class_colors: frontend by class name, then classifier / annotations
                         new_class_colors = []
-                        if nuclei_colors and len(nuclei_colors) == len(class_names):
-                            # Use frontend-provided colors (user's current selection) - highest priority
-                            new_class_colors = nuclei_colors
-                            print(f"Using frontend-provided colors for updated classifier: {new_class_colors}")
+                        old_color_by_name = dict(zip(old_class_names, class_colors))
+                        existing_for_merge = [old_color_by_name.get(cn) for cn in class_names]
+                        mapped_front = _resolve_colors_for_class_names(
+                            class_names, nuclei_classes, nuclei_colors,
+                            existing_colors=existing_for_merge,
+                        )
+                        if mapped_front is not None:
+                            new_class_colors = mapped_front
+                            print(f"Using frontend-provided colors (by class name) for updated classifier: {new_class_colors}")
                         else:
                             # Fallback: Build color mapping prioritizing classifier colors, then annotations
                             # This ensures we use saved colors from classifier (e.g., red) instead of old annotation colors (e.g., blue)
@@ -785,14 +820,14 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         # Class count unchanged, can use warm start for faster training
                         print(f"Class count unchanged, using warm start for incremental training...")
                         
-                        # Update class_colors: prioritize frontend-provided colors, then keep existing colors
-                        # This ensures user's color changes are saved to classifier even when class count doesn't change
-                        if nuclei_colors and len(nuclei_colors) == len(class_names):
-                            # Use frontend-provided colors (user's current selection)
-                            class_colors = nuclei_colors
-                            print(f"Using frontend-provided colors for updated classifier (warm start): {class_colors}")
+                        # Update class_colors: frontend by class name, then keep existing
+                        mapped_warm = _resolve_colors_for_class_names(
+                            class_names, nuclei_classes, nuclei_colors, existing_colors=class_colors
+                        )
+                        if mapped_warm is not None:
+                            class_colors = mapped_warm
+                            print(f"Using frontend-provided colors (by class name) for updated classifier (warm start): {class_colors}")
                         else:
-                            # Keep existing colors from classifier if frontend didn't provide new colors
                             print(f"Keeping existing colors from classifier: {class_colors}")
                         
                         # Extract cell indices from the cell_ID column
@@ -955,12 +990,13 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 # Update class_colors: prioritize frontend-provided colors, then keep existing colors
                 # This ensures user's color changes are saved even when only predicting (no annotations)
                 old_class_colors = class_colors.copy() if isinstance(class_colors, list) else list(class_colors)
-                if nuclei_colors and len(nuclei_colors) == len(class_names):
-                    # Use frontend-provided colors (user's current selection)
-                    class_colors = nuclei_colors
-                    print(f"Using frontend-provided colors for prediction-only classifier: {class_colors}")
+                mapped_pred = _resolve_colors_for_class_names(
+                    class_names, nuclei_classes, nuclei_colors, existing_colors=old_class_colors
+                )
+                if mapped_pred is not None:
+                    class_colors = mapped_pred
+                    print(f"Using frontend-provided colors (by class name) for prediction-only classifier: {class_colors}")
                 else:
-                    # Keep existing colors from classifier if frontend didn't provide new colors
                     print(f"Keeping existing colors from classifier for prediction: {class_colors}")
                 
                 # If UI colors changed, refresh booster + LAST (even without SAVE_CLASSIFIER_PATH) so Save can export.
@@ -1028,12 +1064,12 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         class_names = ["Negative control"] + class_names
         print(f"Added 'Negative control' to class_names (not in annotations): {class_names}")
 
-    # Build class_colors: prioritize frontend-provided colors, then fallback to annotations
+    # Build class_colors: frontend keyed by nuclei_classes -> names, else annotations
     class_colors = []
-    if nuclei_colors and len(nuclei_colors) == len(class_names):
-        # Use frontend-provided colors (user's current selection)
-        class_colors = nuclei_colors
-        print(f"Using frontend-provided colors for classifier: {class_colors}")
+    mapped_new = _resolve_colors_for_class_names(class_names, nuclei_classes, nuclei_colors)
+    if mapped_new is not None:
+        class_colors = mapped_new
+        print(f"Using frontend-provided colors (by class name) for classifier: {class_colors}")
     else:
         # Fallback: Extract colors from annotations
         class_colors_map = positive_annotations.groupby('cell_class')['cell_color'].first().to_dict() if not positive_annotations.empty else {}
@@ -1301,40 +1337,39 @@ def run_classification(args) -> Dict[str, Any]:
         nuclei_classes = getattr(args, "nuclei_classes", [])
         nuclei_colors = getattr(args, "nuclei_colors", [])
 
-        # Determine final_class_colors early (before training) to pass to train_linear_classifier
-        # This ensures saved classifier uses user's current color selection
-        # Priority: frontend colors (if length matches) > classifier colors (loaded in train_linear_classifier) > zarr colors
-        final_class_colors_for_training = None
-        if nuclei_colors and len(nuclei_colors) == len(nuclei_classes):
-            # Use frontend-provided colors (user's current selection) - highest priority
-            # Only use if length matches to avoid using incomplete color arrays (e.g., after reset)
-            final_class_colors_for_training = nuclei_colors
-            print(f"Using frontend-provided colors for training: {final_class_colors_for_training}")
-        elif CLASSIFIER_PATH is not None:
-            # If CLASSIFIER_PATH is set but no frontend colors (or length mismatch), pass None
-            # train_linear_classifier will load colors from classifier file (e.g., red from saved classifier)
-            # This ensures we use saved colors from classifier instead of old zarr colors (e.g., blue)
-            # This is especially important after reset when frontend state is cleared
-            final_class_colors_for_training = None
-            if nuclei_colors and len(nuclei_colors) != len(nuclei_classes):
-                print(f"Frontend colors length mismatch ({len(nuclei_colors)} vs {len(nuclei_classes)}), will use colors from classifier file")
-            else:
-                print(f"Will use colors from classifier file (CLASSIFIER_PATH is set, no frontend colors)")
-        elif NODE_NAME in zf and 'nuclei_class_HEX_color' in zf[NODE_NAME]:
-            # Last fallback: Use existing colors from zarr (only if no classifier path)
-            old_colors = zf[NODE_NAME]['nuclei_class_HEX_color'][()]
+        # Colors passed parallel to nuclei_classes; train_linear_classifier maps them onto class_names by name
+        effective_nuclei_colors: List[str] = list(nuclei_colors) if nuclei_colors else []
+        if (
+            nuclei_classes
+            and len(nuclei_classes) > 0
+            and (not effective_nuclei_colors or len(effective_nuclei_colors) != len(nuclei_classes))
+            and CLASSIFIER_PATH is None
+            and NODE_NAME in zf
+            and "nuclei_class_HEX_color" in zf[NODE_NAME]
+        ):
+            old_colors = zf[NODE_NAME]["nuclei_class_HEX_color"][()]
             if len(old_colors) == len(nuclei_classes):
-                final_class_colors_for_training = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
-                print(f"Using colors from zarr for training: {final_class_colors_for_training}")
-        
+                effective_nuclei_colors = [
+                    c.decode("utf-8") if hasattr(c, "decode") else c for c in old_colors
+                ]
+                print(f"Using colors from zarr for training (aligned with nuclei_classes): {effective_nuclei_colors}")
+
+        if nuclei_colors and nuclei_classes and len(nuclei_colors) == len(nuclei_classes):
+            print(f"UI nuclei_colors mapped to classifier by nuclei_classes names ({len(nuclei_classes)} classes)")
+        elif CLASSIFIER_PATH is not None:
+            if nuclei_colors and nuclei_classes and len(nuclei_colors) != len(nuclei_classes):
+                print(f"Frontend colors length mismatch ({len(nuclei_colors)} vs {len(nuclei_classes)}); use classifier colors where needed")
+            else:
+                print("Will use colors from classifier file (CLASSIFIER_PATH set, no valid UI color list)")
+
         # Try supervised classification if we have classifier path or annotations
         classifier_result = None
         if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
             classifier_result = train_linear_classifier(
-                cell_embeddings, 
-                annotations_data, 
+                cell_embeddings,
+                annotations_data,
                 nuclei_classes=nuclei_classes,
-                nuclei_colors=final_class_colors_for_training
+                nuclei_colors=effective_nuclei_colors if effective_nuclei_colors else None,
             )
             
             # Check for cancellation after training (train_linear_classifier returns None if cancelled)
@@ -1478,19 +1513,18 @@ def run_classification(args) -> Dict[str, Any]:
                             remapped_probs[:, user_idx] = 0.0
                     prediction_probs = remapped_probs
             else:
-                # No user input, but still prioritize frontend-provided colors if available (and length matches)
+                # No user input classes: map UI colors by nuclei_classes name onto classifier class_names
                 final_class_names = class_names
-                if nuclei_colors and len(nuclei_colors) == len(class_names):
-                    # Use frontend-provided colors (user's current selection) even if no user input classes
-                    # Only use if length matches to avoid using incomplete color arrays (e.g., after reset)
-                    final_class_colors = nuclei_colors
-                    print(f"Using frontend-provided colors (no user input classes): {final_class_colors}")
+                mapped_out = _resolve_colors_for_class_names(
+                    class_names, nuclei_classes, nuclei_colors, existing_colors=class_colors
+                )
+                if mapped_out is not None:
+                    final_class_colors = mapped_out
+                    print(f"Using frontend-provided colors by class name (no user input classes): {final_class_colors}")
                 else:
-                    # Use classifier colors if frontend didn't provide colors or length mismatch
-                    # This ensures we use saved colors from classifier (e.g., red) instead of incomplete frontend colors
                     final_class_colors = class_colors
-                    if nuclei_colors and len(nuclei_colors) != len(class_names):
-                        print(f"Frontend colors length mismatch ({len(nuclei_colors)} vs {len(class_names)}), using classifier colors: {final_class_colors}")
+                    if nuclei_colors and nuclei_classes and len(nuclei_colors) != len(nuclei_classes):
+                        print(f"Frontend colors length mismatch ({len(nuclei_colors)} vs {len(nuclei_classes)}), using classifier colors: {final_class_colors}")
                     else:
                         print(f"Using classifier colors (no user input): {final_class_colors}")
         else:

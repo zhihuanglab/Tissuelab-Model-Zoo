@@ -34,7 +34,7 @@ from datetime import datetime
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 
 
@@ -420,8 +420,45 @@ def _log_training_data_counts(class_names, y_train, n_positive):
         print(f"  {cname}: positive={pos_count}, weak={weak_count}")
 
 
-def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame, tissue_colors: list[str] = None):
-    global CLASSIFIER_PATH, ZARR_PATH, ARGS
+def _resolve_colors_for_class_names(
+    class_names: List[str],
+    tissue_classes: Optional[List[str]],
+    tissue_colors: Optional[List[str]],
+    existing_colors: Optional[List[str]] = None,
+) -> Optional[List[str]]:
+    """
+    Align UI colors to classifier class_names by class name (tissue_classes[i] -> tissue_colors[i]).
+    Embeddings/labels are indexed by class_names order; colors must not be applied by index against
+    tissue_colors when UI class order differs from class_names.
+    """
+    if not class_names:
+        return None
+    existing_colors = existing_colors or []
+    if tissue_classes and tissue_colors and len(tissue_classes) == len(tissue_colors):
+        m = {str(tc): col for tc, col in zip(tissue_classes, tissue_colors)}
+        out = []
+        for i, cn in enumerate(class_names):
+            col = m.get(str(cn))
+            if col is not None and str(col).strip() != "":
+                out.append(col)
+            elif i < len(existing_colors) and existing_colors[i] is not None and str(existing_colors[i]).strip() != "":
+                out.append(existing_colors[i])
+            else:
+                out.append("#aaaaaa")
+        return out
+    # Legacy: no class list to key by; only safe when lengths match class_names
+    if tissue_colors and (not tissue_classes or len(tissue_classes) == 0) and len(tissue_colors) == len(class_names):
+        return list(tissue_colors)
+    return None
+
+
+def train_linear_classifier(
+    cell_embeddings: np.ndarray,
+    annotations: pd.DataFrame,
+    tissue_colors: list[str] = None,
+    tissue_classes: list[str] = None,
+):
+    global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_PATH, ARGS
     
     # update XGBoost parameter settings
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -481,12 +518,17 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         old_class_names = class_names.copy()
                         class_names = all_unique_classes
                         
-                        # Update class_colors: prioritize frontend-provided colors, then classifier colors, then annotations
+                        # Update class_colors: prioritize frontend (by class name), then old classifier colors by name, then annotations
                         new_class_colors = []
-                        if tissue_colors and len(tissue_colors) == len(class_names):
-                            # Use frontend-provided colors (user's current selection) - highest priority
-                            new_class_colors = tissue_colors
-                            print(f"Using frontend-provided colors for updated classifier: {new_class_colors}")
+                        old_color_by_name = dict(zip(old_class_names, class_colors))
+                        existing_for_merge = [old_color_by_name.get(cn) for cn in class_names]
+                        mapped_front = _resolve_colors_for_class_names(
+                            class_names, tissue_classes, tissue_colors,
+                            existing_colors=existing_for_merge,
+                        )
+                        if mapped_front is not None:
+                            new_class_colors = mapped_front
+                            print(f"Using frontend-provided colors (by class name) for updated classifier: {new_class_colors}")
                         else:
                             # Fallback: Build color mapping prioritizing classifier colors, then annotations
                             # This ensures we use saved colors from classifier (e.g., red) instead of old annotation colors (e.g., blue)
@@ -559,14 +601,14 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         # Class count unchanged, can use warm start for faster training
                         print(f"Class count unchanged, using warm start for incremental training...")
                         
-                        # Update class_colors: prioritize frontend-provided colors, then keep existing colors
-                        # This ensures user's color changes are saved to classifier even when class count doesn't change
-                        if tissue_colors and len(tissue_colors) == len(class_names):
-                            # Use frontend-provided colors (user's current selection)
-                            class_colors = tissue_colors
-                            print(f"Using frontend-provided colors for updated classifier (warm start): {class_colors}")
+                        # Update class_colors: prioritize frontend (by class name), then keep existing
+                        mapped_warm = _resolve_colors_for_class_names(
+                            class_names, tissue_classes, tissue_colors, existing_colors=class_colors
+                        )
+                        if mapped_warm is not None:
+                            class_colors = mapped_warm
+                            print(f"Using frontend-provided colors (by class name) for updated classifier (warm start): {class_colors}")
                         else:
-                            # Keep existing colors from classifier if frontend didn't provide new colors
                             print(f"Keeping existing colors from classifier: {class_colors}")
                         
                         # Extract cell indices from the patch_ID column
@@ -691,37 +733,40 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         print(f"Processed batch {batch_idx + 1}/{n_batches} ({end_idx}/{n_samples} samples)")
                 
                 print("Prediction completed")
-                
-                # Update class_colors: prioritize frontend-provided colors, then keep existing colors
-                # This ensures user's color changes are saved even when only predicting (no annotations)
+
+                # Colors: map UI (tissue_classes, tissue_colors) onto classifier class_names by name
                 old_class_colors = class_colors.copy() if isinstance(class_colors, list) else list(class_colors)
-                if tissue_colors and len(tissue_colors) == len(class_names):
-                    # Use frontend-provided colors (user's current selection)
-                    class_colors = tissue_colors
-                    print(f"Using frontend-provided colors for prediction-only classifier: {class_colors}")
+                mapped_pred = _resolve_colors_for_class_names(
+                    class_names, tissue_classes, tissue_colors, existing_colors=old_class_colors
+                )
+                if mapped_pred is not None:
+                    class_colors = mapped_pred
+                    print(f"Using frontend-provided colors (by class name) for prediction-only classifier: {class_colors}")
                 else:
-                    # Keep existing colors from classifier if frontend didn't provide new colors
                     print(f"Keeping existing colors from classifier for prediction: {class_colors}")
+
+                td_emb = prev_embeddings
+                td_lbl = prev_labels
+                if "X_train" in locals() and getattr(X_train, "size", 0) > 0:
+                    td_emb, td_lbl = X_train, y_train
 
                 if (
                     class_colors != old_class_colors
-                    and prev_embeddings is not None
-                    and prev_labels is not None
-                    and prev_embeddings.size > 0
+                    and td_emb is not None
+                    and td_lbl is not None
+                    and getattr(td_emb, "size", 0) > 0
                 ):
                     save_classifier_params(
                         clf,
                         class_names,
                         class_colors,
-                        {"embeddings": prev_embeddings, "labels": prev_labels},
+                        {"embeddings": td_emb, "labels": td_lbl},
                     )
-                    print(f"Updated classifier colors in memory (prediction path): {class_colors}")
+                    node_tag = NODE_NAME or "MuskNode"
+                    print(f"[{node_tag}] Updated classifier / bundle after color change (prediction path): {class_colors}")
 
-                td_emb = prev_embeddings
-                td_lbl = prev_labels
-                if 'X_train' in locals() and getattr(X_train, "size", 0) > 0:
-                    td_emb, td_lbl = X_train, y_train
                 remember_classifier_bundle_for_save(clf, class_names, class_colors, td_emb, td_lbl)
+
 
                 return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
         except Exception as e:
@@ -773,12 +818,12 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         class_names = ["Negative control"] + class_names
         print(f"Added 'Negative control' to class_names (not in annotations): {class_names}")
 
-    # Build class_colors: prioritize function parameter, then ARGS, then classifier colors, then annotations
+    # Build class_colors: prioritize function parameter keyed by class name, then ARGS, then classifier, then annotations
     class_colors = []
-    if tissue_colors and len(tissue_colors) == len(class_names):
-        # Use frontend-provided colors (user's current selection) - highest priority
-        class_colors = tissue_colors
-        print(f"Using frontend-provided colors for new classifier: {class_colors}")
+    mapped_new = _resolve_colors_for_class_names(class_names, tissue_classes, tissue_colors)
+    if mapped_new is not None:
+        class_colors = mapped_new
+        print(f"Using frontend-provided colors (by class name) for new classifier: {class_colors}")
     else:
         # Fallback: Build color mapping from ARGS, classifier, or annotations
         class_colors_map = {}
@@ -1028,36 +1073,40 @@ def run_classification(args) -> Dict[str, Any]:
         print(f"[{NODE_NAME}] Using tissue_classes: {tissue_classes}")
         print(f"[{NODE_NAME}] tissue_classes type: {type(tissue_classes)}, length: {len(tissue_classes) if tissue_classes else 0}")
 
-        # Determine final_class_colors early (before training) to pass to train_linear_classifier
-        # This ensures saved classifier uses user's current color selection
-        # Priority: frontend colors (if length matches) > classifier colors (loaded in train_linear_classifier) > zarr colors
-        final_class_colors_for_training = None
-        if tissue_colors and len(tissue_colors) == len(tissue_classes):
-            # Use frontend-provided colors (user's current selection) - highest priority
-            # Only use if length matches to avoid using incomplete color arrays (e.g., after reset)
-            final_class_colors_for_training = tissue_colors
-            print(f"[{NODE_NAME}] Using frontend-provided colors for training: {final_class_colors_for_training}")
-        elif CLASSIFIER_PATH is not None:
-            # If CLASSIFIER_PATH is set but no frontend colors (or length mismatch), pass None
-            # train_linear_classifier will load colors from classifier file (e.g., red from saved classifier)
-            # This ensures we use saved colors from classifier instead of old zarr colors (e.g., blue)
-            # This is especially important after reset when frontend state is cleared
-            final_class_colors_for_training = None
-            if tissue_colors and len(tissue_colors) != len(tissue_classes):
-                print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(tissue_classes)}), will use colors from classifier file")
-            else:
-                print(f"[{NODE_NAME}] Will use colors from classifier file (CLASSIFIER_PATH is set, no frontend colors)")
-        elif ZARR_GROUP in zf and 'tissue_class_HEX_color' in zf[ZARR_GROUP]:
-            # Last fallback: Use existing colors from zarr (only if no classifier path)
-            old_colors = zf[ZARR_GROUP]['tissue_class_HEX_color'][()]
+        # Pass (tissue_classes, tissue_colors) into training so colors map by class name; zarr colors are parallel to tissue_classes
+        effective_tissue_colors: List[str] = list(tissue_colors) if tissue_colors else []
+        if (
+            tissue_classes
+            and len(tissue_classes) > 0
+            and (not effective_tissue_colors or len(effective_tissue_colors) != len(tissue_classes))
+            and CLASSIFIER_PATH is None
+            and ZARR_GROUP in zf
+            and "tissue_class_HEX_color" in zf[ZARR_GROUP]
+        ):
+            old_colors = zf[ZARR_GROUP]["tissue_class_HEX_color"][()]
             if len(old_colors) == len(tissue_classes):
-                final_class_colors_for_training = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
-                print(f"[{NODE_NAME}] Using colors from zarr for training: {final_class_colors_for_training}")
-        
+                effective_tissue_colors = [
+                    c.decode("utf-8") if hasattr(c, "decode") else c for c in old_colors
+                ]
+                print(f"[{NODE_NAME}] Using colors from zarr for training (aligned with tissue_classes by name): {effective_tissue_colors}")
+
+        if tissue_colors and tissue_classes and len(tissue_colors) == len(tissue_classes):
+            print(f"[{NODE_NAME}] UI tissue_colors mapped to classifier by tissue_classes names ({len(tissue_classes)} classes)")
+        elif CLASSIFIER_PATH is not None:
+            if tissue_colors and tissue_classes and len(tissue_colors) != len(tissue_classes):
+                print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(tissue_classes)}); use classifier colors where needed")
+            else:
+                print(f"[{NODE_NAME}] Will use colors from classifier file (CLASSIFIER_PATH set, no valid UI color list)")
+
         # Try supervised classification if we have classifier path or annotations
         classifier_result = None
         if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
-            classifier_result = train_linear_classifier(cell_embeddings, annotations_data, final_class_colors_for_training)
+            classifier_result = train_linear_classifier(
+                cell_embeddings,
+                annotations_data,
+                effective_tissue_colors if effective_tissue_colors else None,
+                tissue_classes if tissue_classes else None,
+            )
             
         # Check if supervised classification succeeded
         if classifier_result is not None:
@@ -1137,34 +1186,33 @@ def run_classification(args) -> Dict[str, Any]:
                 
                 print(f"[{NODE_NAME}] Mapped predictions to merged order. Final class names: {final_class_names}")
             elif CLASSIFIER_PATH is not None:
-                # CLASSIFIER_PATH is set but no user input, still prioritize frontend-provided colors if available (and length matches)
+                # CLASSIFIER_PATH is set but no user input classes: map UI colors by tissue class name onto classifier class_names
                 final_class_names = class_names
-                if tissue_colors and len(tissue_colors) == len(class_names):
-                    # Use frontend-provided colors (user's current selection) even if no user input classes
-                    # Only use if length matches to avoid using incomplete color arrays (e.g., after reset)
-                    final_class_colors = tissue_colors
-                    print(f"[{NODE_NAME}] Using frontend-provided colors (CLASSIFIER_PATH set, no user input classes): {final_class_colors}")
+                mapped_out = _resolve_colors_for_class_names(
+                    class_names, tissue_classes, tissue_colors, existing_colors=class_colors
+                )
+                if mapped_out is not None:
+                    final_class_colors = mapped_out
+                    print(f"[{NODE_NAME}] Using frontend-provided colors by class name (CLASSIFIER_PATH set, no user input classes): {final_class_colors}")
                 else:
-                    # Use classifier colors if frontend didn't provide colors or length mismatch
-                    # This ensures we use saved colors from classifier (e.g., red) instead of incomplete frontend colors
                     final_class_colors = class_colors
-                    if tissue_colors and len(tissue_colors) != len(class_names):
-                        print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(class_names)}), using classifier colors: {final_class_colors}")
+                    if tissue_colors and tissue_classes and len(tissue_colors) != len(tissue_classes):
+                        print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(tissue_classes)}), using classifier colors: {final_class_colors}")
                     else:
                         print(f"[{NODE_NAME}] Using classifier's colors (CLASSIFIER_PATH is set, no user input): {final_class_names}")
             else:
-                # No classifier path, but still prioritize frontend-provided colors if available (and length matches)
+                # No classifier path: same name-based mapping onto returned class_names
                 final_class_names = class_names
-                if tissue_colors and len(tissue_colors) == len(class_names):
-                    # Use frontend-provided colors (user's current selection)
-                    # Only use if length matches to avoid using incomplete color arrays (e.g., after reset)
-                    final_class_colors = tissue_colors
-                    print(f"[{NODE_NAME}] Using frontend-provided colors (no classifier path): {final_class_colors}")
+                mapped_out = _resolve_colors_for_class_names(
+                    class_names, tissue_classes, tissue_colors, existing_colors=class_colors
+                )
+                if mapped_out is not None:
+                    final_class_colors = mapped_out
+                    print(f"[{NODE_NAME}] Using frontend-provided colors by class name (no classifier path): {final_class_colors}")
                 else:
-                    # Use classifier colors if frontend didn't provide colors or length mismatch
                     final_class_colors = class_colors
-                    if tissue_colors and len(tissue_colors) != len(class_names):
-                        print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(class_names)}), using classifier colors: {final_class_colors}")
+                    if tissue_colors and tissue_classes and len(tissue_colors) != len(tissue_classes):
+                        print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(tissue_classes)}), using classifier colors: {final_class_colors}")
                     else:
                         print(f"[{NODE_NAME}] Using classifier output colors (no classifier path): {final_class_colors}")
         else:
