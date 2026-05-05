@@ -24,6 +24,7 @@ import gc
 import logging
 import collections
 import glob
+import shutil
 import traceback
 from sse_starlette.sse import EventSourceResponse
 import xgboost as xgb
@@ -1700,34 +1701,97 @@ def read_node(data: Dict[str, Any]):
     return {"status": "ok", "message": f"[{NODE_NAME}] read done"}
 
 
+def _user_data_write_json(zarr_path: str, node_name: str, key: str, payload: Any) -> None:
+    """Persist one key under {node_name}/userData (JSON bytes), matching tasks_service /read layout."""
+    with zarr.open_group(zarr_path, mode="a") as zf:
+        grp_path = f"{node_name}/userData"
+        grp = zf.require_group(grp_path)
+        if key in grp:
+            del grp[key]
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        grp.create_dataset(key, shape=(), dtype=f"S{len(raw)}", data=raw)
+
+
 @app.post("/classifier/save")
 def classifier_save_endpoint(data: Dict[str, Any]):
-    """Save the last in-memory trained classifier to disk (same contract as NuClass mode=save_trained)."""
-    global LAST_TRAINED_CLF_BUNDLE, SAVE_CLASSIFIER_PATH
-    mode = (data.get("mode") or "").strip().lower()
-    if mode != "save_trained":
-        return {"status": "error", "message": "Only mode=save_trained is supported (in-memory training → file)."}
-    dest = (data.get("save_classifier_path") or data.get("dest_path") or "").strip()
-    if not dest:
-        return {"status": "error", "message": "save_classifier_path or dest_path is required"}
-    if not LAST_TRAINED_CLF_BUNDLE:
-        return {
-            "status": "error",
-            "message": "No trained classifier in this process; run supervised training in /execute first.",
-        }
-    clf, class_names, class_colors, train_data = LAST_TRAINED_CLF_BUNDLE
-    old_save = SAVE_CLASSIFIER_PATH
-    try:
-        SAVE_CLASSIFIER_PATH = dest
-        save_classifier_params(clf, class_names, class_colors, train_data)
-    except Exception as e:
-        traceback.print_exc()
-        return {"status": "error", "message": str(e)}
-    finally:
-        SAVE_CLASSIFIER_PATH = old_save
-    if not os.path.isfile(dest):
-        return {"status": "error", "message": "Expected model file was not created after save."}
-    return {"status": "ok", "dest_path": dest, "message": f"Saved trained classifier to {dest}"}
+    """
+    Step API: export classifier file without running /execute (same contract as NuClass).
+
+    Body JSON:
+      - mode: "copy" (default) | "register_save_path" | "save_trained"
+      - For mode=save_trained:
+          - dest_path or save_classifier_path: write the last in-memory trained model (save_classifier_params)
+      - For mode=copy:
+          - source_path (optional) or classifier_path: defaults to global CLASSIFIER_PATH
+          - dest_path (optional) or save_classifier_path: target file path
+          - persist_to_zarr (bool), zarr_path (str), node_name (str): optional userData update
+      - For mode=register_save_path:
+          - save_classifier_path (str): only sets global SAVE_CLASSIFIER_PATH (+ optional zarr persist)
+    """
+    global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_PATH, NODE_NAME, LAST_TRAINED_CLF_BUNDLE
+    mode = (data.get("mode") or "copy").strip().lower()
+    node_nm = (data.get("node_name") or NODE_NAME or "MuskNode").strip()
+
+    if mode == "save_trained":
+        dest = (data.get("save_classifier_path") or data.get("dest_path") or "").strip()
+        if not dest:
+            return {"status": "error", "message": "save_classifier_path or dest_path is required"}
+        if not LAST_TRAINED_CLF_BUNDLE:
+            return {
+                "status": "error",
+                "message": "No trained classifier in this process; run supervised training in /execute first.",
+            }
+        clf, class_names, class_colors, train_data = LAST_TRAINED_CLF_BUNDLE
+        old_save = SAVE_CLASSIFIER_PATH
+        try:
+            SAVE_CLASSIFIER_PATH = dest
+            save_classifier_params(clf, class_names, class_colors, train_data)
+        except Exception as e:
+            traceback.print_exc()
+            return {"status": "error", "message": str(e)}
+        finally:
+            SAVE_CLASSIFIER_PATH = old_save
+        if not os.path.isfile(dest):
+            return {"status": "error", "message": "Expected model file was not created after save."}
+        return {"status": "ok", "dest_path": dest, "message": f"Saved trained classifier to {dest}"}
+
+    if mode == "register_save_path":
+        sp = (data.get("save_classifier_path") or "").strip()
+        if not sp:
+            return {"status": "error", "message": "save_classifier_path is required"}
+        SAVE_CLASSIFIER_PATH = sp
+        if data.get("persist_to_zarr") and data.get("zarr_path") and os.path.exists(str(data["zarr_path"])):
+            try:
+                _user_data_write_json(str(data["zarr_path"]), node_nm, "save_classifier_path", sp)
+            except Exception as e:
+                return {"status": "error", "message": f"Registered path but zarr persist failed: {e}"}
+        return {"status": "ok", "save_classifier_path": sp, "message": "SAVE_CLASSIFIER_PATH registered"}
+
+    if mode != "copy":
+        return {"status": "error", "message": f"Unknown mode {mode!r}; use 'copy', 'register_save_path', or 'save_trained'"}
+
+    src = (data.get("source_path") or data.get("classifier_path") or CLASSIFIER_PATH or "").strip()
+    dst = (data.get("dest_path") or data.get("save_classifier_path") or "").strip()
+    if not src:
+        return {"status": "error", "message": "source_path or classifier_path (or loaded CLASSIFIER_PATH) required"}
+    if not os.path.isfile(src):
+        return {"status": "error", "message": f"Source file not found: {src}"}
+    if not dst:
+        return {"status": "error", "message": "dest_path or save_classifier_path required"}
+
+    parent = os.path.dirname(os.path.abspath(dst))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    shutil.copy2(src, dst)
+    SAVE_CLASSIFIER_PATH = dst
+
+    if data.get("persist_to_zarr") and data.get("zarr_path") and os.path.exists(str(data["zarr_path"])):
+        try:
+            _user_data_write_json(str(data["zarr_path"]), node_nm, "save_classifier_path", dst)
+        except Exception as e:
+            return {"status": "error", "message": f"File copied but zarr persist failed: {e}"}
+
+    return {"status": "ok", "dest_path": dst, "message": f"Copied classifier to {dst}"}
 
 
 @app.post("/cancel")
