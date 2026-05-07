@@ -828,12 +828,13 @@ class SlideSegmentation():
                 iter += 1
                 pbar.update(1)
                 
-                # Throttle progress callback: only update when progress changes by at least 1%
-                # This reduces SSE overhead significantly for large slide tiles
+                # Call the callback on every tile so cancellation is checked promptly.
+                # update_progress still stores integer progress, so SSE output remains throttled.
                 progress = int((iter / total_tiles) * 100)
-                if self.progress_callback and progress != last_reported_progress:
+                if self.progress_callback:
                     self.progress_callback(progress)
-                    last_reported_progress = progress
+                    if progress != last_reported_progress:
+                        last_reported_progress = progress
                 
                 # Calculate tile position in Level 0 coordinates
                 x_0 = ic*(self.tile_size-self.overlap)
