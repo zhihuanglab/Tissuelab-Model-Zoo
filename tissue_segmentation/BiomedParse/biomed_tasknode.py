@@ -17,6 +17,11 @@ from pathlib import Path
 from sse_starlette.sse import EventSourceResponse
 import time
 import asyncio
+import threading
+
+
+class CooperativeCancel(Exception):
+    """Cooperative stop requested via POST /cancel; raise at explicit checkpoints."""
 
 # =========== 2)other user's independency ===========
 from PIL import Image
@@ -409,6 +414,14 @@ DOWNSAMPLE_RATE = 16
 IMAGE_ARR = None        # normal image array PNG
 
 progress_value = 0  # Global variable to store progress
+progress_cancelled = False
+cancel_event = threading.Event()
+
+
+def _check_cancel():
+    if cancel_event.is_set():
+        raise CooperativeCancel("cancelled")
+
 
 # =========== define /status, /init, /read, /execute four routers ===========
 
@@ -603,6 +616,16 @@ def read_node(data: Dict[str, Any]):
     print(USE_WSI, IMAGE_ARR)
     return {"status": "ok", "message": "biomed read done"}
 
+
+@app.post("/cancel")
+def cancel_task():
+    global cancel_event, progress_cancelled
+    cancel_event.set()
+    progress_cancelled = True
+    print("[BiomedParse] /cancel")
+    return {"status": "ok", "message": "Cancel request received; stopping at next checkpoint."}
+
+
 @app.options("/progress")
 async def progress_options():
     """
@@ -616,23 +639,25 @@ async def progress():
     SSE endpoint to provide progress updates
     """
     async def event_generator():
-        global progress_value
+        global progress_value, progress_cancelled
         last_value = -1
-        while progress_value < 100:
+        progress_cancelled = False
+        while progress_value < 100 and not progress_cancelled:
             if progress_value != last_value:
                 yield {"data": str(progress_value)}
                 last_value = progress_value
-            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+            await asyncio.sleep(0.1)
 
-        # Ensure the final progress update to 100 is sent
-        if last_value != 100:
+        if progress_cancelled:
+            yield {"data": str(-1)}
+            yield {"data": str(progress_value)}
+        elif last_value != 100:
             yield {"data": "100"}
 
-        # Keep the connection open for a short time to ensure the client receives the final update
         await asyncio.sleep(1)
 
-        # Reset progress to 0 after sending the final update
         progress_value = 0
+        progress_cancelled = False
 
     return EventSourceResponse(
         event_generator(),
@@ -652,10 +677,13 @@ def execute_node(background_tasks: BackgroundTasks):
     Execute actual model inference
     """
     global MODEL, PROMPT, USE_WSI, PATCHES, WSI_GRID_SIZE, WSI_ORIGINAL_WH, IMAGE_ARR, BBOX
-    global ZARR_PATH, progress_value
+    global ZARR_PATH, progress_value, cancel_event, progress_cancelled
 
     if MODEL is None:
         return {"status":"error","message":"Model not loaded. Please call /init first."}
+
+    cancel_event.clear()
+    progress_cancelled = False
 
     if PROMPT is None:
         print("[BiomedParse] No prompt => skip")
@@ -676,6 +704,7 @@ def execute_node(background_tasks: BackgroundTasks):
             
             try:
                 for batch_idx in range(num_batches):
+                    _check_cancel()
                     # Actively clean memory before each batch
                     import gc
                     gc.collect()
@@ -688,6 +717,7 @@ def execute_node(background_tasks: BackgroundTasks):
                     # Process only one batch of patches at a time
                     batch_masks = []
                     for idx in range(start_idx, end_idx):
+                        _check_cancel()
                         try:
                             # Load only one patch into memory at a time
                             arr1024 = PATCHES[idx]
@@ -788,6 +818,8 @@ def execute_node(background_tasks: BackgroundTasks):
                 if full_mask is not None:
                     # If complete mask can be created, process normally
                     for idx, pm in enumerate(mask_patches):
+                        if idx % 25 == 0:
+                            _check_cancel()
                         if idx < rows * cols:
                             row = idx // cols
                             col = idx % cols
@@ -815,6 +847,8 @@ def execute_node(background_tasks: BackgroundTasks):
                     
                     # Process mask block by block
                     for idx, pm in enumerate(mask_patches):
+                        if idx % 25 == 0:
+                            _check_cancel()
                         if idx < rows * cols:
                             row = idx // cols
                             col = idx % cols
@@ -852,6 +886,11 @@ def execute_node(background_tasks: BackgroundTasks):
                     "contours": absolute_polygons,
                     "bbox": BBOX
                 }
+            except CooperativeCancel:
+                progress_cancelled = True
+                progress_value = 0
+                result_value = {"status": "cancelled", "message": "Task was cancelled"}
+                print("[BiomedParse] WSI cancelled")
             except Exception as e:
                 print(f"[BiomedParse] WSI processing error: {e}")
                 import traceback
@@ -863,6 +902,7 @@ def execute_node(background_tasks: BackgroundTasks):
                 result_value = {"status": "ok", "msg": "no image => skip."}
             else:
                 try:
+                    _check_cancel()
                     pred_mask = interactive_infer_image(MODEL, Image.fromarray(IMAGE_ARR), [PROMPT])[0]
                     polygons = mask_to_polygons(pred_mask, threshold=0.5)
                     progress_value = 100
@@ -873,6 +913,10 @@ def execute_node(background_tasks: BackgroundTasks):
                         "contours": polygons,
                     }
                     print(polygons)
+                except CooperativeCancel:
+                    progress_cancelled = True
+                    progress_value = 0
+                    result_value = {"status": "cancelled", "message": "Task was cancelled"}
                 except Exception as e:
                     print("[BiomedParse] PNG inference error:", e)
                     result_value = {"status": "error", "message": str(e)}

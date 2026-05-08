@@ -19,10 +19,12 @@ import torch
 import torch.nn as nn
 import colorsys
 import asyncio
+import threading
 import gc
 import logging
 import collections
 import glob
+import shutil
 import traceback
 from sse_starlette.sse import EventSourceResponse
 import xgboost as xgb
@@ -33,8 +35,13 @@ from datetime import datetime
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any
+from typing import Any, Dict, List, Optional
 from pathlib import Path
+
+
+class CooperativeCancel(Exception):
+    """Cooperative stop requested via POST /cancel; raise at explicit checkpoints."""
+
 from musk_for_train import MUSK
 
 app = FastAPI()
@@ -80,10 +87,18 @@ MUSK_MODEL = None
 
 # new global variable for progress
 progress_value = 0  # Global variable to store progress
+cancel_event = threading.Event()
+
+
+def _check_cancel():
+    if cancel_event.is_set():
+        raise CooperativeCancel("cancelled")
+
 
 # Add new global variable
 CLASSIFIER_PATH = None
 SAVE_CLASSIFIER_PATH = None
+LAST_TRAINED_CLF_BUNDLE = None
 
 # ZARR group controls (populated in /read)
 ZARR_GROUP = None
@@ -199,12 +214,9 @@ def generate_distinct_colors(tissue_classes: list[str]) -> list[str]:
     return colors
 
 def save_classifier_params(clf, class_names, class_colors, train_data, max_samples_per_class=100000000000000):
-    """Save classifier parameters and training data to XGBoost model file"""
-    global SAVE_CLASSIFIER_PATH
-    if SAVE_CLASSIFIER_PATH is None:
-        print("No SAVE_CLASSIFIER_PATH specified, skipping saving classifier parameters")
-        return
-        
+    """Embed training metadata into the booster; optionally write XGBoost model to SAVE_CLASSIFIER_PATH."""
+    global SAVE_CLASSIFIER_PATH, LAST_TRAINED_CLF_BUNDLE
+
     # limit the number of samples per class
     embeddings = train_data['embeddings']
     labels = train_data['labels']
@@ -241,10 +253,33 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
                        labels=final_labels)
     train_data_str = base64.b64encode(train_data_bytes.getvalue()).decode('utf-8')
     booster.set_attr(train_data=train_data_str)
-    
-    # save XGBoost model
-    clf.save_model(SAVE_CLASSIFIER_PATH)
-    print(f"Saved classifier with parameters and training data to: {SAVE_CLASSIFIER_PATH}")
+
+    LAST_TRAINED_CLF_BUNDLE = (clf, class_names, class_colors, train_data)
+
+    if SAVE_CLASSIFIER_PATH:
+        clf.save_model(SAVE_CLASSIFIER_PATH)
+        print(f"Saved classifier with parameters and training data to: {SAVE_CLASSIFIER_PATH}")
+    else:
+        print("No SAVE_CLASSIFIER_PATH; classifier metadata embedded in memory only (use POST /classifier/save mode=save_trained to write a file).")
+
+
+def remember_classifier_bundle_for_save(clf, class_names, class_colors, embeddings, labels):
+    """Remember (clf, class_names, class_colors, train_data) for POST /classifier/save mode=save_trained."""
+    global LAST_TRAINED_CLF_BUNDLE
+    if embeddings is None or labels is None:
+        return
+    try:
+        if getattr(embeddings, "size", 0) <= 0 or len(labels) == 0:
+            return
+    except Exception:
+        return
+    LAST_TRAINED_CLF_BUNDLE = (
+        clf,
+        class_names,
+        class_colors,
+        {"embeddings": embeddings, "labels": labels},
+    )
+
 
 def load_classifier_params():
     """Load classifier parameters and training data from XGBoost model file"""
@@ -386,8 +421,45 @@ def _log_training_data_counts(class_names, y_train, n_positive):
         print(f"  {cname}: positive={pos_count}, weak={weak_count}")
 
 
-def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame, tissue_colors: list[str] = None):
-    global CLASSIFIER_PATH, ZARR_PATH, ARGS
+def _resolve_colors_for_class_names(
+    class_names: List[str],
+    tissue_classes: Optional[List[str]],
+    tissue_colors: Optional[List[str]],
+    existing_colors: Optional[List[str]] = None,
+) -> Optional[List[str]]:
+    """
+    Align UI colors to classifier class_names by class name (tissue_classes[i] -> tissue_colors[i]).
+    Embeddings/labels are indexed by class_names order; colors must not be applied by index against
+    tissue_colors when UI class order differs from class_names.
+    """
+    if not class_names:
+        return None
+    existing_colors = existing_colors or []
+    if tissue_classes and tissue_colors and len(tissue_classes) == len(tissue_colors):
+        m = {str(tc): col for tc, col in zip(tissue_classes, tissue_colors)}
+        out = []
+        for i, cn in enumerate(class_names):
+            col = m.get(str(cn))
+            if col is not None and str(col).strip() != "":
+                out.append(col)
+            elif i < len(existing_colors) and existing_colors[i] is not None and str(existing_colors[i]).strip() != "":
+                out.append(existing_colors[i])
+            else:
+                out.append("#aaaaaa")
+        return out
+    # Legacy: no class list to key by; only safe when lengths match class_names
+    if tissue_colors and (not tissue_classes or len(tissue_classes) == 0) and len(tissue_colors) == len(class_names):
+        return list(tissue_colors)
+    return None
+
+
+def train_linear_classifier(
+    cell_embeddings: np.ndarray,
+    annotations: pd.DataFrame,
+    tissue_colors: list[str] = None,
+    tissue_classes: list[str] = None,
+):
+    global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_PATH, ARGS
     
     # update XGBoost parameter settings
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -447,12 +519,17 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         old_class_names = class_names.copy()
                         class_names = all_unique_classes
                         
-                        # Update class_colors: prioritize frontend-provided colors, then classifier colors, then annotations
+                        # Update class_colors: prioritize frontend (by class name), then old classifier colors by name, then annotations
                         new_class_colors = []
-                        if tissue_colors and len(tissue_colors) == len(class_names):
-                            # Use frontend-provided colors (user's current selection) - highest priority
-                            new_class_colors = tissue_colors
-                            print(f"Using frontend-provided colors for updated classifier: {new_class_colors}")
+                        old_color_by_name = dict(zip(old_class_names, class_colors))
+                        existing_for_merge = [old_color_by_name.get(cn) for cn in class_names]
+                        mapped_front = _resolve_colors_for_class_names(
+                            class_names, tissue_classes, tissue_colors,
+                            existing_colors=existing_for_merge,
+                        )
+                        if mapped_front is not None:
+                            new_class_colors = mapped_front
+                            print(f"Using frontend-provided colors (by class name) for updated classifier: {new_class_colors}")
                         else:
                             # Fallback: Build color mapping prioritizing classifier colors, then annotations
                             # This ensures we use saved colors from classifier (e.g., red) instead of old annotation colors (e.g., blue)
@@ -525,14 +602,14 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         # Class count unchanged, can use warm start for faster training
                         print(f"Class count unchanged, using warm start for incremental training...")
                         
-                        # Update class_colors: prioritize frontend-provided colors, then keep existing colors
-                        # This ensures user's color changes are saved to classifier even when class count doesn't change
-                        if tissue_colors and len(tissue_colors) == len(class_names):
-                            # Use frontend-provided colors (user's current selection)
-                            class_colors = tissue_colors
-                            print(f"Using frontend-provided colors for updated classifier (warm start): {class_colors}")
+                        # Update class_colors: prioritize frontend (by class name), then keep existing
+                        mapped_warm = _resolve_colors_for_class_names(
+                            class_names, tissue_classes, tissue_colors, existing_colors=class_colors
+                        )
+                        if mapped_warm is not None:
+                            class_colors = mapped_warm
+                            print(f"Using frontend-provided colors (by class name) for updated classifier (warm start): {class_colors}")
                         else:
-                            # Keep existing colors from classifier if frontend didn't provide new colors
                             print(f"Keeping existing colors from classifier: {class_colors}")
                         
                         # Extract cell indices from the patch_ID column
@@ -608,6 +685,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         print(f"Will enforce exclusion constraints for {len(exclude_map)} patches during prediction")
                 
                 for batch_idx, i in enumerate(range(0, n_samples, batch_size)):
+                    _check_cancel()
                     end_idx = min(i + batch_size, n_samples)
                     batch_embeddings = cell_embeddings[i:end_idx]
                     
@@ -656,17 +734,41 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         print(f"Processed batch {batch_idx + 1}/{n_batches} ({end_idx}/{n_samples} samples)")
                 
                 print("Prediction completed")
-                
-                # Update class_colors: prioritize frontend-provided colors, then keep existing colors
-                # This ensures user's color changes are saved even when only predicting (no annotations)
-                if tissue_colors and len(tissue_colors) == len(class_names):
-                    # Use frontend-provided colors (user's current selection)
-                    class_colors = tissue_colors
-                    print(f"Using frontend-provided colors for prediction-only classifier: {class_colors}")
+
+                # Colors: map UI (tissue_classes, tissue_colors) onto classifier class_names by name
+                old_class_colors = class_colors.copy() if isinstance(class_colors, list) else list(class_colors)
+                mapped_pred = _resolve_colors_for_class_names(
+                    class_names, tissue_classes, tissue_colors, existing_colors=old_class_colors
+                )
+                if mapped_pred is not None:
+                    class_colors = mapped_pred
+                    print(f"Using frontend-provided colors (by class name) for prediction-only classifier: {class_colors}")
                 else:
-                    # Keep existing colors from classifier if frontend didn't provide new colors
                     print(f"Keeping existing colors from classifier for prediction: {class_colors}")
-                
+
+                td_emb = prev_embeddings
+                td_lbl = prev_labels
+                if "X_train" in locals() and getattr(X_train, "size", 0) > 0:
+                    td_emb, td_lbl = X_train, y_train
+
+                if (
+                    class_colors != old_class_colors
+                    and td_emb is not None
+                    and td_lbl is not None
+                    and getattr(td_emb, "size", 0) > 0
+                ):
+                    save_classifier_params(
+                        clf,
+                        class_names,
+                        class_colors,
+                        {"embeddings": td_emb, "labels": td_lbl},
+                    )
+                    node_tag = NODE_NAME or "MuskNode"
+                    print(f"[{node_tag}] Updated classifier / bundle after color change (prediction path): {class_colors}")
+
+                remember_classifier_bundle_for_save(clf, class_names, class_colors, td_emb, td_lbl)
+
+
                 return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
         except Exception as e:
             print(f"Error loading or updating classifier: {e}")
@@ -717,12 +819,12 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         class_names = ["Negative control"] + class_names
         print(f"Added 'Negative control' to class_names (not in annotations): {class_names}")
 
-    # Build class_colors: prioritize function parameter, then ARGS, then classifier colors, then annotations
+    # Build class_colors: prioritize function parameter keyed by class name, then ARGS, then classifier, then annotations
     class_colors = []
-    if tissue_colors and len(tissue_colors) == len(class_names):
-        # Use frontend-provided colors (user's current selection) - highest priority
-        class_colors = tissue_colors
-        print(f"Using frontend-provided colors for new classifier: {class_colors}")
+    mapped_new = _resolve_colors_for_class_names(class_names, tissue_classes, tissue_colors)
+    if mapped_new is not None:
+        class_colors = mapped_new
+        print(f"Using frontend-provided colors (by class name) for new classifier: {class_colors}")
     else:
         # Fallback: Build color mapping from ARGS, classifier, or annotations
         class_colors_map = {}
@@ -841,6 +943,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
             print(f"Will enforce exclusion constraints for {len(exclude_map)} patches during prediction")
     
     for batch_idx, i in enumerate(range(0, n_samples, batch_size)):
+        _check_cancel()
         end_idx = min(i + batch_size, n_samples)
         batch_embeddings = cell_embeddings[i:end_idx]
         
@@ -971,36 +1074,40 @@ def run_classification(args) -> Dict[str, Any]:
         print(f"[{NODE_NAME}] Using tissue_classes: {tissue_classes}")
         print(f"[{NODE_NAME}] tissue_classes type: {type(tissue_classes)}, length: {len(tissue_classes) if tissue_classes else 0}")
 
-        # Determine final_class_colors early (before training) to pass to train_linear_classifier
-        # This ensures saved classifier uses user's current color selection
-        # Priority: frontend colors (if length matches) > classifier colors (loaded in train_linear_classifier) > zarr colors
-        final_class_colors_for_training = None
-        if tissue_colors and len(tissue_colors) == len(tissue_classes):
-            # Use frontend-provided colors (user's current selection) - highest priority
-            # Only use if length matches to avoid using incomplete color arrays (e.g., after reset)
-            final_class_colors_for_training = tissue_colors
-            print(f"[{NODE_NAME}] Using frontend-provided colors for training: {final_class_colors_for_training}")
-        elif CLASSIFIER_PATH is not None:
-            # If CLASSIFIER_PATH is set but no frontend colors (or length mismatch), pass None
-            # train_linear_classifier will load colors from classifier file (e.g., red from saved classifier)
-            # This ensures we use saved colors from classifier instead of old zarr colors (e.g., blue)
-            # This is especially important after reset when frontend state is cleared
-            final_class_colors_for_training = None
-            if tissue_colors and len(tissue_colors) != len(tissue_classes):
-                print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(tissue_classes)}), will use colors from classifier file")
-            else:
-                print(f"[{NODE_NAME}] Will use colors from classifier file (CLASSIFIER_PATH is set, no frontend colors)")
-        elif ZARR_GROUP in zf and 'tissue_class_HEX_color' in zf[ZARR_GROUP]:
-            # Last fallback: Use existing colors from zarr (only if no classifier path)
-            old_colors = zf[ZARR_GROUP]['tissue_class_HEX_color'][()]
+        # Pass (tissue_classes, tissue_colors) into training so colors map by class name; zarr colors are parallel to tissue_classes
+        effective_tissue_colors: List[str] = list(tissue_colors) if tissue_colors else []
+        if (
+            tissue_classes
+            and len(tissue_classes) > 0
+            and (not effective_tissue_colors or len(effective_tissue_colors) != len(tissue_classes))
+            and CLASSIFIER_PATH is None
+            and ZARR_GROUP in zf
+            and "tissue_class_HEX_color" in zf[ZARR_GROUP]
+        ):
+            old_colors = zf[ZARR_GROUP]["tissue_class_HEX_color"][()]
             if len(old_colors) == len(tissue_classes):
-                final_class_colors_for_training = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
-                print(f"[{NODE_NAME}] Using colors from zarr for training: {final_class_colors_for_training}")
-        
+                effective_tissue_colors = [
+                    c.decode("utf-8") if hasattr(c, "decode") else c for c in old_colors
+                ]
+                print(f"[{NODE_NAME}] Using colors from zarr for training (aligned with tissue_classes by name): {effective_tissue_colors}")
+
+        if tissue_colors and tissue_classes and len(tissue_colors) == len(tissue_classes):
+            print(f"[{NODE_NAME}] UI tissue_colors mapped to classifier by tissue_classes names ({len(tissue_classes)} classes)")
+        elif CLASSIFIER_PATH is not None:
+            if tissue_colors and tissue_classes and len(tissue_colors) != len(tissue_classes):
+                print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(tissue_classes)}); use classifier colors where needed")
+            else:
+                print(f"[{NODE_NAME}] Will use colors from classifier file (CLASSIFIER_PATH set, no valid UI color list)")
+
         # Try supervised classification if we have classifier path or annotations
         classifier_result = None
         if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
-            classifier_result = train_linear_classifier(cell_embeddings, annotations_data, final_class_colors_for_training)
+            classifier_result = train_linear_classifier(
+                cell_embeddings,
+                annotations_data,
+                effective_tissue_colors if effective_tissue_colors else None,
+                tissue_classes if tissue_classes else None,
+            )
             
         # Check if supervised classification succeeded
         if classifier_result is not None:
@@ -1080,34 +1187,33 @@ def run_classification(args) -> Dict[str, Any]:
                 
                 print(f"[{NODE_NAME}] Mapped predictions to merged order. Final class names: {final_class_names}")
             elif CLASSIFIER_PATH is not None:
-                # CLASSIFIER_PATH is set but no user input, still prioritize frontend-provided colors if available (and length matches)
+                # CLASSIFIER_PATH is set but no user input classes: map UI colors by tissue class name onto classifier class_names
                 final_class_names = class_names
-                if tissue_colors and len(tissue_colors) == len(class_names):
-                    # Use frontend-provided colors (user's current selection) even if no user input classes
-                    # Only use if length matches to avoid using incomplete color arrays (e.g., after reset)
-                    final_class_colors = tissue_colors
-                    print(f"[{NODE_NAME}] Using frontend-provided colors (CLASSIFIER_PATH set, no user input classes): {final_class_colors}")
+                mapped_out = _resolve_colors_for_class_names(
+                    class_names, tissue_classes, tissue_colors, existing_colors=class_colors
+                )
+                if mapped_out is not None:
+                    final_class_colors = mapped_out
+                    print(f"[{NODE_NAME}] Using frontend-provided colors by class name (CLASSIFIER_PATH set, no user input classes): {final_class_colors}")
                 else:
-                    # Use classifier colors if frontend didn't provide colors or length mismatch
-                    # This ensures we use saved colors from classifier (e.g., red) instead of incomplete frontend colors
                     final_class_colors = class_colors
-                    if tissue_colors and len(tissue_colors) != len(class_names):
-                        print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(class_names)}), using classifier colors: {final_class_colors}")
+                    if tissue_colors and tissue_classes and len(tissue_colors) != len(tissue_classes):
+                        print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(tissue_classes)}), using classifier colors: {final_class_colors}")
                     else:
                         print(f"[{NODE_NAME}] Using classifier's colors (CLASSIFIER_PATH is set, no user input): {final_class_names}")
             else:
-                # No classifier path, but still prioritize frontend-provided colors if available (and length matches)
+                # No classifier path: same name-based mapping onto returned class_names
                 final_class_names = class_names
-                if tissue_colors and len(tissue_colors) == len(class_names):
-                    # Use frontend-provided colors (user's current selection)
-                    # Only use if length matches to avoid using incomplete color arrays (e.g., after reset)
-                    final_class_colors = tissue_colors
-                    print(f"[{NODE_NAME}] Using frontend-provided colors (no classifier path): {final_class_colors}")
+                mapped_out = _resolve_colors_for_class_names(
+                    class_names, tissue_classes, tissue_colors, existing_colors=class_colors
+                )
+                if mapped_out is not None:
+                    final_class_colors = mapped_out
+                    print(f"[{NODE_NAME}] Using frontend-provided colors by class name (no classifier path): {final_class_colors}")
                 else:
-                    # Use classifier colors if frontend didn't provide colors or length mismatch
                     final_class_colors = class_colors
-                    if tissue_colors and len(tissue_colors) != len(class_names):
-                        print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(class_names)}), using classifier colors: {final_class_colors}")
+                    if tissue_colors and tissue_classes and len(tissue_colors) != len(tissue_classes):
+                        print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(tissue_classes)}), using classifier colors: {final_class_colors}")
                     else:
                         print(f"[{NODE_NAME}] Using classifier output colors (no classifier path): {final_class_colors}")
         else:
@@ -1267,6 +1373,13 @@ def run_classification(args) -> Dict[str, Any]:
 
         return result
 
+    except CooperativeCancel:
+        print(f"[{NODE_NAME}] Classification cancelled by user")
+        return {
+            "status": "cancelled",
+            "message": "Task was cancelled",
+            "classification_count": 0,
+        }
     except Exception as e:
         import traceback
         err_msg = f"{str(e)}\n{traceback.format_exc()}"
@@ -1528,7 +1641,8 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_GROUP, DEP_ZARR_GROUPS
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_GROUP, DEP_ZARR_GROUPS, LAST_TRAINED_CLF_BUNDLE, CLASS_OPERATIONS
+    LAST_TRAINED_CLF_BUNDLE = None
     NODE_NAME = data.get("node_name", "MuskNode")
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
@@ -1537,6 +1651,7 @@ def read_node(data: Dict[str, Any]):
 
     CLASSIFIER_PATH = None
     SAVE_CLASSIFIER_PATH = None
+    CLASS_OPERATIONS = {}
 
     print(f"[NODE_NAME] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
     if not ZARR_PATH or not os.path.exists(ZARR_PATH):
@@ -1579,6 +1694,12 @@ def read_node(data: Dict[str, Any]):
                 if isinstance(val_json, list) and len(val_json) > 0:
                     ARGS.tissue_colors = val_json
                     print(f"[{NODE_NAME}] tissue_colors: {ARGS.tissue_colors}")
+            elif k == "class_operations":
+                CLASS_OPERATIONS = _normalize_class_operations(val_json)
+                if _has_rename_cycle(CLASS_OPERATIONS.get("renames", [])):
+                    print(f"[{NODE_NAME}] Detected rename cycle, ignoring rename operations.")
+                    CLASS_OPERATIONS["renames"] = []
+                print(f"[{NODE_NAME}] class_operations => {CLASS_OPERATIONS}")
         
         # Debug: Print final classifier path values
         print(f"[{NODE_NAME}] Final CLASSIFIER_PATH: {CLASSIFIER_PATH}")
@@ -1586,14 +1707,118 @@ def read_node(data: Dict[str, Any]):
 
     return {"status": "ok", "message": f"[{NODE_NAME}] read done"}
 
+
+def _user_data_write_json(zarr_path: str, node_name: str, key: str, payload: Any) -> None:
+    """Persist one key under {node_name}/userData (JSON bytes), matching tasks_service /read layout."""
+    with zarr.open_group(zarr_path, mode="a") as zf:
+        grp_path = f"{node_name}/userData"
+        grp = zf.require_group(grp_path)
+        if key in grp:
+            del grp[key]
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        grp.create_dataset(key, shape=(), dtype=f"S{len(raw)}", data=raw)
+
+
+@app.post("/classifier/save")
+def classifier_save_endpoint(data: Dict[str, Any]):
+    """
+    Step API: export classifier file without running /execute (same contract as NuClass).
+
+    Body JSON:
+      - mode: "copy" (default) | "register_save_path" | "save_trained"
+      - For mode=save_trained:
+          - dest_path or save_classifier_path: write the last in-memory trained model (save_classifier_params)
+      - For mode=copy:
+          - source_path (optional) or classifier_path: defaults to global CLASSIFIER_PATH
+          - dest_path (optional) or save_classifier_path: target file path
+          - persist_to_zarr (bool), zarr_path (str), node_name (str): optional userData update
+      - For mode=register_save_path:
+          - save_classifier_path (str): only sets global SAVE_CLASSIFIER_PATH (+ optional zarr persist)
+    """
+    global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_PATH, NODE_NAME, LAST_TRAINED_CLF_BUNDLE
+    mode = (data.get("mode") or "copy").strip().lower()
+    node_nm = (data.get("node_name") or NODE_NAME or "MuskNode").strip()
+
+    if mode == "save_trained":
+        dest = (data.get("save_classifier_path") or data.get("dest_path") or "").strip()
+        if not dest:
+            return {"status": "error", "message": "save_classifier_path or dest_path is required"}
+        if not LAST_TRAINED_CLF_BUNDLE:
+            return {
+                "status": "error",
+                "message": "No trained classifier in this process; run supervised training in /execute first.",
+            }
+        clf, class_names, class_colors, train_data = LAST_TRAINED_CLF_BUNDLE
+        old_save = SAVE_CLASSIFIER_PATH
+        try:
+            SAVE_CLASSIFIER_PATH = dest
+            save_classifier_params(clf, class_names, class_colors, train_data)
+        except Exception as e:
+            traceback.print_exc()
+            return {"status": "error", "message": str(e)}
+        finally:
+            SAVE_CLASSIFIER_PATH = old_save
+        if not os.path.isfile(dest):
+            return {"status": "error", "message": "Expected model file was not created after save."}
+        return {"status": "ok", "dest_path": dest, "message": f"Saved trained classifier to {dest}"}
+
+    if mode == "register_save_path":
+        sp = (data.get("save_classifier_path") or "").strip()
+        if not sp:
+            return {"status": "error", "message": "save_classifier_path is required"}
+        SAVE_CLASSIFIER_PATH = sp
+        if data.get("persist_to_zarr") and data.get("zarr_path") and os.path.exists(str(data["zarr_path"])):
+            try:
+                _user_data_write_json(str(data["zarr_path"]), node_nm, "save_classifier_path", sp)
+            except Exception as e:
+                return {"status": "error", "message": f"Registered path but zarr persist failed: {e}"}
+        return {"status": "ok", "save_classifier_path": sp, "message": "SAVE_CLASSIFIER_PATH registered"}
+
+    if mode != "copy":
+        return {"status": "error", "message": f"Unknown mode {mode!r}; use 'copy', 'register_save_path', or 'save_trained'"}
+
+    src = (data.get("source_path") or data.get("classifier_path") or CLASSIFIER_PATH or "").strip()
+    dst = (data.get("dest_path") or data.get("save_classifier_path") or "").strip()
+    if not src:
+        return {"status": "error", "message": "source_path or classifier_path (or loaded CLASSIFIER_PATH) required"}
+    if not os.path.isfile(src):
+        return {"status": "error", "message": f"Source file not found: {src}"}
+    if not dst:
+        return {"status": "error", "message": "dest_path or save_classifier_path required"}
+
+    parent = os.path.dirname(os.path.abspath(dst))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    shutil.copy2(src, dst)
+    SAVE_CLASSIFIER_PATH = dst
+
+    if data.get("persist_to_zarr") and data.get("zarr_path") and os.path.exists(str(data["zarr_path"])):
+        try:
+            _user_data_write_json(str(data["zarr_path"]), node_nm, "save_classifier_path", dst)
+        except Exception as e:
+            return {"status": "error", "message": f"File copied but zarr persist failed: {e}"}
+
+    return {"status": "ok", "dest_path": dst, "message": f"Copied classifier to {dst}"}
+
+
+@app.post("/cancel")
+def cancel_task():
+    global cancel_event
+    cancel_event.set()
+    print(f"[{NODE_NAME}] /cancel")
+    return {"status": "ok", "message": "Cancel request received."}
+
+
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event
     
     # CRITICAL: Reset progress to 0 at the start of each /execute call
     # This ensures SSE progress starts from 0% even if previous execution left it at 100%
     progress_value = 0
     print(f"[{NODE_NAME}] Progress reset to 0% at start of /execute")
+
+    cancel_event.clear()
     
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}

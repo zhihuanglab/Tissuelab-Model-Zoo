@@ -13,9 +13,13 @@ from PIL import Image
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
-from pathlib import Path
 from sse_starlette.sse import EventSourceResponse
 import asyncio
+import threading
+
+
+class CooperativeCancel(Exception):
+    """Cooperative stop requested via POST /cancel; raise at explicit checkpoints."""
 
 # =========== 2)other user's independency ===========
 from PIL import Image
@@ -261,6 +265,13 @@ DOWNSAMPLE_RATE = 16
 IMAGE_ARR = None        # normal image array PNG
 
 progress_value = 0  # Global variable to store progress
+cancel_event = threading.Event()
+
+
+def _check_cancel():
+    if cancel_event.is_set():
+        raise CooperativeCancel("cancelled")
+
 
 # =========== define /status, /init, /read, /execute routers ===========
 @app.get("/status")
@@ -370,7 +381,7 @@ def read_node(data: Dict[str, Any]):
 
 def sam_infer_image(model, image: Image.Image, prompt=None):
     """
-    使用 SAM 自动生成分割 mask，忽略 prompt 参数，始终进行自动推理。
+    Run SAM automatic mask generation; ``prompt`` is ignored (always full auto inference).
     """
     image_np = np.array(image)
     mask_generator = SamAutomaticMaskGenerator(model)
@@ -407,17 +418,27 @@ async def progress():
 
     return EventSourceResponse(event_generator())
 
+
+@app.post("/cancel")
+def cancel_task():
+    global cancel_event
+    cancel_event.set()
+    print("[SAM] /cancel")
+    return {"status": "ok", "message": "Cancel request received; stopping between patches."}
+
+
 @app.post("/execute")
 def execute_node(background_tasks: BackgroundTasks):
     """
     Execute SAM inference. Regardless of prompt, always infer.
     """
     global MODEL, PROMPT, USE_WSI, PATCHES, WSI_GRID_SIZE, WSI_ORIGINAL_WH, IMAGE_ARR, BBOX
-    global ZARR_PATH, progress_value
+    global ZARR_PATH, progress_value, cancel_event
 
     if MODEL is None:
         return {"status": "error", "message": "Model not loaded. Please call /init first."}
 
+    cancel_event.clear()
     device = next(MODEL.parameters()).device
     print(f"[SAM] Executing on device: {device}")
 
@@ -435,7 +456,15 @@ def execute_node(background_tasks: BackgroundTasks):
         white_std_threshold = 10
 
         total_patches = len(PATCHES)
+        sam_wsi_cancelled = False
         for idx, arr1024 in enumerate(tqdm(PATCHES, desc="WSI patches")):
+            try:
+                _check_cancel()
+            except CooperativeCancel:
+                sam_wsi_cancelled = True
+                progress_value = 0
+                print("[SAM] WSI patch loop cancelled")
+                break
             patch_filename = os.path.join(debug_patch_dir, f"patch_{idx}.png")
             cv2.imwrite(patch_filename, cv2.cvtColor(arr1024, cv2.COLOR_RGB2BGR))
             original_patches.append(arr1024)
@@ -477,62 +506,65 @@ def execute_node(background_tasks: BackgroundTasks):
             progress_value = int((idx + 1) / total_patches * 100)
             print(f"Progress: {progress_value}%")
 
-        bigmask = patch_concat_mask_overlap(mask_patches, WSI_ORIGINAL_WH, patch_size, WSI_GRID_SIZE, overlap=100)
-        bigmask_path = os.path.join(debug_dir, 'full_region_mask.png')
-        cv2.imwrite(bigmask_path, bigmask)
-        print(f"[DEBUG] Saved full region mask to {bigmask_path}")
+        if sam_wsi_cancelled:
+            result_value = {"status": "cancelled", "message": "Task was cancelled"}
+        else:
+            bigmask = patch_concat_mask_overlap(mask_patches, WSI_ORIGINAL_WH, patch_size, WSI_GRID_SIZE, overlap=100)
+            bigmask_path = os.path.join(debug_dir, 'full_region_mask.png')
+            cv2.imwrite(bigmask_path, bigmask)
+            print(f"[DEBUG] Saved full region mask to {bigmask_path}")
 
-        def patch_concat_rgb(patches, original_wh, patch_size, grid_size, overlap):
-            w, h = original_wh
-            stride = patch_size - overlap
-            acc = np.zeros((h, w, 3), dtype=np.float32)
-            count = np.zeros((h, w, 3), dtype=np.float32)
-            n_rows, n_cols = grid_size
-            idx = 0
-            for row in range(n_rows):
-                for col in range(n_cols):
-                    if idx >= len(patches):
-                        break
-                    patch = patches[idx].astype(np.float32)
-                    x0 = col * stride
-                    y0 = row * stride
-                    x1 = min(x0 + patch_size, w)
-                    y1 = min(y0 + patch_size, h)
-                    patch_crop = patch[0:(y1-y0), 0:(x1-x0), :]
-                    acc[y0:y1, x0:x1, :] += patch_crop
-                    count[y0:y1, x0:x1, :] += 1.0
-                    idx += 1
-            count[count == 0] = 1
-            fused = (acc / count).astype(np.uint8)
-            return fused
+            def patch_concat_rgb(patches, original_wh, patch_size, grid_size, overlap):
+                w, h = original_wh
+                stride = patch_size - overlap
+                acc = np.zeros((h, w, 3), dtype=np.float32)
+                count = np.zeros((h, w, 3), dtype=np.float32)
+                n_rows, n_cols = grid_size
+                idx = 0
+                for row in range(n_rows):
+                    for col in range(n_cols):
+                        if idx >= len(patches):
+                            break
+                        patch = patches[idx].astype(np.float32)
+                        x0 = col * stride
+                        y0 = row * stride
+                        x1 = min(x0 + patch_size, w)
+                        y1 = min(y0 + patch_size, h)
+                        patch_crop = patch[0:(y1-y0), 0:(x1-x0), :]
+                        acc[y0:y1, x0:x1, :] += patch_crop
+                        count[y0:y1, x0:x1, :] += 1.0
+                        idx += 1
+                count[count == 0] = 1
+                fused = (acc / count).astype(np.uint8)
+                return fused
 
-        full_image = patch_concat_rgb(original_patches, WSI_ORIGINAL_WH, patch_size, WSI_GRID_SIZE, overlap=100)
-        full_image_path = os.path.join(debug_dir, 'full_region.png')
-        cv2.imwrite(full_image_path, cv2.cvtColor(full_image, cv2.COLOR_RGB2BGR))
-        print(f"[DEBUG] Saved full region image to {full_image_path}")
+            full_image = patch_concat_rgb(original_patches, WSI_ORIGINAL_WH, patch_size, WSI_GRID_SIZE, overlap=100)
+            full_image_path = os.path.join(debug_dir, 'full_region.png')
+            cv2.imwrite(full_image_path, cv2.cvtColor(full_image, cv2.COLOR_RGB2BGR))
+            print(f"[DEBUG] Saved full region image to {full_image_path}")
 
-        polygons = binary_mask_to_polygons(bigmask)
+            polygons = binary_mask_to_polygons(bigmask)
 
-        absolute_polygons = [
-            [[x + BBOX[0], y + BBOX[1]] for x, y in polygon]
-            for polygon in polygons
-        ]
+            absolute_polygons = [
+                [[x + BBOX[0], y + BBOX[1]] for x, y in polygon]
+                for polygon in polygons
+            ]
         
-        result_img = full_image.copy()
-        for poly in polygons:
-            pts = np.array(poly, np.int32).reshape((-1, 1, 2))
-            cv2.polylines(result_img, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
-        result_path = os.path.join(debug_dir, "result.png")
-        cv2.imwrite(result_path, cv2.cvtColor(result_img, cv2.COLOR_RGB2BGR))
-        print(f"[DEBUG] Saved result image with polygons to {result_path}")
+            result_img = full_image.copy()
+            for poly in polygons:
+                pts = np.array(poly, np.int32).reshape((-1, 1, 2))
+                cv2.polylines(result_img, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+            result_path = os.path.join(debug_dir, "result.png")
+            cv2.imwrite(result_path, cv2.cvtColor(result_img, cv2.COLOR_RGB2BGR))
+            print(f"[DEBUG] Saved result image with polygons to {result_path}")
 
-        result_value = {
-            "status": "ok",
-            "prompt": PROMPT,
-            "contours_count": len(absolute_polygons),
-            "contours": absolute_polygons,
-            "bbox": BBOX
-        }
+            result_value = {
+                "status": "ok",
+                "prompt": PROMPT,
+                "contours_count": len(absolute_polygons),
+                "contours": absolute_polygons,
+                "bbox": BBOX
+            }
     else:
         if IMAGE_ARR is None:
             result_value = {"status": "ok", "msg": "no image => skip."}

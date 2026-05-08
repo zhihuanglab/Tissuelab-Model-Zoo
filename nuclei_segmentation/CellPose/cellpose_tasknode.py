@@ -5,9 +5,9 @@ Segmentation Node for nuclei segmentation + embedding generation using Cellpose
 """
 import argparse
 import os
-import sys
 import time
 import json
+import threading
 import zarr
 import uvicorn
 import requests
@@ -24,6 +24,53 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from pathlib import Path
+
+
+class CooperativeCancel(Exception):
+    """Cooperative stop requested via POST /cancel; raise at explicit checkpoints."""
+
+
+class CancelWatcher:
+    """
+    Daemon thread that polls ``cancel_event`` and calls ``on_cancel`` once when set.
+    Improves SSE/UI responsiveness between rare progress callbacks; cannot preempt native code.
+    """
+
+    def __init__(self, cancel_event: threading.Event, on_cancel, interval_s: float = 0.12):
+        self._cancel_event = cancel_event
+        self._on_cancel = on_cancel
+        self._interval = max(0.02, float(interval_s))
+        self._stop = threading.Event()
+        self._thread = None
+        self._fired = False
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            if self._cancel_event.is_set():
+                if not self._fired:
+                    self._fired = True
+                    try:
+                        self._on_cancel()
+                    except Exception:
+                        pass
+                return
+
+    def start(self):
+        self._fired = False
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="cancel-watcher",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
 
 from cellpose_nuc_seg import SlideSegmentation
 from nuc_embedding_mac import NucleiEmbedding
@@ -47,6 +94,14 @@ NODE_NAME = None
 DEPENDENCIES = []
 progress_value = 0  # Global variable to track progress
 progress_complete = False  # New flag to indicate completion
+progress_cancelled = False
+cancel_event = threading.Event()
+
+
+def _mark_sse_cancelled() -> None:
+    global progress_cancelled
+    progress_cancelled = True
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -82,6 +137,13 @@ def print_h5_structure(file_path):
 
 
 
+def update_progress(value):
+    global progress_value
+    if cancel_event.is_set():
+        raise CooperativeCancel("cancelled")
+    progress_value = value
+
+
 def run_segmentation(args):
     """
     Combined "Segmentation + Embedding" logic in one node.
@@ -90,12 +152,16 @@ def run_segmentation(args):
     3) according to segmentation, generate embedding
     4) write segmentation + embedding to workflow_data.h5
     """
-    global progress_complete
+    global progress_complete, progress_cancelled, progress_value
 
     if ZARR_PATH is None or NODE_NAME is None:
         raise ValueError("ZARR_PATH and NODE_NAME must be set before running segmentation")
 
     result = {"status": "success", "message": "", "nuclei_count": 0}
+
+    def cancel_checker():
+        if cancel_event.is_set():
+            raise CooperativeCancel("cancelled")
 
     try:
         start_time = time.time()
@@ -130,7 +196,8 @@ def run_segmentation(args):
                                    n_tiles=(2, 2, 1),
                                    cellpose_model=args.cellpose_model,
                                    isIHC=args.isIHC,
-                                   progress_callback=update_progress)
+                                   progress_callback=update_progress,
+                                   cancel_checker=cancel_checker)
             ss.run_WSI_segmentation()
             contours = ss.final_coord.astype(np.int32)
             centroids = ss.final_points.astype(np.int32)
@@ -152,7 +219,7 @@ def run_segmentation(args):
 
             if not have_cached_embedding:
                 print("no cached embeddings => generate new embeddings directly into Zarr")
-                ne = NucleiEmbedding(args, centroids, progress_callback=update_progress)
+                ne = NucleiEmbedding(args, centroids, progress_callback=update_progress, cancel_checker=cancel_checker)
                 ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{NODE_NAME}/embedding")
 
         # Step D: write segmentation to workflow Zarr (embedding already written if generated)
@@ -176,6 +243,17 @@ def run_segmentation(args):
         print(f"Time taken: {end_time - start_time:.2f}s")
 
         return result
+
+    except CooperativeCancel:
+        progress_cancelled = True
+        progress_complete = True
+        progress_value = 0
+        print("[CellposeSegmentationNode] run_segmentation cancelled by user")
+        return {
+            "status": "cancelled",
+            "message": "Task was cancelled",
+            "nuclei_count": 0,
+        }
 
     except Exception as e:
         import traceback
@@ -246,23 +324,39 @@ def read_node(data: Dict[str, Any]):
     return {"status": "ok", "message": "CellposeSegmentationNode read done"}
 
 
+@app.post("/cancel")
+def cancel_task():
+    global cancel_event, progress_cancelled
+    cancel_event.set()
+    progress_cancelled = True
+    print("[CellposeSegmentationNode] /cancel — cancel_event set")
+    return {"status": "ok", "message": "Cancel request received; stopping at next checkpoint."}
+
+
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event, progress_cancelled
 
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
 
-    if not ARGS or not getattr(ARGS, "slidepath", None):
-        print("[CellposeSegmentationNode] no path => skip.")
-        out_val = {
-            "status": "ok",
-            "message": "no path, skipping.",
-            "nuclei_count": 0
-        }
-    else:
-        print(f"[CellposeSegmentationNode] /execute => run_segmentation with slidepath={ARGS.slidepath}")
-        out_val = run_segmentation(ARGS)
+    cancel_event.clear()
+    progress_cancelled = False
+    watcher = CancelWatcher(cancel_event, _mark_sse_cancelled)
+    watcher.start()
+    try:
+        if not ARGS or not getattr(ARGS, "slidepath", None):
+            print("[CellposeSegmentationNode] no path => skip.")
+            out_val = {
+                "status": "ok",
+                "message": "no path, skipping.",
+                "nuclei_count": 0
+            }
+        else:
+            print(f"[CellposeSegmentationNode] /execute => run_segmentation with slidepath={ARGS.slidepath}")
+            out_val = run_segmentation(ARGS)
+    finally:
+        watcher.stop()
 
     # store the result to 'output'
     if ZARR_PATH and os.path.exists(ZARR_PATH):
@@ -277,50 +371,49 @@ def execute_node():
     return {"status": "ok", "output": out_val}
 
 
-def update_progress(value):
-    global progress_value
-    progress_value = value
-    # print(f"Global progress updated: {progress_value}%")  # Add debug output
-
-
 @app.get("/progress")
 async def progress():
     """
     SSE endpoint to provide progress updates
     """
     async def event_generator():
-        global progress_value, progress_complete
+        global progress_value, progress_complete, progress_cancelled
         last_value = -1
+        progress_value = 0
+        progress_complete = False
+        progress_cancelled = False
+
         while True:
-            # Check if progress changed or if it's the final 100% update
-            if progress_value != last_value or (progress_value == 100 and progress_complete):
-                if last_value > progress_value:
+            if progress_value != last_value or (progress_value == 100 and progress_complete) or (progress_value == 0 and last_value > 0) or progress_cancelled:
+                if last_value > progress_value or progress_cancelled:
+                    if progress_cancelled:
+                        print("[SSE] Task cancelled, sending reset signal")
                     yield {"data": str(-1)}
                 yield {"data": str(progress_value)}
                 last_value = progress_value
-                # print(f"Progress updated to: {progress_value}%, {progress_complete}")
 
-                # If progress reaches 100 and completion flag is set, wait a bit before breaking
-                if progress_value == 100 and progress_complete:
-                    print("Progress complete, closing connection.")  # Add debug output
-                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
+                if (progress_value == 100 and progress_complete) or progress_cancelled:
+                    if progress_cancelled:
+                        print("Task cancelled, closing connection.")
+                    else:
+                        print("Progress complete, closing connection.")
+                    await asyncio.sleep(0.5)
                     break
 
-            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+            await asyncio.sleep(0.1)
 
-        # Keep the connection open for a short time to ensure the client receives the final update
         await asyncio.sleep(1)
 
-        # Reset progress to 0 and completion flag after sending the final update
         progress_value = 0
         progress_complete = False
-        print("Progress reset to 0.")  # Add debug output
+        progress_cancelled = False
+        print("Progress reset to 0.")
 
     return EventSourceResponse(event_generator())
 
 
 def main():
-    # 添加这一行来支持PyInstaller打包的可执行文件中的多进程
+    # Required for multiprocessing when frozen (e.g. PyInstaller one-file/one-dir builds).
     if __name__ == "__main__":
         multiprocessing.freeze_support()
         multiprocess.freeze_support()

@@ -150,9 +150,10 @@ def collate_patches(batch):
     return [patch for patch in batch if patch is not None]
 
 class NucleiEmbedding:
-    def __init__(self, args, centroids=None, progress_callback=None):
+    def __init__(self, args, centroids=None, progress_callback=None, cancel_checker=None):
         self.args = args
         self.progress_callback = progress_callback
+        self._cancel_checker = cancel_checker
         
         print("Getting slide magnification...")
         
@@ -353,6 +354,8 @@ class NucleiEmbedding:
         pbar = tqdm(total=len(dataset), desc="Generating embeddings")
         
         for batch_idx, batch in enumerate(dataloader):
+            if self._cancel_checker:
+                self._cancel_checker()
             if batch:
                 try:
                     processed_batch = torch.from_numpy(np.concatenate(batch, axis=0)).to("cuda" if torch.cuda.is_available() else "cpu")
@@ -378,6 +381,8 @@ class NucleiEmbedding:
                     if self.progress_callback:
                         progress = int((total_processed / len(dataset)) * 100)
                         self.progress_callback(progress)
+                    if self._cancel_checker:
+                        self._cancel_checker()
                     
                     # clean memory
                     del batch_embeddings

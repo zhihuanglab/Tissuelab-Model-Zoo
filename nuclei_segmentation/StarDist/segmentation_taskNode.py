@@ -85,6 +85,7 @@ DEPENDENCIES = []
 progress_value = 0  # Global variable to track progress
 progress_complete = False  # New flag to indicate completion
 progress_cancelled = False  # Flag to indicate cancellation
+execution_active = False  # True while /execute is processing the current slide
 
 # global variable for cancellation flag - use threading.Event for thread safety
 cancel_event = threading.Event()  # Thread-safe cancellation event
@@ -368,6 +369,57 @@ def run_segmentation(args):
                 ALREADY_HAVE_SEG = False
 
 
+        def _persist_segmentation_outputs_to_zarr(
+            centroids_data: np.ndarray | None,
+            contours_data: np.ndarray | None,
+            probability_data: np.ndarray | None,
+        ) -> None:
+            """Persist segmentation outputs immediately so embedding failures do not lose segmentation."""
+            if centroids_data is None:
+                print("[ZARR WRITE] Centroids are None after segmentation step, nothing to write for this node.")
+                return
+
+            zf_write = zarr.open_group(ZARR_PATH, mode='a')
+            node_grp = zf_write.require_group(NODE_NAME)
+
+            print(f"[ZARR WRITE] Writing centroids. Shape: {centroids_data.shape}")
+            if 'centroids' in node_grp:
+                del node_grp['centroids']
+            node_grp.create_dataset('centroids', data=centroids_data)
+
+            if contours_data is not None:
+                print(f"[ZARR WRITE] Writing contours. Shape: {contours_data.shape}")
+                if 'contours' in node_grp:
+                    del node_grp['contours']
+                node_grp.create_dataset('contours', data=contours_data)
+            else:
+                print("[ZARR WRITE] Contours are None, not writing.")
+
+            if probability_data is not None:
+                print(f"[ZARR WRITE] Writing probability. Shape: {probability_data.shape}")
+                if 'probability' in node_grp:
+                    del node_grp['probability']
+                node_grp.create_dataset('probability', data=probability_data)
+            else:
+                print("[ZARR WRITE] Probability is None, not writing.")
+
+            # Save parameters used to generate this segmentation in node attrs for future comparison
+            node_grp.attrs['bbox'] = current_bbox if current_bbox is not None else ''
+            if current_target_mpp is not None:
+                node_grp.attrs['target_mpp'] = float(current_target_mpp)
+            else:
+                node_grp.attrs['target_mpp'] = ''
+            if current_polygon_points is not None:
+                node_grp.attrs['polygon_points'] = json.dumps(current_polygon_points, ensure_ascii=False)
+            else:
+                node_grp.attrs['polygon_points'] = ''
+
+            print(
+                f"[ZARR WRITE] Saved segmentation parameters to attrs: "
+                f"bbox={current_bbox}, target_mpp={current_target_mpp}, "
+                f"polygon_points={current_polygon_points is not None}"
+            )
+
         # Step B: if not have segmentation => run stardist
         if not ALREADY_HAVE_SEG:
             # Check for cancellation before segmentation
@@ -470,6 +522,10 @@ def run_segmentation(args):
             result["nuclei_count"] = len(centroids) # Based on centroids
             result["message"] = "Segmentation completed successfully"
 
+            # Persist segmentation outputs immediately after segmentation, before embedding.
+            # This guarantees segmentation data survives even if embedding fails/cancels.
+            _persist_segmentation_outputs_to_zarr(centroids, contours, probability)
+
         # Step C: generate embedding if not cached; write directly to Zarr
         # Check for cancellation before embedding
         if cancel_event.is_set():
@@ -523,7 +579,9 @@ def run_segmentation(args):
                 def embed_progress_with_cancel(pct):
                     if cancel_event.is_set():
                         raise CancellationException("Task cancelled during embedding")
-                    update_progress(pct, "embedding")
+                    # NucleiEmbedding may report 100 before final reorder/fusion/cleanup has fully
+                    # returned. Keep UI below "Processed" until SegmentationNode fully returns.
+                    update_progress(min(float(pct), 99.0), "embedding")
                 
                 ne = NucleiEmbedding(args, centroids, contours=contours_for_embedding, progress_callback=embed_progress_with_cancel)
                 try:
@@ -555,62 +613,6 @@ def run_segmentation(args):
             print("[EMBED LOG] No centroids detected from segmentation, skipping embedding generation.")
         else: # centroids is None
             print("[EMBED LOG] Centroids are None, skipping embedding generation.")
-
-
-        # Step D: write segmentation (embedding already written if generated)
-        if centroids is not None: # Only proceed if centroids were processed (even if empty from seg)
-            zf = zarr.open_group(ZARR_PATH, mode='a')
-            # Do NOT delete the whole group, as it would remove previously written 'embedding'.
-            # Instead, create/require the group and overwrite only specific datasets.
-            node_grp = zf.require_group(NODE_NAME)
-
-            print(f"[ZARR WRITE] Writing centroids. Shape: {centroids.shape if centroids is not None else 'None'}")
-            if 'centroids' in node_grp:
-                del node_grp['centroids']
-            node_grp.create_dataset('centroids', data=centroids)
-            
-            if contours is not None:
-                print(f"[ZARR WRITE] Writing contours. Shape: {contours.shape}")
-                if 'contours' in node_grp:
-                    del node_grp['contours']
-                node_grp.create_dataset('contours', data=contours)
-            else:
-                print("[ZARR WRITE] Contours are None, not writing.")
-            
-            if probability is not None: # Save probability if it was generated or loaded
-                print(f"[ZARR WRITE] Writing probability. Shape: {probability.shape}")
-                if 'probability' in node_grp:
-                    del node_grp['probability']
-                node_grp.create_dataset('probability', data=probability)
-            else: # This case should be less common if prob is always attempted
-                print("[ZARR WRITE] Probability is None, not writing.")
-
-            # Save parameters used to generate this segmentation in node attrs for future comparison
-            # This allows us to detect parameter changes and re-run if needed
-            # Using attrs instead of separate datasets to avoid changing zarr structure
-            # Note: current_bbox, current_target_mpp, current_polygon_points are already retrieved at the start of Step A
-            
-            # Save parameters to attrs (zarr attrs support various types including float and string)
-            node_grp.attrs['bbox'] = current_bbox if current_bbox is not None else ''
-            # Save target_mpp as float if not None, empty string if None
-            # Note: attrs['target_mpp'] can be either float or empty string (for None case)
-            if current_target_mpp is not None:
-                node_grp.attrs['target_mpp'] = float(current_target_mpp)
-            else:
-                node_grp.attrs['target_mpp'] = ''
-            # Save polygon_points as JSON string
-            if current_polygon_points is not None:
-                node_grp.attrs['polygon_points'] = json.dumps(current_polygon_points, ensure_ascii=False)
-            else:
-                node_grp.attrs['polygon_points'] = ''
-            
-            print(f"[ZARR WRITE] Saved segmentation parameters to attrs: bbox={current_bbox}, target_mpp={current_target_mpp}, polygon_points={current_polygon_points is not None}")
-
-            # Embedding has been written directly by NucleiEmbedding if needed
-
-            time.sleep(0.5) # Reduced sleep time
-        else:
-            print("[ZARR WRITE] Centroids are None after segmentation step, nothing to write for this node.")
 
         progress_complete = True
         update_progress(100, "embedding")
@@ -781,7 +783,7 @@ def read_node(data: Dict[str, Any]):
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event, progress_value, progress_complete, progress_cancelled
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event, progress_value, progress_complete, progress_cancelled, execution_active
     
     print(f"[SegmentationNode] /execute called - Cancel event state: {cancel_event.is_set()}")
     
@@ -796,49 +798,53 @@ def execute_node():
     progress_value = 0
     progress_complete = False
     progress_cancelled = False  # Reset cancellation flag
+    execution_active = True
 
-    if not IS_MODEL_INITED:
-        print(f"[SegmentationNode] /execute: Model not initialized, returning error.")
-        return {"status": "error", "message": "Please /init first."}
+    try:
+        if not IS_MODEL_INITED:
+            print(f"[SegmentationNode] /execute: Model not initialized, returning error.")
+            return {"status": "error", "message": "Please /init first."}
 
-    if not ARGS or not getattr(ARGS, "slidepath", None):
-        print("[SegmentationNode] no path => skip.")
-        out_val = {
-            "status": "ok",
-            "message": "no path, skipping.",
-            "nuclei_count": 0
-        }
-        progress_value = 100
-        progress_complete = True
-    else:
-        print(f"[SegmentationNode] /execute => run_segmentation with slidepath={ARGS.slidepath}")
-        print(f"[SegmentationNode] /execute: Cancel event state before run_segmentation: {cancel_event.is_set()}")
-        out_val = run_segmentation(ARGS)
-        
-        # Check if task was cancelled
-        if out_val.get("status") == "cancelled":
-            # Reset progress state on cancellation
-            # Force progress update by ensuring it's different from current value
-            current_progress = progress_value
-            progress_value = 0
-            progress_complete = False
-            progress_cancelled = True  # Set cancellation flag
-            # Small delay to allow SSE to pick up the reset
-            if current_progress > 0:
-                time.sleep(0.2)  # Give SSE stream time to send reset signal
-            return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
+        if not ARGS or not getattr(ARGS, "slidepath", None):
+            print("[SegmentationNode] no path => skip.")
+            out_val = {
+                "status": "ok",
+                "message": "no path, skipping.",
+                "nuclei_count": 0
+            }
+            progress_value = 100
+            progress_complete = True
+        else:
+            print(f"[SegmentationNode] /execute => run_segmentation with slidepath={ARGS.slidepath}")
+            print(f"[SegmentationNode] /execute: Cancel event state before run_segmentation: {cancel_event.is_set()}")
+            out_val = run_segmentation(ARGS)
+            
+            # Check if task was cancelled
+            if out_val.get("status") == "cancelled":
+                # Reset progress state on cancellation
+                # Force progress update by ensuring it's different from current value
+                current_progress = progress_value
+                progress_value = 0
+                progress_complete = False
+                progress_cancelled = True  # Set cancellation flag
+                # Small delay to allow SSE to pick up the reset
+                if current_progress > 0:
+                    time.sleep(0.2)  # Give SSE stream time to send reset signal
+                return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
 
-    # store the result to 'output'
-    if ZARR_PATH and os.path.exists(ZARR_PATH):
-        zf = zarr.open_group(ZARR_PATH, mode='a')
-        node_out_path = f"{NODE_NAME}/output"
-        if node_out_path in zf:
-            del zf[node_out_path]
-        out_str = json.dumps(out_val, ensure_ascii=False)
-        out_bytes = out_str.encode("utf-8")
-        zf.create_dataset(node_out_path, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
+        # store the result to 'output'
+        if ZARR_PATH and os.path.exists(ZARR_PATH):
+            zf = zarr.open_group(ZARR_PATH, mode='a')
+            node_out_path = f"{NODE_NAME}/output"
+            if node_out_path in zf:
+                del zf[node_out_path]
+            out_str = json.dumps(out_val, ensure_ascii=False)
+            out_bytes = out_str.encode("utf-8")
+            zf.create_dataset(node_out_path, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
 
-    return {"status": "ok", "output": out_val}
+        return {"status": "ok", "output": out_val}
+    finally:
+        execution_active = False
 
 
 def update_progress(value, phase="segmentation"):
@@ -882,11 +888,17 @@ async def progress():
     SSE endpoint to provide progress updates
     """
     async def event_generator():
-        global progress_value, progress_complete, progress_cancelled
+        global progress_value, progress_complete, progress_cancelled, execution_active
         last_value = -1
-        progress_value = 0  # Reset progress to 0 for each new connection
-        progress_complete = False  # Reset completion flag
-        progress_cancelled = False  # Reset cancellation flag
+
+        # The scheduler opens /progress before it calls /execute. In batch mode the
+        # previous slide may have left a terminal 100% state behind; clear that
+        # idle terminal state so the new stream waits for the next execution.
+        if not execution_active and (progress_complete or progress_cancelled):
+            print("[SSE] Clearing stale terminal progress before next execution.")
+            progress_value = 0
+            progress_complete = False
+            progress_cancelled = False
         
         while True:
             # Check if progress changed or if it's the final 100% update
@@ -917,10 +929,9 @@ async def progress():
         # Keep the connection open for a short time to ensure the client receives the final update
         await asyncio.sleep(1)
 
-        # Reset progress to 0 and completion flag after sending the final update
-        progress_value = 0
-        progress_complete = False
-        print("Progress reset to 0.")  # Add debug output
+        # Do not reset global progress here. /execute owns lifecycle resets; the progress
+        # endpoint may reconnect while a run is active, and resetting here corrupts UI state.
+        print("Progress stream closed.")  # Add debug output
 
     return EventSourceResponse(event_generator())
 

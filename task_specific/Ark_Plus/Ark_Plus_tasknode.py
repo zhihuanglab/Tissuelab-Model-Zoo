@@ -21,6 +21,10 @@ import asyncio
 import threading
 from pathlib import Path
 
+
+class CooperativeCancel(Exception):
+    """Cooperative stop requested via POST /cancel; raise at explicit checkpoints."""
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
@@ -53,6 +57,12 @@ progress_value = 0
 progress_complete = False
 last_printed_progress = -1
 ZARR_GROUP = None
+cancel_event = threading.Event()
+
+
+def _check_cancel():
+    if cancel_event.is_set():
+        raise CooperativeCancel("cancelled")
 DEP_ZARR_GROUPS = {}
 
 # ======================== Model Definition ========================
@@ -140,7 +150,8 @@ def _to_float(val, default=None):
 def update_progress(value):
     """Update the progress value for the frontend"""
     global progress_value, last_printed_progress
-    
+
+    _check_cancel()
     progress_value = value
     
     # Print progress at 10% intervals
@@ -302,6 +313,10 @@ def run_inference(args):
         
         print(f"[{NODE_NAME}] Inference completed successfully in {elapsed_time:.2f}s")
         
+    except CooperativeCancel:
+        progress_complete = True
+        result["status"] = "cancelled"
+        result["message"] = "Task was cancelled"
     except Exception as e:
         import traceback
         error_msg = f"Error during inference: {str(e)}\n{traceback.format_exc()}"
@@ -450,12 +465,22 @@ def _set_image_path(value):
             print(f"[{NODE_NAME}] Warning: Image path does not exist: {value}")
 
 
+@app.post("/cancel")
+def cancel_task():
+    global cancel_event
+    cancel_event.set()
+    print(f"[{NODE_NAME}] /cancel")
+    return {"status": "ok", "message": "Cancel request received."}
+
+
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event
     
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
+
+    cancel_event.clear()
     
     # Validate image path
     if (not ARGS) or (not getattr(ARGS, "image_path", None)) or (not os.path.isfile(ARGS.image_path)):

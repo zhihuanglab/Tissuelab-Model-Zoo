@@ -6,8 +6,8 @@ Creates SegmentationNode and CellFeatureNode in H5 file
 """
 import argparse
 import os
-import sys
 import time
+import threading
 import json
 import h5py
 from safe_h5_utils import safe_h5_open
@@ -27,6 +27,53 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from pathlib import Path
+
+
+class CooperativeCancel(Exception):
+    """Cooperative stop requested via POST /cancel; raise at explicit checkpoints."""
+
+
+class CancelWatcher:
+    """
+    Daemon thread that polls ``cancel_event`` and calls ``on_cancel`` once when set.
+    Improves SSE/UI responsiveness between rare progress callbacks; cannot preempt native code.
+    """
+
+    def __init__(self, cancel_event: threading.Event, on_cancel, interval_s: float = 0.12):
+        self._cancel_event = cancel_event
+        self._on_cancel = on_cancel
+        self._interval = max(0.02, float(interval_s))
+        self._stop = threading.Event()
+        self._thread = None
+        self._fired = False
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            if self._cancel_event.is_set():
+                if not self._fired:
+                    self._fired = True
+                    try:
+                        self._on_cancel()
+                    except Exception:
+                        pass
+                return
+
+    def start(self):
+        self._fired = False
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="cancel-watcher",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
 
 from nuc_seg_mac import SlideSegmentation
 from nuc_stat import SlideProperty
@@ -50,6 +97,14 @@ NODE_NAME = None
 DEPENDENCIES = []
 progress_value = 0
 progress_complete = False
+progress_cancelled = False
+cancel_event = threading.Event()
+
+
+def _mark_sse_cancelled():
+    global progress_cancelled
+    progress_cancelled = True
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -79,6 +134,8 @@ def parse_args():
 
 def update_progress(value):
     global progress_value
+    if cancel_event.is_set():
+        raise CooperativeCancel("cancelled")
     progress_value = value
 
 def run_segmentation_and_features(args):
@@ -86,7 +143,7 @@ def run_segmentation_and_features(args):
     Combined "Segmentation + Feature Extraction" logic in one node.
     This follows the workflow: nuc_seg_mac.py -> nuc_stat.py
     """
-    global progress_complete
+    global progress_complete, progress_cancelled, progress_value
 
     # Monkey patch the problematic FSD computation before running
     import histomicstk_scripts.compute_fsd_features as fsd_module
@@ -165,6 +222,10 @@ def run_segmentation_and_features(args):
     try:
         start_time = time.time()
 
+        def cancel_checker():
+            if cancel_event.is_set():
+                raise CooperativeCancel("cancelled")
+
         # Step A: Check if already have segmentation and features
         ALREADY_HAVE_SEG = False
         ALREADY_HAVE_FEATURES = False
@@ -223,7 +284,8 @@ def run_segmentation_and_features(args):
                 n_tiles=args.n_tiles,
                 stardist_pretrain=args.stardist_pretrain,
                 isIHC=args.isIHC,
-                progress_callback=lambda v: update_progress(10 + int(v * 0.4))  # 10-50%
+                progress_callback=lambda v: update_progress(10 + int(v * 0.4)),  # 10-50%
+                cancel_checker=cancel_checker,
             )
             
             # Run segmentation
@@ -390,6 +452,19 @@ def run_segmentation_and_features(args):
 
         return result
 
+    except CooperativeCancel:
+        progress_cancelled = True
+        progress_complete = True
+        progress_value = 0
+        print("[CellFeatureNode] Cancelled by user")
+        return {
+            "status": "cancelled",
+            "message": "Task was cancelled",
+            "nuclei_count": 0,
+            "feature_count": 0,
+            "h5_path": H5_PATH,
+        }
+
     except Exception as e:
         import traceback
         error_msg = f"Error: {str(e)}"
@@ -482,24 +557,41 @@ def read_node(data: Dict[str, Any]):
 
     return {"status": "ok", "message": "CellFeatureNode read done"}
 
+
+@app.post("/cancel")
+def cancel_task():
+    global cancel_event, progress_cancelled
+    cancel_event.set()
+    progress_cancelled = True
+    print("[CellFeatureNode] /cancel")
+    return {"status": "ok", "message": "Cancel request received."}
+
+
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME
+    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME, cancel_event, progress_cancelled
 
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
 
-    if not ARGS or not getattr(ARGS, "slidepath", None):
-        print("[CellFeatureNode] no path => skip.")
-        out_val = {
-            "status": "ok",
-            "message": "no path, skipping.",
-            "nuclei_count": 0,
-            "feature_count": 0
-        }
-    else:
-        print(f"[CellFeatureNode] /execute => run segmentation and feature extraction with slidepath={ARGS.slidepath}")
-        out_val = run_segmentation_and_features(ARGS)
+    cancel_event.clear()
+    progress_cancelled = False
+    watcher = CancelWatcher(cancel_event, _mark_sse_cancelled)
+    watcher.start()
+    try:
+        if not ARGS or not getattr(ARGS, "slidepath", None):
+            print("[CellFeatureNode] no path => skip.")
+            out_val = {
+                "status": "ok",
+                "message": "no path, skipping.",
+                "nuclei_count": 0,
+                "feature_count": 0
+            }
+        else:
+            print(f"[CellFeatureNode] /execute => run segmentation and feature extraction with slidepath={ARGS.slidepath}")
+            out_val = run_segmentation_and_features(ARGS)
+    finally:
+        watcher.stop()
 
     # The output is already stored in CellFeatureNode/output during run_segmentation_and_features
     # No need to store it again in NODE_NAME
@@ -511,30 +603,33 @@ async def progress():
     SSE endpoint to provide progress updates
     """
     async def event_generator():
-        global progress_value, progress_complete
+        global progress_value, progress_complete, progress_cancelled
         last_value = -1
+        progress_value = 0
+        progress_complete = False
+        progress_cancelled = False
         while True:
-            # Check if progress changed or if it's the final 100% update
-            if progress_value != last_value or (progress_value == 100 and progress_complete):
-                if last_value > progress_value:
+            if progress_value != last_value or (progress_value == 100 and progress_complete) or (progress_value == 0 and last_value > 0) or progress_cancelled:
+                if last_value > progress_value or progress_cancelled:
                     yield {"data": str(-1)}
                 yield {"data": str(progress_value)}
                 last_value = progress_value
 
-                # If progress reaches 100 and completion flag is set, wait a bit before breaking
-                if progress_value == 100 and progress_complete:
-                    print("Progress complete, closing connection.")
-                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
+                if (progress_value == 100 and progress_complete) or progress_cancelled:
+                    if progress_cancelled:
+                        print("Task cancelled, closing connection.")
+                    else:
+                        print("Progress complete, closing connection.")
+                    await asyncio.sleep(0.5)
                     break
 
-            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+            await asyncio.sleep(0.1)
 
-        # Keep the connection open for a short time to ensure the client receives the final update
         await asyncio.sleep(1)
 
-        # Reset progress to 0 and completion flag after sending the final update
         progress_value = 0
         progress_complete = False
+        progress_cancelled = False
         print("Progress reset to 0.")
 
     return EventSourceResponse(event_generator())
