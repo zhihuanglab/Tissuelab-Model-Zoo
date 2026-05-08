@@ -369,6 +369,57 @@ def run_segmentation(args):
                 ALREADY_HAVE_SEG = False
 
 
+        def _persist_segmentation_outputs_to_zarr(
+            centroids_data: np.ndarray | None,
+            contours_data: np.ndarray | None,
+            probability_data: np.ndarray | None,
+        ) -> None:
+            """Persist segmentation outputs immediately so embedding failures do not lose segmentation."""
+            if centroids_data is None:
+                print("[ZARR WRITE] Centroids are None after segmentation step, nothing to write for this node.")
+                return
+
+            zf_write = zarr.open_group(ZARR_PATH, mode='a')
+            node_grp = zf_write.require_group(NODE_NAME)
+
+            print(f"[ZARR WRITE] Writing centroids. Shape: {centroids_data.shape}")
+            if 'centroids' in node_grp:
+                del node_grp['centroids']
+            node_grp.create_dataset('centroids', data=centroids_data)
+
+            if contours_data is not None:
+                print(f"[ZARR WRITE] Writing contours. Shape: {contours_data.shape}")
+                if 'contours' in node_grp:
+                    del node_grp['contours']
+                node_grp.create_dataset('contours', data=contours_data)
+            else:
+                print("[ZARR WRITE] Contours are None, not writing.")
+
+            if probability_data is not None:
+                print(f"[ZARR WRITE] Writing probability. Shape: {probability_data.shape}")
+                if 'probability' in node_grp:
+                    del node_grp['probability']
+                node_grp.create_dataset('probability', data=probability_data)
+            else:
+                print("[ZARR WRITE] Probability is None, not writing.")
+
+            # Save parameters used to generate this segmentation in node attrs for future comparison
+            node_grp.attrs['bbox'] = current_bbox if current_bbox is not None else ''
+            if current_target_mpp is not None:
+                node_grp.attrs['target_mpp'] = float(current_target_mpp)
+            else:
+                node_grp.attrs['target_mpp'] = ''
+            if current_polygon_points is not None:
+                node_grp.attrs['polygon_points'] = json.dumps(current_polygon_points, ensure_ascii=False)
+            else:
+                node_grp.attrs['polygon_points'] = ''
+
+            print(
+                f"[ZARR WRITE] Saved segmentation parameters to attrs: "
+                f"bbox={current_bbox}, target_mpp={current_target_mpp}, "
+                f"polygon_points={current_polygon_points is not None}"
+            )
+
         # Step B: if not have segmentation => run stardist
         if not ALREADY_HAVE_SEG:
             # Check for cancellation before segmentation
@@ -471,6 +522,10 @@ def run_segmentation(args):
             result["nuclei_count"] = len(centroids) # Based on centroids
             result["message"] = "Segmentation completed successfully"
 
+            # Persist segmentation outputs immediately after segmentation, before embedding.
+            # This guarantees segmentation data survives even if embedding fails/cancels.
+            _persist_segmentation_outputs_to_zarr(centroids, contours, probability)
+
         # Step C: generate embedding if not cached; write directly to Zarr
         # Check for cancellation before embedding
         if cancel_event.is_set():
@@ -525,7 +580,7 @@ def run_segmentation(args):
                     if cancel_event.is_set():
                         raise CancellationException("Task cancelled during embedding")
                     # NucleiEmbedding may report 100 before final reorder/fusion/cleanup has fully
-                    # returned. Keep UI below "Processed" until SegmentationNode finishes Step D.
+                    # returned. Keep UI below "Processed" until SegmentationNode fully returns.
                     update_progress(min(float(pct), 99.0), "embedding")
                 
                 ne = NucleiEmbedding(args, centroids, contours=contours_for_embedding, progress_callback=embed_progress_with_cancel)
@@ -558,62 +613,6 @@ def run_segmentation(args):
             print("[EMBED LOG] No centroids detected from segmentation, skipping embedding generation.")
         else: # centroids is None
             print("[EMBED LOG] Centroids are None, skipping embedding generation.")
-
-
-        # Step D: write segmentation (embedding already written if generated)
-        if centroids is not None: # Only proceed if centroids were processed (even if empty from seg)
-            zf = zarr.open_group(ZARR_PATH, mode='a')
-            # Do NOT delete the whole group, as it would remove previously written 'embedding'.
-            # Instead, create/require the group and overwrite only specific datasets.
-            node_grp = zf.require_group(NODE_NAME)
-
-            print(f"[ZARR WRITE] Writing centroids. Shape: {centroids.shape if centroids is not None else 'None'}")
-            if 'centroids' in node_grp:
-                del node_grp['centroids']
-            node_grp.create_dataset('centroids', data=centroids)
-            
-            if contours is not None:
-                print(f"[ZARR WRITE] Writing contours. Shape: {contours.shape}")
-                if 'contours' in node_grp:
-                    del node_grp['contours']
-                node_grp.create_dataset('contours', data=contours)
-            else:
-                print("[ZARR WRITE] Contours are None, not writing.")
-            
-            if probability is not None: # Save probability if it was generated or loaded
-                print(f"[ZARR WRITE] Writing probability. Shape: {probability.shape}")
-                if 'probability' in node_grp:
-                    del node_grp['probability']
-                node_grp.create_dataset('probability', data=probability)
-            else: # This case should be less common if prob is always attempted
-                print("[ZARR WRITE] Probability is None, not writing.")
-
-            # Save parameters used to generate this segmentation in node attrs for future comparison
-            # This allows us to detect parameter changes and re-run if needed
-            # Using attrs instead of separate datasets to avoid changing zarr structure
-            # Note: current_bbox, current_target_mpp, current_polygon_points are already retrieved at the start of Step A
-            
-            # Save parameters to attrs (zarr attrs support various types including float and string)
-            node_grp.attrs['bbox'] = current_bbox if current_bbox is not None else ''
-            # Save target_mpp as float if not None, empty string if None
-            # Note: attrs['target_mpp'] can be either float or empty string (for None case)
-            if current_target_mpp is not None:
-                node_grp.attrs['target_mpp'] = float(current_target_mpp)
-            else:
-                node_grp.attrs['target_mpp'] = ''
-            # Save polygon_points as JSON string
-            if current_polygon_points is not None:
-                node_grp.attrs['polygon_points'] = json.dumps(current_polygon_points, ensure_ascii=False)
-            else:
-                node_grp.attrs['polygon_points'] = ''
-            
-            print(f"[ZARR WRITE] Saved segmentation parameters to attrs: bbox={current_bbox}, target_mpp={current_target_mpp}, polygon_points={current_polygon_points is not None}")
-
-            # Embedding has been written directly by NucleiEmbedding if needed
-
-            time.sleep(0.5) # Reduced sleep time
-        else:
-            print("[ZARR WRITE] Centroids are None after segmentation step, nothing to write for this node.")
 
         progress_complete = True
         update_progress(100, "embedding")
