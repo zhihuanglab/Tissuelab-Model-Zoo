@@ -5,6 +5,21 @@ Classification Node for logistic regression or zero-shot classification
 (Modified to load HF big model at /init stage to avoid concurrent model download + HDF5 read)
 """
 
+# macOS hardening: libomp / Accelerate are NOT fork-safe. xgboost / sklearn /
+# numpy spawn worker threads on import; if those threads exist before this
+# task-node process is forked from the supervisor, training crashes silently
+# (manifests as `resource_tracker: leaked semaphore objects` and the worker
+# disappears without a traceback). Pin every BLAS/OpenMP backend to a single
+# thread before any of them are imported below.
+import os as _os_early
+import platform as _platform_early
+if _platform_early.system() == 'Darwin':
+    _os_early.environ.setdefault('OMP_NUM_THREADS', '1')
+    _os_early.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+    _os_early.environ.setdefault('MKL_NUM_THREADS', '1')
+    _os_early.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
+    _os_early.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
+
 import argparse
 import os
 import sys
@@ -461,7 +476,13 @@ def train_linear_classifier(
 ):
     global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_PATH, ARGS
     
-    # update XGBoost parameter settings
+    # update XGBoost parameter settings.
+    # macOS: libomp + fork() crashes the worker silently with "leaked semaphore
+    # objects" right after fit() starts. Pin to single-threaded training to keep
+    # the worker stable; throughput is still acceptable for the patch counts we
+    # operate on.
+    import platform as _platform
+    _is_darwin = _platform.system() == 'Darwin'
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     xgb_params = {
         'max_depth': 8,
@@ -469,7 +490,9 @@ def train_linear_classifier(
         'device': device,
         'eval_metric': 'mlogloss',
         'random_state': 42,
-        'base_score': 0.5  # Initial value for XGBoost, must be in (0,1) for logistic loss
+        'base_score': 0.5,  # Initial value for XGBoost, must be in (0,1) for logistic loss
+        'n_jobs': 1 if _is_darwin else -1,
+        'nthread': 1 if _is_darwin else -1,
     }
 
     if annotations is None:

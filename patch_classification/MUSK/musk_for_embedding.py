@@ -798,6 +798,15 @@ class MUSK:
         # On Windows, set loader_workers to 0 to avoid multiprocessing issues
         if platform.system() == 'Windows':
             loader_workers = 0
+        # On macOS, cap workers to avoid libomp + fork() crashes and exceeding
+        # the system's suggested worker count. Default 32 was triggering
+        # "leaked semaphore objects" and DataLoader rationality warnings.
+        elif platform.system() == 'Darwin':
+            try:
+                cpu = os.cpu_count() or 4
+            except Exception:
+                cpu = 4
+            loader_workers = min(int(loader_workers), max(2, cpu // 2), 8)
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {device}")
