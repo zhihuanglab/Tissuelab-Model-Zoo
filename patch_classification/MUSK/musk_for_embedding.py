@@ -17,6 +17,7 @@ from datasets import Dataset
 from PIL import Image as PILImage
 from torchvision import transforms
 import cv2
+import gc
 import json
 import os
 import tiffslide
@@ -35,7 +36,12 @@ class WsiPatchDataset(torch.utils.data.Dataset):
         self.wsi_cache_mb = int(wsi_cache_mb) if wsi_cache_mb is not None else 0
         self._slide_local = None  # lazily opened per-worker
         self._fallback_image_local = None  # lazily opened per-worker
-        self.mask = mask
+        # The full-resolution mask is only needed below to precompute patch
+        # coords; it is NOT used by __getitem__. Keeping it on self made every
+        # WsiPatchDataset retain a GB-scale array, which accumulated across
+        # slides via the persistent DataLoader reference cycle. Use the local
+        # `mask` arg for the precompute loop and never store it on self.
+        self.mask = None
         self.width = width
         self.height = height
         self.patch_size = patch_size
@@ -54,7 +60,7 @@ class WsiPatchDataset(torch.utils.data.Dataset):
         for y in range(0, height - ps + 1, ps):
             for x in range(0, width - ps + 1, ps):
                 # Unify coverage strategies to avoid dependence on source types
-                patch_mask = self.mask[y:y + ps, x:x + ps]
+                patch_mask = mask[y:y + ps, x:x + ps]
                 if patch_mask.size == 0:
                     continue
                 coverage = float(np.mean(patch_mask))
@@ -916,7 +922,11 @@ class MUSK:
             pin_memory=pin_mem,
             drop_last=False,
             prefetch_factor=(prefetch_factor if loader_workers > 0 else None),
-            persistent_workers=(loader_workers > 0),
+            # A fresh DataLoader is built per slide and iterated exactly once,
+            # so persistent workers give no speedup -- they only create a
+            # loader<->iterator reference cycle that kept each slide's dataset
+            # (and its workers) alive until a cyclic GC pass. Disable it.
+            persistent_workers=False,
             collate_fn=self._collate_fn
         )
 
@@ -1013,4 +1023,12 @@ class MUSK:
             print("[MUSK][Profile] encode empty_cache: total {:.6f}s".format(stats['encode_empty_cache_s']))
             print("[MUSK][Profile] final cat: {:.3f}s".format(stats['final_cat_s']))
         
+        # Drop per-slide resources before returning so nothing accumulates
+        # across slides in a long batch run.
+        loader = None
+        dataset = None
+        mask = None
+        all_embeddings = None
+        gc.collect()
+
         return final_embeddings, all_coordinates
