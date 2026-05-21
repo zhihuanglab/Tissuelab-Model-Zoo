@@ -1300,6 +1300,15 @@ def run_classification(args) -> Dict[str, Any]:
 
         grp_cls.create_dataset('tissue_class_id', data=predictions.astype(np.int32))
 
+        # Persist per-patch class probabilities so downstream (patch review /
+        # active learning) can do threshold + uncertainty filtering, like cells.
+        # prediction_probs is (n_patches, n_classes); None in zero-shot mode.
+        if prediction_probs is not None:
+            grp_cls.create_dataset(
+                'tissue_class_probabilities',
+                data=np.asarray(prediction_probs, dtype=np.float32),
+            )
+
         class_names_ascii = [n.encode('utf-8') for n in final_class_names]
         grp_cls.create_dataset('tissue_class_name', shape=(len(class_names_ascii),), dtype='S256', data=class_names_ascii)
 
