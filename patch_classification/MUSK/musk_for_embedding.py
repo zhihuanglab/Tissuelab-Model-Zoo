@@ -54,13 +54,24 @@ class WsiPatchDataset(torch.utils.data.Dataset):
         self._macro_cache_capacity = 8
         self.strict_io = bool(strict_io)
 
-        # Precompute accepted patch coordinates
+        # Precompute accepted patch coordinates.
+        # `mask` may be a full-resolution mask (shape == (height, width)) or a
+        # downscaled thumbnail mask. Deriving the scale from mask.shape keeps
+        # this correct for both -- and lets a multi-gigapixel slide skip ever
+        # materialising a full-resolution mask (tens of GiB of RAM).
         coords = []
         ps = patch_size
+        mh, mw = mask.shape[:2]
+        sx = (mw / float(width)) if width else 1.0
+        sy = (mh / float(height)) if height else 1.0
         for y in range(0, height - ps + 1, ps):
+            my0 = int(y * sy)
+            my1 = max(my0 + 1, int((y + ps) * sy))
             for x in range(0, width - ps + 1, ps):
+                mx0 = int(x * sx)
+                mx1 = max(mx0 + 1, int((x + ps) * sx))
                 # Unify coverage strategies to avoid dependence on source types
-                patch_mask = mask[y:y + ps, x:x + ps]
+                patch_mask = mask[my0:my1, mx0:mx1]
                 if patch_mask.size == 0:
                     continue
                 coverage = float(np.mean(patch_mask))
@@ -661,6 +672,46 @@ class MUSK:
         
         return patch_embeddings
 
+    def _read_level_thumbnail(self, slide, level, dim,
+                              max_long_side=4096, safe_block=8192):
+        """Return a downscaled RGB thumbnail of `slide` without OOM risk.
+
+        `dim` is the (width, height) of pyramid `level`. For an ordinary
+        pyramidal slide the chosen level is already small and is read in a
+        single `read_region` call -- identical to the previous behaviour.
+
+        For a non-pyramidal slide `level` collapses to 0 and `dim` can be the
+        full multi-gigapixel image; reading that whole would allocate hundreds
+        of GiB of RGBA and get the process OOM-killed. In that case level 0 is
+        read in `safe_block`-sized tiles, each downscaled on the fly and
+        stitched into a thumbnail whose long side is `max_long_side`. Peak
+        extra RAM is then one tile (~safe_block**2 * 4 bytes).
+        """
+        from PIL import Image as _Image
+        W, H = int(dim[0]), int(dim[1])
+        if max(W, H) <= max_long_side:
+            return slide.read_region((0, 0), level, (W, H)).convert("RGB")
+        W0 = int(slide.level_dimensions[0][0])
+        H0 = int(slide.level_dimensions[0][1])
+        scale = max_long_side / float(max(W0, H0))
+        tw = max(1, int(round(W0 * scale)))
+        th = max(1, int(round(H0 * scale)))
+        print(f"[MUSK] Large/non-pyramidal slide ({W0}x{H0}); tile-reading a "
+              f"{tw}x{th} tissue-mask thumbnail to avoid an OOM.", flush=True)
+        thumb = np.zeros((th, tw, 3), dtype=np.uint8)
+        for by in range(0, H0, safe_block):
+            bh = min(safe_block, H0 - by)
+            ty0 = int(by * scale)
+            ty1 = min(th, max(ty0 + 1, int((by + bh) * scale)))
+            for bx in range(0, W0, safe_block):
+                bw = min(safe_block, W0 - bx)
+                tx0 = int(bx * scale)
+                tx1 = min(tw, max(tx0 + 1, int((bx + bw) * scale)))
+                block = slide.read_region((bx, by), 0, (bw, bh)).convert("RGB")
+                block = block.resize((tx1 - tx0, ty1 - ty0), _Image.BILINEAR)
+                thumb[ty0:ty1, tx0:tx1] = np.asarray(block)
+        return _Image.fromarray(thumb)
+
     def get_tissue_mask(self, slide, edge_width_ratio=0.04, min_area=None, debug_dir=None):
         """
         Generate a filled tissue mask for a whole-slide image.
@@ -696,7 +747,12 @@ class MUSK:
             # ---------------------------------------------------------------------
             level = min(3, len(slide.level_dimensions) - 1)
             dim = slide.level_dimensions[level]
-            temp_thumb = slide.read_region((0, 0), level, dim).convert('RGB')
+            # `_read_level_thumbnail` reads `dim` in one shot when it is small
+            # (the usual pyramidal case) but tile-reads + downscales when it is
+            # a multi-gigapixel non-pyramidal slide -- so this never allocates
+            # hundreds of GiB nor triggers the OOM killer.
+            temp_thumb = self._read_level_thumbnail(slide, level, dim,
+                                                    max_long_side=4096)
             gray = np.array(ImageOps.grayscale(temp_thumb))
             h,  w = gray.shape
 
@@ -787,7 +843,11 @@ class MUSK:
             print(f"Error generating clean tissue mask: {str(e)}")
             import traceback
             traceback.print_exc()
-            return np.ones(dim[::-1], dtype=np.uint8)
+            # All-tissue fallback. A small array is fine: WsiPatchDataset
+            # derives the coordinate<->mask scale from mask.shape, so an
+            # all-ones mask of any size simply accepts every patch -- whereas a
+            # full-resolution one would be tens of GiB for a huge slide.
+            return np.ones((2048, 2048), dtype=np.uint8)
 
     def process_whole_wsi(self, wsi_path: str, patch_size: int = 228, level: int = 0, 
                           batch_size: int = 64, use_tiffslide: bool = True,
@@ -864,7 +924,9 @@ class MUSK:
             
             t_r0 = time.time()
             mask = self.get_tissue_mask(slide, debug_dir=None)
-            mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+            # Keep the mask at thumbnail resolution. Upsampling it to full
+            # level-0 resolution would allocate tens of GiB for a multi-
+            # gigapixel slide; WsiPatchDataset rescales coordinates instead.
             t_r1 = time.time()
             # Export final mask if requested
             if output_mask_path:
