@@ -269,6 +269,37 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
     train_data_str = base64.b64encode(train_data_bytes.getvalue()).decode('utf-8')
     booster.set_attr(train_data=train_data_str)
 
+    # Provenance: also persist the source image name and the per-patch
+    # user_annotation entries into the booster. Each save merges in only
+    # entries new to the booster's existing log, so it grows incrementally
+    # across an iterative training session rather than re-bundling the full
+    # zarr annotation set every save. A relabel of the same patch (different
+    # value) is kept as a separate record so the history is preserved.
+    # Non-fatal on error since the classifier itself is the critical artifact.
+    try:
+        zf_prov = zarr.open_group(ZARR_PATH, mode='r')
+        image_name = os.path.basename(str(ZARR_PATH).rstrip('/')).removesuffix('.zarr')
+        prev_image_names = json.loads(booster.attr('image_names') or '[]')
+        if image_name and image_name not in prev_image_names:
+            prev_image_names.append(image_name)
+        booster.set_attr(image_names=json.dumps(prev_image_names))
+        if 'user_annotation' in zf_prov and 'tissue_annotations' in zf_prov['user_annotation']:
+            raw = zf_prov['user_annotation/tissue_annotations'][()]
+            current_dict = json.loads(raw.decode('utf-8'))
+            current_records = [
+                [pid, json.dumps(val, sort_keys=True)]
+                for pid, val in current_dict.items()
+            ]
+            prev_records = json.loads(booster.attr('user_annotations') or '[]')
+            seen = {tuple(r) for r in prev_records}
+            for r in current_records:
+                if tuple(r) not in seen:
+                    prev_records.append(r)
+                    seen.add(tuple(r))
+            booster.set_attr(user_annotations=json.dumps(prev_records))
+    except Exception as e:
+        print(f"[MuskClassificationNode] Skipping user_annotation provenance embed: {e}")
+
     LAST_TRAINED_CLF_BUNDLE = (clf, class_names, class_colors, train_data)
 
     if SAVE_CLASSIFIER_PATH:
@@ -308,7 +339,17 @@ def load_classifier_params():
         if not os.path.exists(CLASSIFIER_PATH):
             print(f"XGBoost model file not found at: {CLASSIFIER_PATH}")
             return None
-            
+
+        # Empty placeholder created by the frontend Save flow stays 0 bytes if
+        # training never completes; treat it as "no usable classifier" so we
+        # don't crash inside xgb.load_model with wrong model format.
+        try:
+            if os.path.getsize(CLASSIFIER_PATH) == 0:
+                print(f"Classifier file is empty (0 bytes), skipping load: {CLASSIFIER_PATH}")
+                return None
+        except OSError:
+            pass
+
         clf = xgb.XGBClassifier()
         clf.load_model(CLASSIFIER_PATH)
         

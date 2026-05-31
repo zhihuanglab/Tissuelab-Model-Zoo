@@ -15,7 +15,7 @@ ftfy
 opencv-python
 sentencepiece
 pyarrow
-transformers
+transformers<5
 pytorch-lightning==2.2.1
 nltk
 rouge
