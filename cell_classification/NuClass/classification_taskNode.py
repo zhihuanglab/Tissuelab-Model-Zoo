@@ -719,6 +719,44 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
     train_data_str = base64.b64encode(train_data_bytes.getvalue()).decode('utf-8')
     booster.set_attr(train_data=train_data_str)
 
+    # Provenance: also persist the source image name and the per-cell
+    # user_annotation rows into the booster. Each save merges in only rows new
+    # to the booster's existing log, so it grows incrementally across an
+    # iterative training session rather than re-bundling the full zarr
+    # annotation set every save. A relabel of the same cell_id (different
+    # class/annotator) is kept as a separate record so the history is
+    # preserved. Non-fatal on error since the classifier itself is the
+    # critical artifact.
+    try:
+        zf_prov = zarr.open_group(ZARR_PATH, mode='r')
+        image_name = os.path.basename(str(ZARR_PATH).rstrip('/')).removesuffix('.zarr')
+        prev_image_names = json.loads(booster.attr('image_names') or '[]')
+        if image_name and image_name not in prev_image_names:
+            prev_image_names.append(image_name)
+        booster.set_attr(image_names=json.dumps(prev_image_names))
+        if 'user_annotation/nuclei_annotations' in zf_prov:
+            current = zf_prov['user_annotation/nuclei_annotations'][()]
+            prev_attr = booster.attr('user_annotations')
+            if prev_attr:
+                prev_buf = io.BytesIO(base64.b64decode(prev_attr))
+                prev = np.load(prev_buf, allow_pickle=False)['records']
+            else:
+                prev = np.empty(0, dtype=current.dtype)
+            seen = set()
+            merged_list = []
+            for row in np.concatenate([prev, current]):
+                key = tuple(row.tolist())
+                if key not in seen:
+                    seen.add(key)
+                    merged_list.append(row)
+            merged = (np.array(merged_list, dtype=current.dtype)
+                      if merged_list else np.empty(0, dtype=current.dtype))
+            log_buf = io.BytesIO()
+            np.savez_compressed(log_buf, records=merged)
+            booster.set_attr(user_annotations=base64.b64encode(log_buf.getvalue()).decode('utf-8'))
+    except Exception as e:
+        print(f"[ClassificationNode] Skipping user_annotation provenance embed: {e}")
+
     LAST_TRAINED_CLF_BUNDLE = (clf, class_names, class_colors, train_data)
 
     if SAVE_CLASSIFIER_PATH:
@@ -758,7 +796,19 @@ def load_classifier_params(zarr_path):
         if not os.path.exists(CLASSIFIER_PATH):
             print(f"XGBoost model file not found at: {CLASSIFIER_PATH}")
             return None
-            
+
+        # An empty placeholder file is created by the frontend BEFORE training;
+        # if training never runs (or the path got cleared), it stays 0 bytes.
+        # Treat that as "no usable classifier" so callers fall back to training
+        # from annotations instead of crashing inside xgb.load_model with
+        # "BoostLearner: wrong model format".
+        try:
+            if os.path.getsize(CLASSIFIER_PATH) == 0:
+                print(f"Classifier file is empty (0 bytes), skipping load: {CLASSIFIER_PATH}")
+                return None
+        except OSError:
+            pass
+
         clf = xgb.XGBClassifier()
         clf.load_model(CLASSIFIER_PATH)
         
