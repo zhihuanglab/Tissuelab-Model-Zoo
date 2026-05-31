@@ -736,6 +736,19 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
         booster.set_attr(image_names=json.dumps(prev_image_names))
         if 'user_annotation/nuclei_annotations' in zf_prov:
             current = zf_prov['user_annotation/nuclei_annotations'][()]
+            # The dataset has one row per cell with `cell_class == -1` for
+            # unannotated placeholders. Keep only rows the classifier actually
+            # trains on, matching load_structured_nuclei_annotations: positives
+            # (cell_class >= 0) and negatives (cell_class <= -2), all with
+            # cell_color >= 0. On large slides this cuts ~165k rows to a few
+            # hundred, making the per-save dedup loop fast and stopping the
+            # log from being bloated with empty placeholder records.
+            if {'cell_class', 'cell_color'}.issubset(current.dtype.names or ()):
+                meaningful = (
+                    ((current['cell_class'] >= 0) | (current['cell_class'] <= -2))
+                    & (current['cell_color'] >= 0)
+                )
+                current = current[meaningful]
             prev_attr = booster.attr('user_annotations')
             if prev_attr:
                 prev_buf = io.BytesIO(base64.b64decode(prev_attr))
