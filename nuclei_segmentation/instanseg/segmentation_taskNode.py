@@ -87,6 +87,11 @@ IS_MODEL_INITED = False
 MODEL = None  # InstanSeg model instance
 ZARR_PATH = None
 NODE_NAME = None
+# zarr group this tasknode writes to. Decoupled from NODE_NAME so the
+# scheduler can switch model names without moving the data. Defaults to
+# "Cell-Segmentation" (canonical NucleiSeg group); backend can override via
+# /read payload `zarr_group`.
+ZARR_GROUP = "Cell-Segmentation"
 DEPENDENCIES = []
 progress_value = 0  # Global variable to track progress
 progress_complete = False  # New flag to indicate completion
@@ -397,7 +402,7 @@ def run_segmentation(args):
         probability = None
 
         if os.path.exists(ZARR_PATH):
-            centroids, contours, probability = _read_streamed_vectors_from_zarr(ZARR_PATH, NODE_NAME)
+            centroids, contours, probability = _read_streamed_vectors_from_zarr(ZARR_PATH, ZARR_GROUP)
             if centroids is not None and centroids.size > 0:
                 ALREADY_HAVE_SEG = True
                 result["message"] = "Using existing nuclei segmentation"
@@ -462,7 +467,7 @@ def run_segmentation(args):
                     min_area=getattr(args, "min_area_pixels", 50),
                     stardist_rays=getattr(args, "stardist_rays", 32),
                     zarr_path=ZARR_PATH,
-                    node_name=NODE_NAME,
+                    node_name=ZARR_GROUP,
                     progress_callback=seg_progress_callback,
                 )
             except CancellationException:
@@ -496,7 +501,7 @@ def run_segmentation(args):
                     "nuclei_count": 0
                 }
 
-            centroids, contours, probability = _read_streamed_vectors_from_zarr(ZARR_PATH, NODE_NAME)
+            centroids, contours, probability = _read_streamed_vectors_from_zarr(ZARR_PATH, ZARR_GROUP)
             if centroids is None or centroids.size == 0:
                 raise RuntimeError("Streaming pipeline completed but no centroids were written to Zarr.")
             result["message"] = "Segmentation completed successfully"
@@ -534,9 +539,9 @@ def run_segmentation(args):
             zf = zarr.open_group(ZARR_PATH, mode='a')
             have_cached_embedding = False
 
-            if NODE_NAME in zf and 'embeddings' in zf[NODE_NAME]:
+            if ZARR_GROUP in zf and 'embeddings' in zf[ZARR_GROUP]:
                 try:
-                    existing_len = zf[NODE_NAME]['embeddings'].shape[0]
+                    existing_len = zf[ZARR_GROUP]['embeddings'].shape[0]
                     if existing_len == len(centroids):
                         have_cached_embedding = True
                         print("[EMBED LOG] Found existing embeddings in store => skip embedding calculation.")
@@ -548,9 +553,9 @@ def run_segmentation(args):
 
                 # Load contours for bounding box extraction (optional, improves patch quality)
                 contours_for_embedding = None
-                if NODE_NAME in zf and 'contours' in zf[NODE_NAME]:
+                if ZARR_GROUP in zf and 'contours' in zf[ZARR_GROUP]:
                     try:
-                        contours_for_embedding = zf[f"{NODE_NAME}/contours"][()]
+                        contours_for_embedding = zf[f"{ZARR_GROUP}/contours"][()]
                         print(f"[EMBED LOG] Loaded contours for embedding: shape {contours_for_embedding.shape}")
                     except Exception as e:
                         print(f"[EMBED LOG] Warning: Could not load contours for embedding: {e}")
@@ -574,7 +579,7 @@ def run_segmentation(args):
                 try:
                     ne.generate_embeddings(
                         zarr_path=ZARR_PATH,
-                        dataset_path=f"{NODE_NAME}/embeddings"
+                        dataset_path=f"{ZARR_GROUP}/embeddings"
                     )
                 except CancellationException:
                     print("[InstanSegNode] Embedding cancelled by user")
@@ -611,17 +616,17 @@ def run_segmentation(args):
         # ------------------------------------------------------------------
         try:
             zf = zarr.open_group(ZARR_PATH, mode='r')
-            if NODE_NAME in zf:
-                test_centroids = zf[f"{NODE_NAME}/centroids"][()]
+            if ZARR_GROUP in zf:
+                test_centroids = zf[f"{ZARR_GROUP}/centroids"][()]
                 print(f"[ZARR VERIFY] Centroids: {test_centroids.shape}")
-                if f"{NODE_NAME}/contours" in zf:
-                    contours_ds = zf[f"{NODE_NAME}/contours"]
+                if f"{ZARR_GROUP}/contours" in zf:
+                    contours_ds = zf[f"{ZARR_GROUP}/contours"]
                     print(f"[ZARR VERIFY] Contours: {contours_ds.shape} (fixed-length format)")
-                if f"{NODE_NAME}/embeddings" in zf:
-                    embedding_ds = zf[f"{NODE_NAME}/embeddings"]
+                if f"{ZARR_GROUP}/embeddings" in zf:
+                    embedding_ds = zf[f"{ZARR_GROUP}/embeddings"]
                     print(f"[ZARR VERIFY] Embedding: {embedding_ds.shape}")
-                if f"{NODE_NAME}/probabilities" in zf:
-                    prob_ds = zf[f"{NODE_NAME}/probabilities"]
+                if f"{ZARR_GROUP}/probabilities" in zf:
+                    prob_ds = zf[f"{ZARR_GROUP}/probabilities"]
                     print(f"[ZARR VERIFY] Probability: {prob_ds.shape}")
         except Exception as e:
             print(f"[ZARR VERIFY] Verification skipped due to error: {e}")
@@ -746,12 +751,13 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS
-    NODE_NAME = data.get("zarr_group") or data.get("node_name", "Cell-Segmentation")
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, ZARR_GROUP
+    NODE_NAME = data.get("node_name", "InstanSegNode")
+    ZARR_GROUP = data.get("zarr_group") or "Cell-Segmentation"
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)  # Changed from h5_path to zarr_path
 
-    print(f"[InstanSegNode] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
+    print(f"[InstanSegNode] /read => node_name={NODE_NAME}, zarr_group={ZARR_GROUP}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
 
     if not ZARR_PATH or not os.path.exists(ZARR_PATH):
         print("[InstanSegNode] no zarr path => skip read.")
@@ -792,7 +798,7 @@ def read_node(data: Dict[str, Any]):
 
     # Read user data from Zarr
     zf = zarr.open_group(ZARR_PATH, mode='r')
-    user_data_path = f"{NODE_NAME}/userData"
+    user_data_path = f"{ZARR_GROUP}/userData"
     if user_data_path in zf:
         for k in zf[user_data_path].keys():
             raw_bytes = zf[user_data_path][k][()]
@@ -912,7 +918,7 @@ def execute_node():
     # Replaces the historical <NODE_NAME>/output bytes blob.
     if ZARR_PATH and os.path.exists(ZARR_PATH):
         zf = zarr.open_group(ZARR_PATH, mode='a')
-        seg_grp = zf.require_group(NODE_NAME)
+        seg_grp = zf.require_group(ZARR_GROUP)
         if 'metadata' in seg_grp:
             del seg_grp['metadata']
         meta_grp = seg_grp.create_group('metadata')
