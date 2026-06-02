@@ -106,6 +106,11 @@ ARGS = None
 IS_MODEL_INITED = False
 ZARR_PATH = None
 NODE_NAME = None
+# zarr group this tasknode writes to. Decoupled from NODE_NAME so that the
+# scheduler can switch model names (e.g. NuClass) without moving the data.
+# Defaults to "Cell-Classification" (the canonical group for NucleiClassify);
+# the backend can override via /read payload `zarr_group`.
+ZARR_GROUP = "Cell-Classification"
 DEPENDENCIES = []
 
 # new global variable for PLIP model
@@ -1295,26 +1300,31 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
             if 0 <= ann_idx < len(nuclei_classes):
                 unique_classes.append(nuclei_classes[ann_idx])
         unique_classes = list(dict.fromkeys(unique_classes))
-    
+
     if len(unique_classes) < 1 and not has_negative_examples:
         raise ValueError("Need at least 1 class in annotation or negative examples => fallback to zero-shot")
 
-    # Build class_names: ensure "Negative control" is first
-    # IMPORTANT: Even if annotations don't have "Negative control", we need to add it to class_names
-    # BEFORE encoding y_train, so that class indices are consistent
-    class_names = []
-    has_negative_control = "Negative control" in unique_classes
-    if has_negative_control:
-        class_names.append("Negative control")
-        unique_classes.remove("Negative control")
-    class_names.extend(unique_classes)
-    
-    # If "Negative control" is not in annotations, we need to add it to class_names now
-    # (before encoding y_train) so that when we add negative control vectors later,
-    # the class indices will be correct (0 = "Negative control", 1 = "Class1", 2 = "Class2", etc.)
-    if not has_negative_control:
+    # Build class_names. Source priority:
+    #   1. The panel's nuclei_classes (authoritative — preserves every class
+    #      the user configured, even ones without any annotation yet, so
+    #      Cell-Classification/classes stays aligned with the panel and the
+    #      int indices in User-Annotations/cell don't drift between runs).
+    #   2. Fall back to annotation order if nuclei_classes wasn't supplied.
+    # Negative control is always forced to index 0 (matches the negative
+    # control vectors injection below).
+    if nuclei_classes and len(nuclei_classes) > 0:
+        class_names = list(nuclei_classes)
+        # Append any annotation classes not in the panel list (defensive only).
+        for c in unique_classes:
+            if c not in class_names:
+                class_names.append(c)
+    else:
+        class_names = list(unique_classes)
+    if "Negative control" not in class_names:
         class_names = ["Negative control"] + class_names
-        print(f"Added 'Negative control' to class_names (not in annotations): {class_names}")
+        print(f"Added 'Negative control' to class_names (not in panel/annotations): {class_names}")
+    elif class_names[0] != "Negative control":
+        class_names = ["Negative control"] + [c for c in class_names if c != "Negative control"]
 
     # Build class_colors: prioritize frontend-provided colors, then fallback to annotations
     frontend_color_map = _build_frontend_color_map(nuclei_classes, nuclei_colors)
@@ -1393,16 +1403,25 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     
     n_positive = int((sample_weights == 1.0).sum()) if sample_weights is not None else len(y_train)
     _log_training_data_counts(class_names, y_train, n_positive)
-    
+
+    # XGBoost requires y labels to be contiguous starting at 0. When the user
+    # annotates a non-contiguous subset of the panel's classes (e.g. NC=0 +
+    # Tumor=2 but no Lymphocytes=1), remap to [0..K-1] for the fit and
+    # remember the inverse mapping so prediction columns can be scattered back
+    # into the full class_names index space below.
+    unique_y_panel = np.unique(y_train)
+    _compact_to_panel = unique_y_panel.astype(int)
+    _panel_to_compact = {int(p): c for c, p in enumerate(_compact_to_panel)}
+    y_train_compact = np.array([_panel_to_compact[int(v)] for v in y_train], dtype=int)
+
     clf = xgb.XGBClassifier(**xgb_params)
     print("Training new classifier...")
-    
     # Use sample_weights if available (for negative examples)
     if sample_weights is not None:
         print(f"Training with sample weights (positive=1.0, negative=0.3)")
-        clf.fit(X_train, y_train, sample_weight=sample_weights)
+        clf.fit(X_train, y_train_compact, sample_weight=sample_weights)
     else:
-        clf.fit(X_train, y_train)
+        clf.fit(X_train, y_train_compact)
     
     # Check for cancellation after training
     if cancel_event.is_set():
@@ -1426,7 +1445,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     print(f"Starting prediction for {n_cells} cells in {n_batches} batches (batch_size={batch_size})...")
     
     # Build exclude_classes mapping from negative annotations for hard constraint enforcement
-    exclude_map = {}  # cell_id -> list of excluded class indices
+    exclude_map = {}  # cell_id -> list of excluded class indices (panel space)
     if has_negative_examples and not negative_annotations.empty:
         for idx, row in negative_annotations.iterrows():
             cell_id = int(row['cell_ID'])
@@ -1443,9 +1462,18 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             exclude_indices.append(class_names.index(cls))
             if exclude_indices:
                 exclude_map[cell_id] = exclude_indices
-        
+
         if exclude_map:
             print(f"[Cell-Classification] Will enforce exclusion for {len(exclude_map)} cells during prediction")
+
+    # XGBoost's predict_proba returns columns in clf.classes_ order (compact
+    # label space). Map back to the full panel index space via _compact_to_panel
+    # so prediction_probs columns are always (sample, panel_class_idx).
+    _clf_compact_classes = np.array(clf.classes_, dtype=int)
+    _clf_panel_classes = np.array(
+        [int(_compact_to_panel[c]) for c in _clf_compact_classes],
+        dtype=int,
+    )
     if not annotations.empty:
         _log_annotation_counts_per_class(class_names, positive_annotations, negative_annotations, nuclei_classes=None)
     
@@ -1463,28 +1491,34 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         # OPTIMIZATION: Only call predict_proba once, then extract predictions from probabilities
         # This avoids duplicate forward passes through the model
         batch_probs = clf.predict_proba(batch_embeddings)
-        
-        # Apply exclude_classes constraints: set probability to 0 for excluded classes
+
+        # Apply exclude_classes constraints (panel indices → compact columns).
         if exclude_map:
             for local_idx in range(len(batch_probs)):
                 global_idx = i + local_idx
                 if global_idx in exclude_map:
-                    exclude_indices = exclude_map[global_idx]
-                    # Set excluded class probabilities to 0
-                    batch_probs[local_idx, exclude_indices] = 0.0
-                    # Renormalize probabilities
-                    prob_sum = batch_probs[local_idx].sum()
-                    if prob_sum > 0:
-                        batch_probs[local_idx] /= prob_sum
-        
-        batch_predictions = np.argmax(batch_probs, axis=1).astype(np.int32)
-        
+                    excluded_orig = exclude_map[global_idx]
+                    excluded_cols = [j for j, c in enumerate(_clf_panel_classes) if c in excluded_orig]
+                    if excluded_cols:
+                        batch_probs[local_idx, excluded_cols] = 0.0
+                        prob_sum = batch_probs[local_idx].sum()
+                        if prob_sum > 0:
+                            batch_probs[local_idx] /= prob_sum
+
+        # Scatter batch_probs columns (XGBoost compact order) into full panel columns.
+        # Missing-from-training classes stay 0 — they were never learned anyway.
+        batch_full = np.zeros((batch_probs.shape[0], prediction_probs.shape[1]), dtype=np.float32)
+        for j, cls_id in enumerate(_clf_panel_classes):
+            if 0 <= int(cls_id) < prediction_probs.shape[1]:
+                batch_full[:, int(cls_id)] = batch_probs[:, j]
+        batch_predictions = np.argmax(batch_full, axis=1).astype(np.int32)
+
         # Store results
         predictions[i:end_idx] = batch_predictions
-        prediction_probs[i:end_idx] = batch_probs
-        
+        prediction_probs[i:end_idx] = batch_full
+
         # Clear batch data from memory
-        del batch_embeddings, batch_predictions, batch_probs
+        del batch_embeddings, batch_predictions, batch_probs, batch_full
         
         # Update progress: 50% -> 90% during prediction
         progress_value = 50 + int(40 * (batch_idx + 1) / n_batches)
@@ -1611,9 +1645,9 @@ def run_classification(args) -> Dict[str, Any]:
                 print(f"Frontend colors length mismatch ({len(nuclei_colors)} vs {len(nuclei_classes)}), will use colors from classifier file")
             else:
                 print(f"Will use colors from classifier file (CLASSIFIER_PATH is set, no frontend colors)")
-        elif NODE_NAME in zf and 'classes/color' in zf[NODE_NAME]:
+        elif ZARR_GROUP in zf and 'classes/color' in zf[ZARR_GROUP]:
             # Last fallback: Use existing colors from zarr (only if no classifier path)
-            old_colors = zf[NODE_NAME]['classes/color'][()]
+            old_colors = zf[ZARR_GROUP]['classes/color'][()]
             if len(old_colors) == len(nuclei_classes):
                 final_class_colors_for_training = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
                 print(f"Using colors from zarr for training: {final_class_colors_for_training}")
@@ -1817,9 +1851,9 @@ def run_classification(args) -> Dict[str, Any]:
             if nuclei_colors and len(nuclei_colors) == len(nuclei_classes):
                 # Frontend provided colors (user's current selection) - use them
                 final_class_colors = nuclei_colors
-            elif NODE_NAME in zf and 'classes/color' in zf[NODE_NAME]:
+            elif ZARR_GROUP in zf and 'classes/color' in zf[ZARR_GROUP]:
                 # Fallback: Use existing colors from zarr if frontend didn't provide
-                old_colors = zf[NODE_NAME]['classes/color'][()]
+                old_colors = zf[ZARR_GROUP]['classes/color'][()]
                 if len(old_colors) == len(nuclei_classes):
                     final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
 
@@ -1844,9 +1878,9 @@ def run_classification(args) -> Dict[str, Any]:
         progress_value = 95
         print(f"Progress: 95% (Saving results to zarr...)")
         
-        if NODE_NAME in zf:
-            del zf[NODE_NAME]
-        grp_cls = zf.require_group(NODE_NAME)
+        if ZARR_GROUP in zf:
+            del zf[ZARR_GROUP]
+        grp_cls = zf.require_group(ZARR_GROUP)
 
         grp_cls.create_dataset('class_indices', data=predictions.astype(np.int32))
 
@@ -2089,15 +2123,16 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS, LAST_TRAINED_CLF_BUNDLE
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS, LAST_TRAINED_CLF_BUNDLE, ZARR_GROUP
     LAST_TRAINED_CLF_BUNDLE = None
-    NODE_NAME = data.get("node_name", "Cell-Classification")
+    NODE_NAME = data.get("node_name", "NuClass")
+    ZARR_GROUP = data.get("zarr_group") or "Cell-Classification"
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
     # CLASS_LIST = data.get("class_list", ["Negative control", "Tumor", "Lymphocyte"])
     # CLASS_COLORS = data.get("class_colors", [])
 
-    print(f"[Cell-Classification] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, ZARR_PATH={ZARR_PATH}")
+    print(f"[Cell-Classification] /read => node_name={NODE_NAME}, zarr_group={ZARR_GROUP}, deps={DEPENDENCIES}, ZARR_PATH={ZARR_PATH}")
     CLASS_OPERATIONS = {"renames": [], "adds": []}
     if not ZARR_PATH or not os.path.exists(ZARR_PATH):
         print("[Cell-Classification] no h5 => skip read.")
@@ -2113,7 +2148,7 @@ def read_node(data: Dict[str, Any]):
     zf = None
     try:
         zf = zarr.open_group(ZARR_PATH, mode='r')
-        user_data_path = f"{NODE_NAME}/userData"
+        user_data_path = f"{ZARR_GROUP}/userData"
         if user_data_path in zf:
             for k in zf[user_data_path].keys():
                 raw_bytes = zf[user_data_path][k][()]
@@ -2440,7 +2475,7 @@ async def progress():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8006, help='port')
-    parser.add_argument('--name', type=str, default='Cell-Classification', help='node name')
+    parser.add_argument('--name', type=str, default='NuClass', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args = parser.parse_args()
 
@@ -2455,7 +2490,7 @@ def main():
     logs_filter = LogsEndpointFilter()
     uvicorn_access_logger.addFilter(logs_filter)
 
-    print(f"Starting ClassificationNode at port={args.port}, name={args.name}")
+    print(f"Starting NuClass at port={args.port}, name={args.name}")
 
     def run_uvicorn():
         uvicorn.run(app, host="0.0.0.0", port=args.port)

@@ -946,22 +946,28 @@ def train_linear_classifier(
     if len(unique_classes) < 1 and not has_negative_examples:
         raise ValueError("Need at least 1 class in annotation or negative examples => fallback to zero-shot")
 
-    # Build class_names: ensure "Negative control" is first
-    # IMPORTANT: Even if annotations don't have "Negative control", we need to add it to class_names
-    # BEFORE encoding y_train, so that class indices are consistent
-    class_names = []
-    has_negative_control = "Negative control" in unique_classes
-    if has_negative_control:
-        class_names.append("Negative control")
-        unique_classes.remove("Negative control")
-    class_names.extend(unique_classes)
-    
-    # If "Negative control" is not in annotations, we need to add it to class_names now
-    # (before encoding y_train) so that when we add negative control vectors later,
-    # the class indices will be correct (0 = "Negative control", 1 = "Class1", 2 = "Class2", etc.)
-    if not has_negative_control:
+    # Build class_names. Source priority:
+    #   1. The panel's tissue_classes (authoritative — preserves every class
+    #      the user configured, even ones without any annotation yet, so
+    #      Patch-Classification/classes stays aligned with the panel and the
+    #      int indices in User-Annotations/patch don't drift between runs).
+    #   2. Fall back to annotation order if tissue_classes wasn't supplied.
+    # In both cases Negative control is forced to index 0 (required by the
+    # negative-control-vectors injection further down).
+    if tissue_classes and len(tissue_classes) > 0:
+        class_names = list(tissue_classes)
+        # Add any annotation classes not in the panel list (shouldn't happen in
+        # normal use, but stays safe against stale annotations).
+        for c in unique_classes:
+            if c not in class_names:
+                class_names.append(c)
+    else:
+        class_names = list(unique_classes)
+    if "Negative control" not in class_names:
         class_names = ["Negative control"] + class_names
-        print(f"Added 'Negative control' to class_names (not in annotations): {class_names}")
+        print(f"Added 'Negative control' to class_names (not in panel/annotations): {class_names}")
+    elif class_names[0] != "Negative control":
+        class_names = ["Negative control"] + [c for c in class_names if c != "Negative control"]
 
     # Build class_colors: prioritize function parameter keyed by class name, then ARGS, then classifier, then annotations
     class_colors = []
@@ -1049,32 +1055,66 @@ def train_linear_classifier(
     n_positive = int((sample_weights == 1.0).sum()) if sample_weights is not None else len(y_train)
     _log_training_data_counts(class_names, y_train, n_positive)
 
-    # train new classifier
-    clf = xgb.XGBClassifier(**xgb_params)
-    
-    # Use sample_weights if available (for negative examples)
-    if sample_weights is not None:
-        print(f"Training with sample weights (positive=1.0, negative=0.3)")
-        clf.fit(X_train, y_train, sample_weight=sample_weights)
+    n_samples = len(cell_embeddings)
+    # prediction_probs is always sized to the full UI class list (len(class_names));
+    # if the classifier only saw a subset of those classes, columns for missing
+    # classes stay at 0. This avoids broadcast errors when XGBoost falls back to
+    # binary (proba shape (N,2)) on single-class training data.
+    prediction_probs = np.zeros((n_samples, len(class_names)), dtype=np.float32)
+    predictions = np.zeros(n_samples, dtype=int)
+
+    unique_y = np.unique(y_train)
+    # XGBoost requires y labels to be contiguous starting at 0. When the user
+    # annotates a non-contiguous subset of the panel's classes (e.g. NC=0 +
+    # Tumor=2 but no Lymphocytes=1), we remap to [0..K-1] for the fit and
+    # remember the inverse mapping so the prediction columns can be scattered
+    # back into the full class_names index space below.
+    #   y_panel_to_compact: panel index -> compact index (used to encode y_train)
+    #   compact_to_panel:   compact index -> panel index (used to scatter probs)
+    compact_to_panel = unique_y.astype(int)
+    y_panel_to_compact = {int(p): c for c, p in enumerate(compact_to_panel)}
+
+    if unique_y.size < 2:
+        # XGBoost can't fit on a single class. Skip training and emit a uniform
+        # prediction (everything == that one class) so downstream code still
+        # gets sensible shapes back instead of erroring out.
+        only_class = int(unique_y[0]) if unique_y.size == 1 else 0
+        only_class = max(0, min(only_class, len(class_names) - 1))
+        print(f"Only one class ({class_names[only_class]!r}) in training data — skipping XGBoost fit and predicting all samples as that class.")
+        predictions[:] = only_class
+        if 0 <= only_class < prediction_probs.shape[1]:
+            prediction_probs[:, only_class] = 1.0
+        clf = None
+        _log_training_data_counts(class_names, y_train, n_positive)
+        # Skip the prediction loop below by jumping past it.
+        clf_n_classes = 1
     else:
-        clf.fit(X_train, y_train)
+        # Remap y_train to a compact label space before XGBoost.
+        y_train_compact = np.array([y_panel_to_compact[int(v)] for v in y_train], dtype=int)
+        clf = xgb.XGBClassifier(**xgb_params)
+        if sample_weights is not None:
+            print(f"Training with sample weights (positive=1.0, negative=0.3)")
+            clf.fit(X_train, y_train_compact, sample_weight=sample_weights)
+        else:
+            clf.fit(X_train, y_train_compact)
+        clf_n_classes = int(clf.n_classes_)
 
     # predict in chunks to avoid GPU memory issues
     # Optimize batch_size: use larger batches for better performance
     batch_size = 50000  # Increased from 10k for better performance
-    n_samples = len(cell_embeddings)
-    predictions = np.zeros(n_samples, dtype=int)
-    
-    # Get the actual number of classes from the classifier
-    n_classes = clf.n_classes_
-    prediction_probs = np.zeros((n_samples, n_classes), dtype=np.float32)
     
     n_batches = (n_samples + batch_size - 1) // batch_size
-    print(f"Predicting {n_samples} samples in {n_batches} batches (batch_size={batch_size})")
-    
+    if clf is None:
+        # Single-class fallback already populated predictions/prediction_probs;
+        # nothing to do.
+        n_batches = 0
+        print("Skipping prediction loop (single-class fallback).")
+    else:
+        print(f"Predicting {n_samples} samples in {n_batches} batches (batch_size={batch_size})")
+
     # Build exclude_classes mapping from annotations for hard constraint enforcement
     exclude_map = {}  # patch_id -> list of excluded class indices
-    if has_negative_examples and not negative_annotations.empty:
+    if clf is not None and has_negative_examples and not negative_annotations.empty:
         for idx, row in negative_annotations.iterrows():
             patch_id = int(row['patch_ID'])
             exclude_list = _parse_exclude_list(row, class_names)
@@ -1085,33 +1125,51 @@ def train_linear_classifier(
                 exclude_map[patch_id] = exclude_indices
         if exclude_map:
             print(f"Will enforce exclusion constraints for {len(exclude_map)} patches during prediction")
-    
+
+    # XGBoost's predict_proba returns columns in clf.classes_ order (compact
+    # label space). Map back to the full panel index space via compact_to_panel
+    # so prediction_probs columns are always (sample, panel_class_idx).
+    if clf is not None:
+        clf_compact_classes = np.array(clf.classes_, dtype=int)
+        clf_classes = np.array(
+            [int(compact_to_panel[c]) for c in clf_compact_classes],
+            dtype=int,
+        )
+    else:
+        clf_classes = np.array([], dtype=int)
+
     for batch_idx, i in enumerate(range(0, n_samples, batch_size)):
         _check_cancel()
         end_idx = min(i + batch_size, n_samples)
         batch_embeddings = cell_embeddings[i:end_idx]
-        
+
         # OPTIMIZATION: Only call predict_proba once, then extract predictions from probabilities
-        # This avoids duplicate forward passes through the model
         batch_probs = clf.predict_proba(batch_embeddings)
-        
+
         # Apply exclude_classes constraints: set probability to 0 for excluded classes
         if exclude_map:
             for local_idx in range(len(batch_probs)):
                 global_idx = i + local_idx
                 if global_idx in exclude_map:
-                    exclude_indices = exclude_map[global_idx]
-                    # Set excluded class probabilities to 0
-                    batch_probs[local_idx, exclude_indices] = 0.0
-                    # Renormalize probabilities
-                    prob_sum = batch_probs[local_idx].sum()
-                    if prob_sum > 0:
-                        batch_probs[local_idx] /= prob_sum
-        
-        batch_predictions = np.argmax(batch_probs, axis=1).astype(int)
-        
+                    excluded_orig = exclude_map[global_idx]
+                    # Translate full-index exclusions to XGBoost column indices.
+                    excluded_cols = [j for j, c in enumerate(clf_classes) if c in excluded_orig]
+                    if excluded_cols:
+                        batch_probs[local_idx, excluded_cols] = 0.0
+                        prob_sum = batch_probs[local_idx].sum()
+                        if prob_sum > 0:
+                            batch_probs[local_idx] /= prob_sum
+
+        # Scatter batch_probs columns (XGBoost class order) into full class_names columns.
+        # If XGBoost saw fewer classes than class_names, the missing columns stay 0.
+        batch_full = np.zeros((batch_probs.shape[0], prediction_probs.shape[1]), dtype=np.float32)
+        for j, cls_id in enumerate(clf_classes):
+            if 0 <= int(cls_id) < prediction_probs.shape[1]:
+                batch_full[:, int(cls_id)] = batch_probs[:, j]
+        batch_predictions = np.argmax(batch_full, axis=1).astype(int)
+
         predictions[i:end_idx] = batch_predictions
-        prediction_probs[i:end_idx] = batch_probs
+        prediction_probs[i:end_idx] = batch_full
         
         # Clear batch data from memory
         del batch_embeddings, batch_predictions, batch_probs
@@ -1170,13 +1228,19 @@ def run_classification(args) -> Dict[str, Any]:
         # A) check annotation
         annotations_data = None
         use_supervised = False
-        if 'User-Annotations' in zf and 'patch' in zf['User-Annotations']:
-            patch_arr = zf['User-Annotations/patch'][:]
-            # Resolve int class index → human name via Patch-Classification/classes/name
-            # so the downstream training pipeline (which expects string class
-            # labels) keeps working the same way as it did with the JSON dict.
-            class_name_lookup = []
-            class_color_lookup = []
+        # Class names are stored as int indices in User-Annotations/patch['class'].
+        # The mapping comes from (in priority order):
+        #   1. The current workflow params (`args.tissue_classes` / `tissue_colors`)
+        #      — what the user is showing in the panel right now, source of truth
+        #   2. Patch-Classification/classes/{name,color} as backup, if args missing
+        # We deliberately do NOT fall back to f"class_{i}" — that just feeds a
+        # garbage label into XGBoost training, and the bad label ends up written
+        # back to classes/name on the next save.
+        ui_tissue_classes = list(getattr(args, "tissue_classes", []) or [])
+        ui_tissue_colors = list(getattr(args, "tissue_colors", []) or [])
+        class_name_lookup = list(ui_tissue_classes)
+        class_color_lookup = list(ui_tissue_colors)
+        if not class_name_lookup:
             try:
                 if 'Patch-Classification' in zf and 'classes/name' in zf['Patch-Classification']:
                     raw_names = zf['Patch-Classification/classes/name'][:]
@@ -1193,17 +1257,20 @@ def run_classification(args) -> Dict[str, Any]:
             except Exception:
                 pass
 
+        if 'User-Annotations' in zf and 'patch' in zf['User-Annotations']:
+            patch_arr = zf['User-Annotations/patch'][:]
             ann_dict = {}
             if patch_arr.dtype.names and 'class' in patch_arr.dtype.names:
                 for i in range(len(patch_arr)):
                     cls_idx = int(patch_arr['class'][i])
                     if cls_idx < 0:
                         continue
-                    cls_name = (
-                        class_name_lookup[cls_idx]
-                        if 0 <= cls_idx < len(class_name_lookup)
-                        else f"class_{cls_idx}"
-                    )
+                    if not (0 <= cls_idx < len(class_name_lookup)):
+                        # Stale annotation: the user removed a class between
+                        # annotating and re-running. Skip rather than invent a
+                        # f"class_{i}" label that pollutes Patch-Classification.
+                        continue
+                    cls_name = class_name_lookup[cls_idx]
                     cls_color = (
                         class_color_lookup[cls_idx]
                         if 0 <= cls_idx < len(class_color_lookup)
@@ -1516,19 +1583,10 @@ def run_classification(args) -> Dict[str, Any]:
             # If update fails, log but don't fail the workflow.
             print(f"Warning: Could not update patch annotation colors: {e}")
         
-        # Update user_annotation.attrs colormap to match new class colors
-        # This ensures the colormap (used by frontend) reflects the new colors
-        try:
-            if 'User-Annotations' in zf:
-                user_anno_group = zf['User-Annotations']
-                if hasattr(user_anno_group, 'attrs'):
-                    # Update tissue_class_names and tissue_class_colors in user_annotation.attrs
-                    user_anno_group.attrs['tissue_class_names'] = final_class_names
-                    user_anno_group.attrs['tissue_class_colors'] = final_class_colors
-                    print(f"[{NODE_NAME}] Updated user_annotation.attrs colormap: {len(final_class_names)} classes with new colors")
-        except Exception as e:
-            # If update fails, log but don't fail the workflow
-            print(f"[{NODE_NAME}] Warning: Could not update user_annotation.attrs colormap: {e}")
+        # Patch-Classification/classes/{name,color} (written above) is now the
+        # canonical source for the class palette. The old
+        # User-Annotations.attrs['tissue_class_*'] mirror is no longer read by
+        # the backend, so we don't write it anymore.
 
         print("================")
         # Filter tissue_classes to only include classes that are actually predicted

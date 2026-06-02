@@ -81,6 +81,11 @@ ARGS = None
 IS_MODEL_INITED = False
 ZARR_PATH = None
 NODE_NAME = None
+# zarr group this tasknode writes to. Decoupled from NODE_NAME so the
+# scheduler can switch model names without moving the data. Defaults to
+# "Cell-Segmentation" (canonical NucleiSeg group); backend can override via
+# /read payload `zarr_group`.
+ZARR_GROUP = "Cell-Segmentation"
 DEPENDENCIES = []
 progress_value = 0  # Global variable to track progress
 progress_complete = False  # New flag to indicate completion
@@ -98,7 +103,7 @@ class CancellationException(Exception):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8005, help='port')
-    parser.add_argument('--name', type=str, default='Cell-Segmentation', help='node name')
+    parser.add_argument('--name', type=str, default='StarDist', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
 
     # ===  segmentation + embedding parameters ===
@@ -160,14 +165,14 @@ def run_segmentation(args):
 
         if os.path.exists(ZARR_PATH):
             zf = zarr.open_group(ZARR_PATH, mode='r')
-            if NODE_NAME in zf:
+            if ZARR_GROUP in zf:
                 try:
-                    centroids = zf[f"{NODE_NAME}/centroids"][()]
+                    centroids = zf[f"{ZARR_GROUP}/centroids"][()]
                     # Attempt to load contours and probability, but don't fail if not present initially
-                    if f"{NODE_NAME}/contours" in zf:
-                        contours = zf[f"{NODE_NAME}/contours"][()]
-                    if f"{NODE_NAME}/probabilities" in zf:
-                        probability = zf[f"{NODE_NAME}/probabilities"][()]
+                    if f"{ZARR_GROUP}/contours" in zf:
+                        contours = zf[f"{ZARR_GROUP}/contours"][()]
+                    if f"{ZARR_GROUP}/probabilities" in zf:
+                        probability = zf[f"{ZARR_GROUP}/probabilities"][()]
 
                     # Check if essential data (centroids) is valid
                     if centroids is not None and centroids.size > 0:  # Basic check for non-empty centroids
@@ -178,7 +183,7 @@ def run_segmentation(args):
                         # Check target_mpp: read from node attrs (saved when segmentation was generated)
                         # target_mpp affects processing resolution, so we need to verify it matches
                         # Note: userData is updated before each run, so we can't use it to get old parameters
-                        node_grp = zf[NODE_NAME]
+                        node_grp = zf[ZARR_GROUP]
                         saved_target_mpp = None
                         has_target_mpp_attr = 'target_mpp' in node_grp.attrs
                         
@@ -380,7 +385,7 @@ def run_segmentation(args):
                 return
 
             zf_write = zarr.open_group(ZARR_PATH, mode='a')
-            node_grp = zf_write.require_group(NODE_NAME)
+            node_grp = zf_write.require_group(ZARR_GROUP)
 
             print(f"[ZARR WRITE] Writing centroids. Shape: {centroids_data.shape}")
             if 'centroids' in node_grp:
@@ -551,9 +556,9 @@ def run_segmentation(args):
             else:
                 # Segmentation was skipped (using existing data), check if embedding exists and matches
                 zf_embed = zarr.open_group(ZARR_PATH, mode='a')
-                if NODE_NAME in zf_embed and 'embeddings' in zf_embed[NODE_NAME]:
+                if ZARR_GROUP in zf_embed and 'embeddings' in zf_embed[ZARR_GROUP]:
                     try:
-                        existing_len = zf_embed[NODE_NAME]['embeddings'].shape[0]
+                        existing_len = zf_embed[ZARR_GROUP]['embeddings'].shape[0]
                         if existing_len == len(centroids):
                             have_cached_embedding = True
                             print("found existing embeddings in store => skip embedding calculation")
@@ -585,7 +590,7 @@ def run_segmentation(args):
                 
                 ne = NucleiEmbedding(args, centroids, contours=contours_for_embedding, progress_callback=embed_progress_with_cancel)
                 try:
-                    ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{NODE_NAME}/embeddings")
+                    ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{ZARR_GROUP}/embeddings")
                 except CancellationException:
                     print("[Cell-Segmentation] Embedding cancelled by user")
                     cancel_event.clear()
@@ -701,13 +706,14 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, cancel_event
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, cancel_event, ZARR_GROUP
     print(f"[Cell-Segmentation] /read called - Cancel event state: {cancel_event.is_set()}")
-    NODE_NAME = data.get("node_name", "Cell-Segmentation")
+    NODE_NAME = data.get("node_name", "StarDist")
+    ZARR_GROUP = data.get("zarr_group") or "Cell-Segmentation"
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
 
-    print(f"[Cell-Segmentation] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
+    print(f"[Cell-Segmentation] /read => node_name={NODE_NAME}, zarr_group={ZARR_GROUP}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
 
     if not ZARR_PATH or not os.path.exists(ZARR_PATH):
         print("[Cell-Segmentation] no zarr store => skip read.")
@@ -739,7 +745,7 @@ def read_node(data: Dict[str, Any]):
         ARGS.num_z_layers = 1
 
     zf = zarr.open_group(ZARR_PATH, mode='r')
-    user_data_path = f"{NODE_NAME}/userData"
+    user_data_path = f"{ZARR_GROUP}/userData"
     if user_data_path in zf:
         for k in zf[user_data_path].keys():
             raw_bytes = zf[user_data_path][k][()]
@@ -836,7 +842,7 @@ def execute_node():
         # Replaces the historical <NODE_NAME>/output bytes blob.
         if ZARR_PATH and os.path.exists(ZARR_PATH):
             zf = zarr.open_group(ZARR_PATH, mode='a')
-            seg_grp = zf.require_group(NODE_NAME)
+            seg_grp = zf.require_group(ZARR_GROUP)
             if 'metadata' in seg_grp:
                 del seg_grp['metadata']
             meta_grp = seg_grp.create_group('metadata')
@@ -952,7 +958,7 @@ def main():
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8005, help='port')
-    parser.add_argument('--name', type=str, default='Cell-Segmentation', help='node name')
+    parser.add_argument('--name', type=str, default='StarDist', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args, unknown = parser.parse_known_args()
 
@@ -963,7 +969,7 @@ def main():
     os.environ["NODE_NAME"] = args.name
 
     # Log initial cancel_event state
-    print(f"Starting Cell-Segmentation at port={args.port}, name={args.name}")
+    print(f"Starting StarDist at port={args.port}, name={args.name}")
     print(f"[Cell-Segmentation] Initial cancel_event state: {cancel_event.is_set()} (should be False)")
 
     try:
