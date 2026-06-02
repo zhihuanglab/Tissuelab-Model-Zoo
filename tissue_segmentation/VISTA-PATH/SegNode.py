@@ -757,18 +757,24 @@ class PatchDatasetZarr(Dataset):
 
 def _get_mask_node_coords_for_tissue(zf, tissue_name: Optional[str]):
     """
-    Get MaskNode coordinates for a single tissue name (case-insensitive).
-    Returns np.ndarray (K, 4) or None if MuskNode missing / tissue not found / no coords.
+    Join the patch classification group with the patch segmentation group to
+    pull coordinates of patches classified as `tissue_name` (case-insensitive).
+    Returns np.ndarray (K, 4) or None.
     """
     if not zf or not tissue_name:
         return None
     try:
-        if "MuskNode" not in zf:
+        if "Patch-Classification" not in zf or "Patch-Segmentation" not in zf:
             return None
-        mask_node = zf["MuskNode"]
-        if "tissue_class_name" not in mask_node or "coordinates" not in mask_node or "tissue_class_id" not in mask_node:
+        cls_grp = zf["Patch-Classification"]
+        seg_grp = zf["Patch-Segmentation"]
+        if (
+            "classes/name" not in cls_grp
+            or "class_indices" not in cls_grp
+            or "coordinates" not in seg_grp
+        ):
             return None
-        tissue_names = mask_node["tissue_class_name"][:]
+        tissue_names = cls_grp["classes/name"][:]
         tissue_names_decoded = []
         for name_bytes in tissue_names:
             if isinstance(name_bytes, bytes):
@@ -783,8 +789,8 @@ def _get_mask_node_coords_for_tissue(zf, tissue_name: Optional[str]):
                 break
         if target_class_id is None:
             return None
-        mask_coords = mask_node["coordinates"][:]
-        mask_class_ids = mask_node["tissue_class_id"][:]
+        mask_coords = seg_grp["coordinates"][:]
+        mask_class_ids = cls_grp["class_indices"][:]
         target_coords = [
             mask_coords[i] for i in range(len(mask_coords))
             if mask_class_ids[i] == target_class_id
@@ -801,7 +807,7 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
     """
     Sequential tiling and inference: process each patch one by one.
     If tissue_class contains commas, multiple tissues are run in sequence:
-    each tissue uses MuskNode patches if that tissue exists in MuskNode, else full grid;
+    each tissue uses Patch-Classification patches if that tissue exists in Patch-Classification, else full grid;
     each mask is saved as mask_{tissue_name}.
     """
     global progress_value, PASEG_MODEL, ACTUAL_ZARR_GROUP, total_patches, processed_patches, SLIDE_PATH, TISSUE_CLASS
@@ -856,13 +862,13 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         total_patches_overall = 0
         
         for current_tissue in tissue_run_list:
-            # Resolve coordinates for this tissue: MuskNode patches if present, else full grid
+            # Resolve coordinates for this tissue: Patch-Classification patches if present, else full grid
             mask_node_coords = _get_mask_node_coords_for_tissue(zf_check, current_tissue) if current_tissue else None
             if current_tissue:
                 if mask_node_coords is not None:
-                    print(f"[{NODE_NAME}] Tissue '{current_tissue}': using {len(mask_node_coords)} MuskNode patches")
+                    print(f"[{NODE_NAME}] Tissue '{current_tissue}': using {len(mask_node_coords)} Patch-Classification patches")
                 else:
-                    print(f"[{NODE_NAME}] Tissue '{current_tissue}': not in MuskNode, using full grid")
+                    print(f"[{NODE_NAME}] Tissue '{current_tissue}': not in Patch-Classification, using full grid")
             
             # If not using MaskNode coordinates, calculate grid
             if mask_node_coords is None:
@@ -1068,13 +1074,13 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                 print(f"[{NODE_NAME}] Mask saved: {save_key} {level_height}x{level_width} (bool, compressed)")
             
             # Save tissue_class dataset (user-provided string, unchanged; may contain comma-separated names)
-            if 'tissue_class' in out_grp:
-                del out_grp['tissue_class']
+            if 'class' in out_grp:
+                del out_grp['class']
             if TISSUE_CLASS:
                 tissue_class_str = str(TISSUE_CLASS)
                 tissue_class_bytes = tissue_class_str.encode("utf-8")
                 tissue_class_array = np.frombuffer(tissue_class_bytes, dtype=f"S{len(tissue_class_bytes)}")
-                out_grp.create_dataset("tissue_class", data=tissue_class_array, dtype=f"S{len(tissue_class_bytes)}")
+                out_grp.create_dataset("class", data=tissue_class_array, dtype=f"S{len(tissue_class_bytes)}")
                 print(f"[{NODE_NAME}] Tissue class saved: '{tissue_class_str}'")
             
             # Check if centroids/contours/probability exist
@@ -1503,7 +1509,7 @@ def run_segmentation(args) -> Dict[str, Any]:
     device = PASEG_MODEL.device
     num_classes = int(getattr(PASEG_MODEL, "num_classes", 2))
 
-    # 4) rebuild current group & create output array (using actual group name like SegmentationNode)
+    # 4) rebuild current group & create output array (using actual group name like Cell-Segmentation)
     output_group_name = ACTUAL_ZARR_GROUP if ACTUAL_ZARR_GROUP else NODE_NAME
     print(f"[{NODE_NAME}] Saving results to zarr group: {output_group_name}")
     out_grp, _ = recreate_group(zf, output_group_name, preserve_keys=[])
@@ -1638,7 +1644,7 @@ def run_segmentation(args) -> Dict[str, Any]:
             all_contours.append(contour_global[:, 0, :])  # remove the extra dimension
             all_probabilities.append(float(max_foreground_prob))
     
-    # write contours, centroids and probability (matching SegmentationNode format)
+    # write contours, centroids and probability (matching Cell-Segmentation format)
     if len(all_centroids) > 0:
         centroids_array = np.array(all_centroids, dtype=np.int32)  # (N_objects, 2)
         out_grp.create_dataset("centroids", data=centroids_array, 
@@ -1690,7 +1696,7 @@ def run_segmentation(args) -> Dict[str, Any]:
     if 'prob_patches' in out_grp:
         del out_grp['prob_patches']
 
-    # 7) create userData group (matching SegmentationNode format)
+    # 7) create userData group (matching Cell-Segmentation format)
     user_data_grp = out_grp.require_group("userData")
     
     # save path (image path, if exists)
@@ -2028,9 +2034,9 @@ def read_node(data: Dict[str, Any]):
         if found_user_data:
             print(f"[{NODE_NAME}] Found userData at alternative path: {found_user_data}")
     
-    # extract the actual group name from the userData path (like SegmentationNode)
+    # extract the actual group name from the userData path (like Cell-Segmentation)
     if found_user_data:
-        # e.g. "SegmentationNode/userData" -> "SegmentationNode"
+        # e.g. "Cell-Segmentation/userData" -> "Cell-Segmentation"
         if "/" in found_user_data:
             ACTUAL_ZARR_GROUP = found_user_data.split("/")[0]
             print(f"[{NODE_NAME}] Using actual zarr group: {ACTUAL_ZARR_GROUP}")
@@ -2048,7 +2054,7 @@ def read_node(data: Dict[str, Any]):
             
             if k == "path":
                 SLIDE_PATH = val_json
-            elif k == "tissue_class":
+            elif k == "class":
                 TISSUE_CLASS = val_json
 
             print(f"[{NODE_NAME}] user param {k} => {val_json}")

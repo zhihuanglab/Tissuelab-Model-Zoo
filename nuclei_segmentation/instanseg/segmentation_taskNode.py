@@ -158,7 +158,7 @@ def _read_streamed_vectors_from_zarr(
         grp = zf[node_name]
         centroids = grp["centroids"][()] if "centroids" in grp else None
         contours = grp["contours"][()] if "contours" in grp else None
-        probability = grp["probability"][()] if "probability" in grp else None
+        probability = grp["probabilities"][()] if "probabilities" in grp else None
         return centroids, contours, probability
     except Exception as exc:
         print(f"[SEG LOG] Error reading streamed vectors from {zarr_path}: {exc}")
@@ -534,9 +534,9 @@ def run_segmentation(args):
             zf = zarr.open_group(ZARR_PATH, mode='a')
             have_cached_embedding = False
 
-            if NODE_NAME in zf and 'embedding' in zf[NODE_NAME]:
+            if NODE_NAME in zf and 'embeddings' in zf[NODE_NAME]:
                 try:
-                    existing_len = zf[NODE_NAME]['embedding'].shape[0]
+                    existing_len = zf[NODE_NAME]['embeddings'].shape[0]
                     if existing_len == len(centroids):
                         have_cached_embedding = True
                         print("[EMBED LOG] Found existing embeddings in store => skip embedding calculation.")
@@ -563,7 +563,7 @@ def run_segmentation(args):
                 def embed_progress_with_cancel(pct):
                     if cancel_event.is_set():
                         raise CancellationException("Task cancelled during embedding")
-                    update_progress(pct, "embedding")
+                    update_progress(pct, "embeddings")
                 
                 ne = NucleiEmbedding(
                     args,
@@ -574,7 +574,7 @@ def run_segmentation(args):
                 try:
                     ne.generate_embeddings(
                         zarr_path=ZARR_PATH,
-                        dataset_path=f"{NODE_NAME}/embedding"
+                        dataset_path=f"{NODE_NAME}/embeddings"
                     )
                 except CancellationException:
                     print("[InstanSegNode] Embedding cancelled by user")
@@ -617,17 +617,17 @@ def run_segmentation(args):
                 if f"{NODE_NAME}/contours" in zf:
                     contours_ds = zf[f"{NODE_NAME}/contours"]
                     print(f"[ZARR VERIFY] Contours: {contours_ds.shape} (fixed-length format)")
-                if f"{NODE_NAME}/embedding" in zf:
-                    embedding_ds = zf[f"{NODE_NAME}/embedding"]
+                if f"{NODE_NAME}/embeddings" in zf:
+                    embedding_ds = zf[f"{NODE_NAME}/embeddings"]
                     print(f"[ZARR VERIFY] Embedding: {embedding_ds.shape}")
-                if f"{NODE_NAME}/probability" in zf:
-                    prob_ds = zf[f"{NODE_NAME}/probability"]
+                if f"{NODE_NAME}/probabilities" in zf:
+                    prob_ds = zf[f"{NODE_NAME}/probabilities"]
                     print(f"[ZARR VERIFY] Probability: {prob_ds.shape}")
         except Exception as e:
             print(f"[ZARR VERIFY] Verification skipped due to error: {e}")
 
         progress_complete = True
-        update_progress(100, "embedding")
+        update_progress(100, "embeddings")
 
         end_time = time.time()
         print(f"Time taken: {end_time - start_time:.2f}s")
@@ -747,7 +747,7 @@ def init_node():
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
     global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS
-    NODE_NAME = data.get("zarr_group") or data.get("node_name", "SegmentationNode")
+    NODE_NAME = data.get("zarr_group") or data.get("node_name", "Cell-Segmentation")
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)  # Changed from h5_path to zarr_path
 
@@ -908,15 +908,23 @@ def execute_node():
                 time.sleep(0.2)  # Give SSE stream time to send reset signal
             return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
 
-    # store the result to 'output'
+    # Write run metadata to <NODE_NAME>/metadata as a zarr group with attrs.
+    # Replaces the historical <NODE_NAME>/output bytes blob.
     if ZARR_PATH and os.path.exists(ZARR_PATH):
         zf = zarr.open_group(ZARR_PATH, mode='a')
-        node_out_path = f"{NODE_NAME}/output"
-        if node_out_path in zf:
-            del zf[node_out_path]
-        out_str = json.dumps(out_val, ensure_ascii=False)
-        out_bytes = out_str.encode("utf-8")
-        zf.create_dataset(node_out_path, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
+        seg_grp = zf.require_group(NODE_NAME)
+        if 'metadata' in seg_grp:
+            del seg_grp['metadata']
+        meta_grp = seg_grp.create_group('metadata')
+        meta_grp.attrs.update({
+            'model': 'InstanSeg',
+            'status': out_val.get('status', 'unknown'),
+            'message': out_val.get('message', ''),
+            'nuclei_count': int(out_val.get('nuclei_count', 0)),
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            'has_embeddings': 'embeddings' in seg_grp,
+            'has_probabilities': 'probabilities' in seg_grp,
+        })
 
     return {"status": "ok", "output": out_val}
 
@@ -932,7 +940,7 @@ def update_progress(value, phase="segmentation"):
     if phase == "segmentation":
         # Scale segmentation progress from 0-100 to 0-50
         progress_value = int(value * 0.5)
-    elif phase == "embedding":
+    elif phase == "embeddings":
         # Scale embedding progress from 0-100 to 50-100
         progress_value = 50 + int(value * 0.5)
     else:

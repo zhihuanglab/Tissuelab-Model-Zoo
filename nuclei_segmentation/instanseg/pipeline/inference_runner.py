@@ -151,7 +151,7 @@ def run_wsi(
     }
 
     contour_fallback_stats = Counter()
-    effective_node_name = provided_node_name if provided_node_name else "SegmentationNode"
+    effective_node_name = provided_node_name if provided_node_name else "Cell-Segmentation"
     writer = _StreamingSegmentationWriter(
         file_with_zarr_extension,
         node_name=effective_node_name,
@@ -392,7 +392,7 @@ def run_wsi(
                 f"[OUTPUT] Writing completed in {time.time() - writer_start:.2f}s",
             )
             print(
-                f"[OUTPUT] Zarr structure: {file_with_zarr_extension} > {writer.node_name} > [centroids, contours, probability]"
+                f"[OUTPUT] Zarr structure: {file_with_zarr_extension} > {writer.node_name} > [centroids, contours, probabilities]"
             )
     except Exception as exc:  # pragma: no cover - best effort
         if model.verbose:

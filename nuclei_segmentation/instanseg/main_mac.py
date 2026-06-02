@@ -133,11 +133,11 @@ def main(args):
                         centroids = hf['InstanSegNode']['centroids'][()]
                         if 'contours' in hf['InstanSegNode']:
                             contours = hf['InstanSegNode']['contours'][()]
-                        if 'probability' in hf['InstanSegNode']:
-                            probability = hf['InstanSegNode']['probability'][()]
+                        if 'probabilities' in hf['InstanSegNode']:
+                            probability = hf['InstanSegNode']['probabilities'][()]
 
                         ALREADY_HAVE_SEG = True
-                        has_embeddings = 'embedding' in hf['InstanSegNode']
+                        has_embeddings = 'embeddings' in hf['InstanSegNode']
 
                         if has_embeddings:
                             result["nuclei_count"] = len(centroids)
@@ -181,13 +181,13 @@ def main(args):
             result_path = ne.generate_embeddings(label_image, temp_h5_path=temp_h5_path)
 
             with safe_h5_open(temp_h5_path, "r") as tf:
-                embedding_data = tf["embedding"][()]
+                embedding_data = tf["embeddings"][()]
 
             with safe_h5_open(h5_path, 'a') as hf:
                 nuclei_seg = hf['InstanSegNode']
-                if 'embedding' in nuclei_seg:
-                    del nuclei_seg['embedding']
-                nuclei_seg.create_dataset('embedding', data=embedding_data)
+                if 'embeddings' in nuclei_seg:
+                    del nuclei_seg['embeddings']
+                nuclei_seg.create_dataset('embeddings', data=embedding_data)
 
             if os.path.exists(temp_h5_path):
                 os.remove(temp_h5_path)
@@ -243,7 +243,7 @@ def main(args):
             with safe_h5_open(h5_path, mode) as hf:
                 nuclei_seg = hf.create_group('InstanSegNode')
                 nuclei_seg.create_dataset('centroids', data=centroids.astype(np.int32))
-                nuclei_seg.create_dataset('probability', data=probability.astype(np.float32))
+                nuclei_seg.create_dataset('probabilities', data=probability.astype(np.float32))
 
                 if contours and len(contours) > 0:
                     from segmentation_taskNode import format_contours_for_h5
@@ -259,11 +259,11 @@ def main(args):
             result_path = ne.generate_embeddings(label_image, temp_h5_path=temp_h5_path)
 
             with safe_h5_open(temp_h5_path, "r") as tf:
-                embedding_data = tf["embedding"][()]
+                embedding_data = tf["embeddings"][()]
 
             with safe_h5_open(h5_path, 'a') as hf:
                 nuclei_seg = hf['InstanSegNode']
-                nuclei_seg.create_dataset('embedding', data=embedding_data)
+                nuclei_seg.create_dataset('embeddings', data=embedding_data)
 
             if os.path.exists(temp_h5_path):
                 os.remove(temp_h5_path)

@@ -159,7 +159,7 @@ def main():
     
     # Set ZARR_PATH to the expected path (run_wsi will write here)
     tasknode.ZARR_PATH = expected_zarr_path
-    tasknode.NODE_NAME = "SegmentationNode"  # This is what run_wsi uses by default
+    tasknode.NODE_NAME = "Cell-Segmentation"  # This is what run_wsi uses by default
     
     print(f"[TEST] [OK] Expected Zarr path: {tasknode.ZARR_PATH}")
     print(f"[TEST] [OK] Node name: {tasknode.NODE_NAME}")
@@ -207,11 +207,11 @@ def main():
                     contours = zf[f"{node_name}/contours"]
                     print(f"  [OK] Contours: shape={contours.shape}, dtype={contours.dtype}")
                 
-                if 'probability' in zf[node_name]:
+                if 'probabilities' in zf[node_name]:
                     prob = zf[f"{node_name}/probability"]
                     print(f"  [OK] Probability: shape={prob.shape}, dtype={prob.dtype}")
                 
-                if 'embedding' in zf[node_name]:
+                if 'embeddings' in zf[node_name]:
                     embedding = zf[f"{node_name}/embedding"]
                     print(f"  [OK] Embedding: shape={embedding.shape}, dtype={embedding.dtype}")
                     print(f"    [INFO] PLIP embeddings: {embedding.shape[1]} dimensions per nucleus")

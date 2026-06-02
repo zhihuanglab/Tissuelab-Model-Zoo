@@ -121,7 +121,7 @@ class ExampleNode():
                     label: probs[patch_idx, i].item()
                     for i, label in enumerate(self.labels)
                 },
-                'embedding': image_embeddings[patch_idx].cpu().numpy(),
+                'embeddings': image_embeddings[patch_idx].cpu().numpy(),
                 'final_class': self.labels[pred_indices[patch_idx].item()],
                 # 'prediction_confidence': max_probs[patch_idx].item()
             }

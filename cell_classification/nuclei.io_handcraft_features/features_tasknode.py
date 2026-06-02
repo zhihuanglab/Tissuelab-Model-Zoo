@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Task Node for nuclei segmentation using StarDist + feature extraction
-Creates SegmentationNode and CellFeatureNode in H5 file
+Creates Cell-Segmentation and CellFeatureNode in H5 file
 """
 import argparse
 import os
@@ -234,14 +234,14 @@ def run_segmentation_and_features(args):
 
         if os.path.exists(H5_PATH):
             with safe_h5_open(H5_PATH, 'r') as hf:
-                # Check for segmentation data in SegmentationNode
-                if 'SegmentationNode' in hf:
+                # Check for segmentation data in Cell-Segmentation
+                if 'Cell-Segmentation' in hf:
                     try:
-                        if 'centroids' in hf['SegmentationNode'] and 'contours' in hf['SegmentationNode']:
-                            centroids = hf['SegmentationNode/centroids'][()]
-                            contours = hf['SegmentationNode/contours'][()]
+                        if 'centroids' in hf['Cell-Segmentation'] and 'contours' in hf['Cell-Segmentation']:
+                            centroids = hf['Cell-Segmentation/centroids'][()]
+                            contours = hf['Cell-Segmentation/contours'][()]
                             ALREADY_HAVE_SEG = True
-                            print("Found existing nuclei segmentation in SegmentationNode.")
+                            print("Found existing nuclei segmentation in Cell-Segmentation.")
                             result["nuclei_count"] = len(centroids)
                     except:
                         print("Warning: segmentation data is corrupted. Will re-run segmentation.")
@@ -382,11 +382,11 @@ def run_segmentation_and_features(args):
 
         # Step D: Save results to H5 file
         with safe_h5_open(H5_PATH, "a") as hf:
-            # Save segmentation data in SegmentationNode
+            # Save segmentation data in Cell-Segmentation
             if centroids is not None and need_segmentation:
-                if 'SegmentationNode' in hf:
-                    del hf['SegmentationNode']
-                seg_node = hf.create_group('SegmentationNode')
+                if 'Cell-Segmentation' in hf:
+                    del hf['Cell-Segmentation']
+                seg_node = hf.create_group('Cell-Segmentation')
                 
                 seg_node.create_dataset('centroids', data=centroids, compression='gzip')
                 seg_node.create_dataset('contours', data=contours, compression='gzip')
@@ -412,8 +412,8 @@ def run_segmentation_and_features(args):
                 cell_feature_node.create_dataset('features', data=features, compression='gzip')
                 cell_feature_node.create_dataset('feature_names', 
                                                 data=[n.encode('utf-8') for n in feature_names])
-                cell_feature_node.create_dataset('nuclei_class_id', data=nuclei_class_id)
-                cell_feature_node.create_dataset('nuclei_class_name', 
+                cell_feature_node.create_dataset('class_indices', data=nuclei_class_id)
+                cell_feature_node.create_dataset('classes/name', 
                                                 data=nuclei_class_name, 
                                                 dtype=h5py.string_dtype())
                 

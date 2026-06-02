@@ -349,7 +349,7 @@ class NucleiEmbedding:
         with safe_h5_open(temp_h5_path, 'w') as h5f:
             # create extendable dataset
             embeddings_dset = h5f.create_dataset(
-                'embedding',
+                'embeddings',
                 shape=(0, 768),
                 maxshape=(None, 768),
                 dtype=np.float16,

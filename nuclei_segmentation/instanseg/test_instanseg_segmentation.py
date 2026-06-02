@@ -298,9 +298,9 @@ def main():
                         contours = np.array(contours_list, dtype=np.int32) if contours_list else None
                 else:
                     store = zarr.open_group(str(zarr_path), mode="r")
-                    if "SegmentationNode" not in store:
-                        raise RuntimeError(f"'SegmentationNode' group not found in {zarr_path}")
-                    seg_grp = store["SegmentationNode"]
+                    if "Cell-Segmentation" not in store:
+                        raise RuntimeError(f"'Cell-Segmentation' group not found in {zarr_path}")
+                    seg_grp = store["Cell-Segmentation"]
                     if "centroids" not in seg_grp:
                         raise RuntimeError(f"'centroids' dataset not found in {zarr_path}/SegmentationNode")
                     centroids = seg_grp["centroids"][()]  # shape (N, 2), (x, y) in slide space

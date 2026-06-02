@@ -277,7 +277,7 @@ def execute_node():
                     label: probs[patch_idx, i].item()
                     for i, label in enumerate(LABELS)
                 },
-                'embedding': image_embeddings[patch_idx].cpu().numpy().tolist(),
+                'embeddings': image_embeddings[patch_idx].cpu().numpy().tolist(),
                 'final_class': LABELS[pred_indices[patch_idx].item()],
                 'color': colors[pred_indices[patch_idx].item()].tolist()  # Add color information
             }
@@ -351,7 +351,7 @@ def execute_node():
                             "bbox": [x1,y1,x2,y2],
                             "cosine_similarity": {"label1": 0.8, ...},
                             "probability": {"label1": 0.9, ...},
-                            "embedding": [...],
+                            "embeddings": [...],
                             "final_class": "label1",
                             "color": [r,g,b]
                         },
@@ -432,7 +432,7 @@ def execute_node():
                             label: probs[idx, i].item()
                             for i, label in enumerate(LABELS)
                         },
-                        'embedding': image_embeddings[idx].cpu().numpy().tolist(),
+                        'embeddings': image_embeddings[idx].cpu().numpy().tolist(),
                         'final_class': pred_class,
                         'color': colors[pred_idx].tolist()  # Use color of predicted class directly
                     }

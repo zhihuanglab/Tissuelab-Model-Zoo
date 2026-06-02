@@ -12,7 +12,7 @@ class _StreamingSegmentationWriter:
     def __init__(
         self,
         zarr_path: Union[str, Path],
-        node_name: str = "SegmentationNode",
+        node_name: str = "Cell-Segmentation",
         enable_stardist: bool = True,
         verbose: bool = False,
     ):
@@ -91,7 +91,7 @@ class _StreamingSegmentationWriter:
             self._append_dataset("contours_ds", "contours", contours.astype(np.int32))
 
     def write_probabilities(self, probabilities: np.ndarray):
-        if "probability" in self._group:
-            del self._group["probability"]
-        self._group.create_dataset("probability", data=probabilities.astype(np.float32))
+        if "probabilities" in self._group:
+            del self._group["probabilities"]
+        self._group.create_dataset("probabilities", data=probabilities.astype(np.float32))
 

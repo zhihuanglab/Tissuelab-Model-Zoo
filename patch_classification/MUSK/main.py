@@ -65,7 +65,7 @@ def _stored_patch_size_from_coordinates(coordinates):
 
 
 def run_patch_classification_one(musk, wsi_path, output_dir, patch_size=224, level=0,
-                                 batch_size=4, tissue_threshold=0.1, zarr_group="MuskNode"):
+                                 batch_size=4, tissue_threshold=0.1, zarr_group="Patch-Segmentation"):
     """
     One-WSI processing: same logic as musk_embedding_taskNode.run_patch_classification.
     If zarr already exists and patch_size matches => skip. Otherwise process and save.
@@ -80,7 +80,7 @@ def run_patch_classification_one(musk, wsi_path, output_dir, patch_size=224, lev
             zf = zarr.open_group(zarr_path, "r")
             if zarr_group in zf:
                 coordinates = zf[f"{zarr_group}/coordinates"][()]
-                embeddings = zf[f"{zarr_group}/embedding"][()]
+                embeddings = zf[f"{zarr_group}/embeddings"][()]
                 stored_patch_size = _stored_patch_size_from_coordinates(coordinates)
                 if stored_patch_size is not None and stored_patch_size == patch_size:
                     print(f"Using existing embeddings {zarr_path} (patch_size={stored_patch_size}) => skip")
@@ -125,7 +125,7 @@ def run_patch_classification_one(musk, wsi_path, output_dir, patch_size=224, lev
     if zarr_group in zf:
         del zf[zarr_group]
     node_grp = zf.create_group(zarr_group)
-    node_grp.create_dataset("embedding", data=embeddings)
+    node_grp.create_dataset("embeddings", data=embeddings)
     node_grp.create_dataset("coordinates", data=coordinates)
     node_grp.create_dataset("probability", data=np.ones(len(coordinates), dtype=np.float32))
     node_grp.create_dataset("output", shape=(), dtype="S1", data=b"")

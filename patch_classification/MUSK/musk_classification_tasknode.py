@@ -46,7 +46,7 @@ import xgboost as xgb
 import io
 import base64
 import tiffslide
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -120,6 +120,71 @@ ZARR_GROUP = None
 DEP_ZARR_GROUPS = {}
 
 # --------------- utils functions ---------------
+
+def _has_rename_cycle(renames):
+    """Detect cycles in a rename chain. Mirrors NuClass._has_rename_cycle."""
+    if not renames:
+        return False
+    graph = {}
+    for op in renames:
+        src = op.get("from")
+        dst = op.get("to")
+        if src and dst:
+            graph[src] = dst
+
+    visited = set()
+    in_stack = set()
+
+    def visit(node):
+        if node in in_stack:
+            return True
+        if node in visited:
+            return False
+        visited.add(node)
+        in_stack.add(node)
+        nxt = graph.get(node)
+        if nxt is not None and visit(nxt):
+            return True
+        in_stack.remove(node)
+        return False
+
+    for node in list(graph.keys()):
+        if visit(node):
+            return True
+    return False
+
+
+def _normalize_class_operations(raw_ops):
+    """Normalize class_operations dict from frontend `/read` payload.
+
+    Shape: {'renames': [{'from': str, 'to': str}, ...], 'adds': [{'name': str, 'color': str}, ...]}
+    Mirrors NuClass/classification_taskNode.py:_normalize_class_operations.
+    """
+    ops = {"renames": [], "adds": []}
+    if not isinstance(raw_ops, dict):
+        return ops
+
+    renames = raw_ops.get("renames", [])
+    if isinstance(renames, list):
+        for item in renames:
+            if not isinstance(item, dict):
+                continue
+            src = str(item.get("from", "")).strip()
+            dst = str(item.get("to", "")).strip()
+            if src and dst and src != dst:
+                ops["renames"].append({"from": src, "to": dst})
+
+    adds = raw_ops.get("adds", [])
+    if isinstance(adds, list):
+        for item in adds:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            color = item.get("color")
+            if name:
+                ops["adds"].append({"name": name, "color": color})
+    return ops
+
 
 def print_zarr_structure(file_path):
     """print Zarr store"""
@@ -283,22 +348,37 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
         if image_name and image_name not in prev_image_names:
             prev_image_names.append(image_name)
         booster.set_attr(image_names=json.dumps(prev_image_names))
-        if 'user_annotation' in zf_prov and 'tissue_annotations' in zf_prov['user_annotation']:
-            raw = zf_prov['user_annotation/tissue_annotations'][()]
-            current_dict = json.loads(raw.decode('utf-8'))
-            current_records = [
-                [pid, json.dumps(val, sort_keys=True)]
-                for pid, val in current_dict.items()
-            ]
-            prev_records = json.loads(booster.attr('user_annotations') or '[]')
-            seen = {tuple(r) for r in prev_records}
-            for r in current_records:
-                if tuple(r) not in seen:
-                    prev_records.append(r)
-                    seen.add(tuple(r))
-            booster.set_attr(user_annotations=json.dumps(prev_records))
+        if 'User-Annotations/patch' in zf_prov:
+            current = zf_prov['User-Annotations/patch'][()]
+            # Keep only rows the classifier actually trains on — positives
+            # (class >= 0) and weak negatives (class <= -2) with color >= 0.
+            # Mirrors NuClass.save_classifier_params filter.
+            if {'class', 'color'}.issubset(current.dtype.names or ()):
+                meaningful = (
+                    ((current['class'] >= 0) | (current['class'] <= -2))
+                    & (current['color'] >= 0)
+                )
+                current = current[meaningful]
+            prev_attr = booster.attr('user_annotations')
+            if prev_attr:
+                prev_buf = io.BytesIO(base64.b64decode(prev_attr))
+                prev = np.load(prev_buf, allow_pickle=False)['records']
+            else:
+                prev = np.empty(0, dtype=current.dtype)
+            seen = set()
+            merged_list = []
+            for row in np.concatenate([prev, current]):
+                key = tuple(row.tolist())
+                if key not in seen:
+                    seen.add(key)
+                    merged_list.append(row)
+            merged = (np.array(merged_list, dtype=current.dtype)
+                      if merged_list else np.empty(0, dtype=current.dtype))
+            log_buf = io.BytesIO()
+            np.savez_compressed(log_buf, records=merged)
+            booster.set_attr(user_annotations=base64.b64encode(log_buf.getvalue()).decode('utf-8'))
     except Exception as e:
-        print(f"[MuskClassificationNode] Skipping user_annotation provenance embed: {e}")
+        print(f"[Patch-Classification] Skipping user_annotation provenance embed: {e}")
 
     LAST_TRAINED_CLF_BUNDLE = (clf, class_names, class_colors, train_data)
 
@@ -367,7 +447,7 @@ def load_classifier_params():
             train_labels = train_data['labels']
             
             # print the number of samples for each class (same as cell classification)
-            node_tag = NODE_NAME or "MuskNode"
+            node_tag = NODE_NAME or "Patch-Classification"
             print(f"\n[{node_tag}] loaded training data:")
             print(f"total samples: {len(train_labels)}")
             for i, class_name in enumerate(class_names):
@@ -377,7 +457,7 @@ def load_classifier_params():
         else:
             train_embeddings = None
             train_labels = None
-            print(f"[{NODE_NAME or 'MuskNode'}] No saved training data found")
+            print(f"[{NODE_NAME or 'Patch-Classification'}] No saved training data found")
         
         return clf, class_names, class_colors, train_embeddings, train_labels
     except Exception as e:
@@ -541,8 +621,8 @@ def train_linear_classifier(
         annotations = pd.DataFrame()
     
     # Separate positive and negative annotations early (for both new training and incremental)
-    positive_annotations = annotations[annotations['tissue_class'].notna()].copy() if not annotations.empty else pd.DataFrame()
-    negative_annotations = annotations[annotations['tissue_class'].isna()].copy() if not annotations.empty else pd.DataFrame()
+    positive_annotations = annotations[annotations['class'].notna()].copy() if not annotations.empty else pd.DataFrame()
+    negative_annotations = annotations[annotations['class'].isna()].copy() if not annotations.empty else pd.DataFrame()
     has_negative_examples = (
         len(negative_annotations) > 0
         and ('exclude_classes' in negative_annotations.columns or 'exclude_class_indices' in negative_annotations.columns)
@@ -563,7 +643,7 @@ def train_linear_classifier(
                 
                 if not positive_annotations.empty:
                     existing_classes = set(class_names)
-                    annotated_classes = set(positive_annotations['tissue_class'].unique())
+                    annotated_classes = set(positive_annotations['class'].unique())
                     new_classes = annotated_classes - existing_classes
                     
                     # Check if class count changed
@@ -607,7 +687,7 @@ def train_linear_classifier(
                                         new_class_colors.append("#aaaaaa")
                                 elif not positive_annotations.empty:
                                     # For new classes, try to get color from annotations
-                                    class_colors_map = positive_annotations.groupby('tissue_class')['tissue_color'].first().to_dict()
+                                    class_colors_map = positive_annotations.groupby('class')['color'].first().to_dict()
                                     if cn in class_colors_map:
                                         new_class_colors.append(class_colors_map[cn])
                                     else:
@@ -622,7 +702,7 @@ def train_linear_classifier(
                         X_update = cell_embeddings[cell_indices]
                         
                         # Re-encode all labels with new complete class list
-                        y_update = pd.Categorical(annotations['tissue_class'], categories=class_names).codes
+                        y_update = pd.Categorical(annotations['class'], categories=class_names).codes
                         
                         # Check for invalid labels (shouldn't happen, but safety check)
                         if np.any(y_update < 0):
@@ -679,7 +759,7 @@ def train_linear_classifier(
                         # Extract cell indices from the patch_ID column
                         cell_indices = annotations['patch_ID'].astype(int).values
                         X_update = cell_embeddings[cell_indices]
-                        y_update = pd.Categorical(annotations['tissue_class'], categories=class_names).codes
+                        y_update = pd.Categorical(annotations['class'], categories=class_names).codes
                         
                         # Check for invalid labels
                         if np.any(y_update < 0):
@@ -827,7 +907,7 @@ def train_linear_classifier(
                         class_colors,
                         {"embeddings": td_emb, "labels": td_lbl},
                     )
-                    node_tag = NODE_NAME or "MuskNode"
+                    node_tag = NODE_NAME or "Patch-Classification"
                     print(f"[{node_tag}] Updated classifier / bundle after color change (prediction path): {class_colors}")
 
                 remember_classifier_bundle_for_save(clf, class_names, class_colors, td_emb, td_lbl)
@@ -846,8 +926,8 @@ def train_linear_classifier(
     # Separate positive and negative annotations
     # Positive: have tissue_class
     # Negative: have exclude_classes (list of classes to exclude)
-    positive_annotations = annotations[annotations['tissue_class'].notna()].copy()
-    negative_annotations = annotations[annotations['tissue_class'].isna()].copy()
+    positive_annotations = annotations[annotations['class'].notna()].copy()
+    negative_annotations = annotations[annotations['class'].isna()].copy()
     
     print(f"Total annotations: {len(annotations)}, Positive: {len(positive_annotations)}, Negative: {len(negative_annotations)}")
     
@@ -861,27 +941,33 @@ def train_linear_classifier(
         print(f"Found {len(negative_annotations)} negative annotations (exclude_classes or exclude_class_indices)")
     
     # Get unique classes from positive annotations
-    unique_classes = positive_annotations['tissue_class'].unique().tolist() if not positive_annotations.empty else []
+    unique_classes = positive_annotations['class'].unique().tolist() if not positive_annotations.empty else []
     
     if len(unique_classes) < 1 and not has_negative_examples:
         raise ValueError("Need at least 1 class in annotation or negative examples => fallback to zero-shot")
 
-    # Build class_names: ensure "Negative control" is first
-    # IMPORTANT: Even if annotations don't have "Negative control", we need to add it to class_names
-    # BEFORE encoding y_train, so that class indices are consistent
-    class_names = []
-    has_negative_control = "Negative control" in unique_classes
-    if has_negative_control:
-        class_names.append("Negative control")
-        unique_classes.remove("Negative control")
-    class_names.extend(unique_classes)
-    
-    # If "Negative control" is not in annotations, we need to add it to class_names now
-    # (before encoding y_train) so that when we add negative control vectors later,
-    # the class indices will be correct (0 = "Negative control", 1 = "Class1", 2 = "Class2", etc.)
-    if not has_negative_control:
+    # Build class_names. Source priority:
+    #   1. The panel's tissue_classes (authoritative — preserves every class
+    #      the user configured, even ones without any annotation yet, so
+    #      Patch-Classification/classes stays aligned with the panel and the
+    #      int indices in User-Annotations/patch don't drift between runs).
+    #   2. Fall back to annotation order if tissue_classes wasn't supplied.
+    # In both cases Negative control is forced to index 0 (required by the
+    # negative-control-vectors injection further down).
+    if tissue_classes and len(tissue_classes) > 0:
+        class_names = list(tissue_classes)
+        # Add any annotation classes not in the panel list (shouldn't happen in
+        # normal use, but stays safe against stale annotations).
+        for c in unique_classes:
+            if c not in class_names:
+                class_names.append(c)
+    else:
+        class_names = list(unique_classes)
+    if "Negative control" not in class_names:
         class_names = ["Negative control"] + class_names
-        print(f"Added 'Negative control' to class_names (not in annotations): {class_names}")
+        print(f"Added 'Negative control' to class_names (not in panel/annotations): {class_names}")
+    elif class_names[0] != "Negative control":
+        class_names = ["Negative control"] + [c for c in class_names if c != "Negative control"]
 
     # Build class_colors: prioritize function parameter keyed by class name, then ARGS, then classifier, then annotations
     class_colors = []
@@ -905,7 +991,7 @@ def train_linear_classifier(
         
         # Fallback to annotations if still no colors
         if not class_colors_map:
-            annotations_colors_map = positive_annotations.groupby('tissue_class')['tissue_color'].first().to_dict()
+            annotations_colors_map = positive_annotations.groupby('class')['color'].first().to_dict()
             if annotations_colors_map:
                 class_colors_map = annotations_colors_map
                 print(f"Fallback to colors from annotations: {class_colors_map}")
@@ -926,7 +1012,7 @@ def train_linear_classifier(
     # IMPORTANT: Now class_names always has "Negative control" at index 0
     # So y_train codes will be: "Class1" -> 1, "Class2" -> 2, etc. (not 0 and 1)
     # This is correct because we'll add negative control vectors with label 0 later
-    y_train = pd.Categorical(positive_annotations['tissue_class'], categories=class_names).codes
+    y_train = pd.Categorical(positive_annotations['class'], categories=class_names).codes
     
     # Process negative annotations (exclude_classes): same weight 0.3 as incremental
     sample_weights = None
@@ -940,7 +1026,7 @@ def train_linear_classifier(
             y_train = np.concatenate([y_train, neg_y], axis=0)
             sample_weights = np.concatenate([np.ones(n_pos), neg_w])
     
-    if "Negative control" not in positive_annotations["tissue_class"].values.astype(str):
+    if "Negative control" not in positive_annotations["class"].values.astype(str):
         # Cache negative control vectors in memory
         if not hasattr(train_linear_classifier, '_negative_control_vectors'):
             base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
@@ -969,32 +1055,66 @@ def train_linear_classifier(
     n_positive = int((sample_weights == 1.0).sum()) if sample_weights is not None else len(y_train)
     _log_training_data_counts(class_names, y_train, n_positive)
 
-    # train new classifier
-    clf = xgb.XGBClassifier(**xgb_params)
-    
-    # Use sample_weights if available (for negative examples)
-    if sample_weights is not None:
-        print(f"Training with sample weights (positive=1.0, negative=0.3)")
-        clf.fit(X_train, y_train, sample_weight=sample_weights)
+    n_samples = len(cell_embeddings)
+    # prediction_probs is always sized to the full UI class list (len(class_names));
+    # if the classifier only saw a subset of those classes, columns for missing
+    # classes stay at 0. This avoids broadcast errors when XGBoost falls back to
+    # binary (proba shape (N,2)) on single-class training data.
+    prediction_probs = np.zeros((n_samples, len(class_names)), dtype=np.float32)
+    predictions = np.zeros(n_samples, dtype=int)
+
+    unique_y = np.unique(y_train)
+    # XGBoost requires y labels to be contiguous starting at 0. When the user
+    # annotates a non-contiguous subset of the panel's classes (e.g. NC=0 +
+    # Tumor=2 but no Lymphocytes=1), we remap to [0..K-1] for the fit and
+    # remember the inverse mapping so the prediction columns can be scattered
+    # back into the full class_names index space below.
+    #   y_panel_to_compact: panel index -> compact index (used to encode y_train)
+    #   compact_to_panel:   compact index -> panel index (used to scatter probs)
+    compact_to_panel = unique_y.astype(int)
+    y_panel_to_compact = {int(p): c for c, p in enumerate(compact_to_panel)}
+
+    if unique_y.size < 2:
+        # XGBoost can't fit on a single class. Skip training and emit a uniform
+        # prediction (everything == that one class) so downstream code still
+        # gets sensible shapes back instead of erroring out.
+        only_class = int(unique_y[0]) if unique_y.size == 1 else 0
+        only_class = max(0, min(only_class, len(class_names) - 1))
+        print(f"Only one class ({class_names[only_class]!r}) in training data — skipping XGBoost fit and predicting all samples as that class.")
+        predictions[:] = only_class
+        if 0 <= only_class < prediction_probs.shape[1]:
+            prediction_probs[:, only_class] = 1.0
+        clf = None
+        _log_training_data_counts(class_names, y_train, n_positive)
+        # Skip the prediction loop below by jumping past it.
+        clf_n_classes = 1
     else:
-        clf.fit(X_train, y_train)
+        # Remap y_train to a compact label space before XGBoost.
+        y_train_compact = np.array([y_panel_to_compact[int(v)] for v in y_train], dtype=int)
+        clf = xgb.XGBClassifier(**xgb_params)
+        if sample_weights is not None:
+            print(f"Training with sample weights (positive=1.0, negative=0.3)")
+            clf.fit(X_train, y_train_compact, sample_weight=sample_weights)
+        else:
+            clf.fit(X_train, y_train_compact)
+        clf_n_classes = int(clf.n_classes_)
 
     # predict in chunks to avoid GPU memory issues
     # Optimize batch_size: use larger batches for better performance
     batch_size = 50000  # Increased from 10k for better performance
-    n_samples = len(cell_embeddings)
-    predictions = np.zeros(n_samples, dtype=int)
-    
-    # Get the actual number of classes from the classifier
-    n_classes = clf.n_classes_
-    prediction_probs = np.zeros((n_samples, n_classes), dtype=np.float32)
     
     n_batches = (n_samples + batch_size - 1) // batch_size
-    print(f"Predicting {n_samples} samples in {n_batches} batches (batch_size={batch_size})")
-    
+    if clf is None:
+        # Single-class fallback already populated predictions/prediction_probs;
+        # nothing to do.
+        n_batches = 0
+        print("Skipping prediction loop (single-class fallback).")
+    else:
+        print(f"Predicting {n_samples} samples in {n_batches} batches (batch_size={batch_size})")
+
     # Build exclude_classes mapping from annotations for hard constraint enforcement
     exclude_map = {}  # patch_id -> list of excluded class indices
-    if has_negative_examples and not negative_annotations.empty:
+    if clf is not None and has_negative_examples and not negative_annotations.empty:
         for idx, row in negative_annotations.iterrows():
             patch_id = int(row['patch_ID'])
             exclude_list = _parse_exclude_list(row, class_names)
@@ -1005,33 +1125,51 @@ def train_linear_classifier(
                 exclude_map[patch_id] = exclude_indices
         if exclude_map:
             print(f"Will enforce exclusion constraints for {len(exclude_map)} patches during prediction")
-    
+
+    # XGBoost's predict_proba returns columns in clf.classes_ order (compact
+    # label space). Map back to the full panel index space via compact_to_panel
+    # so prediction_probs columns are always (sample, panel_class_idx).
+    if clf is not None:
+        clf_compact_classes = np.array(clf.classes_, dtype=int)
+        clf_classes = np.array(
+            [int(compact_to_panel[c]) for c in clf_compact_classes],
+            dtype=int,
+        )
+    else:
+        clf_classes = np.array([], dtype=int)
+
     for batch_idx, i in enumerate(range(0, n_samples, batch_size)):
         _check_cancel()
         end_idx = min(i + batch_size, n_samples)
         batch_embeddings = cell_embeddings[i:end_idx]
-        
+
         # OPTIMIZATION: Only call predict_proba once, then extract predictions from probabilities
-        # This avoids duplicate forward passes through the model
         batch_probs = clf.predict_proba(batch_embeddings)
-        
+
         # Apply exclude_classes constraints: set probability to 0 for excluded classes
         if exclude_map:
             for local_idx in range(len(batch_probs)):
                 global_idx = i + local_idx
                 if global_idx in exclude_map:
-                    exclude_indices = exclude_map[global_idx]
-                    # Set excluded class probabilities to 0
-                    batch_probs[local_idx, exclude_indices] = 0.0
-                    # Renormalize probabilities
-                    prob_sum = batch_probs[local_idx].sum()
-                    if prob_sum > 0:
-                        batch_probs[local_idx] /= prob_sum
-        
-        batch_predictions = np.argmax(batch_probs, axis=1).astype(int)
-        
+                    excluded_orig = exclude_map[global_idx]
+                    # Translate full-index exclusions to XGBoost column indices.
+                    excluded_cols = [j for j, c in enumerate(clf_classes) if c in excluded_orig]
+                    if excluded_cols:
+                        batch_probs[local_idx, excluded_cols] = 0.0
+                        prob_sum = batch_probs[local_idx].sum()
+                        if prob_sum > 0:
+                            batch_probs[local_idx] /= prob_sum
+
+        # Scatter batch_probs columns (XGBoost class order) into full class_names columns.
+        # If XGBoost saw fewer classes than class_names, the missing columns stay 0.
+        batch_full = np.zeros((batch_probs.shape[0], prediction_probs.shape[1]), dtype=np.float32)
+        for j, cls_id in enumerate(clf_classes):
+            if 0 <= int(cls_id) < prediction_probs.shape[1]:
+                batch_full[:, int(cls_id)] = batch_probs[:, j]
+        batch_predictions = np.argmax(batch_full, axis=1).astype(int)
+
         predictions[i:end_idx] = batch_predictions
-        prediction_probs[i:end_idx] = batch_probs
+        prediction_probs[i:end_idx] = batch_full
         
         # Clear batch data from memory
         del batch_embeddings, batch_predictions, batch_probs
@@ -1090,11 +1228,64 @@ def run_classification(args) -> Dict[str, Any]:
         # A) check annotation
         annotations_data = None
         use_supervised = False
-        if 'user_annotation' in zf and 'tissue_annotations' in zf['user_annotation']:
-            raw_bytes = zf['user_annotation/tissue_annotations'][()]
-            ann_dict = json.loads(raw_bytes.decode("utf-8"))
-            annotations_data = pd.DataFrame(ann_dict).T
-            use_supervised = True
+        # Class names are stored as int indices in User-Annotations/patch['class'].
+        # The mapping comes from (in priority order):
+        #   1. The current workflow params (`args.tissue_classes` / `tissue_colors`)
+        #      — what the user is showing in the panel right now, source of truth
+        #   2. Patch-Classification/classes/{name,color} as backup, if args missing
+        # We deliberately do NOT fall back to f"class_{i}" — that just feeds a
+        # garbage label into XGBoost training, and the bad label ends up written
+        # back to classes/name on the next save.
+        ui_tissue_classes = list(getattr(args, "tissue_classes", []) or [])
+        ui_tissue_colors = list(getattr(args, "tissue_colors", []) or [])
+        class_name_lookup = list(ui_tissue_classes)
+        class_color_lookup = list(ui_tissue_colors)
+        if not class_name_lookup:
+            try:
+                if 'Patch-Classification' in zf and 'classes/name' in zf['Patch-Classification']:
+                    raw_names = zf['Patch-Classification/classes/name'][:]
+                    class_name_lookup = [
+                        n.decode('utf-8') if isinstance(n, bytes) else str(n)
+                        for n in raw_names
+                    ]
+                if 'Patch-Classification' in zf and 'classes/color' in zf['Patch-Classification']:
+                    raw_colors = zf['Patch-Classification/classes/color'][:]
+                    class_color_lookup = [
+                        c.decode('utf-8') if isinstance(c, bytes) else str(c)
+                        for c in raw_colors
+                    ]
+            except Exception:
+                pass
+
+        if 'User-Annotations' in zf and 'patch' in zf['User-Annotations']:
+            patch_arr = zf['User-Annotations/patch'][:]
+            ann_dict = {}
+            if patch_arr.dtype.names and 'class' in patch_arr.dtype.names:
+                for i in range(len(patch_arr)):
+                    cls_idx = int(patch_arr['class'][i])
+                    if cls_idx < 0:
+                        continue
+                    if not (0 <= cls_idx < len(class_name_lookup)):
+                        # Stale annotation: the user removed a class between
+                        # annotating and re-running. Skip rather than invent a
+                        # f"class_{i}" label that pollutes Patch-Classification.
+                        continue
+                    cls_name = class_name_lookup[cls_idx]
+                    cls_color = (
+                        class_color_lookup[cls_idx]
+                        if 0 <= cls_idx < len(class_color_lookup)
+                        else ""
+                    )
+                    ann_dict[str(i)] = {
+                        'patch_ID': i,
+                        'class': cls_name,
+                        'color': cls_color,
+                        'datetime': int(patch_arr['datetime'][i]) if 'datetime' in patch_arr.dtype.names else 0,
+                        'method': str(patch_arr['method'][i]) if 'method' in patch_arr.dtype.names else '',
+                        'annotator': str(patch_arr['annotator'][i]) if 'annotator' in patch_arr.dtype.names else '',
+                    }
+            annotations_data = pd.DataFrame(ann_dict).T if ann_dict else None
+            use_supervised = bool(ann_dict)
         else:
             annotations_data = None
             use_supervised = False
@@ -1106,25 +1297,25 @@ def run_classification(args) -> Dict[str, Any]:
             dep0 = DEPENDENCIES[0]
             dep_group = DEP_ZARR_GROUPS.get(dep0, dep0) if isinstance(DEP_ZARR_GROUPS, dict) else dep0
             print(f"[{NODE_NAME}] Attempting to read embeddings from dependency group: {dep_group}")
-            if dep_group in zf and 'embedding' in zf[dep_group]:
-                cell_embeddings = zf[dep_group]['embedding'][()]
+            if dep_group in zf and 'embeddings' in zf[dep_group]:
+                cell_embeddings = zf[dep_group]['embeddings'][()]
                 embedding_source_group = dep_group
                 print(f"[{NODE_NAME}] Successfully loaded embeddings from dependency group '{embedding_source_group}', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
             else:
                 print(f"[{NODE_NAME}] Embedding not found in dependency group '{dep_group}'. Will try reading from own group.")
 
         if cell_embeddings is None:
-            if 'MuskNode' in zf and 'embedding' in zf['MuskNode']:
-                cell_embeddings = zf['MuskNode']['embedding'][()]
-                embedding_source_group = 'MuskNode'
-                print(f"[{NODE_NAME}] Loaded embeddings from 'MuskNode', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
+            if 'Patch-Segmentation' in zf and 'embeddings' in zf['Patch-Segmentation']:
+                cell_embeddings = zf['Patch-Segmentation']['embeddings'][()]
+                embedding_source_group = 'Patch-Segmentation'
+                print(f"[{NODE_NAME}] Loaded embeddings from 'Patch-Segmentation', shape: {cell_embeddings.shape if cell_embeddings is not None else 'None'}")
 
         if cell_embeddings is None:
             error_msg = f"Embedding dataset not found in expected locations: "
             expected_locations = []
             if DEPENDENCIES:
                 expected_locations.append(f"dependency group '{DEPENDENCIES[0]}'")
-            expected_locations.extend([f"own group '{ZARR_GROUP}'", "MuskNode"])
+            expected_locations.extend([f"own group '{ZARR_GROUP}'", "Patch-Segmentation"])
             error_msg += " or ".join(sorted(list(set(expected_locations))))
             raise ValueError(error_msg + " => no cell_embeddings")
 
@@ -1146,9 +1337,9 @@ def run_classification(args) -> Dict[str, Any]:
             and (not effective_tissue_colors or len(effective_tissue_colors) != len(tissue_classes))
             and CLASSIFIER_PATH is None
             and ZARR_GROUP in zf
-            and "tissue_class_HEX_color" in zf[ZARR_GROUP]
+            and "classes/color" in zf[ZARR_GROUP]
         ):
-            old_colors = zf[ZARR_GROUP]["tissue_class_HEX_color"][()]
+            old_colors = zf[ZARR_GROUP]["classes/color"][()]
             if len(old_colors) == len(tissue_classes):
                 effective_tissue_colors = [
                     c.decode("utf-8") if hasattr(c, "decode") else c for c in old_colors
@@ -1307,7 +1498,12 @@ def run_classification(args) -> Dict[str, Any]:
                 
             sims_arr = np.concatenate(sim_list, axis=1) # Concatenate along class dimension
             predictions = np.argmax(sims_arr, axis=1)
-            prediction_probs = None # For zero-shot
+            # Convert cosine similarities to pseudo-probabilities via softmax
+            # so Patch-Classification/probabilities is always written (matches
+            # the NuClass zero-shot behavior + lets downstream uncertainty
+            # filtering work for zero-shot patches too).
+            exp_sims = np.exp(sims_arr - np.max(sims_arr, axis=1, keepdims=True))
+            prediction_probs = exp_sims / np.sum(exp_sims, axis=1, keepdims=True)
 
             # Priority: Use tissue_colors from frontend (user's current color selection)
             # Only fallback to zarr colors if frontend didn't provide colors
@@ -1316,9 +1512,9 @@ def run_classification(args) -> Dict[str, Any]:
             if tissue_colors and len(tissue_colors) == len(tissue_classes):
                 # Frontend provided colors (user's current selection) - use them
                 final_class_colors = tissue_colors
-            elif ZARR_GROUP in zf and 'tissue_class_HEX_color' in zf[ZARR_GROUP]:
+            elif ZARR_GROUP in zf and 'classes/color' in zf[ZARR_GROUP]:
                 # Fallback: Use existing colors from zarr if frontend didn't provide
-                old_colors = zf[ZARR_GROUP]['tissue_class_HEX_color'][()]
+                old_colors = zf[ZARR_GROUP]['classes/color'][()]
                 if len(old_colors) == len(tissue_classes):
                     final_class_colors = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
             
@@ -1327,85 +1523,70 @@ def run_classification(args) -> Dict[str, Any]:
                 final_class_colors = generate_distinct_colors(tissue_classes)
             final_class_names = tissue_classes
 
-        # D) result => cell_classification
-        saved_datasets = {}
-        if ZARR_GROUP in zf:
-            for name in ['coordinates', 'embedding']:
-                if name in zf[ZARR_GROUP]:
-                    print(f"[{NODE_NAME}] Found {name} in existing group, will preserve it")
-                    saved_datasets[name] = zf[ZARR_GROUP][name][()]
-            
+        # D) Write classification output to Patch-Classification group.
+        # Embeddings + coordinates live in Patch-Segmentation (written by the
+        # embedding tasknode); we no longer copy them into this group.
         if ZARR_GROUP in zf:
             del zf[ZARR_GROUP]
         grp_cls = zf.create_group(ZARR_GROUP)
 
-        grp_cls.create_dataset('tissue_class_id', data=predictions.astype(np.int32))
+        grp_cls.create_dataset('class_indices', data=predictions.astype(np.int32))
 
         # Persist per-patch class probabilities so downstream (patch review /
-        # active learning) can do threshold + uncertainty filtering, like cells.
+        # active learning) can do threshold + uncertainty filtering.
         # prediction_probs is (n_patches, n_classes); None in zero-shot mode.
         if prediction_probs is not None:
             grp_cls.create_dataset(
-                'tissue_class_probabilities',
+                'probabilities',
                 data=np.asarray(prediction_probs, dtype=np.float32),
             )
 
+        # Per-class taxonomy under classes/{index, name, color}.
+        classes_grp = grp_cls.require_group('classes')
+        classes_grp.create_dataset('index', data=np.arange(len(final_class_names), dtype=np.int32))
         class_names_ascii = [n.encode('utf-8') for n in final_class_names]
-        grp_cls.create_dataset('tissue_class_name', shape=(len(class_names_ascii),), dtype='S256', data=class_names_ascii)
-
+        classes_grp.create_dataset('name', shape=(len(class_names_ascii),), dtype='S256', data=class_names_ascii)
         colors_ascii = [c.encode('utf-8') for c in final_class_colors]
-        grp_cls.create_dataset('tissue_class_HEX_color', shape=(len(colors_ascii),), dtype='S256', data=colors_ascii)
+        classes_grp.create_dataset('color', shape=(len(colors_ascii),), dtype='S256', data=colors_ascii)
 
         # Update all annotation colors to match new class colors
         # This ensures that when user changes a class color and clicks Update,
         # all annotations using that class get the new color
+        # Refresh denormalised per-row color (color field on each annotation row)
+        # so it matches the new class colors. With the dense structured-array
+        # format this is a vectorised np.where update.
         try:
-            if 'user_annotation' in zf and 'tissue_annotations' in zf['user_annotation']:
-                tissue_annotations_path = 'user_annotation/tissue_annotations'
-                dataset = zf[tissue_annotations_path]
-                
-                # Only update if dataset is reasonably small (performance consideration)
-                if hasattr(dataset, 'size') and dataset.size < 100000:
-                    raw_bytes = dataset[()]
-                    manual_tissue_annotations = json.loads(raw_bytes.decode("utf-8"))
-                    
-                    # Build mapping from class_name to new color
-                    class_name_to_color = dict(zip(final_class_names, final_class_colors))
-                    
+            if 'User-Annotations' in zf and 'patch' in zf['User-Annotations']:
+                patch_ds = zf['User-Annotations/patch']
+                patch_arr = patch_ds[:]
+                if patch_arr.dtype.names and 'class' in patch_arr.dtype.names and 'color' in patch_arr.dtype.names:
+                    new_color_ints = []
+                    for c in final_class_colors:
+                        try:
+                            ci = int(str(c).lstrip('#'), 16) if c else -1
+                        except (TypeError, ValueError):
+                            ci = -1
+                        new_color_ints.append(ci)
                     updated_count = 0
-                    for patch_id, annotation in manual_tissue_annotations.items():
-                        tissue_class = annotation.get("tissue_class")
-                        if tissue_class and tissue_class in class_name_to_color:
-                            new_color = class_name_to_color[tissue_class]
-                            if annotation.get("tissue_color") != new_color:
-                                annotation["tissue_color"] = new_color
+                    for idx in range(len(patch_arr)):
+                        cls_idx = int(patch_arr['class'][idx])
+                        if 0 <= cls_idx < len(new_color_ints):
+                            new_c = new_color_ints[cls_idx]
+                            if new_c >= 0 and int(patch_arr['color'][idx]) != new_c:
+                                patch_arr['color'][idx] = new_c
                                 updated_count += 1
-                    
                     if updated_count > 0:
-                        # Write updated annotations back
-                        del zf[tissue_annotations_path]
-                        zf['user_annotation'].create_dataset('tissue_annotations', 
-                                                             data=json.dumps(manual_tissue_annotations).encode('utf-8'))
+                        del zf['User-Annotations/patch']
+                        zf['User-Annotations'].create_dataset('patch', data=patch_arr, dtype=patch_arr.dtype)
                         print(f"Updated {updated_count} patch annotation colors to match new class colors")
-                else:
-                    print(f"Info: Skipped annotation color update (dataset too large: {dataset.size})")
         except Exception as e:
-            # If update fails, log but don't fail the workflow
+            # If update fails, log but don't fail the workflow.
             print(f"Warning: Could not update patch annotation colors: {e}")
         
-        # Update user_annotation.attrs colormap to match new class colors
-        # This ensures the colormap (used by frontend) reflects the new colors
-        try:
-            if 'user_annotation' in zf:
-                user_anno_group = zf['user_annotation']
-                if hasattr(user_anno_group, 'attrs'):
-                    # Update tissue_class_names and tissue_class_colors in user_annotation.attrs
-                    user_anno_group.attrs['tissue_class_names'] = final_class_names
-                    user_anno_group.attrs['tissue_class_colors'] = final_class_colors
-                    print(f"[{NODE_NAME}] Updated user_annotation.attrs colormap: {len(final_class_names)} classes with new colors")
-        except Exception as e:
-            # If update fails, log but don't fail the workflow
-            print(f"[{NODE_NAME}] Warning: Could not update user_annotation.attrs colormap: {e}")
+        # Patch-Classification/classes/{name,color} (written above) is now the
+        # canonical source for the class palette. The old
+        # User-Annotations.attrs['tissue_class_*'] mirror is no longer read by
+        # the backend, so we don't write it anymore.
 
         print("================")
         # Filter tissue_classes to only include classes that are actually predicted
@@ -1418,25 +1599,21 @@ def run_classification(args) -> Dict[str, Any]:
             "tissue_classes": predicted_tissue_classes, 
             "classification_method": classification_method
         })
-        metadata_dict = {
-            "tissue_classes": final_class_names,
-            "classification_method": classification_method
+        # Run metadata as <Patch-Classification>/metadata group + attrs.
+        if 'metadata' in grp_cls:
+            del grp_cls['metadata']
+        meta_grp = grp_cls.create_group('metadata')
+        meta_attrs = {
+            'model': 'MUSK-Classification',
+            'classification_method': classification_method,
+            'classification_count': int(len(predictions)),
+            'num_classes': int(len(final_class_names)),
+            'created_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         }
         if use_supervised and annotations_data is not None and 'train_time' in locals() and 'test_time' in locals():
-            metadata_dict["training_time"] = train_time
-            metadata_dict["testing_time"] = test_time
-        metadata_dict['created'] = datetime.now().isoformat()
-        meta_bytes = json.dumps(metadata_dict).encode("utf-8")
-        grp_cls.create_dataset('metadata', shape=(), dtype=f'S{len(meta_bytes)}', data=meta_bytes)
-            
-        # Restore previously saved datasets under the new NODE_NAME group
-        for name, data in saved_datasets.items():
-            try:
-                print(f"[{NODE_NAME}] Restoring {name} to new group")
-                grp_cls.create_dataset(name, data=data)
-            except Exception as e:
-                print(f"[{NODE_NAME}] Error restoring {name} to new group: {e}")
-        # no flush needed for zarr
+            meta_attrs['training_time_sec'] = float(train_time)
+            meta_attrs['testing_time_sec'] = float(test_time)
+        meta_grp.attrs.update(meta_attrs)
             
         end_time = time.time()
         result["classification_count"] = len(predictions)
@@ -1716,10 +1893,10 @@ def init_node():
 def read_node(data: Dict[str, Any]):
     global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_GROUP, DEP_ZARR_GROUPS, LAST_TRAINED_CLF_BUNDLE, CLASS_OPERATIONS
     LAST_TRAINED_CLF_BUNDLE = None
-    NODE_NAME = data.get("node_name", "MuskNode")
+    NODE_NAME = data.get("node_name", "Patch-Classification")
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
-    ZARR_GROUP = data.get("zarr_group", "MuskNode")
+    ZARR_GROUP = data.get("zarr_group", "Patch-Classification")
     DEP_ZARR_GROUPS = data.get("dependencies_zarr_groups", {})
 
     CLASSIFIER_PATH = None
@@ -1810,7 +1987,7 @@ def classifier_save_endpoint(data: Dict[str, Any]):
     """
     global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_PATH, NODE_NAME, LAST_TRAINED_CLF_BUNDLE
     mode = (data.get("mode") or "copy").strip().lower()
-    node_nm = (data.get("node_name") or NODE_NAME or "MuskNode").strip()
+    node_nm = (data.get("node_name") or NODE_NAME or "Patch-Classification").strip()
 
     if mode == "save_trained":
         dest = (data.get("save_classifier_path") or data.get("dest_path") or "").strip()
@@ -1911,15 +2088,10 @@ def execute_node():
         print(f"[{NODE_NAME}] ARGS: {ARGS}")
         out_val = run_classification(ARGS)
 
-    if ZARR_PATH and os.path.exists(ZARR_PATH):
-        zf = zarr.open_group(ZARR_PATH, "a")
-        out_ds = f"{ZARR_GROUP}/classification_output"
-        if out_ds in zf:
-            del zf[out_ds]
-        out_str = json.dumps(out_val, ensure_ascii=False)
-        out_bytes = out_str.encode("utf-8")
-        zf.create_dataset(out_ds, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
-    
+    # Run-summary (out_val) is already written to Patch-Classification/metadata
+    # as group + attrs inside run_classification; the HTTP response below
+    # carries it for the caller as well. No need for a separate bytes blob.
+
     progress_value = 100
     print(f"[{NODE_NAME}] Progress: 100%")
 
@@ -1989,7 +2161,7 @@ def main():
     import time
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8006, help='port')
-    parser.add_argument('--name', type=str, default='MuskNode', help='node name')
+    parser.add_argument('--name', type=str, default='Patch-Classification', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args = parser.parse_args()
 

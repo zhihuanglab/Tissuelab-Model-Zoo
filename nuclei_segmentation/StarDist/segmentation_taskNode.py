@@ -81,6 +81,11 @@ ARGS = None
 IS_MODEL_INITED = False
 ZARR_PATH = None
 NODE_NAME = None
+# zarr group this tasknode writes to. Decoupled from NODE_NAME so the
+# scheduler can switch model names without moving the data. Defaults to
+# "Cell-Segmentation" (canonical NucleiSeg group); backend can override via
+# /read payload `zarr_group`.
+ZARR_GROUP = "Cell-Segmentation"
 DEPENDENCIES = []
 progress_value = 0  # Global variable to track progress
 progress_complete = False  # New flag to indicate completion
@@ -98,7 +103,7 @@ class CancellationException(Exception):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8005, help='port')
-    parser.add_argument('--name', type=str, default='SegmentationNode', help='node name')
+    parser.add_argument('--name', type=str, default='StarDist', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
 
     # ===  segmentation + embedding parameters ===
@@ -134,7 +139,7 @@ def run_segmentation(args):
         # Note: This check is defensive - cancel_event should already be cleared in execute_node
         # but we check here in case it was set between execute_node and run_segmentation
         if cancel_event.is_set():
-            print(f"[SegmentationNode] WARNING: Cancel event is set at start of run_segmentation (unexpected). Clearing it.")
+            print(f"[Cell-Segmentation] WARNING: Cancel event is set at start of run_segmentation (unexpected). Clearing it.")
             cancel_event.clear()
             progress_value = 0
             progress_complete = False
@@ -160,14 +165,14 @@ def run_segmentation(args):
 
         if os.path.exists(ZARR_PATH):
             zf = zarr.open_group(ZARR_PATH, mode='r')
-            if NODE_NAME in zf:
+            if ZARR_GROUP in zf:
                 try:
-                    centroids = zf[f"{NODE_NAME}/centroids"][()]
+                    centroids = zf[f"{ZARR_GROUP}/centroids"][()]
                     # Attempt to load contours and probability, but don't fail if not present initially
-                    if f"{NODE_NAME}/contours" in zf:
-                        contours = zf[f"{NODE_NAME}/contours"][()]
-                    if f"{NODE_NAME}/probability" in zf:
-                        probability = zf[f"{NODE_NAME}/probability"][()]
+                    if f"{ZARR_GROUP}/contours" in zf:
+                        contours = zf[f"{ZARR_GROUP}/contours"][()]
+                    if f"{ZARR_GROUP}/probabilities" in zf:
+                        probability = zf[f"{ZARR_GROUP}/probabilities"][()]
 
                     # Check if essential data (centroids) is valid
                     if centroids is not None and centroids.size > 0:  # Basic check for non-empty centroids
@@ -178,7 +183,7 @@ def run_segmentation(args):
                         # Check target_mpp: read from node attrs (saved when segmentation was generated)
                         # target_mpp affects processing resolution, so we need to verify it matches
                         # Note: userData is updated before each run, so we can't use it to get old parameters
-                        node_grp = zf[NODE_NAME]
+                        node_grp = zf[ZARR_GROUP]
                         saved_target_mpp = None
                         has_target_mpp_attr = 'target_mpp' in node_grp.attrs
                         
@@ -380,7 +385,7 @@ def run_segmentation(args):
                 return
 
             zf_write = zarr.open_group(ZARR_PATH, mode='a')
-            node_grp = zf_write.require_group(NODE_NAME)
+            node_grp = zf_write.require_group(ZARR_GROUP)
 
             print(f"[ZARR WRITE] Writing centroids. Shape: {centroids_data.shape}")
             if 'centroids' in node_grp:
@@ -397,9 +402,9 @@ def run_segmentation(args):
 
             if probability_data is not None:
                 print(f"[ZARR WRITE] Writing probability. Shape: {probability_data.shape}")
-                if 'probability' in node_grp:
-                    del node_grp['probability']
-                node_grp.create_dataset('probability', data=probability_data)
+                if 'probabilities' in node_grp:
+                    del node_grp['probabilities']
+                node_grp.create_dataset('probabilities', data=probability_data)
             else:
                 print("[ZARR WRITE] Probability is None, not writing.")
 
@@ -424,7 +429,7 @@ def run_segmentation(args):
         if not ALREADY_HAVE_SEG:
             # Check for cancellation before segmentation
             if cancel_event.is_set():
-                print("[SegmentationNode] Task cancelled before segmentation")
+                print("[Cell-Segmentation] Task cancelled before segmentation")
                 cancel_event.clear()
                 progress_value = 0
                 progress_complete = False
@@ -469,7 +474,7 @@ def run_segmentation(args):
             try:
                 ss.run_WSI_segmentation()
             except CancellationException:
-                print("[SegmentationNode] Segmentation cancelled by user")
+                print("[Cell-Segmentation] Segmentation cancelled by user")
                 cancel_event.clear()
                 # Reset progress immediately and send a reset signal
                 progress_value = 0
@@ -486,7 +491,7 @@ def run_segmentation(args):
             
             # Check for cancellation after segmentation
             if cancel_event.is_set():
-                print("[SegmentationNode] Task cancelled after segmentation")
+                print("[Cell-Segmentation] Task cancelled after segmentation")
                 cancel_event.clear()
                 progress_value = 0
                 progress_complete = False
@@ -529,7 +534,7 @@ def run_segmentation(args):
         # Step C: generate embedding if not cached; write directly to Zarr
         # Check for cancellation before embedding
         if cancel_event.is_set():
-            print("[SegmentationNode] Task cancelled before embedding")
+            print("[Cell-Segmentation] Task cancelled before embedding")
             cancel_event.clear()
             progress_value = 0
             progress_complete = False
@@ -551,9 +556,9 @@ def run_segmentation(args):
             else:
                 # Segmentation was skipped (using existing data), check if embedding exists and matches
                 zf_embed = zarr.open_group(ZARR_PATH, mode='a')
-                if NODE_NAME in zf_embed and 'embedding' in zf_embed[NODE_NAME]:
+                if ZARR_GROUP in zf_embed and 'embeddings' in zf_embed[ZARR_GROUP]:
                     try:
-                        existing_len = zf_embed[NODE_NAME]['embedding'].shape[0]
+                        existing_len = zf_embed[ZARR_GROUP]['embeddings'].shape[0]
                         if existing_len == len(centroids):
                             have_cached_embedding = True
                             print("found existing embeddings in store => skip embedding calculation")
@@ -580,14 +585,14 @@ def run_segmentation(args):
                     if cancel_event.is_set():
                         raise CancellationException("Task cancelled during embedding")
                     # NucleiEmbedding may report 100 before final reorder/fusion/cleanup has fully
-                    # returned. Keep UI below "Processed" until SegmentationNode fully returns.
-                    update_progress(min(float(pct), 99.0), "embedding")
+                    # returned. Keep UI below "Processed" until Cell-Segmentation fully returns.
+                    update_progress(min(float(pct), 99.0), "embeddings")
                 
                 ne = NucleiEmbedding(args, centroids, contours=contours_for_embedding, progress_callback=embed_progress_with_cancel)
                 try:
-                    ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{NODE_NAME}/embedding")
+                    ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{ZARR_GROUP}/embeddings")
                 except CancellationException:
-                    print("[SegmentationNode] Embedding cancelled by user")
+                    print("[Cell-Segmentation] Embedding cancelled by user")
                     cancel_event.clear()
                     progress_value = 0
                     progress_complete = False
@@ -599,7 +604,7 @@ def run_segmentation(args):
                 
                 # Check for cancellation after embedding
                 if cancel_event.is_set():
-                    print("[SegmentationNode] Task cancelled after embedding")
+                    print("[Cell-Segmentation] Task cancelled after embedding")
                     cancel_event.clear()
                     progress_value = 0
                     progress_complete = False
@@ -615,7 +620,7 @@ def run_segmentation(args):
             print("[EMBED LOG] Centroids are None, skipping embedding generation.")
 
         progress_complete = True
-        update_progress(100, "embedding")
+        update_progress(100, "embeddings")
 
         end_time = time.time()
         print(f"Time taken: {end_time - start_time:.2f}s")
@@ -689,28 +694,29 @@ def get_logs(lines: int = 200):
 @app.post("/init")
 def init_node():
     global IS_MODEL_INITED, cancel_event
-    print(f"[SegmentationNode] /init called - Cancel event state: {cancel_event.is_set()}")
+    print(f"[Cell-Segmentation] /init called - Cancel event state: {cancel_event.is_set()}")
     if not IS_MODEL_INITED:
         IS_MODEL_INITED = True
-        print("[SegmentationNode] /init => inited model/resources (with embedding)")
-        return {"status": "ok", "message": "SegmentationNode init done"}
+        print("[Cell-Segmentation] /init => inited model/resources (with embedding)")
+        return {"status": "ok", "message": "Cell-Segmentation init done"}
     else:
-        print("[SegmentationNode] /init => already done.")
+        print("[Cell-Segmentation] /init => already done.")
         return {"status": "ok", "message": "Already init."}
 
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, cancel_event
-    print(f"[SegmentationNode] /read called - Cancel event state: {cancel_event.is_set()}")
-    NODE_NAME = data.get("node_name", "SegmentationNode")
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, cancel_event, ZARR_GROUP
+    print(f"[Cell-Segmentation] /read called - Cancel event state: {cancel_event.is_set()}")
+    NODE_NAME = data.get("node_name", "StarDist")
+    ZARR_GROUP = data.get("zarr_group") or "Cell-Segmentation"
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
 
-    print(f"[SegmentationNode] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
+    print(f"[Cell-Segmentation] /read => node_name={NODE_NAME}, zarr_group={ZARR_GROUP}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
 
     if not ZARR_PATH or not os.path.exists(ZARR_PATH):
-        print("[SegmentationNode] no zarr store => skip read.")
+        print("[Cell-Segmentation] no zarr store => skip read.")
         return {"status": "ok", "message": "no Zarr store found."}
 
     if ARGS is None:
@@ -739,7 +745,7 @@ def read_node(data: Dict[str, Any]):
         ARGS.num_z_layers = 1
 
     zf = zarr.open_group(ZARR_PATH, mode='r')
-    user_data_path = f"{NODE_NAME}/userData"
+    user_data_path = f"{ZARR_GROUP}/userData"
     if user_data_path in zf:
         for k in zf[user_data_path].keys():
             raw_bytes = zf[user_data_path][k][()]
@@ -748,7 +754,7 @@ def read_node(data: Dict[str, Any]):
                 val_json = json.loads(raw_str)
             except:
                 val_json = raw_str
-            print(f"[SegmentationNode] user param {k} => {val_json}")
+            print(f"[Cell-Segmentation] user param {k} => {val_json}")
 
             if k == "path":
                 ARGS.slidepath = val_json
@@ -777,24 +783,24 @@ def read_node(data: Dict[str, Any]):
                     print(f"Warning: polygon_points value '{val_json}' is not in the expected [[x1,y1],[x2,y2],...] format.")
                     ARGS.polygon_points = None
 
-    print(f"[SegmentationNode] /read completed - Cancel event state: {cancel_event.is_set()}")
-    return {"status": "ok", "message": "SegmentationNode read done"}
+    print(f"[Cell-Segmentation] /read completed - Cancel event state: {cancel_event.is_set()}")
+    return {"status": "ok", "message": "Cell-Segmentation read done"}
 
 
 @app.post("/execute")
 def execute_node():
     global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event, progress_value, progress_complete, progress_cancelled, execution_active
     
-    print(f"[SegmentationNode] /execute called - Cancel event state: {cancel_event.is_set()}")
+    print(f"[Cell-Segmentation] /execute called - Cancel event state: {cancel_event.is_set()}")
     
     # Reset cancel event and progress state when starting new execution
     # Clear the cancel event first to ensure a clean start
     was_set = cancel_event.is_set()
     cancel_event.clear()
     if was_set:
-        print(f"[SegmentationNode] /execute: Cancel event was set, cleared it. Starting fresh execution.")
+        print(f"[Cell-Segmentation] /execute: Cancel event was set, cleared it. Starting fresh execution.")
     else:
-        print(f"[SegmentationNode] /execute: Cancel event was not set, starting fresh execution.")
+        print(f"[Cell-Segmentation] /execute: Cancel event was not set, starting fresh execution.")
     progress_value = 0
     progress_complete = False
     progress_cancelled = False  # Reset cancellation flag
@@ -802,11 +808,11 @@ def execute_node():
 
     try:
         if not IS_MODEL_INITED:
-            print(f"[SegmentationNode] /execute: Model not initialized, returning error.")
+            print(f"[Cell-Segmentation] /execute: Model not initialized, returning error.")
             return {"status": "error", "message": "Please /init first."}
 
         if not ARGS or not getattr(ARGS, "slidepath", None):
-            print("[SegmentationNode] no path => skip.")
+            print("[Cell-Segmentation] no path => skip.")
             out_val = {
                 "status": "ok",
                 "message": "no path, skipping.",
@@ -815,8 +821,8 @@ def execute_node():
             progress_value = 100
             progress_complete = True
         else:
-            print(f"[SegmentationNode] /execute => run_segmentation with slidepath={ARGS.slidepath}")
-            print(f"[SegmentationNode] /execute: Cancel event state before run_segmentation: {cancel_event.is_set()}")
+            print(f"[Cell-Segmentation] /execute => run_segmentation with slidepath={ARGS.slidepath}")
+            print(f"[Cell-Segmentation] /execute: Cancel event state before run_segmentation: {cancel_event.is_set()}")
             out_val = run_segmentation(ARGS)
             
             # Check if task was cancelled
@@ -832,15 +838,23 @@ def execute_node():
                     time.sleep(0.2)  # Give SSE stream time to send reset signal
                 return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
 
-        # store the result to 'output'
+        # Write run metadata to <NODE_NAME>/metadata as a zarr group with attrs.
+        # Replaces the historical <NODE_NAME>/output bytes blob.
         if ZARR_PATH and os.path.exists(ZARR_PATH):
             zf = zarr.open_group(ZARR_PATH, mode='a')
-            node_out_path = f"{NODE_NAME}/output"
-            if node_out_path in zf:
-                del zf[node_out_path]
-            out_str = json.dumps(out_val, ensure_ascii=False)
-            out_bytes = out_str.encode("utf-8")
-            zf.create_dataset(node_out_path, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
+            seg_grp = zf.require_group(ZARR_GROUP)
+            if 'metadata' in seg_grp:
+                del seg_grp['metadata']
+            meta_grp = seg_grp.create_group('metadata')
+            meta_grp.attrs.update({
+                'model': 'StarDist',
+                'status': out_val.get('status', 'unknown'),
+                'message': out_val.get('message', ''),
+                'nuclei_count': int(out_val.get('nuclei_count', 0)),
+                'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                'has_embeddings': 'embeddings' in seg_grp,
+                'has_probabilities': 'probabilities' in seg_grp,
+            })
 
         return {"status": "ok", "output": out_val}
     finally:
@@ -858,7 +872,7 @@ def update_progress(value, phase="segmentation"):
     if phase == "segmentation":
         # Scale segmentation progress from 0-100 to 0-50
         progress_value = int(value * 0.5)
-    elif phase == "embedding":
+    elif phase == "embeddings":
         # Scale embedding progress from 0-100 to 50-100
         progress_value = 50 + int(value * 0.5)
     else:
@@ -877,9 +891,9 @@ def cancel_task():
     Long-running operations (like segmentation/embedding) cannot be interrupted mid-execution.
     """
     global cancel_event
-    print(f"[SegmentationNode] /cancel called - Setting cancel event (was: {cancel_event.is_set()})")
+    print(f"[Cell-Segmentation] /cancel called - Setting cancel event (was: {cancel_event.is_set()})")
     cancel_event.set()
-    print(f"[SegmentationNode] Cancel requested - will stop at next checkpoint (now: {cancel_event.is_set()})")
+    print(f"[Cell-Segmentation] Cancel requested - will stop at next checkpoint (now: {cancel_event.is_set()})")
     return {"status": "ok", "message": "Cancel request received. Task will stop at next checkpoint."}
 
 @app.get("/progress")
@@ -944,7 +958,7 @@ def main():
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8005, help='port')
-    parser.add_argument('--name', type=str, default='SegmentationNode', help='node name')
+    parser.add_argument('--name', type=str, default='StarDist', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args, unknown = parser.parse_known_args()
 
@@ -955,8 +969,8 @@ def main():
     os.environ["NODE_NAME"] = args.name
 
     # Log initial cancel_event state
-    print(f"Starting SegmentationNode at port={args.port}, name={args.name}")
-    print(f"[SegmentationNode] Initial cancel_event state: {cancel_event.is_set()} (should be False)")
+    print(f"Starting StarDist at port={args.port}, name={args.name}")
+    print(f"[Cell-Segmentation] Initial cancel_event state: {cancel_event.is_set()} (should be False)")
 
     try:
         # Apply log filter to suppress /logs endpoint access logs

@@ -106,7 +106,7 @@ def _mark_sse_cancelled() -> None:
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8011, help='port')
-    parser.add_argument('--name', type=str, default='CellposeSegmentationNode', help='node name')
+    parser.add_argument('--name', type=str, default='Cell-Segmentation', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
 
     # ===  segmentation + embedding parameters ===
@@ -209,9 +209,9 @@ def run_segmentation(args):
         if centroids is not None:
             have_cached_embedding = False
             zf = zarr.open_group(ZARR_PATH, mode='a')
-            if NODE_NAME in zf and 'embedding' in zf[NODE_NAME]:
+            if NODE_NAME in zf and 'embeddings' in zf[NODE_NAME]:
                 try:
-                    if zf[NODE_NAME]['embedding'].shape[0] == len(centroids):
+                    if zf[NODE_NAME]['embeddings'].shape[0] == len(centroids):
                         have_cached_embedding = True
                         print("found existing embeddings => skip embedding calculation")
                 except Exception:
@@ -220,7 +220,7 @@ def run_segmentation(args):
             if not have_cached_embedding:
                 print("no cached embeddings => generate new embeddings directly into Zarr")
                 ne = NucleiEmbedding(args, centroids, progress_callback=update_progress, cancel_checker=cancel_checker)
-                ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{NODE_NAME}/embedding")
+                ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{NODE_NAME}/embeddings")
 
         # Step D: write segmentation to workflow Zarr (embedding already written if generated)
         if centroids is not None:
@@ -232,8 +232,8 @@ def run_segmentation(args):
             node_grp.create_dataset('centroids', data=centroids)
             if contours is not None:
                 node_grp.create_dataset('contours', data=contours)
-            if not ALREADY_HAVE_SEG and 'probability' in locals():
-                node_grp.create_dataset('probability', data=probability)
+            if not ALREADY_HAVE_SEG and 'probabilities' in locals():
+                node_grp.create_dataset('probabilities', data=probability)
 
         # Ensure progress is set to 100 after Step C and D are completed
         progress_complete = True
@@ -248,7 +248,7 @@ def run_segmentation(args):
         progress_cancelled = True
         progress_complete = True
         progress_value = 0
-        print("[CellposeSegmentationNode] run_segmentation cancelled by user")
+        print("[Cell-Segmentation] run_segmentation cancelled by user")
         return {
             "status": "cancelled",
             "message": "Task was cancelled",
@@ -272,24 +272,24 @@ def init_node():
     global IS_MODEL_INITED
     if not IS_MODEL_INITED:
         IS_MODEL_INITED = True
-        print("[CellposeSegmentationNode] /init => inited model/resources (with embedding)")
-        return {"status": "ok", "message": "CellposeSegmentationNode init done"}
+        print("[Cell-Segmentation] /init => inited model/resources (with embedding)")
+        return {"status": "ok", "message": "Cell-Segmentation init done"}
     else:
-        print("[CellposeSegmentationNode] /init => already done.")
+        print("[Cell-Segmentation] /init => already done.")
         return {"status": "ok", "message": "Already init."}
 
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
     global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS
-    NODE_NAME = data.get("node_name", "CellposeSegmentationNode")
+    NODE_NAME = data.get("node_name", "Cell-Segmentation")
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
 
-    print(f"[CellposeSegmentationNode] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
+    print(f"[Cell-Segmentation] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
 
     if not ZARR_PATH or not os.path.exists(ZARR_PATH):
-        print("[CellposeSegmentationNode] no zarr store => skip read.")
+        print("[Cell-Segmentation] no zarr store => skip read.")
         return {"status": "ok", "message": "no Zarr store found."}
 
     if ARGS is None:
@@ -310,7 +310,7 @@ def read_node(data: Dict[str, Any]):
                 val_json = json.loads(raw_str)
             except:
                 val_json = raw_str
-            print(f"[CellposeSegmentationNode] user param {k} => {val_json}")
+            print(f"[Cell-Segmentation] user param {k} => {val_json}")
 
             if k == "path":
                 ARGS.slidepath = val_json
@@ -321,7 +321,7 @@ def read_node(data: Dict[str, Any]):
             elif k == "isIHC":
                 ARGS.isIHC = (val_json in [True, "true", "True"])
 
-    return {"status": "ok", "message": "CellposeSegmentationNode read done"}
+    return {"status": "ok", "message": "Cell-Segmentation read done"}
 
 
 @app.post("/cancel")
@@ -329,7 +329,7 @@ def cancel_task():
     global cancel_event, progress_cancelled
     cancel_event.set()
     progress_cancelled = True
-    print("[CellposeSegmentationNode] /cancel — cancel_event set")
+    print("[Cell-Segmentation] /cancel — cancel_event set")
     return {"status": "ok", "message": "Cancel request received; stopping at next checkpoint."}
 
 
@@ -346,14 +346,14 @@ def execute_node():
     watcher.start()
     try:
         if not ARGS or not getattr(ARGS, "slidepath", None):
-            print("[CellposeSegmentationNode] no path => skip.")
+            print("[Cell-Segmentation] no path => skip.")
             out_val = {
                 "status": "ok",
                 "message": "no path, skipping.",
                 "nuclei_count": 0
             }
         else:
-            print(f"[CellposeSegmentationNode] /execute => run_segmentation with slidepath={ARGS.slidepath}")
+            print(f"[Cell-Segmentation] /execute => run_segmentation with slidepath={ARGS.slidepath}")
             out_val = run_segmentation(ARGS)
     finally:
         watcher.stop()
@@ -420,11 +420,11 @@ def main():
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8011, help='port')
-    parser.add_argument('--name', type=str, default='CellposeSegmentationNode', help='node name')
+    parser.add_argument('--name', type=str, default='Cell-Segmentation', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args, unknown = parser.parse_known_args()
 
-    print(f"Starting CellposeSegmentationNode at port={args.port}")
+    print(f"Starting Cell-Segmentation at port={args.port}")
 
     try:
         def run_uvicorn():

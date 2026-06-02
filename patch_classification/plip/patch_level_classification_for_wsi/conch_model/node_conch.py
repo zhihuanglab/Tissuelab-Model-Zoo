@@ -123,7 +123,7 @@ def execute_node(model, wsi_path, labels, texts, scale_factor):
                 label: probs[patch_idx, i].item()
                 for i, label in enumerate(labels)
             },
-            'embedding': image_embeddings[patch_idx].cpu().numpy(),
+            'embeddings': image_embeddings[patch_idx].cpu().numpy(),
             'final_class': labels[pred_indices[patch_idx].item()],
             # 'prediction_confidence': max_probs[patch_idx].item()
         }
@@ -207,7 +207,7 @@ def save_results_to_h5(results, output_path):
                 prob_group.attrs[label] = value
             
             # 保存embedding
-            patch_group.create_dataset('embedding', data=patch_data['embedding'])
+            patch_group.create_dataset('embeddings', data=patch_data['embeddings'])
             
             # 保存final_class
             patch_group.attrs['final_class'] = patch_data['final_class']
