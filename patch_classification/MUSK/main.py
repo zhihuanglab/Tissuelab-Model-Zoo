@@ -1,6 +1,7 @@
 """
 Standalone script: same logic as musk_embedding_taskNode.run_patch_classification.
-Process WSI(s) and save MuskNode embedding/coordinates to zarr (one .zarr dir per WSI).
+Process WSI(s) and save Patch-Segmentation embeddings/coordinates to zarr
+(one .zarr dir per WSI).
 """
 from musk_for_embedding import MUSK
 import time
@@ -120,17 +121,16 @@ def run_patch_classification_one(musk, wsi_path, output_dir, patch_size=224, lev
     embeddings = patch_embeddings.cpu().numpy()
     coordinates = np.array(patch_coordinates)
 
-    # Same structure as taskNode: root group -> MuskNode with embedding, coordinates, probability, output, metadata
+    # Same canonical layout as musk_embedding_taskNode writes:
+    #   <zarr_group>/embeddings, /coordinates, /metadata (group + attrs).
     zf = zarr.open_group(zarr_path, "w")
     if zarr_group in zf:
         del zf[zarr_group]
     node_grp = zf.create_group(zarr_group)
     node_grp.create_dataset("embeddings", data=embeddings)
     node_grp.create_dataset("coordinates", data=coordinates)
-    node_grp.create_dataset("probability", data=np.ones(len(coordinates), dtype=np.float32))
-    node_grp.create_dataset("output", shape=(), dtype="S1", data=b"")
-    meta = json.dumps({"patch_size": patch_size, "level": level}).encode("utf-8")
-    node_grp.create_dataset("metadata", shape=(), dtype=f"S{len(meta)}", data=meta)
+    meta_grp = node_grp.require_group("metadata")
+    meta_grp.attrs.update({"patch_size": int(patch_size), "level": int(level)})
 
     elapsed = time.time() - start_time
     print(f"Saved {embeddings.shape} -> {zarr_path} ({elapsed:.1f}s)")
