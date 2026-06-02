@@ -455,7 +455,7 @@ def process_embedding(patch_data):
                 'patch_id': patch_data.get('patch_id'),
                 'patch_index': patch_data.get('patch_index'),
                 'embeddings': [],
-                'timing': {'total': 0, 'embedding': 0}
+                'timing': {'total': 0, 'embeddings': 0}
             }
         
         class Args:
@@ -474,7 +474,7 @@ def process_embedding(patch_data):
         # Read embeddings from HDF5 file
         embeddings_array = None
         with h5py.File(h5_path, 'r') as h5f:
-            embeddings_array = h5f['embedding'][:]
+            embeddings_array = h5f['embeddings'][:]
         
         # Clean up the temp HDF5 file
         if os.path.exists(h5_path):
@@ -487,7 +487,7 @@ def process_embedding(patch_data):
             'patch_id': patch_data.get('patch_id'),
             'patch_index': patch_data.get('patch_index'),
             'embeddings': embeddings_array.tolist(),
-            'timing': {'total': embed_time, 'embedding': embed_time}
+            'timing': {'total': embed_time, 'embeddings': embed_time}
         }
         
     except Exception as e:
@@ -574,7 +574,7 @@ def process_from_url(
             'read_image_method': 'tiffslide',
         }
         emb_result = process_embedding.remote(emb_payload)
-        seg_result['embedding'] = emb_result
+        seg_result['embeddings'] = emb_result
         # Cleanup the kept temp file after embeddings
         if slide_path and os.path.exists(slide_path):
             try:

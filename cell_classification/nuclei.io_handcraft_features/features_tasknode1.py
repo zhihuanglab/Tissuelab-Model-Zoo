@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Task Node for nuclei segmentation using StarDist + feature extraction
-Creates SegmentationNode and ClassificationNode in H5 file
+Creates Cell-Segmentation and ClassificationNode in H5 file
 """
 import argparse
 import os
@@ -54,7 +54,7 @@ progress_complete = False
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8022, help='port')
-    parser.add_argument('--name', type=str, default='ClassificationNode', help='node name')
+    parser.add_argument('--name', type=str, default='Cell-Classification', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
 
     # === segmentation + feature extraction parameters ===
@@ -173,22 +173,22 @@ def run_segmentation_and_features(args):
 
         if os.path.exists(H5_PATH):
             with safe_h5_open(H5_PATH, 'r') as hf:
-                # Check for segmentation data in SegmentationNode
-                if 'SegmentationNode' in hf:
+                # Check for segmentation data in Cell-Segmentation
+                if 'Cell-Segmentation' in hf:
                     try:
-                        if 'centroids' in hf['SegmentationNode'] and 'contours' in hf['SegmentationNode']:
-                            centroids = hf['SegmentationNode/centroids'][()]
-                            contours = hf['SegmentationNode/contours'][()]
+                        if 'centroids' in hf['Cell-Segmentation'] and 'contours' in hf['Cell-Segmentation']:
+                            centroids = hf['Cell-Segmentation/centroids'][()]
+                            contours = hf['Cell-Segmentation/contours'][()]
                             ALREADY_HAVE_SEG = True
-                            print("Found existing nuclei segmentation in SegmentationNode.")
+                            print("Found existing nuclei segmentation in Cell-Segmentation.")
                             result["nuclei_count"] = len(centroids)
                     except:
                         print("Warning: segmentation data is corrupted. Will re-run segmentation.")
                 
                 # Check for features in ClassificationNode
-                if 'ClassificationNode' in hf:
+                if 'Cell-Classification' in hf:
                     try:
-                        if 'features' in hf['ClassificationNode']:
+                        if 'features' in hf['Cell-Classification']:
                             ALREADY_HAVE_FEATURES = True
                             print("Found existing features in ClassificationNode.")
                     except:
@@ -320,11 +320,11 @@ def run_segmentation_and_features(args):
 
         # Step D: Save results to H5 file
         with safe_h5_open(H5_PATH, "a") as hf:
-            # Save segmentation data in SegmentationNode
+            # Save segmentation data in Cell-Segmentation
             if centroids is not None and need_segmentation:
-                if 'SegmentationNode' in hf:
-                    del hf['SegmentationNode']
-                seg_node = hf.create_group('SegmentationNode')
+                if 'Cell-Segmentation' in hf:
+                    del hf['Cell-Segmentation']
+                seg_node = hf.create_group('Cell-Segmentation')
                 
                 seg_node.create_dataset('centroids', data=centroids, compression='gzip')
                 seg_node.create_dataset('contours', data=contours, compression='gzip')
@@ -343,15 +343,15 @@ def run_segmentation_and_features(args):
             
             # Save feature data in ClassificationNode
             if features is not None:
-                if 'ClassificationNode' in hf:
-                    del hf['ClassificationNode']
-                cell_feature_node = hf.create_group('ClassificationNode')
+                if 'Cell-Classification' in hf:
+                    del hf['Cell-Classification']
+                cell_feature_node = hf.create_group('Cell-Classification')
                 
                 cell_feature_node.create_dataset('features', data=features, compression='gzip')
                 cell_feature_node.create_dataset('feature_names', 
                                                 data=[n.encode('utf-8') for n in feature_names])
-                cell_feature_node.create_dataset('nuclei_class_id', data=nuclei_class_id)
-                cell_feature_node.create_dataset('nuclei_class_name', 
+                cell_feature_node.create_dataset('class_indices', data=nuclei_class_id)
+                cell_feature_node.create_dataset('classes/name', 
                                                 data=nuclei_class_name, 
                                                 dtype=h5py.string_dtype())
                 
@@ -412,23 +412,23 @@ def init_node():
     global IS_MODEL_INITED
     if not IS_MODEL_INITED:
         IS_MODEL_INITED = True
-        print("[ClassificationNode] /init => initialized model/resources")
+        print("[Cell-Classification] /init => initialized model/resources")
         return {"status": "ok", "message": "ClassificationNode init done"}
     else:
-        print("[ClassificationNode] /init => already initialized.")
+        print("[Cell-Classification] /init => already initialized.")
         return {"status": "ok", "message": "Already initialized."}
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
     global NODE_NAME, DEPENDENCIES, H5_PATH, ARGS
-    NODE_NAME = data.get("node_name", "ClassificationNode")
+    NODE_NAME = data.get("node_name", "Cell-Classification")
     DEPENDENCIES = data.get("dependencies", [])
     H5_PATH = data.get("h5_path", None)
 
-    print(f"[ClassificationNode] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}")
+    print(f"[Cell-Classification] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, h5_path={H5_PATH}")
 
     if not H5_PATH:
-        print("[ClassificationNode] no h5 file path provided.")
+        print("[Cell-Classification] no h5 file path provided.")
         return {"status": "error", "message": "no H5 file path provided."}
 
     if ARGS is None:
@@ -459,7 +459,7 @@ def read_node(data: Dict[str, Any]):
                         val_json = json.loads(raw_str)
                     except:
                         val_json = raw_str
-                    print(f"[ClassificationNode] user param {k} => {val_json}")
+                    print(f"[Cell-Classification] user param {k} => {val_json}")
 
                     if k == "path":
                         ARGS.slidepath = val_json
@@ -490,7 +490,7 @@ def execute_node():
         return {"status": "error", "message": "Please /init first."}
 
     if not ARGS or not getattr(ARGS, "slidepath", None):
-        print("[ClassificationNode] no path => skip.")
+        print("[Cell-Classification] no path => skip.")
         out_val = {
             "status": "ok",
             "message": "no path, skipping.",
@@ -498,10 +498,10 @@ def execute_node():
             "feature_count": 0
         }
     else:
-        print(f"[ClassificationNode] /execute => run segmentation and feature extraction with slidepath={ARGS.slidepath}")
+        print(f"[Cell-Classification] /execute => run segmentation and feature extraction with slidepath={ARGS.slidepath}")
         out_val = run_segmentation_and_features(ARGS)
 
-    # The output is already stored in ClassificationNode/output during run_segmentation_and_features
+    # The output is already stored in Cell-Classification/metadata during run_segmentation_and_features
     # No need to store it again in NODE_NAME
     return {"status": "ok", "output": out_val}
 
@@ -547,7 +547,7 @@ def main():
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8022, help='port')
-    parser.add_argument('--name', type=str, default='ClassificationNode', help='node name')
+    parser.add_argument('--name', type=str, default='Cell-Classification', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args, unknown = parser.parse_known_args()
 

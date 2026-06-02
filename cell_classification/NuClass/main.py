@@ -75,17 +75,17 @@ def train_linear_classifier(cell_embeddings: np.ndarray,
         tuple: (classifier, nuclei_class_names, nuclei_class_colors)
     """
     # Ensure 'Negative control' is first in nuclei_classes (class_id 0)
-    unique_classes = annotations['cell_class'].unique()
+    unique_classes = annotations['class'].unique()
     nuclei_class_names = ['Negative control'] + [c for c in unique_classes if c != 'Negative control']
     
     # Create class color mapping
-    class_colors = annotations.groupby('cell_class')['cell_color'].first().to_dict()
+    class_colors = annotations.groupby('class')['color'].first().to_dict()
     nuclei_class_colors = [class_colors[c] for c in nuclei_class_names]
     
     # Convert cell_ID to integers and prepare data
     cell_indices = annotations['cell_ID'].astype(int).values
     X = cell_embeddings[cell_indices]
-    y = pd.Categorical(annotations['cell_class'], categories=nuclei_class_names).codes
+    y = pd.Categorical(annotations['class'], categories=nuclei_class_names).codes
     
     start_time = time.time()
     # Train logistic regression
@@ -151,13 +151,13 @@ def main(slidepath: str,
         with safe_h5_open(h5_path, 'r') as hf:
             # Check for annotations in either location
             annotations_data = None
-            if 'user_annotation' in hf and 'nuclei_annotations' in hf['user_annotation']:
-                annotations_data = hf['user_annotation/nuclei_annotations'][()]
+            if 'User-Annotations' in hf and 'cell' in hf['User-Annotations']:
+                annotations_data = hf['User-Annotations/cell'][()]
             # If `annotations_data` is in bytes format, decode it first
             if annotations_data is not None:
                 __annotations_dict = json.loads(annotations_data.decode("utf-8"))
                 annotations_data = pd.DataFrame(__annotations_dict).T
-                if "Negative control" in annotations_data["cell_class"].values.astype(str):
+                if "Negative control" in annotations_data["class"].values.astype(str):
                     use_supervised = True
                 else:
                     print("Found annotations, but there is no 'Negative control' class, using zero-shot classification")
@@ -204,8 +204,8 @@ def main(slidepath: str,
             # Check for existing colors in h5 file before generating new ones
             existing_colors = None
             with safe_h5_open(h5_path, 'r') as hf:
-                if 'cell_classification' in hf and 'nuclei_class_HEX_color' in hf['cell_classification']:
-                    existing_colors = hf['cell_classification']['nuclei_class_HEX_color'][()]
+                if 'cell_classification' in hf and 'classes/color' in hf['cell_classification']:
+                    existing_colors = hf['cell_classification']['classes/color'][()]
             # Use existing colors if available and match current classes, otherwise generate new ones
             if existing_colors is not None and len(existing_colors) == len(nuclei_classes):
                 nuclei_classes_HEX_color = existing_colors
@@ -218,9 +218,9 @@ def main(slidepath: str,
             if 'cell_classification' in hf:
                 del hf['cell_classification']
             cell_class = hf.create_group('cell_classification')
-            cell_class.create_dataset('nuclei_class_id', data=predictions)
-            cell_class.create_dataset('nuclei_class_name', data=nuclei_class_names)
-            cell_class.create_dataset('nuclei_class_HEX_color', data=nuclei_classes_HEX_color)
+            cell_class.create_dataset('class_indices', data=predictions)
+            cell_class.create_dataset('classes/name', data=nuclei_class_names)
+            cell_class.create_dataset('classes/color', data=nuclei_classes_HEX_color)
             
             if use_supervised:
                 cell_class.create_dataset('classifier_coef', data=classifier_coef)

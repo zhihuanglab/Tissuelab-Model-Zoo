@@ -209,10 +209,10 @@ def check_existing_results(h5_path):
     
     try:
         with safe_h5_open(h5_path, 'r') as hf:
-            if 'SegmentationNode' not in hf:
+            if 'Cell-Segmentation' not in hf:
                 return False, None, None, False
             
-            seg_node = hf['SegmentationNode']
+            seg_node = hf['Cell-Segmentation']
             has_segmentation = 'centroids' in seg_node and 'contours' in seg_node
             
             if not has_segmentation:
@@ -296,10 +296,10 @@ def main(args):
             # Save segmentation results
             mode = 'w' if args.force_recalculate else 'a'
             with safe_h5_open(h5_path, mode) as hf:
-                # Create or get SegmentationNode group
-                if 'SegmentationNode' in hf:
-                    del hf['SegmentationNode']
-                nuclei_seg = hf.create_group('SegmentationNode')
+                # Create or get Cell-Segmentation group
+                if 'Cell-Segmentation' in hf:
+                    del hf['Cell-Segmentation']
+                nuclei_seg = hf.create_group('Cell-Segmentation')
                 
                 # Save segmentation data only
                 nuclei_seg.create_dataset('contours', data=contours, compression='gzip')
@@ -345,10 +345,10 @@ def main(args):
                 cell_feature_node.create_dataset('features', data=features, compression='gzip')
                 cell_feature_node.create_dataset('feature_names', 
                                         data=[n.encode('utf-8') for n in feature_names])
-                cell_feature_node.create_dataset('nuclei_class_id', data=nuclei_class_id)
+                cell_feature_node.create_dataset('class_indices', data=nuclei_class_id)
                 
                 # Save class names as string
-                cell_feature_node.create_dataset('nuclei_class_name', 
+                cell_feature_node.create_dataset('classes/name', 
                                         data=nuclei_class_name, 
                                         dtype=h5py.string_dtype())
                 

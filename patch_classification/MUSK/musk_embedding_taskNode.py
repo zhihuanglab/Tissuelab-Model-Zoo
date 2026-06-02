@@ -233,7 +233,7 @@ def run_patch_classification(args):
                     try:
                         # Load coordinates and embeddings
                         coordinates = zf[f"{ZARR_GROUP}/coordinates"][()]
-                        embeddings = zf[f"{ZARR_GROUP}/embedding"][()]
+                        embeddings = zf[f"{ZARR_GROUP}/embeddings"][()]
                         
                         # Calculate stored_patch_size from coordinates
                         stored_patch_size = None
@@ -332,14 +332,21 @@ def run_patch_classification(args):
             if ZARR_GROUP in zf:
                 del zf[ZARR_GROUP]
             node_grp = zf.create_group(ZARR_GROUP)
-            node_grp.create_dataset('embedding', data=embeddings)
+            node_grp.create_dataset('embeddings', data=embeddings)
             node_grp.create_dataset('coordinates', data=coordinates)
-            node_grp.create_dataset('probability', data=np.ones(len(coordinates), dtype=np.float32))
-            # Pre-create empty output as 0-D bytes array
-            node_grp.create_dataset('output', shape=(), dtype='S1', data=b'')
-            # Save metadata as group attributes equivalent: store as a small dataset
-            meta = json.dumps({"patch_size": args.patch_size, "level": args.level}).encode('utf-8')
-            node_grp.create_dataset('metadata', shape=(), dtype=f'S{len(meta)}', data=meta)
+            # Run metadata as a sub-group with attrs (matches the
+            # Cell-Segmentation/metadata pattern; replaces the historical
+            # JSON-bytes 'output' + 'metadata' blobs).
+            if 'metadata' in node_grp:
+                del node_grp['metadata']
+            meta_grp = node_grp.create_group('metadata')
+            meta_grp.attrs.update({
+                'model': 'MUSK',
+                'patch_size': int(args.patch_size),
+                'level': int(args.level),
+                'patch_count': int(len(coordinates)),
+                'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            })
         
         # Ensure progress is set to 100 when complete
         progress_complete = True
@@ -585,7 +592,7 @@ def read_node(data: Dict[str, Any]):
     NODE_NAME = data.get("node_name", "MuskEmbedding")
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
-    ZARR_GROUP = data.get("zarr_group") or "MuskNode"
+    ZARR_GROUP = data.get("zarr_group") or "Patch-Segmentation"
     DEP_ZARR_GROUPS = data.get("dependencies_zarr_groups", {})
 
     print(f"[{NODE_NAME}] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}, zarr_group={ZARR_GROUP}")

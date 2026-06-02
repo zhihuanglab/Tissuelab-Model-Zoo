@@ -2920,14 +2920,14 @@ class NucleiEmbedding:
 
             return embeddings
 
-    def generate_embeddings(self, batch_size=None, num_workers=None, zarr_path=None, dataset_path='embedding'):
+    def generate_embeddings(self, batch_size=None, num_workers=None, zarr_path=None, dataset_path='embeddings'):
         """Generate embeddings and write directly to a Zarr dataset.
 
         Args:
             batch_size: Optional batch size for DataLoader
             num_workers: Optional num_workers for DataLoader (default: 0 to avoid pickling issues)
             zarr_path: Path to the root Zarr store to write into (required)
-            dataset_path: Dataset path under the root group to write (default: 'embedding')
+            dataset_path: Dataset path under the root group to write (default: 'embeddings')
         """
         # Set num_workers
         # Note: On Windows, multiprocessing has issues with pickling file handles (slide objects)

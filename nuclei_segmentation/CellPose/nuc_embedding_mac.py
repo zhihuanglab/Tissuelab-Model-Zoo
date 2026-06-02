@@ -275,7 +275,7 @@ class NucleiEmbedding:
 
         return embeddings
 
-    def generate_embeddings(self, batch_size=None, num_workers=0, zarr_path=None, dataset_path='embedding'):
+    def generate_embeddings(self, batch_size=None, num_workers=0, zarr_path=None, dataset_path='embeddings'):
         """Generate embeddings for all nuclei and write directly to a Zarr dataset.
 
         Note: Set num_workers=0 to avoid multiprocessing conflicts with Cellpose/TensorFlow
