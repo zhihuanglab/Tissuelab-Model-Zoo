@@ -344,11 +344,8 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
     try:
         zf_prov = zarr.open_group(ZARR_PATH, mode='r')
         image_name = os.path.basename(str(ZARR_PATH).rstrip('/')).removesuffix('.zarr')
-        prev_image_names = json.loads(booster.attr('image_names') or '[]')
-        if image_name and image_name not in prev_image_names:
-            prev_image_names.append(image_name)
-        booster.set_attr(image_names=json.dumps(prev_image_names))
         if 'User-Annotations/patch' in zf_prov:
+            from numpy.lib.recfunctions import append_fields
             current = zf_prov['User-Annotations/patch'][()]
             # Keep only rows the classifier actually trains on — positives
             # (class >= 0) and weak negatives (class <= -2) with color >= 0.
@@ -359,10 +356,26 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
                     & (current['color'] >= 0)
                 )
                 current = current[meaningful]
+            # Tag each row with the slide it came from so future extraction can
+            # attribute annotations back to their source image.
+            if 'image_name' not in (current.dtype.names or ()):
+                current = append_fields(
+                    current, 'image_name',
+                    np.full(len(current), image_name or '', dtype='U128'),
+                    usemask=False,
+                )
             prev_attr = booster.attr('user_annotations')
             if prev_attr:
                 prev_buf = io.BytesIO(base64.b64decode(prev_attr))
                 prev = np.load(prev_buf, allow_pickle=False)['records']
+                # Legacy .tlcls files: no image_name column — backfill empty
+                # string so it concatenates with current without dtype clash.
+                if 'image_name' not in (prev.dtype.names or ()):
+                    prev = append_fields(
+                        prev, 'image_name',
+                        np.full(len(prev), '', dtype='U128'),
+                        usemask=False,
+                    )
             else:
                 prev = np.empty(0, dtype=current.dtype)
             seen = set()
@@ -377,6 +390,16 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
             log_buf = io.BytesIO()
             np.savez_compressed(log_buf, records=merged)
             booster.set_attr(user_annotations=base64.b64encode(log_buf.getvalue()).decode('utf-8'))
+            # (wsi, annotator) is the real "image" unit — same slide annotated
+            # by two people counts as two distinct sources. Derive from records.
+            if {'image_name', 'annotator'}.issubset(merged.dtype.names or ()):
+                pairs = sorted({
+                    (str(r['image_name']), str(r['annotator']))
+                    for r in merged
+                })
+                booster.set_attr(image_annotator_pairs=json.dumps(
+                    [{'image_name': n, 'annotator': a} for n, a in pairs]
+                ))
     except Exception as e:
         print(f"[Patch-Classification] Skipping user_annotation provenance embed: {e}")
 
