@@ -93,6 +93,20 @@ def _is_array(node) -> bool:
     return not isinstance(node, zarr.hierarchy.Group)
 
 
+def _read_bytes_blob(node) -> bytes:
+    """Read a legacy metadata blob that may be stored as bytes, str, or a numpy
+    scalar (some stores wrote an object-dtype string instead of uint8 bytes)."""
+    val = node[()]
+    if isinstance(val, bytes):  # also covers np.bytes_
+        return val
+    if isinstance(val, str):  # also covers np.str_
+        return val.encode("utf-8")
+    try:
+        return bytes(val)
+    except TypeError:
+        return str(val).encode("utf-8")
+
+
 def _split_old_node(zf, dry_run: bool) -> List[str]:
     """
     Inspect MuskNode and (in non-dry-run mode) migrate its contents into
@@ -121,7 +135,7 @@ def _split_old_node(zf, dry_run: bool) -> List[str]:
                     actions.append(f"{OLD_GROUP}/{old_key} → {PATCH_SEG}/{new_key}")
             # Promote legacy metadata bytes blob if it carries patch-embedding params.
             if LEGACY_METADATA_DATASET in old and _is_array(old[LEGACY_METADATA_DATASET]):
-                raw = bytes(old[LEGACY_METADATA_DATASET][()])
+                raw = _read_bytes_blob(old[LEGACY_METADATA_DATASET])
                 try:
                     payload = json.loads(raw.decode("utf-8")) if raw else {}
                 except Exception:
@@ -192,7 +206,7 @@ def _split_old_node(zf, dry_run: bool) -> List[str]:
                 and _is_array(old[LEGACY_METADATA_DATASET])
                 and not has_embedding_data
             ):
-                raw = bytes(old[LEGACY_METADATA_DATASET][()])
+                raw = _read_bytes_blob(old[LEGACY_METADATA_DATASET])
                 try:
                     payload = json.loads(raw.decode("utf-8")) if raw else {}
                 except Exception:

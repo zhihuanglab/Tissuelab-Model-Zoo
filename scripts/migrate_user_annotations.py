@@ -34,6 +34,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Tuple
@@ -48,6 +49,7 @@ NEW_CELL_DS = "cell"
 OLD_PATCH_DS = "tissue_annotations"
 NEW_PATCH_DS = "patch"
 PATCH_SEG_GROUP = "Patch-Segmentation"
+CELL_SEG_GROUP = "Cell-Segmentation"
 
 
 # Same dtype as TissueLab-Dev/app/service/app/services/tasks.py:_get_annotation_dtype
@@ -155,6 +157,96 @@ def _patch_dict_to_array(ann_dict: dict, n_patches: int, class_names: List[str])
     return arr
 
 
+def _parse_dt(s) -> int:
+    """Best-effort parse of a legacy datetime into epoch-milliseconds (UTC).
+    Accepts an int/numeric string (already epoch) or 'YYYY-MM-DD HH:MM:SS[.fff]'.
+    Returns 0 when unparseable."""
+    if s is None:
+        return 0
+    if isinstance(s, (int, np.integer)):
+        return int(s)
+    s = str(s).strip()
+    if s.isdigit():
+        return int(s)
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return int(datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp() * 1000)
+        except ValueError:
+            continue
+    return 0
+
+
+def _cell_dict_to_array(ann_dict: dict, n_cells: int,
+                        attr_class_names: List[str], attr_class_colors: List[str]):
+    """Materialise a *legacy* cell-annotation JSON dict (keyed by cell_ID) into a
+    dense structured array of length n_cells (unannotated rows: class=-1).
+
+    This is the cell-side analogue of ``_patch_dict_to_array`` for stores whose
+    ``nuclei_annotations`` was a 0-d JSON-bytes blob rather than a structured
+    array. Legacy entries carry ``cell_class`` (string name), ``cell_color``
+    (hex), ``region_geometry`` {x1,y1,x2,y2}, ``annotator``, ``datetime``,
+    ``method``. The cell's centroid is intentionally dropped — it is already the
+    canonical ``Cell-Segmentation/centroids[cell_ID]``.
+
+    The class taxonomy is taken from attrs when present, else synthesised from
+    the distinct cell_class values in first-seen order. Returns
+    (arr, class_names, class_colors).
+    """
+    class_names = list(attr_class_names) if attr_class_names else []
+    class_colors = list(attr_class_colors) if attr_class_colors else []
+    name_to_idx = {n: i for i, n in enumerate(class_names)}
+
+    def _ensure_class(name: str, color_hex) -> int:
+        if name in name_to_idx:
+            return name_to_idx[name]
+        idx = len(class_names)
+        name_to_idx[name] = idx
+        class_names.append(name)
+        class_colors.append(color_hex if isinstance(color_hex, str) else "")
+        return idx
+
+    arr = np.zeros(max(n_cells, 0), dtype=ANNOTATION_DTYPE)
+    arr['class'][:] = -1
+    arr['color'][:] = -1
+    for region in ('region_x1', 'region_y1', 'region_x2', 'region_y2'):
+        arr[region][:] = -1
+
+    for k, v in ann_dict.items():
+        try:
+            i = int(k)
+        except (TypeError, ValueError):
+            continue
+        if i < 0 or i >= n_cells:
+            continue
+        if not isinstance(v, dict):
+            continue
+        cls_name = v.get('cell_class') if v.get('cell_class') is not None else v.get('class')
+        col_hex = v.get('cell_color') if v.get('cell_color') is not None else v.get('color')
+        if cls_name is None:
+            continue
+        cls_idx = _ensure_class(str(cls_name), col_hex)
+        arr['class'][i] = cls_idx
+        if isinstance(col_hex, str):
+            arr['color'][i] = _hex_to_int(col_hex)
+        elif isinstance(col_hex, (int, np.integer)):
+            arr['color'][i] = int(col_hex)
+        arr['datetime'][i] = _parse_dt(v.get('datetime'))
+        arr['method'][i] = str(v.get('method', ''))[:32]
+        arr['annotator'][i] = str(v.get('annotator', ''))[:64]
+        geom = v.get('region_geometry')
+        if isinstance(geom, dict):
+            for fld, key in (('region_x1', 'x1'), ('region_y1', 'y1'),
+                             ('region_x2', 'x2'), ('region_y2', 'y2')):
+                val = geom.get(key)
+                if val is not None:
+                    try:
+                        arr[fld][i] = int(round(float(val)))
+                    except (TypeError, ValueError):
+                        pass
+
+    return arr, class_names, class_colors
+
+
 def migrate_one(zarr_path: Path, dry_run: bool) -> Tuple[Path, str, List[str]]:
     actions: List[str] = []
     try:
@@ -165,9 +257,24 @@ def migrate_one(zarr_path: Path, dry_run: bool) -> Tuple[Path, str, List[str]]:
         if OLD_GROUP not in zf and NEW_GROUP not in zf:
             return zarr_path, "skipped", ["no user_annotation group present"]
 
-        # Already migrated? (NEW_GROUP exists, OLD_GROUP gone)
+        # Already migrated? (NEW_GROUP exists, OLD_GROUP gone) — but only treat
+        # it as done when no legacy leftovers remain. A run that renamed the
+        # group then failed mid-way (e.g. on the cell side) leaves NEW_GROUP in
+        # place with legacy datasets/attrs still inside; fall through to finish.
         if NEW_GROUP in zf and OLD_GROUP not in zf:
-            return zarr_path, "skipped", ["already migrated"]
+            ua_chk = zf[NEW_GROUP]
+            leftover = (
+                OLD_CELL_DS in ua_chk
+                or OLD_PATCH_DS in ua_chk
+                or 'class_counts' in ua_chk
+                or 'patch_class_counts' in ua_chk
+                or 'reclassification_metadata' in ua_chk
+                or any(k in ua_chk.attrs for k in (
+                    'class_names', 'class_colors',
+                    'tissue_class_names', 'tissue_class_colors', 'annotation_format'))
+            )
+            if not leftover:
+                return zarr_path, "skipped", ["already migrated"]
 
         # ── Phase 1: rename top-level group ─────────────────────────────────
         if OLD_GROUP in zf and NEW_GROUP not in zf:
@@ -203,15 +310,43 @@ def migrate_one(zarr_path: Path, dry_run: bool) -> Tuple[Path, str, List[str]]:
             if dry_run:
                 actions.append(f"would rename {OLD_CELL_DS} → {NEW_CELL_DS} (and field renames)")
             else:
-                old_arr = ua[OLD_CELL_DS][:]
-                needs_field_rename = any(k in (old_arr.dtype.names or ()) for k in CELL_FIELD_RENAMES)
-                if needs_field_rename:
-                    new_arr = _rename_fields_in_array(old_arr, CELL_FIELD_RENAMES)
+                cell_node = ua[OLD_CELL_DS]
+                if getattr(cell_node, 'ndim', 1) == 0:
+                    # Legacy 0-d JSON-bytes blob (cell_ID-keyed dict) → dense array.
+                    try:
+                        raw = bytes(cell_node[()])
+                        ann_dict = json.loads(raw.decode('utf-8')) if raw else {}
+                    except Exception:
+                        ann_dict = {}
+                    n_cells = 0
+                    try:
+                        if CELL_SEG_GROUP in zf and 'centroids' in zf[CELL_SEG_GROUP]:
+                            n_cells = int(zf[CELL_SEG_GROUP]['centroids'].shape[0])
+                    except Exception:
+                        n_cells = 0
+                    if n_cells == 0:
+                        ids = [int(x) for x in ann_dict.keys() if str(x).lstrip('-').isdigit()]
+                        n_cells = (max(ids) + 1) if ids else 0
+                    new_arr, syn_names, syn_colors = _cell_dict_to_array(
+                        ann_dict, n_cells, cell_class_names, cell_class_colors)
+                    ua.create_dataset(NEW_CELL_DS, data=new_arr, dtype=new_arr.dtype)
+                    del ua[OLD_CELL_DS]
+                    # Feed synthesised taxonomy into the attrs-writing step below.
+                    if not cell_class_names and syn_names:
+                        cell_class_names = syn_names
+                    if not cell_class_colors and syn_colors:
+                        cell_class_colors = syn_colors
+                    actions.append(f"{OLD_CELL_DS} JSON({len(ann_dict)}) → {NEW_CELL_DS} dense({n_cells})")
                 else:
-                    new_arr = old_arr
-                ua.create_dataset(NEW_CELL_DS, data=new_arr, dtype=new_arr.dtype)
-                del ua[OLD_CELL_DS]
-                actions.append(f"renamed {OLD_CELL_DS} → {NEW_CELL_DS}")
+                    old_arr = cell_node[:]
+                    needs_field_rename = any(k in (old_arr.dtype.names or ()) for k in CELL_FIELD_RENAMES)
+                    if needs_field_rename:
+                        new_arr = _rename_fields_in_array(old_arr, CELL_FIELD_RENAMES)
+                    else:
+                        new_arr = old_arr
+                    ua.create_dataset(NEW_CELL_DS, data=new_arr, dtype=new_arr.dtype)
+                    del ua[OLD_CELL_DS]
+                    actions.append(f"renamed {OLD_CELL_DS} → {NEW_CELL_DS}")
 
         # Move attrs.class_names/class_colors → cell.attrs
         if not dry_run and NEW_CELL_DS in ua:
