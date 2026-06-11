@@ -256,9 +256,9 @@ def _persist_nuclei_rename_to_user_annotation(zf, effective_renames, nuclei_clas
     rename_graph = {op["from"]: op["to"] for op in effective_renames}
 
     # 1) Remap persisted class_counts (name -> count)
-    if "class_counts" in ua:
+    if "cell_class_counts" in ua:
         try:
-            raw = ua["class_counts"][()]
+            raw = ua["cell_class_counts"][()]
             if isinstance(raw, bytes):
                 counts_dict = json.loads(raw.decode("utf-8"))
             else:
@@ -277,10 +277,10 @@ def _persist_nuclei_rename_to_user_annotation(zf, effective_renames, nuclei_clas
                 new_counts[nk] = new_counts.get(nk, 0) + iv
             out_bytes = json.dumps(new_counts, ensure_ascii=False).encode("utf-8")
             try:
-                del ua["class_counts"]
+                del ua["cell_class_counts"]
             except KeyError:
                 pass
-            ua.create_dataset("class_counts", data=out_bytes)
+            ua.create_dataset("cell_class_counts", data=out_bytes)
             print(f"[Cell-Classification] Remapped User-Annotations/cell/__attrs_class_counts__ after rename: {new_counts}")
 
     # 2) Sync attrs class_names / class_colors with workflow (preferred) or apply rename chain
