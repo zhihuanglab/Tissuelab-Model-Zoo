@@ -736,65 +736,58 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
         zf_prov = zarr.open_group(ZARR_PATH, mode='r')
         image_name = os.path.basename(str(ZARR_PATH).rstrip('/')).removesuffix('.zarr')
         if 'User-Annotations/cell' in zf_prov:
-            from numpy.lib.recfunctions import append_fields
             current = zf_prov['User-Annotations/cell'][()]
-            # The dataset has one row per cell with `cell_class == -1` for
-            # unannotated placeholders. Keep only rows the classifier actually
-            # trains on, matching load_structured_nuclei_annotations: positives
-            # (cell_class >= 0) and negatives (cell_class <= -2), all with
-            # cell_color >= 0. On large slides this cuts ~165k rows to a few
-            # hundred, making the per-save dedup loop fast and stopping the
-            # log from being bloated with empty placeholder records.
+            # One row per cell with `class == -1` for unannotated placeholders.
+            # Keep only rows the classifier trains on: positives (class >= 0)
+            # and negatives (class <= -2), all with color >= 0.
             if {'class', 'color'}.issubset(current.dtype.names or ()):
                 meaningful = (
                     ((current['class'] >= 0) | (current['class'] <= -2))
                     & (current['color'] >= 0)
                 )
                 current = current[meaningful]
-            # Tag each row with the slide it came from so future extraction can
-            # attribute annotations back to their source image.
-            if 'image_name' not in (current.dtype.names or ()):
-                current = append_fields(
-                    current, 'image_name',
-                    np.full(len(current), image_name or '', dtype='U128'),
-                    usemask=False,
-                )
+            # The drawn shape vertices (rectangle/polygon/single — all stored as
+            # vertices at save time) live on the group attr, keyed by datetime.
+            geom = dict(zf_prov['User-Annotations'].attrs.get('cell_selection_geometry', {}) or {})
+            # Build one provenance record per unique annotation action, carrying
+            # its shape vertices instead of a bbox. All cells of one selection
+            # share (class, datetime, ...) so they collapse to a single record.
+            cur = {}
+            for row in current:
+                dt = int(row['datetime'])
+                k = (int(row['class']), int(row['color']), dt,
+                     str(row['method']), str(row['annotator']), image_name)
+                if k in cur:
+                    continue
+                g = geom.get(str(dt)) or {}
+                cur[k] = {
+                    'class': int(row['class']),
+                    'color': int(row['color']),
+                    'datetime': dt,
+                    'method': str(row['method']),
+                    'annotator': str(row['annotator']),
+                    'image_name': image_name,
+                    'vertices': g.get('vertices'),
+                }
+            # Merge with the previous classifier's records (JSON), dedup by key.
+            merged = {}
             prev_attr = booster.attr('user_annotations')
             if prev_attr:
-                prev_buf = io.BytesIO(base64.b64decode(prev_attr))
-                prev = np.load(prev_buf, allow_pickle=False)['records']
-                # Legacy .tlcls files: no image_name column — backfill empty
-                # string so it concatenates with current without dtype clash.
-                if 'image_name' not in (prev.dtype.names or ()):
-                    prev = append_fields(
-                        prev, 'image_name',
-                        np.full(len(prev), '', dtype='U128'),
-                        usemask=False,
-                    )
-            else:
-                prev = np.empty(0, dtype=current.dtype)
-            seen = set()
-            merged_list = []
-            for row in np.concatenate([prev, current]):
-                key = tuple(row.tolist())
-                if key not in seen:
-                    seen.add(key)
-                    merged_list.append(row)
-            merged = (np.array(merged_list, dtype=current.dtype)
-                      if merged_list else np.empty(0, dtype=current.dtype))
-            log_buf = io.BytesIO()
-            np.savez_compressed(log_buf, records=merged)
-            booster.set_attr(user_annotations=base64.b64encode(log_buf.getvalue()).decode('utf-8'))
-            # (wsi, annotator) is the real "image" unit — same slide annotated
-            # by two people counts as two distinct sources. Derive from records.
-            if {'image_name', 'annotator'}.issubset(merged.dtype.names or ()):
-                pairs = sorted({
-                    (str(r['image_name']), str(r['annotator']))
-                    for r in merged
-                })
-                booster.set_attr(image_annotator_pairs=json.dumps(
-                    [{'image_name': n, 'annotator': a} for n, a in pairs]
-                ))
+                try:
+                    for r in json.loads(prev_attr):
+                        merged[(r.get('class'), r.get('color'), r.get('datetime'),
+                                r.get('method'), r.get('annotator'),
+                                r.get('image_name'))] = r
+                except Exception:
+                    merged = {}  # legacy npz format — superseded (migrate separately)
+            merged.update(cur)
+            records = list(merged.values())
+            booster.set_attr(user_annotations=json.dumps(records, ensure_ascii=False))
+            # (wsi, annotator) is the real "image" unit — derive from records.
+            pairs = sorted({(r['image_name'], r['annotator']) for r in records})
+            booster.set_attr(image_annotator_pairs=json.dumps(
+                [{'image_name': n, 'annotator': a} for n, a in pairs]
+            ))
     except Exception as e:
         print(f"[Cell-Classification] Skipping user_annotation provenance embed: {e}")
 
