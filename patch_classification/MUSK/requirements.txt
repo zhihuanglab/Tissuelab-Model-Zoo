@@ -35,7 +35,11 @@ safetensors
 uvicorn
 sse_starlette
 starlette
-xgboost
+# Match the cloud musk env. 3.0.x still loads the legacy `binf` classifiers
+# and rebuilds XGBClassifier.n_classes_ from the booster on load; do NOT bump
+# to 3.1+ (binf loading was removed there) or down to 1.7.x (loads binf but
+# does not rebuild n_classes_, so predict on a loaded classifier breaks).
+xgboost==3.0.5
 tiffslide
 datasets
 fastapi

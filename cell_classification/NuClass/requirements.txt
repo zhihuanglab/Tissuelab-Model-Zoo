@@ -7,7 +7,11 @@ scipy==1.11.0
 tiffslide==1.5.0
 multiprocess==0.70.17
 zarr==2.17.2
-xgboost==1.7.4
+# Match the cloud stardist env. Keep xgboost in the 2.0–3.0 range: these load
+# the legacy `binf` classifiers AND rebuild XGBClassifier.n_classes_ from the
+# booster on load. 1.7.x loads binf but does NOT rebuild n_classes_ (breaks
+# predict_proba on a loaded classifier); 3.1+ drops binf loading entirely.
+xgboost==2.1.4
 scikit-learn==1.2.1
 tqdm==4.64.1
 natsort==8.2.0
