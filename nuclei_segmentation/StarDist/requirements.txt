@@ -5,6 +5,11 @@ pandas>=2.0.0
 opencv-python>=4.8.0
 scipy>=1.11.0
 tiffslide==1.5.0
+# tiffslide 1.5.0 references tifffile.TIFF.RESUNIT, removed in tifffile>=2025.x.
+# Newer tifffile makes tiffslide crash -> wrapper fallback hides the pyramid and
+# forces a full-resolution thumbnail read (multi-minute stall). Pin to a version
+# that still exposes RESUNIT so the pyramid loads.
+tifffile<2025
 multiprocess==0.70.17
 # Pin to match the cloud stardist env. 2.0–3.0 range loads legacy `binf`
 # classifiers and rebuilds n_classes_ on load; 1.7.x breaks predict on a

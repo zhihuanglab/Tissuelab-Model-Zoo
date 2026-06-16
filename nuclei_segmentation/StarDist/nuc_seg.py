@@ -713,6 +713,14 @@ class SlideSegmentation():
                 self.slide = TiffFileWrapper(self.args.slidepath)
                 mpp = 0.25  # Default value
         
+        # Guard against implausible MPP from broken/garbage resolution metadata.
+        # Brightfield H&E scans are ~0.1-1.0 um/px; some exported TIFFs report a
+        # bogus value (e.g. mpp=1000) which would yield magnification ~0.01x and
+        # corrupt tiling/patch scale. Fall back to 0.25 um/px (~40x).
+        if not (0.05 <= mpp <= 2.0):
+            print(f"Implausible MPP {mpp} from metadata; falling back to 0.25 um/px (~40x).")
+            mpp = 0.25
+
         # Detect z-stack after slide is loaded
         self._detect_zstack()
         # Store original MPP before any overrides (needed for resize calculation)

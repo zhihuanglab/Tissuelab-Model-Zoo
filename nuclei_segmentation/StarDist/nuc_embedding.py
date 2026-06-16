@@ -238,6 +238,14 @@ class NucleiPatchDataset(Dataset):
         if self.slide is not None:
             print(f"[PERF] Opened slide object for reuse (will save ~21% DataLoader overhead)")
         
+        # Guard against implausible magnification from garbage MPP metadata (see
+        # nuc_seg.read_data). Bogus mpp (e.g. 1000 -> ~0.01x) would make
+        # scale_factor ~4000 and extraction_size ~896000px, producing junk patches.
+        if self.magnification is None or not (5 <= self.magnification <= 100):
+            print(f"[WARNING] Implausible magnification {self.magnification}; falling back to 40x.")
+            self.magnification = 40
+            self.mpp = 0.25
+
         # FIXED: Use the same calculation method as old code (centroid-based fixed-size extraction)
         # Calculate extraction_size using the same formula as old code
         self.scale_factor = 40 / self.magnification
@@ -2665,6 +2673,13 @@ class NucleiEmbedding:
             if not hasattr(self.args, 'magnification') or self.args.magnification is None:
                 self.args.magnification = 40
         
+        # Guard against implausible magnification from garbage MPP metadata (see
+        # nuc_seg.read_data). These exported TIFFs report mpp=1000 -> ~0.01x, which
+        # would make patch extraction scale meaningless. Fall back to 40x.
+        if self.args.magnification is None or not (5 <= self.args.magnification <= 100):
+            print(f"Implausible magnification {self.args.magnification}; falling back to 40x.")
+            self.args.magnification = 40
+
         print(f"Using read method: {self.read_image_method} for file: {self.args.slidepath}")
         print(f"Magnification: {self.args.magnification}x")
         
