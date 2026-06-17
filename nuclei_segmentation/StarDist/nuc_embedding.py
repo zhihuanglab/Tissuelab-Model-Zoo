@@ -39,6 +39,17 @@ from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
 from nuc_stat import NumpySlide, PILSlide, VipsSlide
 from tissuelab_sdk.wrapper import DicomImageWrapper, SimpleImageWrapper, TiffFileWrapper
 
+
+def _open_tiffslide(path):
+    """Open a slide with tiffslide, disabling tifffile's 'shaped series' detector.
+
+    Some exported pyramidal TIFFs carry a shaped-series marker that makes
+    tifffile's series detection raise 'incompatible keyframe' on the
+    differently-sized pyramid levels. is_shaped=False forces generic parsing.
+    """
+    import tiffslide
+    return tiffslide.TiffSlide(path, tifffile_options={'is_shaped': False})
+
 VIPS_AVAILABLE = importlib.util.find_spec("pyvips") is not None
 
 """
@@ -179,7 +190,7 @@ class NucleiPatchDataset(Dataset):
             # For methods that can't read MPP directly, try tiffslide/openslide first
             try:
                 import tiffslide
-                temp_slide = tiffslide.TiffSlide(slide_path)
+                temp_slide = _open_tiffslide(slide_path)
                 self.mpp = float(temp_slide.properties['tiffslide.mpp-x'])
                 reference_mpp_1x = 10  # objective magnification
                 self.magnification = reference_mpp_1x / self.mpp
@@ -213,7 +224,7 @@ class NucleiPatchDataset(Dataset):
                 self.magnification = reference_mpp_1x / self.mpp
         elif read_image_method == 'tiffslide':
             import tiffslide
-            self.slide = tiffslide.TiffSlide(slide_path)
+            self.slide = _open_tiffslide(slide_path)
             self.slide_dimensions = self.slide.dimensions
             if self.mpp is None:
                 self.mpp = float(self.slide.properties['tiffslide.mpp-x'])
@@ -908,7 +919,7 @@ class NucleiPatchDataset(Dataset):
             if self.read_image_method in ['tiffslide', 'openslide']:
                 try:
                     import tiffslide
-                    with tiffslide.TiffSlide(self.slide_path) as slide:
+                    with _open_tiffslide(self.slide_path) as slide:
                         # Check if there are multiple series (z-stack in ndpi)
                         if hasattr(slide, 'ts_tifffile') and hasattr(slide.ts_tifffile, 'series'):
                             series = slide.ts_tifffile.series
@@ -986,7 +997,7 @@ class NucleiPatchDataset(Dataset):
             self.slide_dimensions = self.slide.dimensions
         elif self.read_image_method == 'tiffslide':
             import tiffslide
-            self.slide = tiffslide.TiffSlide(self.slide_path)
+            self.slide = _open_tiffslide(self.slide_path)
             self.slide_dimensions = self.slide.dimensions
         elif self.read_image_method == 'vips':
             self.slide = VipsSlide(self.slide_path)
@@ -2614,7 +2625,7 @@ class NucleiEmbedding:
                         print(f"OpenSlide MPP read failed: {str(e)}")
                         try:
                             import tiffslide
-                            with tiffslide.TiffSlide(self.args.slidepath) as slide:
+                            with _open_tiffslide(self.args.slidepath) as slide:
                                 mpp = float(slide.properties['tiffslide.mpp-x'])
                                 print("tiffslide (for MPP) success")
                         except (ImportError, Exception) as e2:
@@ -2635,7 +2646,7 @@ class NucleiEmbedding:
                     except (ImportError, Exception) as e:
                         print(f"OpenSlide failed: {str(e)}")
                         import tiffslide
-                        with tiffslide.TiffSlide(self.args.slidepath) as slide:
+                        with _open_tiffslide(self.args.slidepath) as slide:
                             mpp = float(slide.properties['tiffslide.mpp-x'])
                             self.args.magnification = reference_mpp_1x / mpp
                         self.read_image_method = 'tiffslide'
@@ -2656,7 +2667,7 @@ class NucleiEmbedding:
                 # Try TiffSlide as fallback
                 try:
                     import tiffslide
-                    with tiffslide.TiffSlide(self.args.slidepath) as slide:
+                    with _open_tiffslide(self.args.slidepath) as slide:
                         mpp = float(slide.properties['tiffslide.mpp-x'])
                         reference_mpp_1x = 10
                         self.args.magnification = reference_mpp_1x / mpp

@@ -61,6 +61,18 @@ from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFil
 import tiffslide
 from collections import defaultdict
 
+
+def _open_tiffslide(path):
+    """Open a slide with tiffslide, disabling tifffile's 'shaped series' detector.
+
+    Some exported pyramidal TIFFs carry a shaped-series marker in their
+    ImageDescription. tifffile then routes them through the shaped-series parser,
+    whose keyframe check raises 'incompatible keyframe' on the differently-sized
+    pyramid levels -> tiffslide cannot open the file at all (and the TiffFileWrapper
+    fallback hits the same crash). is_shaped=False forces generic pyramid parsing.
+    """
+    return tiffslide.TiffSlide(path, tifffile_options={'is_shaped': False})
+
 opj = os.path.join
 
 class SlideSegmentation():
@@ -272,7 +284,7 @@ class SlideSegmentation():
             # Method 2: Try tiffslide for multi-series files (like ndpi z-stack)
             try:
                 import tiffslide
-                with tiffslide.TiffSlide(self.args.slidepath) as slide:
+                with _open_tiffslide(self.args.slidepath) as slide:
                     # Check if there are multiple series (z-stack in ndpi)
                     if hasattr(slide, 'ts_tifffile') and hasattr(slide.ts_tifffile, 'series'):
                         series = slide.ts_tifffile.series
@@ -695,7 +707,7 @@ class SlideSegmentation():
         print("Reading data ...", datetime.now().strftime("%H:%M:%S"))
 
         try:
-            self.slide = tiffslide.TiffSlide(self.args.slidepath)
+            self.slide = _open_tiffslide(self.args.slidepath)
             mpp = float(self.slide.properties['tiffslide.mpp-x'])
             print("Successfully read file using TiffSlide")
         except Exception as e:
@@ -856,7 +868,7 @@ class SlideSegmentation():
         slide = None
         try:
             if not self.is_zstack:
-                slide = tiffslide.TiffSlide(self.args.slidepath)
+                slide = _open_tiffslide(self.args.slidepath)
             else:
                 # For z-stack, open tifffile ONCE for the entire thread lifecycle
                 import tifffile
