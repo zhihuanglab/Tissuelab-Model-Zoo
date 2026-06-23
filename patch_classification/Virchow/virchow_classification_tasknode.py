@@ -57,7 +57,14 @@ from pathlib import Path
 class CooperativeCancel(Exception):
     """Cooperative stop requested via POST /cancel; raise at explicit checkpoints."""
 
-from musk_for_train import MUSK
+# Virchow is vision-only: the model object is only used by the (disabled)
+# text/zero-shot branch. The supervised xgboost path operates purely on the
+# precomputed embeddings, so no model is loaded. Guard the import so a missing
+# wrapper never crashes the node.
+try:
+    from virchow_for_embedding import MUSK  # noqa: F401 (kept for symbol compat)
+except Exception:
+    MUSK = None
 
 app = FastAPI()
 
@@ -1053,7 +1060,10 @@ def train_linear_classifier(
         # Cache negative control vectors in memory
         if not hasattr(train_linear_classifier, '_negative_control_vectors'):
             base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
-            neg_control_path = os.path.join(base_path, "negative_control_vectors_1024d.npy")
+            # H-optimus-0 embeddings are 1536-d (MUSK was 1024-d). The negative-
+            # control file must match that dim; if it's absent we just skip the
+            # injection (guarded below) instead of crashing on a shape mismatch.
+            neg_control_path = os.path.join(base_path, "negative_control_vectors_2560d.npy")
             print(f"Loading negative control vectors from: {neg_control_path}")
             try:
                 train_linear_classifier._negative_control_vectors = np.load(neg_control_path)
@@ -1062,10 +1072,6 @@ def train_linear_classifier(
                 train_linear_classifier._negative_control_vectors = None # Set to None if loading fails
 
         negative_control_vectors = train_linear_classifier._negative_control_vectors
-        # The 1024-d MUSK neg-control only matches MUSK embeddings. If the zarr's
-        # Patch-Segmentation/embeddings were produced by a different model (e.g.
-        # Virchow 2560-d — the group is shared), skip injection instead of
-        # crashing on the concatenate dim mismatch.
         if negative_control_vectors is not None and negative_control_vectors.shape[1] != X_train.shape[1]:
             print(f"Negative control dim {negative_control_vectors.shape[1]} != embedding dim {X_train.shape[1]} => skipping injection.")
             negative_control_vectors = None
@@ -1662,7 +1668,7 @@ def run_classification(args) -> Dict[str, Any]:
             del grp_cls['metadata']
         meta_grp = grp_cls.create_group('metadata')
         meta_attrs = {
-            'model': 'MUSK-Classification',
+            'model': 'Virchow-Classification',
             'classification_method': classification_method,
             'classification_count': int(len(predictions)),
             'num_classes': int(len(final_class_names)),
@@ -2219,7 +2225,7 @@ def main():
     import time
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8006, help='port')
-    parser.add_argument('--name', type=str, default='MuskClassification', help='node name')
+    parser.add_argument('--name', type=str, default='VirchowClassification', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args = parser.parse_args()
 
