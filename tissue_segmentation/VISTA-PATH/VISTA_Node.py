@@ -21,6 +21,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import zarr
 import uvicorn
+
+# Silence zarr v3 "unstable data type" warnings (structured arrays + fixed-length
+# string/bytes dtypes used by our schema). No cross-library portability needed.
+import warnings
+from zarr.errors import UnstableSpecificationWarning
+warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image

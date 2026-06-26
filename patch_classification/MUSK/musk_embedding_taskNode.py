@@ -12,6 +12,12 @@ import time
 import json
 import zarr
 import uvicorn
+
+# Silence zarr v3 "unstable data type" warnings (structured arrays + fixed-length
+# string/bytes dtypes used by our schema). No cross-library portability needed.
+import warnings
+from zarr.errors import UnstableSpecificationWarning
+warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 import requests
 import platform
 import numpy as np
@@ -145,7 +151,7 @@ def update_progress(value):
 def print_zarr_structure(file_path):
     """Helper to print Zarr structure"""
     def _visit(group, prefix=""):
-        for key, val in group.items():
+        for key, val in group.members():
             name = f"{prefix}/{key}" if prefix else key
             if isinstance(val, zarr.Group):
                 print(f"{name} (Group)")

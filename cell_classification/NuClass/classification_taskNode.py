@@ -59,6 +59,12 @@ import uvicorn
 import xgboost as xgb
 import zarr
 from fastapi import FastAPI
+
+# Silence zarr v3 "unstable data type" warnings (structured arrays + fixed-length
+# string/bytes dtypes used by our schema). No cross-library portability needed.
+import warnings
+from zarr.errors import UnstableSpecificationWarning
+warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -539,7 +545,7 @@ def _annotation_labels_to_classifier_indices(annotations, class_names, nuclei_cl
 def print_h5_structure(file_path):
     """Print Zarr group structure"""
     def _visit(group, prefix=""):
-        for key, val in group.items():
+        for key, val in group.members():
             name = f"{prefix}/{key}" if prefix else key
             if isinstance(val, zarr.Group):
                 print(f"{name} (Group)")
