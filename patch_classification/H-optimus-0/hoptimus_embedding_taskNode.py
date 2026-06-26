@@ -154,7 +154,7 @@ def print_zarr_structure(file_path):
                 shape = getattr(val, 'shape', None)
                 dtype = getattr(val, 'dtype', None)
                 print(f"{name} (Dataset), shape: {shape}, dtype: {dtype}")
-    zf = zarr.open_group(file_path, "r")
+    zf = zarr.open_group(file_path, mode="r")
     _visit(zf)
 
 def load_model_at_init():
@@ -206,7 +206,7 @@ def run_patch_classification(args):
         coordinates = None
         
         if os.path.exists(ZARR_PATH):
-            zf = zarr.open_group(ZARR_PATH, 'r')
+            zf = zarr.open_group(ZARR_PATH, mode='r')
             if ZARR_GROUP in zf:
                     try:
                         # Load coordinates and embeddings
@@ -306,7 +306,7 @@ def run_patch_classification(args):
         
         # Step 3: Save to Zarr store (only if we generated new embeddings)
         if not ALREADY_HAVE_EMBEDDINGS and embeddings is not None and coordinates is not None:
-            zf = zarr.open_group(ZARR_PATH, "a")
+            zf = zarr.open_group(ZARR_PATH, mode="a")
             if ZARR_GROUP in zf:
                 del zf[ZARR_GROUP]
             node_grp = zf.create_group(ZARR_GROUP)
@@ -612,7 +612,7 @@ def _load_parameters_from_zarr(zarr_path: str, zarr_group: str):
     global ARGS
     
     try:
-        zf = zarr.open_group(zarr_path, "r")
+        zf = zarr.open_group(zarr_path, mode="r")
         user_data_path = f"{zarr_group}/userData"
         if user_data_path not in zf:
             print(f"[{NODE_NAME}] No userData found in {zarr_group}")
@@ -733,7 +733,7 @@ def execute_node():
     
     # Store the result to 'output'
     if ZARR_PATH and os.path.exists(ZARR_PATH):
-        zf = zarr.open_group(ZARR_PATH, "a")
+        zf = zarr.open_group(ZARR_PATH, mode="a")
         node_out_path = f"{ZARR_GROUP}/output"
         if node_out_path in zf:
             del zf[node_out_path]

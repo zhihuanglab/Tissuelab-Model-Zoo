@@ -1282,7 +1282,7 @@ def run_classification(args) -> Dict[str, Any]:
         zarr_path = ZARR_PATH
 
         # Open Zarr store once for all operations
-        zf = zarr.open_group(zarr_path, 'a')
+        zf = zarr.open_group(zarr_path, mode='a')
         # A) check annotation
         annotations_data = None
         use_supervised = False
@@ -1972,7 +1972,7 @@ def read_node(data: Dict[str, Any]):
             tissue_classes=["Negative control", "Tumor"]
         )
 
-    zf = zarr.open_group(ZARR_PATH, "r")
+    zf = zarr.open_group(ZARR_PATH, mode="r")
     user_data_path = f"{ZARR_GROUP}/userData"
     if user_data_path in zf:
         for k in zf[user_data_path].keys():

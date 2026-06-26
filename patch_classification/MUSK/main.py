@@ -78,7 +78,7 @@ def run_patch_classification_one(musk, wsi_path, output_dir, patch_size=224, lev
     # Step 1: Check if zarr exists and patch_size matches => skip (same as taskNode)
     if os.path.exists(zarr_path):
         try:
-            zf = zarr.open_group(zarr_path, "r")
+            zf = zarr.open_group(zarr_path, mode="r")
             if zarr_group in zf:
                 coordinates = zf[f"{zarr_group}/coordinates"][()]
                 embeddings = zf[f"{zarr_group}/embeddings"][()]
@@ -123,7 +123,7 @@ def run_patch_classification_one(musk, wsi_path, output_dir, patch_size=224, lev
 
     # Same canonical layout as musk_embedding_taskNode writes:
     #   <zarr_group>/embeddings, /coordinates, /metadata (group + attrs).
-    zf = zarr.open_group(zarr_path, "w")
+    zf = zarr.open_group(zarr_path, mode="w")
     if zarr_group in zf:
         del zf[zarr_group]
     node_grp = zf.create_group(zarr_group)
