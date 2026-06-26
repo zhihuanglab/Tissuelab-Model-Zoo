@@ -1603,9 +1603,9 @@ def run_classification(args) -> Dict[str, Any]:
         classes_grp = grp_cls.require_group('classes')
         classes_grp.create_array('index', data=np.arange(len(final_class_names), dtype=np.int32))
         class_names_ascii = [n.encode('utf-8') for n in final_class_names]
-        classes_grp.create_array('name', shape=(len(class_names_ascii),), dtype='S256', data=class_names_ascii)
+        classes_grp.create_array('name', data=np.array(class_names_ascii, dtype='S256'))
         colors_ascii = [c.encode('utf-8') for c in final_class_colors]
-        classes_grp.create_array('color', shape=(len(colors_ascii),), dtype='S256', data=colors_ascii)
+        classes_grp.create_array('color', data=np.array(colors_ascii, dtype='S256'))
 
         # Update all annotation colors to match new class colors
         # This ensures that when user changes a class color and clicks Update,
@@ -1635,7 +1635,7 @@ def run_classification(args) -> Dict[str, Any]:
                                 updated_count += 1
                     if updated_count > 0:
                         del zf['User-Annotations/patch']
-                        zf['User-Annotations'].create_array('patch', data=patch_arr, dtype=patch_arr.dtype)
+                        zf['User-Annotations'].create_array('patch', data=patch_arr)
                         print(f"Updated {updated_count} patch annotation colors to match new class colors")
         except Exception as e:
             # If update fails, log but don't fail the workflow.

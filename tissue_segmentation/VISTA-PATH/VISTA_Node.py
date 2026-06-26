@@ -186,7 +186,7 @@ def _put_str_dataset(grp, key: str, value: str):
         b = b" "
     if key in grp:
         del grp[key]
-    grp.create_array(key, data=np.frombuffer(b, dtype=f"S{len(b)}"), dtype=f"S{len(b)}")
+    grp.create_array(key, data=np.frombuffer(b, dtype=f"S{len(b)}"))
 
 def compute_grid(width: int, height: int, patch_size: int, stride: int):
     """
@@ -293,7 +293,6 @@ def tile_slide_incrementally(
         user_data_grp.create_array(
             "path",
             data=np.frombuffer(path_bytes, dtype=f"S{len(path_bytes)}"),
-            dtype=f"S{len(path_bytes)}"
         )
 
         # save tiling parameters
@@ -309,7 +308,6 @@ def tile_slide_incrementally(
         user_data_grp.create_array(
             "tiling_params",
             data=np.frombuffer(param_bytes, dtype=f"S{len(param_bytes)}"),
-            dtype=f"S{len(param_bytes)}"
         )
 
         # get downsample factor
@@ -1108,8 +1106,8 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             classes_grp = out_grp.create_group("classes")
             names_ascii = np.array([str(n).encode("utf-8") for n in class_names], dtype="S256")
             colors_ascii = np.array([c.encode("utf-8") for c in class_colors], dtype="S256")
-            classes_grp.create_array("name", data=names_ascii, dtype="S256")
-            classes_grp.create_array("color", data=colors_ascii, dtype="S256")
+            classes_grp.create_array("name", data=names_ascii)
+            classes_grp.create_array("color", data=colors_ascii)
 
             # userData provenance: model + run config so other TissueSeg models reuse the layout
             user_data_grp = out_grp.create_group("userData")
@@ -1142,6 +1140,7 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         import traceback
         traceback.print_exc()
         raise
+
 
 
 
@@ -1530,7 +1529,7 @@ def execute_node():
         # use create_dataset to create scalar array (string data)
         # convert bytes to numpy array
         out_array = np.frombuffer(out_bytes, dtype=f'S{len(out_bytes)}')
-        zf.create_array(node_out_path, data=out_array, dtype=f'S{len(out_bytes)}')
+        zf.create_array(node_out_path, data=out_array)
 
     progress_value = 0  # 归零，上一个人 execute 结束
     return {"status": "ok", "output": out}
