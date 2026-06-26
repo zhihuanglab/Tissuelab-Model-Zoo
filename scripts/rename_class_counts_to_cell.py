@@ -103,7 +103,8 @@ def migrate_store(store: Path, dry_run: bool) -> Tuple[str, str]:
     if dry_run:
         return ("migrated", f"would rename {OLD_NAME} -> {NEW_NAME} (dtype={dtype}, value={preview})")
 
-    ua.create_dataset(NEW_NAME, data=value, shape=shape, dtype=dtype, overwrite=True)
+    new_ds = ua.create_array(NEW_NAME, shape=shape, dtype=dtype, overwrite=True)
+    new_ds[...] = value
     del ua[OLD_NAME]
     return ("migrated", f"renamed {OLD_NAME} -> {NEW_NAME} (value={preview})")
 

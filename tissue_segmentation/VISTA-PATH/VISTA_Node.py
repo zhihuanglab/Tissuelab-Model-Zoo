@@ -186,7 +186,7 @@ def _put_str_dataset(grp, key: str, value: str):
         b = b" "
     if key in grp:
         del grp[key]
-    grp.create_dataset(key, shape=(), dtype=f"S{len(b)}", data=b)
+    grp.create_array(key, data=np.frombuffer(b, dtype=f"S{len(b)}"), dtype=f"S{len(b)}")
 
 def compute_grid(width: int, height: int, patch_size: int, stride: int):
     """
@@ -264,21 +264,21 @@ def tile_slide_incrementally(
         grp = root.create_group(zarr_group)
 
         # create datasets
-        images_ds = grp.create_dataset(
+        images_ds = grp.create_array(
             "images",
             shape=(N, patch_size, patch_size, 3),
             chunks=(chunk_size, patch_size, patch_size, 3),
             dtype="uint8",
         )
 
-        patch_id_ds = grp.create_dataset(
+        patch_id_ds = grp.create_array(
             "patch_id",
             shape=(N,),
             chunks=(chunk_size,),
             dtype="int64",
         )
 
-        coords_ds = grp.create_dataset(
+        coords_ds = grp.create_array(
             "coordinates",
             shape=(N, 4),
             chunks=(chunk_size, 4),
@@ -290,7 +290,7 @@ def tile_slide_incrementally(
 
         # save WSI path
         path_bytes = wsi_path.encode("utf-8")
-        user_data_grp.create_dataset(
+        user_data_grp.create_array(
             "path",
             data=np.frombuffer(path_bytes, dtype=f"S{len(path_bytes)}"),
             dtype=f"S{len(path_bytes)}"
@@ -306,7 +306,7 @@ def tile_slide_incrementally(
         }
         param_str = json.dumps(tiling_params)
         param_bytes = param_str.encode("utf-8")
-        user_data_grp.create_dataset(
+        user_data_grp.create_array(
             "tiling_params",
             data=np.frombuffer(param_bytes, dtype=f"S{len(param_bytes)}"),
             dtype=f"S{len(param_bytes)}"
@@ -420,21 +420,21 @@ def create_segnode_zarr(
     grp = root.create_group(zarr_group)
 
     # create datasets
-    images_ds = grp.create_dataset(
+    images_ds = grp.create_array(
         "images",
         shape=(N, patch_size, patch_size, 3),
         chunks=(chunk_size, patch_size, patch_size, 3),
         dtype="uint8",
     )
 
-    patch_id_ds = grp.create_dataset(
+    patch_id_ds = grp.create_array(
         "patch_id",
         shape=(N,),
         chunks=(chunk_size,),
         dtype="int64",
     )
 
-    coords_ds = grp.create_dataset(
+    coords_ds = grp.create_array(
         "coordinates",
         shape=(N, 4),
         chunks=(chunk_size, 4),
@@ -446,11 +446,9 @@ def create_segnode_zarr(
 
     # save WSI path
     path_bytes = wsi_path.encode("utf-8")
-    user_data_grp.create_dataset(
+    user_data_grp.create_array(
         "path",
-        shape=(),
-        dtype=f"S{len(path_bytes)}",
-        data=path_bytes,
+        data=np.array(path_bytes, dtype=f"S{len(path_bytes)}"),
     )
 
     # save tiling parameters
@@ -463,11 +461,9 @@ def create_segnode_zarr(
         "chunk_size": chunk_size,
     }
     tiling_bytes = json.dumps(tiling_params, ensure_ascii=False).encode("utf-8")
-    user_data_grp.create_dataset(
+    user_data_grp.create_array(
         "tiling_params",
-        shape=(),
-        dtype=f"S{len(tiling_bytes)}",
-        data=tiling_bytes,
+        data=np.array(tiling_bytes, dtype=f"S{len(tiling_bytes)}"),
     )
 
     # get downsample factor
@@ -596,16 +592,16 @@ def generate_dzi_tiles_to_zarr(full_mask, zarr_path, dzi_group_path, slide_name,
         # Create zarr dataset for this level
         # Store as (num_tiles, tile_size, tile_size, 4) RGBA
         level_grp = dzi_grp.create_group(f"L{dzi_level}")
-        tiles_ds = level_grp.create_dataset(
+        tiles_ds = level_grp.create_array(
             "tiles",
             shape=(num_tiles, tile_size, tile_size, 4),
             chunks=(1, tile_size, tile_size, 4),
             dtype='uint8',
-            compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.SHUFFLE)
+            compressors=[zarr.codecs.BloscCodec(cname='zstd', clevel=3)]
         )
         
         # Create tile index mapping: stores (tile_x, tile_y) for each tile
-        tile_coords_ds = level_grp.create_dataset(
+        tile_coords_ds = level_grp.create_array(
             "tile_coords",
             shape=(num_tiles, 2),
             chunks=(min(1000, num_tiles), 2),
@@ -623,11 +619,9 @@ def generate_dzi_tiles_to_zarr(full_mask, zarr_path, dzi_group_path, slide_name,
         }
         meta_str = json.dumps(level_meta, ensure_ascii=False)
         meta_bytes = meta_str.encode('utf-8')
-        level_grp.create_dataset(
+        level_grp.create_array(
             "meta",
-            shape=(),
-            dtype=f'S{len(meta_bytes)}',
-            data=meta_bytes
+            data=np.array(meta_bytes, dtype=f'S{len(meta_bytes)}')
         )
         
         # Generate and save tiles
@@ -692,11 +686,9 @@ def generate_dzi_tiles_to_zarr(full_mask, zarr_path, dzi_group_path, slide_name,
     }
     meta_str = json.dumps(meta, indent=2, ensure_ascii=False)
     meta_bytes = meta_str.encode('utf-8')
-    dzi_grp.create_dataset(
+    dzi_grp.create_array(
         "meta",
-        shape=(),
-        dtype=f'S{len(meta_bytes)}',
-        data=meta_bytes
+        data=np.array(meta_bytes, dtype=f'S{len(meta_bytes)}')
     )
     
     print(f"[INFO] DZI tiles metadata saved to zarr: {dzi_group_path}/meta")
@@ -1096,13 +1088,12 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                 sub = _sanitize_class_name(tissue_display)
                 tissue_grp = masks_grp.create_group(sub)
                 binary_mask = (full_mask > 0).astype(bool)
-                tissue_grp.create_dataset(
+                tissue_grp.create_array(
                     "mask",
                     data=binary_mask,
-                    shape=(level_height, level_width),
                     chunks=(min(1024, level_height), min(1024, level_width)),
                     dtype=bool,
-                    compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.BITSHUFFLE)
+                    compressors=[zarr.codecs.BloscCodec(cname='zstd', clevel=3)]
                 )
                 print(f"[{NODE_NAME}] Mask saved: masks/{sub}/mask {level_height}x{level_width} (bool)")
 
@@ -1117,8 +1108,8 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             classes_grp = out_grp.create_group("classes")
             names_ascii = np.array([str(n).encode("utf-8") for n in class_names], dtype="S256")
             colors_ascii = np.array([c.encode("utf-8") for c in class_colors], dtype="S256")
-            classes_grp.create_dataset("name", shape=(len(names_ascii),), dtype="S256", data=names_ascii)
-            classes_grp.create_dataset("color", shape=(len(colors_ascii),), dtype="S256", data=colors_ascii)
+            classes_grp.create_array("name", data=names_ascii, dtype="S256")
+            classes_grp.create_array("color", data=colors_ascii, dtype="S256")
 
             # userData provenance: model + run config so other TissueSeg models reuse the layout
             user_data_grp = out_grp.create_group("userData")
@@ -1151,6 +1142,7 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         import traceback
         traceback.print_exc()
         raise
+
 
 
 # ======================= API routes =======================
@@ -1538,7 +1530,7 @@ def execute_node():
         # use create_dataset to create scalar array (string data)
         # convert bytes to numpy array
         out_array = np.frombuffer(out_bytes, dtype=f'S{len(out_bytes)}')
-        zf.create_dataset(node_out_path, data=out_array, dtype=f'S{len(out_bytes)}')
+        zf.create_array(node_out_path, data=out_array, dtype=f'S{len(out_bytes)}')
 
     progress_value = 0  # 归零，上一个人 execute 结束
     return {"status": "ok", "output": out}

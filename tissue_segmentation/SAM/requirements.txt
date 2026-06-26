@@ -83,7 +83,7 @@ nest-asyncio==1.6.0
 networkx==3.4.2
 notebook==7.2.2
 notebook_shim==0.2.4
-numcodecs==0.15.1
+numcodecs
 numpy==2.2.3
 omegaconf==2.3.0
 opencv-python==4.11.0.86
@@ -155,7 +155,7 @@ websocket-client==1.8.0
 websockets==15.0
 wheel==0.45.1
 wrapt==1.17.2
-zarr==2.13.3
+zarr==3.1.5
 protobuf>=3.20.0,<4
 sse-starlette
 

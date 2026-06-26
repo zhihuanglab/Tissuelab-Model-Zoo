@@ -147,7 +147,7 @@ def print_zarr_structure(file_path):
     def _visit(group, prefix=""):
         for key, val in group.items():
             name = f"{prefix}/{key}" if prefix else key
-            if isinstance(val, zarr.hierarchy.Group):
+            if isinstance(val, zarr.Group):
                 print(f"{name} (Group)")
                 _visit(val, name)
             else:
@@ -310,8 +310,8 @@ def run_patch_classification(args):
             if ZARR_GROUP in zf:
                 del zf[ZARR_GROUP]
             node_grp = zf.create_group(ZARR_GROUP)
-            node_grp.create_dataset('embeddings', data=embeddings)
-            node_grp.create_dataset('coordinates', data=coordinates)
+            node_grp.create_array('embeddings', data=embeddings)
+            node_grp.create_array('coordinates', data=coordinates)
             # Run metadata as a sub-group with attrs (matches the
             # Cell-Segmentation/metadata pattern; replaces the historical
             # JSON-bytes 'output' + 'metadata' blobs).
@@ -739,7 +739,7 @@ def execute_node():
             del zf[node_out_path]
         out_str = json.dumps(out_val, ensure_ascii=False)
         out_bytes = out_str.encode("utf-8")
-        zf.create_dataset(node_out_path, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
+        zf.create_array(node_out_path, data=np.array(out_bytes, dtype=f'S{len(out_bytes)}'))
         time.sleep(1)
     
     return {"status": "ok", "output": out_val}

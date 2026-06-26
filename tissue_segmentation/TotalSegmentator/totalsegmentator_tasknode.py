@@ -785,11 +785,10 @@ def save_organ_to_zarr(organ_name: str, organ_data: np.ndarray, zarr_path: str, 
 
         # Create organ dataset in voxel_mask group
         print(f"[Zarr] Creating dataset with shape {organ_data.shape}")
-        organ_dataset = voxel_group.create_dataset(
+        organ_dataset = voxel_group.create_array(
             dataset_name,
             data=organ_data,
-            compressor=zarr.Zlib(level=3),  # Zarr uses compressor instead of compression
-            chunks=True
+            compressors=[zarr.codecs.GzipCodec(level=3)],
         )
         print(f"[Zarr] Dataset created successfully")
 

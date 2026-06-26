@@ -343,11 +343,12 @@ class NucleiEmbedding:
         ds_name = parts[-1]
         if ds_name in parent:
             del parent[ds_name]
-        embeddings_dset = parent.create_dataset(
+        embeddings_dset = parent.create_array(
             ds_name,
             shape=(0, 768),
             chunks=(min(1000, batch_size), 768),
-            dtype=np.float16
+            dtype=np.float16,
+            overwrite=True
         )
         
         total_start_time = time.time()

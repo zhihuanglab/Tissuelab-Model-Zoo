@@ -127,8 +127,8 @@ def run_patch_classification_one(musk, wsi_path, output_dir, patch_size=224, lev
     if zarr_group in zf:
         del zf[zarr_group]
     node_grp = zf.create_group(zarr_group)
-    node_grp.create_dataset("embeddings", data=embeddings)
-    node_grp.create_dataset("coordinates", data=coordinates)
+    node_grp.create_array("embeddings", data=embeddings)
+    node_grp.create_array("coordinates", data=coordinates)
     meta_grp = node_grp.require_group("metadata")
     meta_grp.attrs.update({"patch_size": int(patch_size), "level": int(level)})
 

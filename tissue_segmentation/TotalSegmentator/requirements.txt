@@ -2,7 +2,7 @@ fastapi>=0.104.1
 uvicorn[standard]>=0.24.0
 pydantic>=2.4.0
 sse-starlette>=1.6.5
-zarr>=2.17.0
+zarr==3.1.5
 numpy==1.26.4
 nibabel>=5.1.0
 dicom2nifti>=2.4.0

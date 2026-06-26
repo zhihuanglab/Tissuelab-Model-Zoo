@@ -3392,7 +3392,7 @@ class NucleiEmbedding:
                 dataset.z_layer = layer_idx
 
                 # Create temporary dataset for this layer
-                layer_dset = parent.create_dataset(
+                layer_dset = parent.create_array(
                     f'_temp_layer_{layer_idx}',
                     shape=(num_cells, 768),
                     chunks=(min(1000, batch_size), 768),
@@ -3483,7 +3483,7 @@ class NucleiEmbedding:
             fusion_start_time = time.time()
             
             # Create final dataset
-            final_dset = parent.create_dataset(
+            final_dset = parent.create_array(
                 ds_name,
                 shape=(num_cells, 768),
                 chunks=(min(1000, batch_size), 768),
@@ -3557,7 +3557,7 @@ class NucleiEmbedding:
             # Write sequentially (in new index order) first, then reorder at the end
             # This provides the performance benefit of sequential writes
         
-        embeddings_dset = parent.create_dataset(
+        embeddings_dset = parent.create_array(
             ds_name,
             shape=(len(dataset), 768) if need_reorder else (0, 768),
             chunks=(min(1000, batch_size), 768),

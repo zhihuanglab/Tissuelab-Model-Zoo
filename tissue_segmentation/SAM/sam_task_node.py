@@ -606,7 +606,7 @@ def execute_node(background_tasks: BackgroundTasks):
         if ds_name in parent:
             del parent[ds_name]
         out_str = json.dumps(result_value, ensure_ascii=False).encode("utf-8")
-        parent.create_dataset(ds_name, shape=(), dtype=f'S{len(out_str)}', data=out_str)
+        parent.create_array(ds_name, data=np.array(out_str, dtype=f'S{len(out_str)}'))
         print(f"[DEBUG] => wrote JSON to {out_path}: {out_str.decode('utf-8')}")
         # Optionally print Zarr structure
         print("[DEBUG] Zarr top-level keys:", list(zf.keys()))

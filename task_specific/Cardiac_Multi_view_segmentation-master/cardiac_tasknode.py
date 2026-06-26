@@ -436,10 +436,9 @@ def save_segmentation_to_zarr(segmentation_data: np.ndarray, original_image: sit
             
             # Create segmentation dataset
             print(f"[Zarr] Creating dataset with shape {segmentation_data.shape}")
-            seg_dataset = voxel_group.create_dataset(
+            seg_dataset = voxel_group.create_array(
                 dataset_name,
                 data=segmentation_data,
-                chunks=True
             )
             print(f"[Zarr] Dataset created successfully")
             
@@ -851,7 +850,7 @@ def read_node(data: Dict[str, Any]):
     # Check if Zarr store exists and read user data from it
     if ZARR_PATH and os.path.exists(ZARR_PATH):
         try:
-            zf = zarr.open_group(ZARR_PATH, "r")
+            zf = zarr.open_group(ZARR_PATH, mode="r")
             user_data_path = f"{NODE_NAME}/userData"
             if user_data_path in zf:
                 print(f"[Read] Found userData in Zarr store")

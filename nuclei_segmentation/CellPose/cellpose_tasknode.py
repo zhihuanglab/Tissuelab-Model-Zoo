@@ -125,7 +125,7 @@ def print_h5_structure(file_path):
     def _visit(group, prefix=""):
         for key, val in group.items():
             name = f"{prefix}/{key}" if prefix else key
-            if isinstance(val, zarr.hierarchy.Group):
+            if isinstance(val, zarr.Group):
                 print(f"{name} (Group)")
                 _visit(val, name)
             else:
@@ -229,11 +229,11 @@ def run_segmentation(args):
                 del zf[NODE_NAME]
             node_grp = zf.create_group(NODE_NAME)
 
-            node_grp.create_dataset('centroids', data=centroids)
+            node_grp.create_array('centroids', data=centroids)
             if contours is not None:
-                node_grp.create_dataset('contours', data=contours)
+                node_grp.create_array('contours', data=contours)
             if not ALREADY_HAVE_SEG and 'probabilities' in locals():
-                node_grp.create_dataset('probabilities', data=probability)
+                node_grp.create_array('probabilities', data=probability)
 
         # Ensure progress is set to 100 after Step C and D are completed
         progress_complete = True
@@ -366,7 +366,7 @@ def execute_node():
             del zf[node_out_path]
         out_str = json.dumps(out_val, ensure_ascii=False)
         out_bytes = out_str.encode("utf-8")
-        zf.create_dataset(node_out_path, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
+        zf.create_array(node_out_path, data=np.array(out_bytes, dtype=f'S{len(out_bytes)}'))
 
     return {"status": "ok", "output": out_val}
 

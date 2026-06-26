@@ -929,7 +929,7 @@ def execute_node(background_tasks: BackgroundTasks):
             del zf[out_path]
         out_str = json.dumps(result_value, ensure_ascii=False)
         out_bytes = out_str.encode("utf-8")
-        zf.create_dataset(out_path, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
+        zf.create_array(out_path, data=np.array(out_bytes, dtype=f'S{len(out_bytes)}'))
 
     return {"status":"ok","output":result_value}
 

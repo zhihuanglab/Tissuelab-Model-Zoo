@@ -333,15 +333,15 @@ def _save_results_to_zarr(predictions, disease_list, image_name):
     """Save predictions to Zarr store"""
     global ZARR_PATH, ZARR_GROUP
     try:
-        zf = zarr.open_group(ZARR_PATH, "a")
+        zf = zarr.open_group(ZARR_PATH, mode="a")
         if ZARR_GROUP in zf:
             del zf[ZARR_GROUP]
         group = zf.create_group(ZARR_GROUP)
-        group.create_dataset("predictions", data=predictions.astype(np.float32))
+        group.create_array("predictions", data=predictions.astype(np.float32))
         img_bytes = image_name.encode('utf-8')
-        group.create_dataset("image_name", shape=(), dtype=f'S{len(img_bytes)}', data=img_bytes)
+        group.create_array("image_name", data=np.array(img_bytes, dtype=f'S{len(img_bytes)}'))
         dl = np.array(disease_list, dtype='S')
-        group.create_dataset("disease_list", data=dl)
+        group.create_array("disease_list", data=dl)
         print(f"[{NODE_NAME}] Results saved to Zarr: {ZARR_GROUP}")
     except Exception as e:
         print(f"[{NODE_NAME}] Error saving results to Zarr: {e}")
@@ -409,7 +409,7 @@ def _load_parameters_from_zarr(zarr_path: str, zarr_group: str):
     """Load user parameters from Zarr"""
     global ARGS
     try:
-        zf = zarr.open_group(zarr_path, "r")
+        zf = zarr.open_group(zarr_path, mode="r")
         user_data_path = f"{zarr_group}/userData"
         if user_data_path not in zf:
             print(f"[{NODE_NAME}] No userData found in {zarr_group}")
@@ -495,13 +495,13 @@ def execute_node():
     
     # Store the result to 'output'
     if ZARR_PATH and os.path.exists(ZARR_PATH):
-        zf = zarr.open_group(ZARR_PATH, "a")
+        zf = zarr.open_group(ZARR_PATH, mode="a")
         node_out_path = f"{ZARR_GROUP}/output"
         if node_out_path in zf:
             del zf[node_out_path]
         out_str = json.dumps(out_val, ensure_ascii=False)
         out_bytes = out_str.encode("utf-8")
-        zf.create_dataset(node_out_path, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
+        zf.create_array(node_out_path, data=np.array(out_bytes, dtype=f'S{len(out_bytes)}'))
         time.sleep(1)
     
     return {"status": "ok", "output": out_val}
