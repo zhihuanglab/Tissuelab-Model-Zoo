@@ -1100,21 +1100,12 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                 )
                 print(f"[{NODE_NAME}] Mask saved: masks/{sub}/mask {level_height}x{level_width} (bool)")
 
-                # Derived overlay pyramid, bound to this tissue's mask
-                try:
-                    slide_name = (
-                        os.path.splitext(os.path.basename(SLIDE_PATH))[0]
-                        if SLIDE_PATH else sub
-                    )
-                    generate_dzi_tiles_to_zarr(
-                        binary_mask.astype(np.uint8),
-                        ZARR_PATH,
-                        f"{TISSUE_SEG_GROUP}/masks/{sub}/dzi",
-                        slide_name,
-                        level,
-                    )
-                except Exception as e:
-                    print(f"[{NODE_NAME}] WARN: DZI generation failed for '{sub}': {e}")
+                # NOTE: DZI overlay-pyramid generation intentionally skipped. The overlay
+                # renders from the full-resolution `mask` (get_segmentation_mask crops the
+                # viewport), so the pyramid was never read — and building it (thousands of
+                # 1024x1024 RGBA tiles per tissue on a whole-slide mask, single-threaded)
+                # was the slow step that made VISTA look stuck. generate_dzi_tiles_to_zarr
+                # is kept for a future async/lazy tile-rendering path.
 
             # classes/name + classes/color (same convention as cell/patch lineage)
             classes_grp = out_grp.create_group("classes")
