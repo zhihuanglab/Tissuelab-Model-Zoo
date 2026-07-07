@@ -31,6 +31,12 @@ import torch
 import uvicorn
 import zarr
 from fastapi import FastAPI
+
+# Silence zarr v3 "unstable data type" warnings (structured arrays + fixed-length
+# string/bytes dtypes used by our schema). No cross-library portability needed.
+import warnings
+from zarr.errors import UnstableSpecificationWarning
+warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 from tiffslide import TiffSlide

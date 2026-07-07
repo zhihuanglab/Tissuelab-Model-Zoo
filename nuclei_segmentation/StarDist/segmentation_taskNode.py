@@ -28,6 +28,12 @@ import torch
 import uvicorn
 import zarr
 from fastapi import FastAPI
+
+# Silence zarr v3 "unstable data type" warnings (structured arrays + fixed-length
+# string/bytes dtypes used by our schema). No cross-library portability needed.
+import warnings
+from zarr.errors import UnstableSpecificationWarning
+warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -390,13 +396,13 @@ def run_segmentation(args):
             print(f"[ZARR WRITE] Writing centroids. Shape: {centroids_data.shape}")
             if 'centroids' in node_grp:
                 del node_grp['centroids']
-            node_grp.create_dataset('centroids', data=centroids_data)
+            node_grp.create_array('centroids', data=centroids_data)
 
             if contours_data is not None:
                 print(f"[ZARR WRITE] Writing contours. Shape: {contours_data.shape}")
                 if 'contours' in node_grp:
                     del node_grp['contours']
-                node_grp.create_dataset('contours', data=contours_data)
+                node_grp.create_array('contours', data=contours_data)
             else:
                 print("[ZARR WRITE] Contours are None, not writing.")
 
@@ -404,7 +410,7 @@ def run_segmentation(args):
                 print(f"[ZARR WRITE] Writing probability. Shape: {probability_data.shape}")
                 if 'probabilities' in node_grp:
                     del node_grp['probabilities']
-                node_grp.create_dataset('probabilities', data=probability_data)
+                node_grp.create_array('probabilities', data=probability_data)
             else:
                 print("[ZARR WRITE] Probability is None, not writing.")
 

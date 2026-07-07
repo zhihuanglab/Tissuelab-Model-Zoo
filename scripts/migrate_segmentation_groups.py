@@ -79,12 +79,26 @@ def _rename_group_fs(zarr_path: Path) -> bool:
     return True
 
 
+def _zarr_copy(src, dst_parent, name):
+    """zarr v3 replacement for the removed ``zarr.copy``: deep-copy an array or
+    group ``src`` into ``dst_parent`` under ``name``, preserving dtype/attrs."""
+    if isinstance(src, zarr.Group):
+        dst = dst_parent.require_group(name)
+        dst.attrs.update(dict(src.attrs))
+        for key in src.keys():
+            _zarr_copy(src[key], dst, key)
+        return dst
+    dst = dst_parent.create_array(name, data=src[...], chunks=src.chunks, overwrite=True)
+    dst.attrs.update(dict(src.attrs))
+    return dst
+
+
 def _rename_datasets(seg_grp) -> List[str]:
     """In-place rename embedding→embeddings, probability→probabilities."""
     renamed = []
     for old_key, new_key in DATASET_RENAMES.items():
         if old_key in seg_grp and new_key not in seg_grp:
-            zarr.copy(seg_grp[old_key], seg_grp, name=new_key)
+            _zarr_copy(seg_grp[old_key], seg_grp, new_key)
             del seg_grp[old_key]
             renamed.append(f"{old_key} → {new_key}")
     return renamed

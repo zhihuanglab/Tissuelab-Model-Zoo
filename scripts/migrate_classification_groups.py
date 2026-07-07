@@ -83,12 +83,26 @@ def _rename_group_fs(zarr_path: Path) -> bool:
     return True
 
 
+def _zarr_copy(src, dst_parent, name):
+    """zarr v3 replacement for the removed ``zarr.copy``: deep-copy an array or
+    group ``src`` into ``dst_parent`` under ``name``, preserving dtype/attrs."""
+    if isinstance(src, zarr.Group):
+        dst = dst_parent.require_group(name)
+        dst.attrs.update(dict(src.attrs))
+        for key in src.keys():
+            _zarr_copy(src[key], dst, key)
+        return dst
+    dst = dst_parent.create_array(name, data=src[...], chunks=src.chunks, overwrite=True)
+    dst.attrs.update(dict(src.attrs))
+    return dst
+
+
 def _rename_flat_datasets(grp) -> List[str]:
     """In-place rename for flat per-cell datasets."""
     renamed: List[str] = []
     for old_key, new_key in FLAT_DATASET_RENAMES.items():
         if old_key in grp and new_key not in grp:
-            zarr.copy(grp[old_key], grp, name=new_key)
+            _zarr_copy(grp[old_key], grp, new_key)
             del grp[old_key]
             renamed.append(f"{old_key} → {new_key}")
     return renamed
@@ -113,7 +127,7 @@ def _move_class_datasets_to_subgroup(grp) -> List[str]:
             continue
         if new_key in classes_grp:
             del classes_grp[new_key]
-        zarr.copy(grp[old_key], classes_grp, name=new_key)
+        _zarr_copy(grp[old_key], classes_grp, new_key)
         del grp[old_key]
         moved.append(f"{old_key} → {CLASSES_SUBGROUP}/{new_key}")
 
@@ -128,7 +142,7 @@ def _move_class_datasets_to_subgroup(grp) -> List[str]:
             except Exception:
                 pass
     if m is not None and "index" not in classes_grp:
-        classes_grp.create_dataset("index", data=np.arange(m, dtype=np.int32))
+        classes_grp.create_array("index", data=np.arange(m, dtype=np.int32))
         moved.append(f"classes/index materialised [0..{m - 1}]")
 
     return moved
@@ -140,7 +154,7 @@ def _promote_output_to_metadata(grp) -> bool:
         return False
     node = grp[OUTPUT_DATASET]
     # If it's already a group, nothing to do.
-    if isinstance(node, zarr.hierarchy.Group):
+    if isinstance(node, zarr.Group):
         return False
     raw = bytes(node[()])
     payload = {}
@@ -195,7 +209,7 @@ def migrate_one(zarr_path: Path, dry_run: bool) -> Tuple[Path, str, List[str]]:
             for old_key, new_key in CLASS_DATASET_MOVES.items():
                 if old_key in grp:
                     actions.append(f"would move {old_key} → {CLASSES_SUBGROUP}/{new_key}")
-            if OUTPUT_DATASET in grp and not isinstance(grp[OUTPUT_DATASET], zarr.hierarchy.Group):
+            if OUTPUT_DATASET in grp and not isinstance(grp[OUTPUT_DATASET], zarr.Group):
                 actions.append(f"would promote {OUTPUT_DATASET} (bytes) → metadata group + attrs")
             return zarr_path, "migrated" if actions else "skipped", actions
 
@@ -210,7 +224,7 @@ def migrate_one(zarr_path: Path, dry_run: bool) -> Tuple[Path, str, List[str]]:
             actions.append(f"promoted {OUTPUT_DATASET} → metadata group + attrs")
         # Drop the older sibling "output" JSON-bytes blob if present — newer
         # NuClass writes everything into metadata attrs, so it is dead data.
-        if LEGACY_OUTPUT_DATASET in grp and not isinstance(grp[LEGACY_OUTPUT_DATASET], zarr.hierarchy.Group):
+        if LEGACY_OUTPUT_DATASET in grp and not isinstance(grp[LEGACY_OUTPUT_DATASET], zarr.Group):
             del grp[LEGACY_OUTPUT_DATASET]
             actions.append(f"dropped legacy {LEGACY_OUTPUT_DATASET} bytes blob")
 

@@ -59,6 +59,12 @@ import uvicorn
 import xgboost as xgb
 import zarr
 from fastapi import FastAPI
+
+# Silence zarr v3 "unstable data type" warnings (structured arrays + fixed-length
+# string/bytes dtypes used by our schema). No cross-library portability needed.
+import warnings
+from zarr.errors import UnstableSpecificationWarning
+warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -280,7 +286,7 @@ def _persist_nuclei_rename_to_user_annotation(zf, effective_renames, nuclei_clas
                 del ua["cell_class_counts"]
             except KeyError:
                 pass
-            ua.create_dataset("cell_class_counts", data=out_bytes)
+            ua.create_array("cell_class_counts", data=np.array(out_bytes, dtype=f"S{len(out_bytes)}"))
             print(f"[Cell-Classification] Remapped User-Annotations/cell/__attrs_class_counts__ after rename: {new_counts}")
 
     # 2) Sync attrs class_names / class_colors with workflow (preferred) or apply rename chain
@@ -539,9 +545,9 @@ def _annotation_labels_to_classifier_indices(annotations, class_names, nuclei_cl
 def print_h5_structure(file_path):
     """Print Zarr group structure"""
     def _visit(group, prefix=""):
-        for key, val in group.items():
+        for key, val in group.members():
             name = f"{prefix}/{key}" if prefix else key
-            if isinstance(val, zarr.hierarchy.Group):
+            if isinstance(val, zarr.Group):
                 print(f"{name} (Group)")
                 _visit(val, name)
             else:
@@ -1898,15 +1904,15 @@ def run_classification(args) -> Dict[str, Any]:
             del zf[ZARR_GROUP]
         grp_cls = zf.require_group(ZARR_GROUP)
 
-        grp_cls.create_dataset('class_indices', data=predictions.astype(np.int32))
+        grp_cls.create_array('class_indices', data=predictions.astype(np.int32))
 
         # Per-class taxonomy: classes/{index, name, color} parallel arrays.
         classes_grp = grp_cls.require_group('classes')
-        classes_grp.create_dataset('index', data=np.arange(len(final_class_names), dtype=np.int32))
+        classes_grp.create_array('index', data=np.arange(len(final_class_names), dtype=np.int32))
         class_names_ascii = np.array([n.encode('utf-8') for n in final_class_names], dtype='S256')
-        classes_grp.create_dataset('name', data=class_names_ascii)
+        classes_grp.create_array('name', data=class_names_ascii)
         colors_ascii = np.array([c.encode('utf-8') for c in final_class_colors], dtype='S256')
-        classes_grp.create_dataset('color', data=colors_ascii)
+        classes_grp.create_array('color', data=colors_ascii)
 
         # Update all annotation colors to match new class colors
         # This ensures that when user changes a class color and clicks Update,
@@ -1949,9 +1955,7 @@ def run_classification(args) -> Dict[str, Any]:
                         # Write updated annotations back
                         # Note: We need to delete and recreate the dataset to update it
                         del zf['User-Annotations/cell']
-                        zf['User-Annotations'].create_dataset('cell', data=all_annotations, 
-                                                             dtype=annotations_dataset.dtype, 
-                                                             shape=annotations_dataset.shape)
+                        zf['User-Annotations'].create_array('cell', data=all_annotations)
                         print(f"Updated {updated_count} annotation colors to match new class colors")
         except Exception as e:
             # If update fails, log but don't fail the workflow
@@ -1973,7 +1977,7 @@ def run_classification(args) -> Dict[str, Any]:
 
         # Save probability scores for active learning
         if prediction_probs is not None:
-            grp_cls.create_dataset('probabilities', data=prediction_probs.astype(np.float32))
+            grp_cls.create_array('probabilities', data=prediction_probs.astype(np.float32))
             print(f"Saved classification probabilities for active learning, shape: {prediction_probs.shape}")
         elif classification_method == "zero-shot" and 'sims_arr' in locals() and sims_arr is not None:
             # For zero-shot: save similarity scores as pseudo-probabilities
@@ -1981,7 +1985,7 @@ def run_classification(args) -> Dict[str, Any]:
             print(f"Converting similarity scores to probabilities, shape: {sims_arr.shape}")
             exp_sims = np.exp(sims_arr - np.max(sims_arr, axis=1, keepdims=True))
             pseudo_probs = exp_sims / np.sum(exp_sims, axis=1, keepdims=True)
-            grp_cls.create_dataset('probabilities', data=pseudo_probs.astype(np.float32))
+            grp_cls.create_array('probabilities', data=pseudo_probs.astype(np.float32))
             print(f"Saved zero-shot similarity scores as probabilities for active learning, shape: {pseudo_probs.shape}")
         else:
             print("Warning: No probability data available to save for active learning")
@@ -2206,13 +2210,13 @@ def read_node(data: Dict[str, Any]):
 
 def _user_data_write_json(zarr_path: str, node_name: str, key: str, payload: Any) -> None:
     """Persist one key under {node_name}/userData (JSON bytes), matching tasks_service /read layout."""
-    with zarr.open_group(zarr_path, mode="a") as zf:
-        grp_path = f"{node_name}/userData"
-        grp = zf.require_group(grp_path)
-        if key in grp:
-            del grp[key]
-        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        grp.create_dataset(key, shape=(), dtype=f"S{len(raw)}", data=raw)
+    zf = zarr.open_group(zarr_path, mode="a")
+    grp_path = f"{node_name}/userData"
+    grp = zf.require_group(grp_path)
+    if key in grp:
+        del grp[key]
+    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    grp.create_array(key, data=np.array(raw, dtype=f"S{len(raw)}"))
 
 
 @app.post("/classifier/load")

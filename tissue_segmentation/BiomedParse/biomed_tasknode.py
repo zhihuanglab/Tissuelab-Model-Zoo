@@ -521,7 +521,7 @@ def read_node(data: Dict[str, Any]):
     user_data_dict = {}
 
     # 3) Open the Zarr store and read userData / dependency outputs
-    zf = zarr.open_group(ZARR_PATH, "r")
+    zf = zarr.open_group(ZARR_PATH, mode="r")
     # 3.1) Read this node's userData
     self_ud = f"{NODE_NAME}/userData"
     if self_ud in zf:
@@ -923,13 +923,13 @@ def execute_node(background_tasks: BackgroundTasks):
 
     # write result to /<NODE_NAME>/output in Zarr
     if ZARR_PATH and os.path.exists(ZARR_PATH):
-        zf = zarr.open_group(ZARR_PATH, "a")
+        zf = zarr.open_group(ZARR_PATH, mode="a")
         out_path = f"{NODE_NAME}/output"
         if out_path in zf:
             del zf[out_path]
         out_str = json.dumps(result_value, ensure_ascii=False)
         out_bytes = out_str.encode("utf-8")
-        zf.create_dataset(out_path, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)
+        zf.create_array(out_path, data=np.array(out_bytes, dtype=f'S{len(out_bytes)}'))
 
     return {"status":"ok","output":result_value}
 

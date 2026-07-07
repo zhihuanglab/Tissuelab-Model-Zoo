@@ -114,7 +114,7 @@ def create_segnode_zarr(
 
     # Create datasets
     # images: (N, patch_size, patch_size, 3) uint8
-    images_ds = grp.create_dataset(
+    images_ds = grp.create_array(
         "images",
         shape=(N, patch_size, patch_size, 3),
         chunks=(chunk_size, patch_size, patch_size, 3),
@@ -122,7 +122,7 @@ def create_segnode_zarr(
     )
 
     # patch_id: simply 0..N-1
-    patch_id_ds = grp.create_dataset(
+    patch_id_ds = grp.create_array(
         "patch_id",
         shape=(N,),
         chunks=(chunk_size,),
@@ -130,7 +130,7 @@ def create_segnode_zarr(
     )
 
     # coordinates: (N,4) -> [x0,y0,x1,y1] in level coordinates
-    coords_ds = grp.create_dataset(
+    coords_ds = grp.create_array(
         "coordinates",
         shape=(N, 4),
         chunks=(chunk_size, 4),
@@ -142,11 +142,9 @@ def create_segnode_zarr(
 
     # Save original wsi path
     path_bytes = wsi_path.encode("utf-8")
-    user_data_grp.create_dataset(
+    user_data_grp.create_array(
         "path",
-        shape=(),
-        dtype=f"S{len(path_bytes)}",
-        data=path_bytes,
+        data=np.array(path_bytes, dtype=f"S{len(path_bytes)}"),
     )
 
     # Save tiling parameters as JSON
@@ -159,11 +157,9 @@ def create_segnode_zarr(
         "chunk_size": chunk_size,
     }
     tiling_bytes = json.dumps(tiling_params, ensure_ascii=False).encode("utf-8")
-    user_data_grp.create_dataset(
+    user_data_grp.create_array(
         "tiling_params",
-        shape=(),
-        dtype=f"S{len(tiling_bytes)}",
-        data=tiling_bytes,
+        data=np.array(tiling_bytes, dtype=f"S{len(tiling_bytes)}"),
     )
 
     # We also save a default SegNode config placeholder, for example:
@@ -181,11 +177,9 @@ def create_segnode_zarr(
         # "tissue_colors": ["#000000", "#FF0000"],
     }
     cfg_bytes = json.dumps(default_config, ensure_ascii=False).encode("utf-8")
-    user_data_grp.create_dataset(
+    user_data_grp.create_array(
         "SegNode_config",
-        shape=(),
-        dtype=f"S{len(cfg_bytes)}",
-        data=cfg_bytes,
+        data=np.array(cfg_bytes, dtype=f"S{len(cfg_bytes)}"),
     )
 
     # Precompute downsample factor from base level to chosen level

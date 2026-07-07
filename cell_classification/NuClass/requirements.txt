@@ -6,7 +6,7 @@ opencv-python==4.6.0.66
 scipy==1.11.0
 tiffslide==1.5.0
 multiprocess==0.70.17
-zarr==2.17.2
+zarr==3.1.5
 # Match the cloud stardist env. Keep xgboost in the 2.0–3.0 range: these load
 # the legacy `binf` classifiers AND rebuild XGBClassifier.n_classes_ from the
 # booster on load. 1.7.x loads binf but does NOT rebuild n_classes_ (breaks

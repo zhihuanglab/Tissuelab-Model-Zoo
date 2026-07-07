@@ -329,7 +329,7 @@ def migrate_one(zarr_path: Path, dry_run: bool) -> Tuple[Path, str, List[str]]:
                         n_cells = (max(ids) + 1) if ids else 0
                     new_arr, syn_names, syn_colors = _cell_dict_to_array(
                         ann_dict, n_cells, cell_class_names, cell_class_colors)
-                    ua.create_dataset(NEW_CELL_DS, data=new_arr, dtype=new_arr.dtype)
+                    ua.create_array(NEW_CELL_DS, data=new_arr, overwrite=True)
                     del ua[OLD_CELL_DS]
                     # Feed synthesised taxonomy into the attrs-writing step below.
                     if not cell_class_names and syn_names:
@@ -344,7 +344,7 @@ def migrate_one(zarr_path: Path, dry_run: bool) -> Tuple[Path, str, List[str]]:
                         new_arr = _rename_fields_in_array(old_arr, CELL_FIELD_RENAMES)
                     else:
                         new_arr = old_arr
-                    ua.create_dataset(NEW_CELL_DS, data=new_arr, dtype=new_arr.dtype)
+                    ua.create_array(NEW_CELL_DS, data=new_arr, overwrite=True)
                     del ua[OLD_CELL_DS]
                     actions.append(f"renamed {OLD_CELL_DS} → {NEW_CELL_DS}")
 
@@ -409,7 +409,7 @@ def migrate_one(zarr_path: Path, dry_run: bool) -> Tuple[Path, str, List[str]]:
                     n_patches = (max(keys_as_int) + 1) if keys_as_int else 0
                 # 3) Materialise dense array.
                 patch_arr = _patch_dict_to_array(ann_dict, n_patches, list(patch_class_names))
-                ua.create_dataset(NEW_PATCH_DS, data=patch_arr, dtype=patch_arr.dtype)
+                ua.create_array(NEW_PATCH_DS, data=patch_arr, overwrite=True)
                 del ua[OLD_PATCH_DS]
                 actions.append(f"{OLD_PATCH_DS} JSON({len(ann_dict)}) → {NEW_PATCH_DS} dense({n_patches})")
 

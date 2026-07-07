@@ -90,7 +90,21 @@ def find_zarr_stores(root: Path) -> List[Path]:
 
 def _is_array(node) -> bool:
     """True iff node is a zarr Array (not a Group)."""
-    return not isinstance(node, zarr.hierarchy.Group)
+    return not isinstance(node, zarr.Group)
+
+
+def _zarr_copy(src, dst_parent, name):
+    """zarr v3 replacement for the removed ``zarr.copy``: deep-copy an array or
+    group ``src`` into ``dst_parent`` under ``name``, preserving dtype/attrs."""
+    if isinstance(src, zarr.Group):
+        dst = dst_parent.require_group(name)
+        dst.attrs.update(dict(src.attrs))
+        for key in src.keys():
+            _zarr_copy(src[key], dst, key)
+        return dst
+    dst = dst_parent.create_array(name, data=src[...], chunks=src.chunks, overwrite=True)
+    dst.attrs.update(dict(src.attrs))
+    return dst
 
 
 def _read_bytes_blob(node) -> bytes:
@@ -131,7 +145,7 @@ def _split_old_node(zf, dry_run: bool) -> List[str]:
                 if old_key in old:
                     if new_key in seg:
                         del seg[new_key]
-                    zarr.copy(old[old_key], seg, name=new_key)
+                    _zarr_copy(old[old_key], seg, new_key)
                     actions.append(f"{OLD_GROUP}/{old_key} → {PATCH_SEG}/{new_key}")
             # Promote legacy metadata bytes blob if it carries patch-embedding params.
             if LEGACY_METADATA_DATASET in old and _is_array(old[LEGACY_METADATA_DATASET]):
@@ -156,7 +170,7 @@ def _split_old_node(zf, dry_run: bool) -> List[str]:
             if USER_DATA_DATASET in old:
                 if USER_DATA_DATASET in seg:
                     del seg[USER_DATA_DATASET]
-                zarr.copy(old[USER_DATA_DATASET], seg, name=USER_DATA_DATASET)
+                _zarr_copy(old[USER_DATA_DATASET], seg, USER_DATA_DATASET)
                 actions.append(f"{OLD_GROUP}/{USER_DATA_DATASET} → {PATCH_SEG}/{USER_DATA_DATASET}")
 
     elif dry_run and (LEGACY_METADATA_DATASET in old and _is_array(old[LEGACY_METADATA_DATASET])):
@@ -172,7 +186,7 @@ def _split_old_node(zf, dry_run: bool) -> List[str]:
                 if old_key in old:
                     if new_key in cls:
                         del cls[new_key]
-                    zarr.copy(old[old_key], cls, name=new_key)
+                    _zarr_copy(old[old_key], cls, new_key)
                     actions.append(f"{OLD_GROUP}/{old_key} → {PATCH_CLS}/{new_key}")
 
             # Per-class taxonomy into classes/ subgroup.
@@ -183,7 +197,7 @@ def _split_old_node(zf, dry_run: bool) -> List[str]:
                     if old_key in old:
                         if new_key in classes_grp:
                             del classes_grp[new_key]
-                        zarr.copy(old[old_key], classes_grp, name=new_key)
+                        _zarr_copy(old[old_key], classes_grp, new_key)
                         actions.append(
                             f"{OLD_GROUP}/{old_key} → {PATCH_CLS}/{CLS_CLASSES_SUBGROUP}/{new_key}"
                         )
@@ -197,7 +211,7 @@ def _split_old_node(zf, dry_run: bool) -> List[str]:
                         except Exception:
                             pass
                 if m is not None and "index" not in classes_grp:
-                    classes_grp.create_dataset("index", data=np.arange(m, dtype=np.int32))
+                    classes_grp.create_array("index", data=np.arange(m, dtype=np.int32))
                     actions.append(f"{PATCH_CLS}/{CLS_CLASSES_SUBGROUP}/index materialised [0..{m - 1}]")
 
             # Promote classification metadata bytes blob if not already used by embedding side.

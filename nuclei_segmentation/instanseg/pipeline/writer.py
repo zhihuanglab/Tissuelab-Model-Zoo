@@ -34,11 +34,10 @@ class _StreamingSegmentationWriter:
             if self.verbose:
                 print(f"[WRITER] Reusing existing centroids dataset: {self.count} nuclei")
         else:
-            self.centroids_ds = self._group.create_dataset(
+            self.centroids_ds = self._group.create_array(
                 "centroids",
                 shape=(0, 2),
                 chunks=(8192, 2),
-                maxshape=(None, 2),
                 dtype="i4",
             )
             self.count = 0
@@ -56,12 +55,10 @@ class _StreamingSegmentationWriter:
         ds = getattr(self, attr_name)
         if ds is None:
             chunks = (min(8192, max(1, data.shape[0])),) + data.shape[1:]
-            maxshape = (None,) + data.shape[1:]
-            ds = self._group.create_dataset(
+            ds = self._group.create_array(
                 name,
                 shape=(0,) + data.shape[1:],
                 chunks=chunks,
-                maxshape=maxshape,
                 dtype=data.dtype,
             )
             setattr(self, attr_name, ds)
@@ -93,5 +90,5 @@ class _StreamingSegmentationWriter:
     def write_probabilities(self, probabilities: np.ndarray):
         if "probabilities" in self._group:
             del self._group["probabilities"]
-        self._group.create_dataset("probabilities", data=probabilities.astype(np.float32))
+        self._group.create_array("probabilities", data=probabilities.astype(np.float32))
 
