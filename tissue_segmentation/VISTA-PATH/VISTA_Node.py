@@ -970,7 +970,13 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                 coord_source = "Patch-Segmentation"
             total_patches = len(mask_node_coords)
             print(f"[{NODE_NAME}] Tissue {current_tissue!r}: {total_patches} patches from {coord_source}")
-            
+
+            # VISTA v2 is text-conditioned: the prompt must name the tissue being
+            # segmented, or the model produces the wrong class. Update it per tissue.
+            prompt_tissue = current_tissue if current_tissue else "tumor"
+            PASEG_MODEL.set_prompt(f"an image of {prompt_tissue}")
+            print(f"[{NODE_NAME}] Text prompt: {PASEG_MODEL.default_text!r}")
+
             progress_value = 10
             full_mask = np.zeros((level_height, level_width), dtype=np.uint8)
             batch_imgs = []
