@@ -1429,6 +1429,12 @@ def read_node(data: Dict[str, Any]):
     # which also avoids mis-reading our own Tissue-Segmentation/userData output group.
     ACTUAL_ZARR_GROUP = ZARR_GROUP
     _control_keys = {"node_name", "dependencies", "zarr_path", "zarr_group", "dependencies_zarr_groups"}
+    # Params VISTA deliberately ignores: the patch grid + level come from the patch
+    # station (Patch-Segmentation/coordinates) and the model tile / batch size are
+    # fixed module constants (see run_segmentation_sequential). We still setattr them
+    # for provenance, but flag them as ignored in the log so a stray patch_size=224
+    # doesn't read as "VISTA tiled at 224".
+    _ignored_keys = {"patch_size", "stride", "level", "tissue_threshold", "batch_size", "num_workers"}
     for k, val in data.items():
         if k in _control_keys:
             continue
@@ -1444,7 +1450,8 @@ def read_node(data: Dict[str, Any]):
             if isinstance(val, list) and len(val) > 0:
                 TISSUE_COLORS = [str(x) for x in val]
                 print(f"[{NODE_NAME}] tissue_colors: {TISSUE_COLORS}")
-        print(f"[{NODE_NAME}] user param {k} => {val}")
+        suffix = " (ignored: grid from patch station, tile/batch fixed)" if k in _ignored_keys else ""
+        print(f"[{NODE_NAME}] user param {k} => {val}{suffix}")
         setattr(ARGS, k, val)
 
     # default image_array_path / default_text
