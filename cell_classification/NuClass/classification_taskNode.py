@@ -71,6 +71,40 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from sklearn.linear_model import LogisticRegression
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
+from contextlib import nullcontext
+
+try:
+    from filelock import FileLock as _FileLock
+except Exception:  # pragma: no cover
+    _FileLock = None  # type: ignore
+
+
+def _zarr_store_lock(path: str, timeout: float = 120.0):
+    """Cross-process write lock aligned with TissueLab's local hashed lock files.
+
+    Prevents viewer reload from observing a half-written Cell-Classification group
+    while this node deletes/recreates it.
+    """
+    if _FileLock is None:
+        return nullcontext()
+    import hashlib
+    import tempfile
+
+    abs_path = os.path.normcase(os.path.abspath(os.path.normpath(path)))
+    digest = hashlib.sha256(abs_path.encode("utf-8")).hexdigest()
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+        lock_dir = os.path.join(base, "TissueLab", "locks")
+    else:
+        xdg = os.environ.get("XDG_CACHE_HOME")
+        lock_dir = (
+            os.path.join(xdg, "tissuelab", "locks")
+            if xdg
+            else os.path.join(os.path.expanduser("~"), ".cache", "tissuelab", "locks")
+        )
+    os.makedirs(lock_dir, exist_ok=True)
+    return _FileLock(os.path.join(lock_dir, f"{digest}.lock"), timeout=timeout)
+
 
 app = FastAPI()
 
@@ -129,6 +163,7 @@ CLASS_OPERATIONS = {}
 # new global variable for progress
 progress_value = 0  # Global variable to store progress
 progress_cancelled = False  # Flag to indicate cancellation
+execution_active = False  # True while /execute is processing
 
 # global variable for cancellation flag - use threading.Event for thread safety
 import threading
@@ -207,6 +242,28 @@ def _decode_attr_str_list(val):
         else:
             out.append(str(x))
     return out
+
+
+def _read_user_cell_palette(ua):
+    """Read User-Annotations cell palette (TissueLab prefixed keys only)."""
+    if ua is None or not hasattr(ua, "attrs"):
+        return [], []
+    attrs = ua.attrs
+    if "cell_class_names" not in attrs:
+        return [], []
+    names = _decode_attr_str_list(attrs.get("cell_class_names"))
+    colors = _decode_attr_str_list(attrs.get("cell_class_colors"))
+    return names, colors
+
+
+def _write_user_cell_palette(ua, class_names, class_colors=None):
+    """Write User-Annotations cell palette (TissueLab prefixed keys only)."""
+    if ua is None or not hasattr(ua, "attrs"):
+        return
+    names = [str(n) for n in (class_names or [])]
+    ua.attrs["cell_class_names"] = names
+    if class_colors is not None and len(class_colors) == len(names):
+        ua.attrs["cell_class_colors"] = [str(c) for c in class_colors]
 
 
 def _resolve_rename_terminal(name: str, rename_graph: dict) -> str:
@@ -289,24 +346,20 @@ def _persist_nuclei_rename_to_user_annotation(zf, effective_renames, nuclei_clas
             ua.create_array("cell_class_counts", data=np.array(out_bytes, dtype=f"S{len(out_bytes)}"))
             print(f"[Cell-Classification] Remapped User-Annotations/cell/__attrs_class_counts__ after rename: {new_counts}")
 
-    # 2) Sync attrs class_names / class_colors with workflow (preferred) or apply rename chain
+    # 2) Sync attrs cell_class_names / cell_class_colors with workflow (preferred) or apply rename chain
     if hasattr(ua, "attrs"):
         nc = [str(x) for x in (nuclei_classes or [])]
-        old_names = _decode_attr_str_list(ua.attrs.get("class_names", []))
+        old_names, _old_colors = _read_user_cell_palette(ua)
         if nc and old_names and len(old_names) == len(nc):
-            ua.attrs["class_names"] = nc
-            if nuclei_colors and len(nuclei_colors) == len(nc):
-                ua.attrs["class_colors"] = [str(c) for c in nuclei_colors]
-            print(f"[Cell-Classification] user_annotation.attrs class_names synced to workflow list ({len(nc)} classes)")
+            _write_user_cell_palette(ua, nc, nuclei_colors if nuclei_colors and len(nuclei_colors) == len(nc) else None)
+            print(f"[Cell-Classification] user_annotation.attrs cell_class_names synced to workflow list ({len(nc)} classes)")
         elif nc and not old_names:
-            ua.attrs["class_names"] = nc
-            if nuclei_colors and len(nuclei_colors) == len(nc):
-                ua.attrs["class_colors"] = [str(c) for c in nuclei_colors]
-            print(f"[Cell-Classification] user_annotation.attrs class_names initialized from workflow")
+            _write_user_cell_palette(ua, nc, nuclei_colors if nuclei_colors and len(nuclei_colors) == len(nc) else None)
+            print(f"[Cell-Classification] user_annotation.attrs cell_class_names initialized from workflow")
         elif old_names:
             mapped = [_resolve_rename_terminal(nm, rename_graph) for nm in old_names]
-            ua.attrs["class_names"] = mapped
-            print(f"[Cell-Classification] user_annotation.attrs class_names remapped by rename ops: {mapped}")
+            _write_user_cell_palette(ua, mapped)
+            print(f"[Cell-Classification] user_annotation.attrs cell_class_names remapped by rename ops: {mapped}")
 
 
 def _int_color_to_hex(color_int: int) -> str:
@@ -350,12 +403,10 @@ def load_structured_nuclei_annotations(zf, annotation_path: str) -> pd.DataFrame
         # Get class_names from metadata (optional: needed only for positive ID->name and for negative name output)
         class_names = None
         if 'User-Annotations' in zf:
-            user_anno_group = zf['User-Annotations']
-            if hasattr(user_anno_group, 'attrs') and 'class_names' in user_anno_group.attrs:
-                class_names = user_anno_group.attrs.get('class_names', [])
-        
+            class_names, _ = _read_user_cell_palette(zf['User-Annotations'])
+
         if not class_names:
-            print(f"[load_structured_nuclei_annotations] Warning: No class_names in metadata; will load negative annotations by computed exclude index only")
+            print(f"[load_structured_nuclei_annotations] Warning: No cell_class_names in metadata; will load negative annotations by computed exclude index only")
         
         # Read structured array (zarr supports direct path access)
         annotations_array = zf[annotation_path][()]
@@ -1862,9 +1913,9 @@ def run_classification(args) -> Dict[str, Any]:
             if device.startswith('cuda'):
                 torch.cuda.empty_cache()
             
-            # Update progress after similarity computation (once for zero-shot)
-            progress_value = 100
-            print("Progress: 100% (Similarities computed for zero-shot)")
+            # Update progress after similarity computation (write still pending)
+            progress_value = 90
+            print("Progress: 90% (Similarities computed for zero-shot)")
 
             # Priority: Use nuclei_colors from frontend (user's current color selection)
             # Only fallback to zarr colors if frontend didn't provide colors
@@ -1897,130 +1948,146 @@ def run_classification(args) -> Dict[str, Any]:
             }
         
         # D) result => cell_classification (common for both supervised and zero-shot)
+        # Hold the same hashed lock TissueLab uses so concurrent viewer reloads
+        # do not observe a deleted/half-written Cell-Classification group.
         progress_value = 95
         print(f"Progress: 95% (Saving results to zarr...)")
-        
-        if ZARR_GROUP in zf:
-            del zf[ZARR_GROUP]
-        grp_cls = zf.require_group(ZARR_GROUP)
 
-        grp_cls.create_array('class_indices', data=predictions.astype(np.int32))
+        with _zarr_store_lock(ZARR_PATH):
+            if ZARR_GROUP in zf:
+                del zf[ZARR_GROUP]
+            grp_cls = zf.require_group(ZARR_GROUP)
 
-        # Per-class taxonomy: classes/{index, name, color} parallel arrays.
-        classes_grp = grp_cls.require_group('classes')
-        classes_grp.create_array('index', data=np.arange(len(final_class_names), dtype=np.int32))
-        class_names_ascii = np.array([n.encode('utf-8') for n in final_class_names], dtype='S256')
-        classes_grp.create_array('name', data=class_names_ascii)
-        colors_ascii = np.array([c.encode('utf-8') for c in final_class_colors], dtype='S256')
-        classes_grp.create_array('color', data=colors_ascii)
+            grp_cls.create_array('class_indices', data=predictions.astype(np.int32))
 
-        # Update all annotation colors to match new class colors
-        # This ensures that when user changes a class color and clicks Update,
-        # all annotations using that class get the new color
-        try:
-            if 'User-Annotations' in zf and 'cell' in zf['User-Annotations']:
-                annotations_dataset = zf['User-Annotations/cell']
-                if 'class' in annotations_dataset.dtype.names and 'color' in annotations_dataset.dtype.names:
-                    # Build mapping from class_name to new color
-                    class_name_to_color = dict(zip(final_class_names, final_class_colors))
-                    
-                    # Helper function to convert hex color to int (0xRRGGBB format)
-                    def hex_to_int(hex_color):
-                        hex_color = hex_color.lstrip('#')
-                        if len(hex_color) == 6:
-                            return int(hex_color, 16)
-                        return -1
-                    
-                    # Read all annotations
-                    all_annotations = annotations_dataset[:]
-                    updated_count = 0
-                    
-                    # Update colors for annotations matching each class
-                    # Note: cell_class stores class index (0, 1, 2, ...), not class name
-                    for class_idx, class_name in enumerate(final_class_names):
-                        if class_name in class_name_to_color:
-                            new_color_hex = class_name_to_color[class_name]
-                            new_color_int = hex_to_int(new_color_hex)
-                            
-                            # Find annotations with this class index
-                            # cell_class stores the index into final_class_names array
-                            class_mask = (all_annotations['class'] == class_idx)
-                            if np.any(class_mask):
-                                # Update colors in-place
-                                all_annotations['color'][class_mask] = new_color_int
-                                updated_count += np.sum(class_mask)
-                                print(f"Updated {np.sum(class_mask)} annotations for class '{class_name}' (index {class_idx}) to color {new_color_hex}")
-                    
-                    if updated_count > 0:
-                        # Write updated annotations back
-                        # Note: We need to delete and recreate the dataset to update it
-                        del zf['User-Annotations/cell']
-                        zf['User-Annotations'].create_array('cell', data=all_annotations)
-                        print(f"Updated {updated_count} annotation colors to match new class colors")
-        except Exception as e:
-            # If update fails, log but don't fail the workflow
-            print(f"Warning: Could not update annotation colors: {e}")
-        
-        # Update user_annotation.attrs colormap to match new class colors
-        # This ensures the colormap (used by frontend) reflects the new colors
-        try:
-            if 'User-Annotations' in zf:
-                user_anno_group = zf['User-Annotations']
-                if hasattr(user_anno_group, 'attrs'):
-                    # Update class_names and class_colors in user_annotation.attrs
-                    user_anno_group.attrs['class_names'] = final_class_names
-                    user_anno_group.attrs['class_colors'] = final_class_colors
-                    print(f"Updated user_annotation.attrs colormap: {len(final_class_names)} classes with new colors")
-        except Exception as e:
-            # If update fails, log but don't fail the workflow
-            print(f"Warning: Could not update user_annotation.attrs colormap: {e}")
+            # Per-class taxonomy: classes/{index, name, color} parallel arrays.
+            classes_grp = grp_cls.require_group('classes')
+            classes_grp.create_array('index', data=np.arange(len(final_class_names), dtype=np.int32))
+            class_names_ascii = np.array([n.encode('utf-8') for n in final_class_names], dtype='S256')
+            classes_grp.create_array('name', data=class_names_ascii)
+            colors_ascii = np.array([c.encode('utf-8') for c in final_class_colors], dtype='S256')
+            classes_grp.create_array('color', data=colors_ascii)
 
-        # Save probability scores for active learning
-        if prediction_probs is not None:
-            grp_cls.create_array('probabilities', data=prediction_probs.astype(np.float32))
-            print(f"Saved classification probabilities for active learning, shape: {prediction_probs.shape}")
-        elif classification_method == "zero-shot" and 'sims_arr' in locals() and sims_arr is not None:
-            # For zero-shot: save similarity scores as pseudo-probabilities
-            # Normalize similarity scores to [0, 1] range using softmax
-            print(f"Converting similarity scores to probabilities, shape: {sims_arr.shape}")
-            exp_sims = np.exp(sims_arr - np.max(sims_arr, axis=1, keepdims=True))
-            pseudo_probs = exp_sims / np.sum(exp_sims, axis=1, keepdims=True)
-            grp_cls.create_array('probabilities', data=pseudo_probs.astype(np.float32))
-            print(f"Saved zero-shot similarity scores as probabilities for active learning, shape: {pseudo_probs.shape}")
-        else:
-            print("Warning: No probability data available to save for active learning")
+            # Update all annotation colors / remapped class indices to match new palette.
+            # Remap by class name so reordered nuclei_classes do not paint the wrong overlay.
+            try:
+                if 'User-Annotations' in zf and 'cell' in zf['User-Annotations']:
+                    annotations_dataset = zf['User-Annotations/cell']
+                    if 'class' in annotations_dataset.dtype.names and 'color' in annotations_dataset.dtype.names:
+                        user_anno_group = zf['User-Annotations']
+                        old_names, _ = _read_user_cell_palette(user_anno_group)
 
-        print("================")
-        # Filter nuclei_classes to only include classes that are actually predicted
-        # Negative control (index 0) is a placeholder and should not appear if not in predictions
-        unique_predictions = np.unique(predictions)
-        valid_indices = unique_predictions[unique_predictions < len(final_class_names)]
-        predicted_nuclei_classes = [final_class_names[i] for i in valid_indices]
-        print({
-            "predictions": unique_predictions.tolist(),
-            "nuclei_classes": predicted_nuclei_classes,
-            "classification_method": classification_method,
-            "organ": organ
-        })
-        # Run metadata as <NODE_NAME>/metadata group + attrs (matches the
-        # Cell-Segmentation/metadata pattern; replaces the historical flat
-        # JSON-bytes dataset).
-        if 'metadata' in grp_cls:
-            del grp_cls['metadata']
-        meta_grp = grp_cls.create_group('metadata')
-        meta_attrs = {
-            'model': 'NuClass',
-            'classification_method': classification_method,
-            'organ': organ,
-            'classification_count': int(len(predictions)),
-            'num_classes': int(len(final_class_names)),
-            'created_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-        }
-        if use_supervised and annotations_data is not None and 'train_time' in locals() and 'test_time' in locals():
-            meta_attrs['training_time_sec'] = float(train_time)
-            meta_attrs['testing_time_sec'] = float(test_time)
-        meta_grp.attrs.update(meta_attrs)
-            
+                        class_name_to_color = dict(zip(final_class_names, final_class_colors))
+                        name_to_new_idx = {n: i for i, n in enumerate(final_class_names)}
+
+                        def hex_to_int(hex_color):
+                            hex_color = hex_color.lstrip('#')
+                            if len(hex_color) == 6:
+                                return int(hex_color, 16)
+                            return -1
+
+                        all_annotations = annotations_dataset[:]
+                        updated_count = 0
+
+                        if old_names and old_names != list(final_class_names):
+                            old_classes = np.asarray(all_annotations['class']).copy()
+                            remapped = old_classes.copy()
+                            for old_idx, old_name in enumerate(old_names):
+                                new_idx = name_to_new_idx.get(old_name)
+                                if new_idx is None:
+                                    remapped[old_classes == old_idx] = -1
+                                elif new_idx != old_idx:
+                                    remapped[old_classes == old_idx] = new_idx
+                            all_annotations['class'] = remapped
+                            updated_count += int(np.sum(remapped != old_classes))
+                            print(
+                                f"Remapped user annotation class indices for palette reorder "
+                                f"({len(old_names)} -> {len(final_class_names)} classes)"
+                            )
+
+                        for class_idx, class_name in enumerate(final_class_names):
+                            if class_name in class_name_to_color:
+                                new_color_hex = class_name_to_color[class_name]
+                                new_color_int = hex_to_int(new_color_hex)
+                                class_mask = (all_annotations['class'] == class_idx)
+                                if np.any(class_mask):
+                                    all_annotations['color'][class_mask] = new_color_int
+                                    updated_count += int(np.sum(class_mask))
+                                    print(
+                                        f"Updated {np.sum(class_mask)} annotations for class "
+                                        f"'{class_name}' (index {class_idx}) to color {new_color_hex}"
+                                    )
+
+                        if updated_count > 0:
+                            del zf['User-Annotations/cell']
+                            zf['User-Annotations'].create_array('cell', data=all_annotations)
+                            print(f"Updated {updated_count} annotation rows after classification write")
+            except Exception as e:
+                print(f"Warning: Could not update annotation colors/indices: {e}")
+
+            try:
+                if 'User-Annotations' in zf:
+                    _write_user_cell_palette(
+                        zf['User-Annotations'],
+                        final_class_names,
+                        final_class_colors,
+                    )
+                    print(
+                        f"Updated user_annotation.attrs cell colormap: "
+                        f"{len(final_class_names)} classes with new colors"
+                    )
+            except Exception as e:
+                print(f"Warning: Could not update user_annotation.attrs colormap: {e}")
+
+            # Also write Cell-Classification group attrs so TissueLab load_file
+            # takes the primary metadata path (not classes/name datasets only).
+            try:
+                grp_cls.attrs['class_names'] = [str(n) for n in final_class_names]
+                grp_cls.attrs['class_colors'] = [str(c) for c in final_class_colors]
+            except Exception as e:
+                print(f"Warning: Could not set Cell-Classification attrs: {e}")
+
+            if prediction_probs is not None:
+                grp_cls.create_array('probabilities', data=prediction_probs.astype(np.float32))
+                print(f"Saved classification probabilities for active learning, shape: {prediction_probs.shape}")
+            elif classification_method == "zero-shot" and 'sims_arr' in locals() and sims_arr is not None:
+                print(f"Converting similarity scores to probabilities, shape: {sims_arr.shape}")
+                exp_sims = np.exp(sims_arr - np.max(sims_arr, axis=1, keepdims=True))
+                pseudo_probs = exp_sims / np.sum(exp_sims, axis=1, keepdims=True)
+                grp_cls.create_array('probabilities', data=pseudo_probs.astype(np.float32))
+                print(
+                    f"Saved zero-shot similarity scores as probabilities for active learning, "
+                    f"shape: {pseudo_probs.shape}"
+                )
+            else:
+                print("Warning: No probability data available to save for active learning")
+
+            print("================")
+            unique_predictions = np.unique(predictions)
+            valid_indices = unique_predictions[unique_predictions < len(final_class_names)]
+            predicted_nuclei_classes = [final_class_names[i] for i in valid_indices]
+            print({
+                "predictions": unique_predictions.tolist(),
+                "nuclei_classes": predicted_nuclei_classes,
+                "classification_method": classification_method,
+                "organ": organ
+            })
+            if 'metadata' in grp_cls:
+                del grp_cls['metadata']
+            meta_grp = grp_cls.create_group('metadata')
+            meta_attrs = {
+                'model': 'NuClass',
+                'classification_method': classification_method,
+                'organ': organ,
+                'classification_count': int(len(predictions)),
+                'num_classes': int(len(final_class_names)),
+                'created_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            }
+            if use_supervised and annotations_data is not None and 'train_time' in locals() and 'test_time' in locals():
+                meta_attrs['training_time_sec'] = float(train_time)
+                meta_attrs['testing_time_sec'] = float(test_time)
+            meta_grp.attrs.update(meta_attrs)
+
         end_time = time.time()
         result["classification_count"] = len(predictions)
         result["message"] = f"Classification completed using {classification_method} in {end_time - start_time:.2f}s"
@@ -2072,8 +2139,12 @@ def run_classification(args) -> Dict[str, Any]:
 # ========== FastAPI  ==========
 
 @app.get("/status")
-def get_status():
-    return {"status": "classification_node running"}
+async def get_status():
+    if cancel_event.is_set() and execution_active:
+        return {"status": "cancelling", "progress": int(progress_value)}
+    if execution_active:
+        return {"status": "running", "progress": int(progress_value)}
+    return {"status": "idle"}
 
 @app.get("/logs")
 def get_logs(lines: int = 200):
@@ -2361,7 +2432,7 @@ def classifier_save_endpoint(data: Dict[str, Any]):
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event, current_execution_thread, progress_cancelled
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event, current_execution_thread, progress_cancelled, execution_active
     
     print(f"[Cell-Classification] /execute called - Cancel event state: {cancel_event.is_set()}")
     
@@ -2374,48 +2445,52 @@ def execute_node():
     else:
         print(f"[Cell-Classification] /execute: Cancel event was not set, starting fresh execution.")
     progress_value = 0
+    execution_active = True
     
-    if not IS_MODEL_INITED:
-        print(f"[Cell-Classification] /execute: Model not initialized, returning error.")
-        return {"status": "error", "message": "Please /init first."}
+    try:
+        if not IS_MODEL_INITED:
+            print(f"[Cell-Classification] /execute: Model not initialized, returning error.")
+            return {"status": "error", "message": "Please /init first."}
 
-    if not ZARR_PATH or not os.path.exists(ZARR_PATH):
-        print("[Cell-Classification] no H5 => skip classification.")
-        out_val = {
-            "status": "ok",
-            "message": "no H5 => skip classification",
-            "classification_count": 0
-        }
-        # Update progress to 100 when skipping
-        progress_value = 100
-        print("Progress: 100%")
-    else:
-        print(f"[Cell-Classification] /execute => run_classification with h5={ZARR_PATH}")
-        print(f"[Cell-Classification] ARGS: {ARGS}")
-        print(f"[Cell-Classification] /execute: Cancel event state before run_classification: {cancel_event.is_set()}")
-        
-        # Run classification in current thread (synchronous execution)
-        # Note: For true cancellation of C extensions, we'd need to run in a separate process
-        # But for now, we check cancellation at strategic points
-        out_val = run_classification(ARGS)
-        
-        # Check if task was cancelled
-        if out_val.get("status") == "cancelled":
-            # Reset progress on cancellation
-            # Force progress update by ensuring it's different from current value
-            current_progress = progress_value
-            progress_value = 0
-            progress_cancelled = True  # Set cancellation flag
-            # Small delay to allow SSE to pick up the reset
-            if current_progress > 0:
-                time.sleep(0.2)  # Give SSE stream time to send reset signal
-            return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
+        if not ZARR_PATH or not os.path.exists(ZARR_PATH):
+            print("[Cell-Classification] no H5 => skip classification.")
+            out_val = {
+                "status": "ok",
+                "message": "no H5 => skip classification",
+                "classification_count": 0
+            }
+            # Update progress to 100 when skipping
+            progress_value = 100
+            print("Progress: 100%")
+        else:
+            print(f"[Cell-Classification] /execute => run_classification with h5={ZARR_PATH}")
+            print(f"[Cell-Classification] ARGS: {ARGS}")
+            print(f"[Cell-Classification] /execute: Cancel event state before run_classification: {cancel_event.is_set()}")
+            
+            # Run classification in current thread (synchronous execution)
+            # Note: For true cancellation of C extensions, we'd need to run in a separate process
+            # But for now, we check cancellation at strategic points
+            out_val = run_classification(ARGS)
+            
+            # Check if task was cancelled
+            if out_val.get("status") == "cancelled":
+                # Reset progress on cancellation
+                # Force progress update by ensuring it's different from current value
+                current_progress = progress_value
+                progress_value = 0
+                progress_cancelled = True  # Set cancellation flag
+                # Small delay to allow SSE to pick up the reset
+                if current_progress > 0:
+                    time.sleep(0.2)  # Give SSE stream time to send reset signal
+                return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
 
-    # Run-summary metadata is written inside cell_classification() (Cell-Classification/metadata
-    # group + attrs). The HTTP response below already carries the same out_val for
-    # the caller; no need to stash a separate JSON bytes blob in zarr.
+        # Run-summary metadata is written inside cell_classification() (Cell-Classification/metadata
+        # group + attrs). The HTTP response below already carries the same out_val for
+        # the caller; no need to stash a separate JSON bytes blob in zarr.
 
-    return {"status": "ok", "output": out_val}
+        return {"status": "ok", "output": out_val}
+    finally:
+        execution_active = False
 
 @app.options("/progress")
 async def progress_options():
