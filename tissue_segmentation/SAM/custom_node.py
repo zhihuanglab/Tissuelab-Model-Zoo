@@ -251,10 +251,15 @@ DOWNSAMPLE_RATE = 16
 
 IMAGE_ARR = None        # normal image array PNG
 
+progress_value = 0  # Global variable to store progress
+execution_active = False
+
 # =========== define /status, /init, /read, /execute routers ===========
 @app.get("/status")
-def get_status():
-    return {"status": "running"}
+async def get_status():
+    if execution_active:
+        return {"status": "running", "progress": int(progress_value)}
+    return {"status": "idle"}
 
 @app.post("/init")
 def init_node():
@@ -373,6 +378,20 @@ def sam_infer_image(model, image: Image.Image, prompt=None):
 
 @app.post("/execute")
 def execute_node():
+    """
+    Execute SAM inference (wraps _execute_node_impl to track execution_active)
+    """
+    global execution_active, progress_value
+    execution_active = True
+    progress_value = 0
+    try:
+        return _execute_node_impl()
+    finally:
+        progress_value = 100
+        execution_active = False
+
+
+def _execute_node_impl():
     """
     Execute SAM inference. Regardless of prompt, always infer.
     """

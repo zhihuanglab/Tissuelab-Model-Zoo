@@ -50,6 +50,7 @@ NODE_NAME = None
 DEPENDENCIES = []
 progress_value = 0
 progress_complete = False
+execution_active = False
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -404,8 +405,10 @@ def run_segmentation_and_features(args):
         }
 
 @app.get("/status")
-def get_status():
-    return {"status": "cell_feature_node running"}
+async def get_status():
+    if execution_active:
+        return {"status": "running", "progress": int(progress_value)}
+    return {"status": "idle"}
 
 @app.post("/init")
 def init_node():
@@ -484,26 +487,29 @@ def read_node(data: Dict[str, Any]):
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME
+    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME, execution_active
+    execution_active = True
+    try:
+        if not IS_MODEL_INITED:
+            return {"status": "error", "message": "Please /init first."}
 
-    if not IS_MODEL_INITED:
-        return {"status": "error", "message": "Please /init first."}
+        if not ARGS or not getattr(ARGS, "slidepath", None):
+            print("[Cell-Classification] no path => skip.")
+            out_val = {
+                "status": "ok",
+                "message": "no path, skipping.",
+                "nuclei_count": 0,
+                "feature_count": 0
+            }
+        else:
+            print(f"[Cell-Classification] /execute => run segmentation and feature extraction with slidepath={ARGS.slidepath}")
+            out_val = run_segmentation_and_features(ARGS)
 
-    if not ARGS or not getattr(ARGS, "slidepath", None):
-        print("[Cell-Classification] no path => skip.")
-        out_val = {
-            "status": "ok",
-            "message": "no path, skipping.",
-            "nuclei_count": 0,
-            "feature_count": 0
-        }
-    else:
-        print(f"[Cell-Classification] /execute => run segmentation and feature extraction with slidepath={ARGS.slidepath}")
-        out_val = run_segmentation_and_features(ARGS)
-
-    # The output is already stored in Cell-Classification/metadata during run_segmentation_and_features
-    # No need to store it again in NODE_NAME
-    return {"status": "ok", "output": out_val}
+        # The output is already stored in Cell-Classification/metadata during run_segmentation_and_features
+        # No need to store it again in NODE_NAME
+        return {"status": "ok", "output": out_val}
+    finally:
+        execution_active = False
 
 @app.get("/progress")
 async def progress():

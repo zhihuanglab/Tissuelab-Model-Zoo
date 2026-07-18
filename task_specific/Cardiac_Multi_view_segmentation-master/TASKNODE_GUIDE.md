@@ -146,20 +146,23 @@ eventSource.onmessage = (event) => {
 ---
 
 ### 6. GET `/status`
-Get current TaskNode status and configuration.
+Poll-friendly task busy/idle status (used by TaskNodeManager). Always HTTP 200 when reachable.
 
-**Response:**
+**Idle:**
 ```json
-{
-  "status": "Cardiac Segmentation TaskNode running",
-  "model_initialized": true,
-  "available_views": ["LVSA", "4CH", "VLA", "LVOT"],
-  "selected_view": "LVSA",
-  "h5_path": "/path/to/workflow.h5",
-  "node_name": "CardiacSegmentation",
-  "is_processing": false
-}
+{"status":"idle"}
 ```
+
+**Running:**
+```json
+{"status":"running","progress":42}
+```
+
+| Field | When | Meaning |
+|-------|------|---------|
+| `status` | always | `idle` \| `running` \| `cancelling` \| `error` |
+| `progress` | running/cancelling | `0–100` |
+| `message` | error (optional) | short detail |
 
 ---
 

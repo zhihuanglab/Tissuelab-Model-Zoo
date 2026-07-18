@@ -981,16 +981,9 @@ async def progress():
 
 @app.get("/status")
 async def get_status():
-    """Get node status"""
-    return {
-        "status": "Cardiac Segmentation TaskNode running",
-        "model_initialized": IS_MODEL_INITED,
-        "available_views": list(AVAILABLE_VIEWS.keys()),
-        "selected_view": SELECTED_VIEW,
-        "zarr_path": ZARR_PATH,
-        "node_name": NODE_NAME,
-        "is_processing": IS_PROCESSING
-    }
+    if IS_PROCESSING:
+        return {"status": "running", "progress": int(CURRENT_PROGRESS)}
+    return {"status": "idle"}
 
 @app.get("/views")
 async def list_views():

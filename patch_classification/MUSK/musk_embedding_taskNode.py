@@ -95,6 +95,7 @@ last_printed_progress = -1  # Added for the new update_progress function
 ZARR_GROUP = None
 DEP_ZARR_GROUPS = {}
 cancel_event = threading.Event()
+execution_active = False
 
 
 def _check_cancel():
@@ -375,8 +376,12 @@ def run_patch_classification(args):
 # === FastAPI Routes ===
 
 @app.get("/status")
-def get_status():
-    return {"status": "patch_classification_node running"}
+async def get_status():
+    if cancel_event.is_set() and execution_active:
+        return {"status": "cancelling", "progress": int(progress_value)}
+    if execution_active:
+        return {"status": "running", "progress": int(progress_value)}
+    return {"status": "idle"}
 
 @app.get("/logs")
 def get_logs(lines: int = 200):
@@ -741,36 +746,39 @@ def cancel_task():
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event
-    
-    if not IS_MODEL_INITED:
-        return {"status": "error", "message": "Please /init first."}
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event, execution_active
+    execution_active = True
+    try:
+        if not IS_MODEL_INITED:
+            return {"status": "error", "message": "Please /init first."}
 
-    cancel_event.clear()
-    
-    # Validate slide path
-    if (not ARGS) or (not getattr(ARGS, "slidepath", None)) or (not os.path.isfile(ARGS.slidepath)):
-        msg = f"Invalid slide path: {getattr(ARGS,'slidepath',None)}"
-        print(f"[{NODE_NAME}] {msg}")
-        out_val = {"status": "error", "message": msg, "patch_count": 0}
-        progress_value = 100
-    else:
-        print(f"[{NODE_NAME}] /execute => run_patch_classification with slidepath={ARGS.slidepath}")
-        print(f"[{NODE_NAME}] ARGS: {ARGS}")
-        out_val = run_patch_classification(ARGS)
-    
-    # Store the result to 'output'
-    if ZARR_PATH and os.path.exists(ZARR_PATH):
-        zf = zarr.open_group(ZARR_PATH, mode="a")
-        node_out_path = f"{ZARR_GROUP}/output"
-        if node_out_path in zf:
-            del zf[node_out_path]
-        out_str = json.dumps(out_val, ensure_ascii=False)
-        out_bytes = out_str.encode("utf-8")
-        zf.create_array(node_out_path, data=np.array(out_bytes, dtype=f'S{len(out_bytes)}'))
-        time.sleep(1)
-    
-    return {"status": "ok", "output": out_val}
+        cancel_event.clear()
+
+        # Validate slide path
+        if (not ARGS) or (not getattr(ARGS, "slidepath", None)) or (not os.path.isfile(ARGS.slidepath)):
+            msg = f"Invalid slide path: {getattr(ARGS,'slidepath',None)}"
+            print(f"[{NODE_NAME}] {msg}")
+            out_val = {"status": "error", "message": msg, "patch_count": 0}
+            progress_value = 100
+        else:
+            print(f"[{NODE_NAME}] /execute => run_patch_classification with slidepath={ARGS.slidepath}")
+            print(f"[{NODE_NAME}] ARGS: {ARGS}")
+            out_val = run_patch_classification(ARGS)
+
+        # Store the result to 'output'
+        if ZARR_PATH and os.path.exists(ZARR_PATH):
+            zf = zarr.open_group(ZARR_PATH, mode="a")
+            node_out_path = f"{ZARR_GROUP}/output"
+            if node_out_path in zf:
+                del zf[node_out_path]
+            out_str = json.dumps(out_val, ensure_ascii=False)
+            out_bytes = out_str.encode("utf-8")
+            zf.create_array(node_out_path, data=np.array(out_bytes, dtype=f'S{len(out_bytes)}'))
+            time.sleep(1)
+
+        return {"status": "ok", "output": out_val}
+    finally:
+        execution_active = False
 
 @app.options("/progress")
 async def progress_options():

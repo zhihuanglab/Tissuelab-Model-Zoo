@@ -123,6 +123,7 @@ DEP_ZARR_GROUPS: Dict[str, str] = {}
 progress_value = 0  # SSE progress
 total_patches = 0  # total number of patches to process
 processed_patches = 0  # number of patches that have been processed
+execution_active = False
 
 
 PASEG_MODEL: Optional[PASeg] = None
@@ -1153,8 +1154,10 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
 # ======================= API routes =======================
 
 @app.get("/status")
-def get_status():
-    return {"status": "segnode running"}
+async def get_status():
+    if execution_active:
+        return {"status": "running", "progress": int(progress_value)}
+    return {"status": "idle"}
 
 @app.get("/logs")
 def get_logs(lines: int = 200):
@@ -1466,79 +1469,82 @@ def execute_node():
     execute the segmentation.
     if slide_path is provided and zarr does not exist, tiling will be performed first.
     """
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, PASEG_MODEL, progress_value, SLIDE_PATH, ZARR_GROUP, ACTUAL_ZARR_GROUP, total_patches, processed_patches
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, PASEG_MODEL, progress_value, SLIDE_PATH, ZARR_GROUP, ACTUAL_ZARR_GROUP, total_patches, processed_patches, execution_active
+    execution_active = True
+    try:
+        # reset progress at the start
+        progress_value = 0
+        total_patches = 0
+        processed_patches = 0
 
-    # reset progress at the start
-    progress_value = 0
-    total_patches = 0
-    processed_patches = 0
+        if not IS_MODEL_INITED:
+            return {"status": "error", "message": "Please /init first."}
 
-    if not IS_MODEL_INITED:
-        return {"status": "error", "message": "Please /init first."}
-
-    # check if tiling is needed
-    # 1. if ZARR_PATH does not exist or the zarr file does not exist
-    # 2. or zarr exists but does not have images array
-    need_tiling = False
-    if SLIDE_PATH:
-        if not ZARR_PATH or not os.path.exists(ZARR_PATH):
-            need_tiling = True
-        else:
-            # check if zarr has images array
-            zf_check = zarr.open_group(ZARR_PATH, mode='r')
-            has_images = False
-            # search all possible images paths
-            def find_images(group, prefix=""):
-                for key in group.keys():
-                    if key == "images":
-                        return True
-                    full_path = f"{prefix}/{key}" if prefix else key
-                    if isinstance(group[key], zarr.Group):
-                        if find_images(group[key], full_path):
-                            return True
-                return False
-            
-            has_images = find_images(zf_check)
-            if not has_images:
-                print(f"[{NODE_NAME}] Zarr exists but no images found, need tiling.")
+        # check if tiling is needed
+        # 1. if ZARR_PATH does not exist or the zarr file does not exist
+        # 2. or zarr exists but does not have images array
+        need_tiling = False
+        if SLIDE_PATH:
+            if not ZARR_PATH or not os.path.exists(ZARR_PATH):
                 need_tiling = True
-    
-    # Path A: VISTA always performs dense tissue segmentation by reading the slide
-    # directly (run_segmentation_sequential). The legacy patch->contour path is removed.
-    if SLIDE_PATH and os.path.exists(SLIDE_PATH):
-        print(f"[{NODE_NAME}] Starting dense tissue segmentation for slide: {SLIDE_PATH}")
-        progress_value = 20
-        try:
-            out = run_segmentation_sequential(ARGS)
-            print(f"[{NODE_NAME}] Segmentation completed")
-        except Exception as e:
-            progress_value = 100
-            print(f"[{NODE_NAME}] Error during segmentation: {e}")
-            import traceback
-            print(traceback.format_exc())
-            out = {"status": "error", "message": str(e), "num_patches": 0}
-    else:
-        # Dense segmentation requires the source slide.
-        progress_value = 100
-        msg = f"[{NODE_NAME}] no slide available => skip segmentation"
-        print(msg)
-        out = {"status": "ok", "message": msg, "num_patches": 0}
-    
-    # store the result to 'output'
-    if ZARR_PATH and os.path.exists(ZARR_PATH):
-        zf = zarr.open_group(ZARR_PATH, mode='a')
-        node_out_path = f"{TISSUE_SEG_GROUP}/output"
-        if node_out_path in zf:
-            del zf[node_out_path]
-        out_str = json.dumps(out, ensure_ascii=False)
-        out_bytes = out_str.encode("utf-8")
-        # use create_dataset to create scalar array (string data)
-        # convert bytes to numpy array
-        out_array = np.frombuffer(out_bytes, dtype=f'S{len(out_bytes)}')
-        zf.create_array(node_out_path, data=out_array)
+            else:
+                # check if zarr has images array
+                zf_check = zarr.open_group(ZARR_PATH, mode='r')
+                has_images = False
+                # search all possible images paths
+                def find_images(group, prefix=""):
+                    for key in group.keys():
+                        if key == "images":
+                            return True
+                        full_path = f"{prefix}/{key}" if prefix else key
+                        if isinstance(group[key], zarr.Group):
+                            if find_images(group[key], full_path):
+                                return True
+                    return False
 
-    progress_value = 0  # 归零，上一个人 execute 结束
-    return {"status": "ok", "output": out}
+                has_images = find_images(zf_check)
+                if not has_images:
+                    print(f"[{NODE_NAME}] Zarr exists but no images found, need tiling.")
+                    need_tiling = True
+
+        # Path A: VISTA always performs dense tissue segmentation by reading the slide
+        # directly (run_segmentation_sequential). The legacy patch->contour path is removed.
+        if SLIDE_PATH and os.path.exists(SLIDE_PATH):
+            print(f"[{NODE_NAME}] Starting dense tissue segmentation for slide: {SLIDE_PATH}")
+            progress_value = 20
+            try:
+                out = run_segmentation_sequential(ARGS)
+                print(f"[{NODE_NAME}] Segmentation completed")
+            except Exception as e:
+                progress_value = 100
+                print(f"[{NODE_NAME}] Error during segmentation: {e}")
+                import traceback
+                print(traceback.format_exc())
+                out = {"status": "error", "message": str(e), "num_patches": 0}
+        else:
+            # Dense segmentation requires the source slide.
+            progress_value = 100
+            msg = f"[{NODE_NAME}] no slide available => skip segmentation"
+            print(msg)
+            out = {"status": "ok", "message": msg, "num_patches": 0}
+
+        # store the result to 'output'
+        if ZARR_PATH and os.path.exists(ZARR_PATH):
+            zf = zarr.open_group(ZARR_PATH, mode='a')
+            node_out_path = f"{TISSUE_SEG_GROUP}/output"
+            if node_out_path in zf:
+                del zf[node_out_path]
+            out_str = json.dumps(out, ensure_ascii=False)
+            out_bytes = out_str.encode("utf-8")
+            # use create_dataset to create scalar array (string data)
+            # convert bytes to numpy array
+            out_array = np.frombuffer(out_bytes, dtype=f'S{len(out_bytes)}')
+            zf.create_array(node_out_path, data=out_array)
+
+        progress_value = 0  # 归零，上一个人 execute 结束
+        return {"status": "ok", "output": out}
+    finally:
+        execution_active = False
 
 @app.options("/progress")
 async def progress_options():
