@@ -643,8 +643,13 @@ def run_segmentation(args):
 
 
 @app.get("/status")
-def get_status():
-    return {"status": "segmentation_node with embedding running"}
+async def get_status():
+    # Poll-friendly contract for TaskNodeManager (HTTP 200 always when reachable).
+    if cancel_event.is_set() and execution_active:
+        return {"status": "cancelling", "progress": int(progress_value)}
+    if execution_active:
+        return {"status": "running", "progress": int(progress_value)}
+    return {"status": "idle"}
 
 @app.get("/logs")
 def get_logs(lines: int = 200):

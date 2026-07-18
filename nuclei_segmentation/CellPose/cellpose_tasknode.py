@@ -101,6 +101,7 @@ DEPENDENCIES = []
 progress_value = 0  # Global variable to track progress
 progress_complete = False  # New flag to indicate completion
 progress_cancelled = False
+execution_active = False  # True while /execute is processing
 cancel_event = threading.Event()
 
 
@@ -269,8 +270,12 @@ def run_segmentation(args):
 
 
 @app.get("/status")
-def get_status():
-    return {"status": "cellpose_segmentation_node with embedding running"}
+async def get_status():
+    if cancel_event.is_set() and execution_active:
+        return {"status": "cancelling", "progress": int(progress_value)}
+    if execution_active:
+        return {"status": "running", "progress": int(progress_value)}
+    return {"status": "idle"}
 
 
 @app.post("/init")
@@ -341,13 +346,14 @@ def cancel_task():
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event, progress_cancelled
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event, progress_cancelled, execution_active
 
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
 
     cancel_event.clear()
     progress_cancelled = False
+    execution_active = True
     watcher = CancelWatcher(cancel_event, _mark_sse_cancelled)
     watcher.start()
     try:
@@ -361,20 +367,21 @@ def execute_node():
         else:
             print(f"[Cell-Segmentation] /execute => run_segmentation with slidepath={ARGS.slidepath}")
             out_val = run_segmentation(ARGS)
+
+        # store the result to 'output'
+        if ZARR_PATH and os.path.exists(ZARR_PATH):
+            zf = zarr.open_group(ZARR_PATH, mode='a')
+            node_out_path = f"{NODE_NAME}/output"
+            if node_out_path in zf:
+                del zf[node_out_path]
+            out_str = json.dumps(out_val, ensure_ascii=False)
+            out_bytes = out_str.encode("utf-8")
+            zf.create_array(node_out_path, data=np.array(out_bytes, dtype=f'S{len(out_bytes)}'))
+
+        return {"status": "ok", "output": out_val}
     finally:
         watcher.stop()
-
-    # store the result to 'output'
-    if ZARR_PATH and os.path.exists(ZARR_PATH):
-        zf = zarr.open_group(ZARR_PATH, mode='a')
-        node_out_path = f"{NODE_NAME}/output"
-        if node_out_path in zf:
-            del zf[node_out_path]
-        out_str = json.dumps(out_val, ensure_ascii=False)
-        out_bytes = out_str.encode("utf-8")
-        zf.create_array(node_out_path, data=np.array(out_bytes, dtype=f'S{len(out_bytes)}'))
-
-    return {"status": "ok", "output": out_val}
+        execution_active = False
 
 
 @app.get("/progress")

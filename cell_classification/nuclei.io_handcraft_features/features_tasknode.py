@@ -99,6 +99,7 @@ progress_value = 0
 progress_complete = False
 progress_cancelled = False
 cancel_event = threading.Event()
+execution_active = False
 
 
 def _mark_sse_cancelled():
@@ -479,8 +480,12 @@ def run_segmentation_and_features(args):
         }
 
 @app.get("/status")
-def get_status():
-    return {"status": "cell_feature_node running"}
+async def get_status():
+    if cancel_event.is_set() and execution_active:
+        return {"status": "cancelling", "progress": int(progress_value)}
+    if execution_active:
+        return {"status": "running", "progress": int(progress_value)}
+    return {"status": "idle"}
 
 @app.post("/init")
 def init_node():
@@ -569,33 +574,36 @@ def cancel_task():
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME, cancel_event, progress_cancelled
-
-    if not IS_MODEL_INITED:
-        return {"status": "error", "message": "Please /init first."}
-
-    cancel_event.clear()
-    progress_cancelled = False
-    watcher = CancelWatcher(cancel_event, _mark_sse_cancelled)
-    watcher.start()
+    global IS_MODEL_INITED, ARGS, H5_PATH, NODE_NAME, cancel_event, progress_cancelled, execution_active
+    execution_active = True
     try:
-        if not ARGS or not getattr(ARGS, "slidepath", None):
-            print("[CellFeatureNode] no path => skip.")
-            out_val = {
-                "status": "ok",
-                "message": "no path, skipping.",
-                "nuclei_count": 0,
-                "feature_count": 0
-            }
-        else:
-            print(f"[CellFeatureNode] /execute => run segmentation and feature extraction with slidepath={ARGS.slidepath}")
-            out_val = run_segmentation_and_features(ARGS)
-    finally:
-        watcher.stop()
+        if not IS_MODEL_INITED:
+            return {"status": "error", "message": "Please /init first."}
 
-    # The output is already stored in CellFeatureNode/output during run_segmentation_and_features
-    # No need to store it again in NODE_NAME
-    return {"status": "ok", "output": out_val}
+        cancel_event.clear()
+        progress_cancelled = False
+        watcher = CancelWatcher(cancel_event, _mark_sse_cancelled)
+        watcher.start()
+        try:
+            if not ARGS or not getattr(ARGS, "slidepath", None):
+                print("[CellFeatureNode] no path => skip.")
+                out_val = {
+                    "status": "ok",
+                    "message": "no path, skipping.",
+                    "nuclei_count": 0,
+                    "feature_count": 0
+                }
+            else:
+                print(f"[CellFeatureNode] /execute => run segmentation and feature extraction with slidepath={ARGS.slidepath}")
+                out_val = run_segmentation_and_features(ARGS)
+        finally:
+            watcher.stop()
+
+        # The output is already stored in CellFeatureNode/output during run_segmentation_and_features
+        # No need to store it again in NODE_NAME
+        return {"status": "ok", "output": out_val}
+    finally:
+        execution_active = False
 
 @app.get("/progress")
 async def progress():

@@ -266,6 +266,7 @@ IMAGE_ARR = None        # normal image array PNG
 
 progress_value = 0  # Global variable to store progress
 cancel_event = threading.Event()
+execution_active = False
 
 
 def _check_cancel():
@@ -275,8 +276,12 @@ def _check_cancel():
 
 # =========== define /status, /init, /read, /execute routers ===========
 @app.get("/status")
-def get_status():
-    return {"status": "running"}
+async def get_status():
+    if cancel_event.is_set() and execution_active:
+        return {"status": "cancelling", "progress": int(progress_value)}
+    if execution_active:
+        return {"status": "running", "progress": int(progress_value)}
+    return {"status": "idle"}
 
 @app.post("/init")
 def init_node():
@@ -429,6 +434,18 @@ def cancel_task():
 
 @app.post("/execute")
 def execute_node(background_tasks: BackgroundTasks):
+    """
+    Execute SAM inference (wraps _execute_node_impl to track execution_active)
+    """
+    global execution_active
+    execution_active = True
+    try:
+        return _execute_node_impl(background_tasks)
+    finally:
+        execution_active = False
+
+
+def _execute_node_impl(background_tasks: BackgroundTasks):
     """
     Execute SAM inference. Regardless of prompt, always infer.
     """

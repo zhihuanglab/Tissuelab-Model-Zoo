@@ -1753,21 +1753,9 @@ async def websocket_progress(websocket: WebSocket):
 
 @app.get("/status")
 async def get_status():
-    """
-    Get node status
-    """
-    return {
-        "status": "TotalSegmentator TaskNode running",
-        "model_initialized": MODEL_CONFIG is not None,
-        "model_config": MODEL_CONFIG,
-        "zarr_path": ZARR_PATH,
-        "node_name": NODE_NAME,
-        "is_processing": IS_PROCESSING,
-        "current_progress": CURRENT_PROGRESS,
-        "progress_message": PROGRESS_MESSAGE,
-        "progress_complete": progress_complete,
-        "active_connections": len(active_connections)
-    }
+    if IS_PROCESSING:
+        return {"status": "running", "progress": int(CURRENT_PROGRESS)}
+    return {"status": "idle"}
 
 @app.get("/debug/threads")
 async def debug_threads():

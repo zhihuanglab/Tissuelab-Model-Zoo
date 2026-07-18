@@ -102,6 +102,7 @@ DEPENDENCIES = []
 progress_value = 0  # Global variable to track progress
 progress_complete = False  # New flag to indicate completion
 progress_cancelled = False  # Flag to indicate cancellation
+execution_active = False  # True while /execute is processing
 
 # global variable for cancellation flag - use threading.Event for thread safety
 cancel_event = threading.Event()  # Thread-safe cancellation event
@@ -655,8 +656,12 @@ def run_segmentation(args):
 
 
 @app.get("/status")
-def get_status():
-    return {"status": "instanseg_segmentation_node running"}
+async def get_status():
+    if cancel_event.is_set() and execution_active:
+        return {"status": "cancelling", "progress": int(progress_value)}
+    if execution_active:
+        return {"status": "running", "progress": int(progress_value)}
+    return {"status": "idle"}
 
 @app.get("/logs")
 def get_logs(lines: int = 200):
@@ -874,7 +879,7 @@ def read_node(data: Dict[str, Any]):
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event, progress_value, progress_complete, progress_cancelled
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event, progress_value, progress_complete, progress_cancelled, execution_active
     
     print(f"[InstanSegNode] /execute called - Cancel event state: {cancel_event.is_set()}")
     
@@ -889,56 +894,60 @@ def execute_node():
     progress_value = 0
     progress_complete = False
     progress_cancelled = False  # Reset cancellation flag
+    execution_active = True
 
-    if not IS_MODEL_INITED:
-        print(f"[InstanSegNode] /execute: Model not initialized, returning error.")
-        return {"status": "error", "message": "Please /init first."}
+    try:
+        if not IS_MODEL_INITED:
+            print(f"[InstanSegNode] /execute: Model not initialized, returning error.")
+            return {"status": "error", "message": "Please /init first."}
 
-    if not ARGS or not getattr(ARGS, "slidepath", None):
-        print("[InstanSegNode] no path => skip.")
-        out_val = {
-            "status": "ok",
-            "message": "no path, skipping.",
-            "nuclei_count": 0
-        }
-        progress_value = 100
-        progress_complete = True
-    else:
-        print(f"[InstanSegNode] /execute => run_segmentation with slidepath={ARGS.slidepath}")
-        out_val = run_segmentation(ARGS)
-        
-        # Check if task was cancelled
-        if out_val.get("status") == "cancelled":
-            # Reset progress state on cancellation
-            # Force progress update by ensuring it's different from current value
-            current_progress = progress_value
-            progress_value = 0
-            progress_complete = False
-            progress_cancelled = True  # Set cancellation flag
-            # Small delay to allow SSE to pick up the reset
-            if current_progress > 0:
-                time.sleep(0.2)  # Give SSE stream time to send reset signal
-            return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
+        if not ARGS or not getattr(ARGS, "slidepath", None):
+            print("[InstanSegNode] no path => skip.")
+            out_val = {
+                "status": "ok",
+                "message": "no path, skipping.",
+                "nuclei_count": 0
+            }
+            progress_value = 100
+            progress_complete = True
+        else:
+            print(f"[InstanSegNode] /execute => run_segmentation with slidepath={ARGS.slidepath}")
+            out_val = run_segmentation(ARGS)
+            
+            # Check if task was cancelled
+            if out_val.get("status") == "cancelled":
+                # Reset progress state on cancellation
+                # Force progress update by ensuring it's different from current value
+                current_progress = progress_value
+                progress_value = 0
+                progress_complete = False
+                progress_cancelled = True  # Set cancellation flag
+                # Small delay to allow SSE to pick up the reset
+                if current_progress > 0:
+                    time.sleep(0.2)  # Give SSE stream time to send reset signal
+                return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
 
-    # Write run metadata to <NODE_NAME>/metadata as a zarr group with attrs.
-    # Replaces the historical <NODE_NAME>/output bytes blob.
-    if ZARR_PATH and os.path.exists(ZARR_PATH):
-        zf = zarr.open_group(ZARR_PATH, mode='a')
-        seg_grp = zf.require_group(ZARR_GROUP)
-        if 'metadata' in seg_grp:
-            del seg_grp['metadata']
-        meta_grp = seg_grp.create_group('metadata')
-        meta_grp.attrs.update({
-            'model': 'InstanSeg',
-            'status': out_val.get('status', 'unknown'),
-            'message': out_val.get('message', ''),
-            'nuclei_count': int(out_val.get('nuclei_count', 0)),
-            'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-            'has_embeddings': 'embeddings' in seg_grp,
-            'has_probabilities': 'probabilities' in seg_grp,
-        })
+        # Write run metadata to <NODE_NAME>/metadata as a zarr group with attrs.
+        # Replaces the historical <NODE_NAME>/output bytes blob.
+        if ZARR_PATH and os.path.exists(ZARR_PATH):
+            zf = zarr.open_group(ZARR_PATH, mode='a')
+            seg_grp = zf.require_group(ZARR_GROUP)
+            if 'metadata' in seg_grp:
+                del seg_grp['metadata']
+            meta_grp = seg_grp.create_group('metadata')
+            meta_grp.attrs.update({
+                'model': 'InstanSeg',
+                'status': out_val.get('status', 'unknown'),
+                'message': out_val.get('message', ''),
+                'nuclei_count': int(out_val.get('nuclei_count', 0)),
+                'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                'has_embeddings': 'embeddings' in seg_grp,
+                'has_probabilities': 'probabilities' in seg_grp,
+            })
 
-    return {"status": "ok", "output": out_val}
+        return {"status": "ok", "output": out_val}
+    finally:
+        execution_active = False
 
 
 def update_progress(value, phase="segmentation"):

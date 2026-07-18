@@ -109,6 +109,7 @@ MUSK_MODEL = None
 # new global variable for progress
 progress_value = 0  # Global variable to store progress
 cancel_event = threading.Event()
+execution_active = False
 
 
 def _check_cancel():
@@ -1721,8 +1722,12 @@ def run_classification(args) -> Dict[str, Any]:
 app = FastAPI()
 
 @app.get("/status")
-def get_status():
-    return {"status": "classification_node running"}
+async def get_status():
+    if cancel_event.is_set() and execution_active:
+        return {"status": "cancelling", "progress": int(progress_value)}
+    if execution_active:
+        return {"status": "running", "progress": int(progress_value)}
+    return {"status": "idle"}
 
 @app.get("/logs")
 def get_logs(lines: int = 200):
@@ -2125,41 +2130,44 @@ def cancel_task():
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event
-    
-    # CRITICAL: Reset progress to 0 at the start of each /execute call
-    # This ensures SSE progress starts from 0% even if previous execution left it at 100%
-    progress_value = 0
-    print(f"[{NODE_NAME}] Progress reset to 0% at start of /execute")
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event, execution_active
+    execution_active = True
+    try:
+        # CRITICAL: Reset progress to 0 at the start of each /execute call
+        # This ensures SSE progress starts from 0% even if previous execution left it at 100%
+        progress_value = 0
+        print(f"[{NODE_NAME}] Progress reset to 0% at start of /execute")
 
-    cancel_event.clear()
-    
-    if not IS_MODEL_INITED:
-        return {"status": "error", "message": "Please /init first."}
+        cancel_event.clear()
 
-    if not ZARR_PATH or not os.path.exists(ZARR_PATH):
-        print(f"[{NODE_NAME}] no Zarr => skip classification.")
-        out_val = {
-            "status": "ok",
-            "message": "no Zarr => skip classification",
-            "classification_count": 0
-        }
-        # Update progress to 100 when skipping
+        if not IS_MODEL_INITED:
+            return {"status": "error", "message": "Please /init first."}
+
+        if not ZARR_PATH or not os.path.exists(ZARR_PATH):
+            print(f"[{NODE_NAME}] no Zarr => skip classification.")
+            out_val = {
+                "status": "ok",
+                "message": "no Zarr => skip classification",
+                "classification_count": 0
+            }
+            # Update progress to 100 when skipping
+            progress_value = 100
+            print(f"[{NODE_NAME}] Progress: 100%")
+        else:
+            print(f"[{NODE_NAME}] /execute => run_classification with zarr={ZARR_PATH}")
+            print(f"[{NODE_NAME}] ARGS: {ARGS}")
+            out_val = run_classification(ARGS)
+
+        # Run-summary (out_val) is already written to Patch-Classification/metadata
+        # as group + attrs inside run_classification; the HTTP response below
+        # carries it for the caller as well. No need for a separate bytes blob.
+
         progress_value = 100
         print(f"[{NODE_NAME}] Progress: 100%")
-    else:
-        print(f"[{NODE_NAME}] /execute => run_classification with zarr={ZARR_PATH}")
-        print(f"[{NODE_NAME}] ARGS: {ARGS}")
-        out_val = run_classification(ARGS)
 
-    # Run-summary (out_val) is already written to Patch-Classification/metadata
-    # as group + attrs inside run_classification; the HTTP response below
-    # carries it for the caller as well. No need for a separate bytes blob.
-
-    progress_value = 100
-    print(f"[{NODE_NAME}] Progress: 100%")
-
-    return {"status": "ok", "output": out_val}
+        return {"status": "ok", "output": out_val}
+    finally:
+        execution_active = False
 
 @app.options("/progress")
 async def progress_options():
