@@ -627,6 +627,10 @@ def run_segmentation(args):
 
         progress_complete = True
         update_progress(100, "embeddings")
+        # Give /progress SSE a moment to flush 100% before /execute returns.
+        # AI scheduler cancels its progress watcher in `finally` as soon as HTTP ends;
+        # without this, clients often freeze on overall 99% (embedding bar 98%).
+        time.sleep(0.3)
 
         end_time = time.time()
         print(f"Time taken: {end_time - start_time:.2f}s")
