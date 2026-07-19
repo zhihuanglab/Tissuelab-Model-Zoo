@@ -889,8 +889,6 @@ def update_progress(value, phase="segmentation"):
     else:
         # Default behavior for backward compatibility
         progress_value = value
-    
-    # print(f"Global progress updated: {progress_value}% (phase: {phase})")  # Add debug output
 
 
 @app.post("/cancel")
@@ -915,6 +913,10 @@ async def progress():
     async def event_generator():
         global progress_value, progress_complete, progress_cancelled, execution_active
         last_value = -1
+        last_emit = time.monotonic()
+        # Re-emit while busy so AI-service↔TaskNode proxies do not idle-kill the
+        # stream during long StarDist tiles (integer % can stay flat for a long time).
+        KEEPALIVE_SEC = 2.0
 
         # The scheduler opens /progress before it calls /execute. In batch mode the
         # previous slide may have left a terminal 100% state behind; clear that
@@ -926,39 +928,49 @@ async def progress():
             progress_cancelled = False
         
         while True:
-            # Check if progress changed or if it's the final 100% update
-            # Also check if progress was reset to 0 (cancellation case)
-            if progress_value != last_value or (progress_value == 100 and progress_complete) or (progress_value == 0 and last_value > 0) or progress_cancelled:
-                if last_value > progress_value or progress_cancelled:
-                    # Progress decreased (likely reset/cancellation) - send reset signal
+            now = time.monotonic()
+            changed = (
+                progress_value != last_value
+                or (progress_value == 100 and progress_complete)
+                or (progress_value == 0 and last_value > 0)
+                or progress_cancelled
+            )
+            keepalive = (
+                execution_active
+                and not changed
+                and (now - last_emit) >= KEEPALIVE_SEC
+            )
+
+            if changed or keepalive:
+                if changed and (last_value > progress_value or progress_cancelled):
                     if progress_cancelled:
                         print(f"[SSE] Task cancelled, sending completion signal")
                     else:
                         print(f"[SSE] Progress reset detected: {last_value}% -> {progress_value}%")
-                    yield {"data": str(-1)}  # Send reset signal
-                print(f"[SSE] Progress: {progress_value}%")  # Add consistent debug output
+                    yield {"data": str(-1)}
+                if changed:
+                    print(f"[SSE] Progress: {progress_value}%")
                 yield {"data": str(progress_value)}
                 last_value = progress_value
+                last_emit = now
 
-                # If progress reaches 100 and completion flag is set, or if cancelled, wait a bit before breaking
                 if (progress_value == 100 and progress_complete) or progress_cancelled:
                     if progress_cancelled:
-                        print("Task cancelled, closing connection.")  # Add debug output
+                        print("Task cancelled, closing connection.")
                     else:
-                        print("Progress complete, closing connection.")  # Add debug output
-                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
+                        print("Progress complete, closing connection.")
+                    await asyncio.sleep(0.5)
                     break
 
-            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+            await asyncio.sleep(0.1)
 
-        # Keep the connection open for a short time to ensure the client receives the final update
         await asyncio.sleep(1)
 
         # Do not reset global progress here. /execute owns lifecycle resets; the progress
         # endpoint may reconnect while a run is active, and resetting here corrupts UI state.
-        print("Progress stream closed.")  # Add debug output
+        print("Progress stream closed.")
 
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(event_generator(), ping=15)
 
 
 def main():
