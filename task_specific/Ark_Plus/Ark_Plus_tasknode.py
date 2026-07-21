@@ -530,10 +530,14 @@ async def progress_options():
 async def progress():
     """SSE endpoint to provide progress updates"""
     async def event_generator():
-        global progress_value, progress_complete
+        global progress_value, progress_complete, execution_active
         last_value = -1
-        progress_value = 0
-        progress_complete = False
+        # Only clear stale terminal state when idle. Resetting on every connect
+        # wipes in-flight progress when the AI service reconnects.
+        if not execution_active and (progress_complete or progress_value >= 100):
+            progress_value = 0
+            progress_complete = False
+            print("[SSE] Cleared stale terminal progress before next execution")
         
         while not progress_complete and progress_value < 100:
             if progress_value != last_value:
@@ -549,9 +553,7 @@ async def progress():
         # Keep connection open briefly to ensure client receives final update
         await asyncio.sleep(1)
         
-        # Reset progress state for next run
-        progress_value = 0
-        progress_complete = False
+        # Do not reset here — /execute owns lifecycle; reconnects must not wipe state.
     
     return EventSourceResponse(
         event_generator(),

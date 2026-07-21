@@ -48,6 +48,7 @@ import glob
 import shutil
 import traceback
 from sse_starlette.sse import EventSourceResponse
+from progress_sse import ProgressSSEState, iter_progress_events
 import xgboost as xgb
 import io
 import base64
@@ -113,10 +114,9 @@ DEPENDENCIES = []
 
 MUSK_MODEL = None
 
-# new global variable for progress
-progress_value = 0  # Global variable to store progress
+# Per-folder SSE progress (progress_sse.py). Stream end does not reset.
+progress_state = ProgressSSEState()
 cancel_event = threading.Event()
-execution_active = False
 
 
 def _check_cancel():
@@ -1258,14 +1258,13 @@ def run_classification(args) -> Dict[str, Any]:
         raise ValueError("ZARR_PATH not set => please ensure /read is called first.")
 
     global MUSK_MODEL, NODE_NAME, CLASSIFIER_PATH
-    global progress_value
 
     result = {"status": "success", "message": "", "classification_count": 0}
     cell_embeddings = None
     class_embeddings = None # Renamed from class_embeddings_arr for clarity if it's a list of arrays
     sims_arr = None # Or sims if it's a list before converting to numpy array
     
-    progress_value = 30
+    progress_state.value = 30
     print(f"[{NODE_NAME}] Progress: 30%")
 
     try:
@@ -1393,7 +1392,7 @@ def run_classification(args) -> Dict[str, Any]:
         # C) supervised or zero-shot
         tissue_classes = getattr(args, "tissue_classes", [])
         tissue_colors = getattr(args, "tissue_colors", [])
-        progress_value = 80
+        progress_state.value = 80
         print(f"[{NODE_NAME}] Progress: 80%")
             
         # Debug: Print tissue_classes to see what's being used
@@ -1696,6 +1695,7 @@ def run_classification(args) -> Dict[str, Any]:
 
     except CooperativeCancel:
         print(f"[{NODE_NAME}] Classification cancelled by user")
+        progress_state.mark_cancelled()
         return {
             "status": "cancelled",
             "message": "Task was cancelled",
@@ -1729,10 +1729,10 @@ app = FastAPI()
 
 @app.get("/status")
 async def get_status():
-    if cancel_event.is_set() and execution_active:
-        return {"status": "cancelling", "progress": int(progress_value)}
-    if execution_active:
-        return {"status": "running", "progress": int(progress_value)}
+    if cancel_event.is_set() and progress_state.execution_active:
+        return {"status": "cancelling", "progress": int(progress_state.value)}
+    if progress_state.execution_active:
+        return {"status": "running", "progress": int(progress_state.value)}
     return {"status": "idle"}
 
 @app.get("/logs")
@@ -1936,15 +1936,15 @@ def init_node():
     CRITICAL: Only initialize if not already initialized to avoid redundant /init calls.
     This prevents unnecessary checkpoint loading attempts and ensures proper lifecycle.
     """
-    global IS_MODEL_INITED, progress_value, MUSK_MODEL
+    global IS_MODEL_INITED, MUSK_MODEL
     
     # CRITICAL: Reset progress to 0 at start of /init to ensure fresh tracking
-    progress_value = 0
+    progress_state.value = 0
     print(f"[{NODE_NAME}] Progress reset to 0% at start of /init")
     
     if not IS_MODEL_INITED:
         IS_MODEL_INITED = True
-        progress_value = 10
+        progress_state.value = 10
         print(f"[{NODE_NAME}] Progress: 10%")
         print("[MuskNode] /init => let's load HF big model now ...")
         try:
@@ -2136,12 +2136,9 @@ def cancel_task():
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event, execution_active
-    execution_active = True
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event
+    progress_state.begin_execution()
     try:
-        # CRITICAL: Reset progress to 0 at the start of each /execute call
-        # This ensures SSE progress starts from 0% even if previous execution left it at 100%
-        progress_value = 0
         print(f"[{NODE_NAME}] Progress reset to 0% at start of /execute")
 
         cancel_event.clear()
@@ -2157,7 +2154,7 @@ def execute_node():
                 "classification_count": 0
             }
             # Update progress to 100 when skipping
-            progress_value = 100
+            progress_state.set_value(100)
             print(f"[{NODE_NAME}] Progress: 100%")
         else:
             print(f"[{NODE_NAME}] /execute => run_classification with zarr={ZARR_PATH}")
@@ -2168,12 +2165,17 @@ def execute_node():
         # as group + attrs inside run_classification; the HTTP response below
         # carries it for the caller as well. No need for a separate bytes blob.
 
-        progress_value = 100
+        if out_val.get("status") == "cancelled":
+            progress_state.mark_cancelled()
+            return {"status": "cancelled", "output": out_val}
+
+        if not progress_state.mark_terminal_and_wait(100, 2.0):
+            print("[SSE] Timed out waiting for progress flush after 100%")
         print(f"[{NODE_NAME}] Progress: 100%")
 
         return {"status": "ok", "output": out_val}
     finally:
-        execution_active = False
+        progress_state.end_execution()
 
 @app.options("/progress")
 async def progress_options():
@@ -2184,46 +2186,9 @@ async def progress_options():
 
 @app.get("/progress")
 async def progress():
-    """
-    SSE endpoint to provide progress updates
-    CRITICAL: Reset progress to 0 when a new SSE connection is established.
-    This ensures each new workflow execution starts with 0% progress.
-    """
-    async def event_generator():
-        global progress_value
-        last_value = -1
-        # CRITICAL: Reset progress to 0 when SSE connection is established
-        # This ensures fresh progress tracking for each workflow execution
-        progress_value = 0
-        print(f"[SSE] Progress reset to 0% for new SSE connection")
-        
-        while True:
-            if progress_value != last_value:
-                print(f"[SSE] Progress: {progress_value}%")
-                yield {"data": str(progress_value)}
-                last_value = progress_value
-                
-                # If progress reaches 100, wait a bit then close connection
-                if progress_value == 100:
-                    await asyncio.sleep(0.5)  # Ensure client receives final update
-                    break
-                    
-            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
-
-        # Ensure the final progress update to 100 is sent
-        if last_value != 100:
-            yield {"data": "100"}
-            await asyncio.sleep(0.5)
-
-        # Keep the connection open for a short time to ensure the client receives the final update
-        await asyncio.sleep(1)
-
-        # Reset progress to 0 after sending the final update
-        progress_value = 0
-        print(f"[SSE] Progress reset to 0% after closing connection")
-
+    """SSE progress. Idle terminal cleared on connect; stream end does not reset."""
     return EventSourceResponse(
-        event_generator(),
+        iter_progress_events(progress_state),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -2233,6 +2198,9 @@ async def progress():
             "Access-Control-Allow-Methods": "GET, OPTIONS"
         }
     )
+
+
+
 
 def main():
     import threading

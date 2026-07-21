@@ -611,11 +611,13 @@ async def progress():
     SSE endpoint to provide progress updates
     """
     async def event_generator():
-        global progress_value, progress_complete, progress_cancelled
+        global progress_value, progress_complete, progress_cancelled, execution_active
         last_value = -1
-        progress_value = 0
-        progress_complete = False
-        progress_cancelled = False
+        if not execution_active and (progress_complete or progress_cancelled or progress_value >= 100):
+            print("[SSE] Clearing stale terminal progress before next execution.")
+            progress_value = 0
+            progress_complete = False
+            progress_cancelled = False
         while True:
             if progress_value != last_value or (progress_value == 100 and progress_complete) or (progress_value == 0 and last_value > 0) or progress_cancelled:
                 if last_value > progress_value or progress_cancelled:
@@ -635,10 +637,8 @@ async def progress():
 
         await asyncio.sleep(1)
 
-        progress_value = 0
-        progress_complete = False
-        progress_cancelled = False
-        print("Progress reset to 0.")
+        # Do not reset here — /execute owns lifecycle; reconnects must not wipe state.
+        print("Progress stream closed.")
 
     return EventSourceResponse(event_generator())
 

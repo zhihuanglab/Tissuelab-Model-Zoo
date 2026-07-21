@@ -1556,10 +1556,12 @@ async def progress():
     SSE endpoint to provide progress updates
     """
     async def event_generator():
-        global progress_value, progress_complete
+        global progress_value, progress_complete, execution_active
         last_value = -1
-        progress_value = 0  # Reset progress to 0 for each new connection
-        progress_complete = False  # Reset completion flag
+        if not execution_active and (progress_complete or progress_value >= 100):
+            print("[SSE] Clearing stale terminal progress before next execution.")
+            progress_value = 0
+            progress_complete = False
         
         while True:
             # Check if progress changed or if it's the final 100% update
@@ -1581,10 +1583,8 @@ async def progress():
         # Keep the connection open for a short time to ensure the client receives the final update
         await asyncio.sleep(1)
 
-        # Reset progress to 0 and completion flag after sending the final update
-        progress_value = 0
-        progress_complete = False
-        print("Progress reset to 0.")  # Add debug output
+        # Do not reset here — /execute owns lifecycle; reconnects must not wipe state.
+        print("Progress stream closed.")
 
     return EventSourceResponse(event_generator())
 

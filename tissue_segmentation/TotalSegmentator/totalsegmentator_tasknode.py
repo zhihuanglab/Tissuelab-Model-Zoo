@@ -1594,9 +1594,12 @@ async def progress():
         global CURRENT_PROGRESS, PROGRESS_MESSAGE, IS_PROCESSING, progress_complete
         last_value = -1
         
-        # Reset progress to 0 for each new connection
-        CURRENT_PROGRESS = 0
-        progress_complete = False  # Reset completion flag
+        # Only clear stale terminal state when idle. Resetting on every connect
+        # wipes in-flight progress when the AI service reconnects.
+        if not IS_PROCESSING and (progress_complete or CURRENT_PROGRESS >= 100):
+            CURRENT_PROGRESS = 0
+            progress_complete = False
+            print("[SSE] Cleared stale terminal progress before next execution")
         
         # Event-driven approach - no polling, no sleep
         while not progress_complete:
@@ -1621,9 +1624,7 @@ async def progress():
         if last_value != 100:
             yield {"data": "100"}
         
-        # Reset progress state for next run (no sleep needed)
-        CURRENT_PROGRESS = 0
-        progress_complete = False
+        # Do not reset here — /execute owns lifecycle; reconnects must not wipe state.
     
     return EventSourceResponse(
         event_generator(),

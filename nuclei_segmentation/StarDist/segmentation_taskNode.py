@@ -36,6 +36,7 @@ from zarr.errors import UnstableSpecificationWarning
 warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
+from progress_sse import ProgressSSEState, iter_progress_events
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
@@ -93,10 +94,8 @@ NODE_NAME = None
 # /read payload `zarr_group`.
 ZARR_GROUP = "Cell-Segmentation"
 DEPENDENCIES = []
-progress_value = 0  # Global variable to track progress
-progress_complete = False  # New flag to indicate completion
-progress_cancelled = False  # Flag to indicate cancellation
-execution_active = False  # True while /execute is processing the current slide
+# Per-folder SSE progress (progress_sse.py). Stream end does not reset.
+progress_state = ProgressSSEState()
 
 # global variable for cancellation flag - use threading.Event for thread safety
 cancel_event = threading.Event()  # Thread-safe cancellation event
@@ -133,7 +132,7 @@ def run_segmentation(args):
     3) according to segmentation, generate embedding
     4) write segmentation + embedding to zarr
     """
-    global progress_complete, cancel_event, progress_value, progress_cancelled
+    global cancel_event
 
     if ZARR_PATH is None or NODE_NAME is None:
         raise ValueError("ZARR_PATH and NODE_NAME must be set before running segmentation")
@@ -147,9 +146,9 @@ def run_segmentation(args):
         if cancel_event.is_set():
             print(f"[Cell-Segmentation] WARNING: Cancel event is set at start of run_segmentation (unexpected). Clearing it.")
             cancel_event.clear()
-            progress_value = 0
-            progress_complete = False
-            progress_cancelled = True
+            progress_state.value = 0
+            progress_state.complete = False
+            progress_state.cancelled = True
             return {
                 "status": "cancelled",
                 "message": "Task was cancelled",
@@ -437,9 +436,9 @@ def run_segmentation(args):
             if cancel_event.is_set():
                 print("[Cell-Segmentation] Task cancelled before segmentation")
                 cancel_event.clear()
-                progress_value = 0
-                progress_complete = False
-                progress_cancelled = True
+                progress_state.value = 0
+                progress_state.complete = False
+                progress_state.cancelled = True
                 return {
                     "status": "cancelled",
                     "message": "Task was cancelled",
@@ -483,9 +482,9 @@ def run_segmentation(args):
                 print("[Cell-Segmentation] Segmentation cancelled by user")
                 cancel_event.clear()
                 # Reset progress immediately and send a reset signal
-                progress_value = 0
-                progress_complete = False
-                progress_cancelled = True  # Set cancellation flag
+                progress_state.value = 0
+                progress_state.complete = False
+                progress_state.cancelled = True  # Set cancellation flag
                 # Force a progress update by briefly setting to a different value then back to 0
                 # This ensures SSE stream picks up the reset
                 time.sleep(0.1)  # Small delay to ensure progress update is sent
@@ -499,9 +498,9 @@ def run_segmentation(args):
             if cancel_event.is_set():
                 print("[Cell-Segmentation] Task cancelled after segmentation")
                 cancel_event.clear()
-                progress_value = 0
-                progress_complete = False
-                progress_cancelled = True
+                progress_state.value = 0
+                progress_state.complete = False
+                progress_state.cancelled = True
                 return {
                     "status": "cancelled",
                     "message": "Task was cancelled",
@@ -542,9 +541,9 @@ def run_segmentation(args):
         if cancel_event.is_set():
             print("[Cell-Segmentation] Task cancelled before embedding")
             cancel_event.clear()
-            progress_value = 0
-            progress_complete = False
-            progress_cancelled = True
+            progress_state.value = 0
+            progress_state.complete = False
+            progress_state.cancelled = True
             return {
                 "status": "cancelled",
                 "message": "Task was cancelled",
@@ -600,8 +599,8 @@ def run_segmentation(args):
                 except CancellationException:
                     print("[Cell-Segmentation] Embedding cancelled by user")
                     cancel_event.clear()
-                    progress_value = 0
-                    progress_complete = False
+                    progress_state.value = 0
+                    progress_state.complete = False
                     return {
                         "status": "cancelled",
                         "message": "Task was cancelled during embedding",
@@ -612,9 +611,9 @@ def run_segmentation(args):
                 if cancel_event.is_set():
                     print("[Cell-Segmentation] Task cancelled after embedding")
                     cancel_event.clear()
-                    progress_value = 0
-                    progress_complete = False
-                    progress_cancelled = True
+                    progress_state.value = 0
+                    progress_state.complete = False
+                    progress_state.cancelled = True
                     return {
                         "status": "cancelled",
                         "message": "Task was cancelled",
@@ -625,8 +624,9 @@ def run_segmentation(args):
         else: # centroids is None
             print("[EMBED LOG] Centroids are None, skipping embedding generation.")
 
-        progress_complete = True
         update_progress(100, "embeddings")
+        if not progress_state.mark_terminal_and_wait(100, 2.0):
+            print("[SSE] Timed out waiting for progress flush after 100%")
 
         end_time = time.time()
         print(f"Time taken: {end_time - start_time:.2f}s")
@@ -639,16 +639,18 @@ def run_segmentation(args):
     except Exception as e:
         print(f"Error: {str(e)}")
         print(traceback.format_exc())
+        if not progress_state.complete and not progress_state.cancelled:
+            progress_state.mark_cancelled()
         return {"status": "error", "message": str(e), "nuclei_count": 0}
 
 
 @app.get("/status")
 async def get_status():
     # Poll-friendly contract for TaskNodeManager (HTTP 200 always when reachable).
-    if cancel_event.is_set() and execution_active:
-        return {"status": "cancelling", "progress": int(progress_value)}
-    if execution_active:
-        return {"status": "running", "progress": int(progress_value)}
+    if cancel_event.is_set() and progress_state.execution_active:
+        return {"status": "cancelling", "progress": int(progress_state.value)}
+    if progress_state.execution_active:
+        return {"status": "running", "progress": int(progress_state.value)}
     return {"status": "idle"}
 
 @app.get("/logs")
@@ -800,7 +802,7 @@ def read_node(data: Dict[str, Any]):
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event, progress_value, progress_complete, progress_cancelled, execution_active
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event
     
     print(f"[Cell-Segmentation] /execute called - Cancel event state: {cancel_event.is_set()}")
     
@@ -812,10 +814,7 @@ def execute_node():
         print(f"[Cell-Segmentation] /execute: Cancel event was set, cleared it. Starting fresh execution.")
     else:
         print(f"[Cell-Segmentation] /execute: Cancel event was not set, starting fresh execution.")
-    progress_value = 0
-    progress_complete = False
-    progress_cancelled = False  # Reset cancellation flag
-    execution_active = True
+    progress_state.begin_execution()
 
     try:
         if not IS_MODEL_INITED:
@@ -829,8 +828,7 @@ def execute_node():
                 "message": "no path, skipping.",
                 "nuclei_count": 0
             }
-            progress_value = 100
-            progress_complete = True
+            progress_state.mark_terminal_and_wait(100, 2.0)
         else:
             print(f"[Cell-Segmentation] /execute => run_segmentation with slidepath={ARGS.slidepath}")
             print(f"[Cell-Segmentation] /execute: Cancel event state before run_segmentation: {cancel_event.is_set()}")
@@ -838,16 +836,12 @@ def execute_node():
             
             # Check if task was cancelled
             if out_val.get("status") == "cancelled":
-                # Reset progress state on cancellation
-                # Force progress update by ensuring it's different from current value
-                current_progress = progress_value
-                progress_value = 0
-                progress_complete = False
-                progress_cancelled = True  # Set cancellation flag
-                # Small delay to allow SSE to pick up the reset
-                if current_progress > 0:
-                    time.sleep(0.2)  # Give SSE stream time to send reset signal
+                progress_state.mark_cancelled()
                 return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
+            if out_val.get("status") == "error":
+                if not progress_state.complete and not progress_state.cancelled:
+                    progress_state.mark_cancelled()
+
 
         # Write run metadata to <NODE_NAME>/metadata as a zarr group with attrs.
         # Replaces the historical <NODE_NAME>/output bytes blob.
@@ -869,7 +863,7 @@ def execute_node():
 
         return {"status": "ok", "output": out_val}
     finally:
-        execution_active = False
+        progress_state.end_execution()
 
 
 def update_progress(value, phase="segmentation"):
@@ -878,19 +872,16 @@ def update_progress(value, phase="segmentation"):
     - segmentation: 0-50
     - embedding: 50-100
     """
-    global progress_value
     
     if phase == "segmentation":
         # Scale segmentation progress from 0-100 to 0-50
-        progress_value = int(value * 0.5)
+        progress_state.value = int(value * 0.5)
     elif phase == "embeddings":
         # Scale embedding progress from 0-100 to 50-100
-        progress_value = 50 + int(value * 0.5)
+        progress_state.value = 50 + int(value * 0.5)
     else:
         # Default behavior for backward compatibility
-        progress_value = value
-    
-    # print(f"Global progress updated: {progress_value}% (phase: {phase})")  # Add debug output
+        progress_state.value = value
 
 
 @app.post("/cancel")
@@ -910,55 +901,12 @@ def cancel_task():
 @app.get("/progress")
 async def progress():
     """
-    SSE endpoint to provide progress updates
+    SSE endpoint to provide progress updates.
+    Idle terminal state is cleared on connect; stream end does not reset.
     """
-    async def event_generator():
-        global progress_value, progress_complete, progress_cancelled, execution_active
-        last_value = -1
+    return EventSourceResponse(iter_progress_events(progress_state))
 
-        # The scheduler opens /progress before it calls /execute. In batch mode the
-        # previous slide may have left a terminal 100% state behind; clear that
-        # idle terminal state so the new stream waits for the next execution.
-        if not execution_active and (progress_complete or progress_cancelled):
-            print("[SSE] Clearing stale terminal progress before next execution.")
-            progress_value = 0
-            progress_complete = False
-            progress_cancelled = False
-        
-        while True:
-            # Check if progress changed or if it's the final 100% update
-            # Also check if progress was reset to 0 (cancellation case)
-            if progress_value != last_value or (progress_value == 100 and progress_complete) or (progress_value == 0 and last_value > 0) or progress_cancelled:
-                if last_value > progress_value or progress_cancelled:
-                    # Progress decreased (likely reset/cancellation) - send reset signal
-                    if progress_cancelled:
-                        print(f"[SSE] Task cancelled, sending completion signal")
-                    else:
-                        print(f"[SSE] Progress reset detected: {last_value}% -> {progress_value}%")
-                    yield {"data": str(-1)}  # Send reset signal
-                print(f"[SSE] Progress: {progress_value}%")  # Add consistent debug output
-                yield {"data": str(progress_value)}
-                last_value = progress_value
 
-                # If progress reaches 100 and completion flag is set, or if cancelled, wait a bit before breaking
-                if (progress_value == 100 and progress_complete) or progress_cancelled:
-                    if progress_cancelled:
-                        print("Task cancelled, closing connection.")  # Add debug output
-                    else:
-                        print("Progress complete, closing connection.")  # Add debug output
-                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
-                    break
-
-            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
-
-        # Keep the connection open for a short time to ensure the client receives the final update
-        await asyncio.sleep(1)
-
-        # Do not reset global progress here. /execute owns lifecycle resets; the progress
-        # endpoint may reconnect while a run is active, and resetting here corrupts UI state.
-        print("Progress stream closed.")  # Add debug output
-
-    return EventSourceResponse(event_generator())
 
 
 def main():
