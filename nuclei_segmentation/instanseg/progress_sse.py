@@ -57,10 +57,12 @@ class ProgressSSEState:
         AI scheduler should still publish 100% on HTTP return as a backstop.
         """
         with self._lock:
+            # Clear BEFORE publishing terminal state. Clearing after complete=True
+            # races with SSE notify_flushed() and can drop the handshake forever.
+            self._flush.clear()
             self.value = max(0, min(100, int(value)))
             self.complete = True
             clients = self._clients
-            self._flush.clear()
         if clients <= 0:
             return True
         return self._flush.wait(timeout=timeout)
