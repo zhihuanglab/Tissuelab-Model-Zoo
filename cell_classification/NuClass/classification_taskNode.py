@@ -67,6 +67,7 @@ from zarr.errors import UnstableSpecificationWarning
 warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
+from progress_sse import ProgressSSEState, iter_progress_events
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from sklearn.linear_model import LogisticRegression
@@ -126,10 +127,8 @@ SAVE_CLASSIFIER_PATH = None
 LAST_TRAINED_CLF_BUNDLE = None
 CLASS_OPERATIONS = {}
 
-# new global variable for progress
-progress_value = 0  # Global variable to store progress
-progress_cancelled = False  # Flag to indicate cancellation
-execution_active = False  # True while /execute is processing
+# Per-folder SSE progress (progress_sse.py). Stream end does not reset.
+progress_state = ProgressSSEState()
 
 # global variable for cancellation flag - use threading.Event for thread safety
 import threading
@@ -634,9 +633,8 @@ def _generate_text_description(processor,
             torch.cuda.synchronize()  # Ensure all GPU operations complete
         
         # Update progress after text embedding generation (once)
-        global progress_value
         # Set progress to a value that indicates text embeddings are done, ex. 50%
-        progress_value = 50 
+        progress_state.value = 50 
         print("Progress: 50% (Text embeddings generated for zero-shot)")
 
         return result
@@ -914,7 +912,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
             If provided and length matches class_names, these colors will be used instead of
             extracting from annotations.
     """
-    global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS, progress_value, cancel_event
+    global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS, cancel_event
     class_ops = _normalize_class_operations(CLASS_OPERATIONS)
     effective_renames = [] if _has_rename_cycle(class_ops.get("renames", [])) else class_ops.get("renames", [])
     
@@ -976,7 +974,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 old_class_names = class_names.copy()
                 print(f"Loaded existing classifier parameters, classes: {class_names}")
                 # Update progress after loading classifier
-                progress_value = 40
+                progress_state.value = 40
                 print(f"Progress: 40% (Classifier loaded)")
                 
                 if not positive_annotations.empty:
@@ -1090,7 +1088,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         if cancel_event.is_set():
                             print("[Cell-Classification] Task cancelled after retraining")
                             cancel_event.clear()
-                            progress_value = 0
+                            progress_state.value = 0
                             return None
                         
                         print("Classifier retrained with new classes")
@@ -1169,7 +1167,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         if cancel_event.is_set():
                             print("[Cell-Classification] Task cancelled after incremental training")
                             cancel_event.clear()
-                            progress_value = 0
+                            progress_state.value = 0
                             return None
                         
                         print("Classifier updated with warm start (incremental training)")
@@ -1232,7 +1230,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     if cancel_event.is_set():
                         print(f"[Cell-Classification] Task cancelled during prediction (batch {batch_idx + 1}/{n_batches})")
                         cancel_event.clear()  # Reset for next execution
-                        progress_value = 0
+                        progress_state.value = 0
                         return None
                     
                     end_idx = min(i + batch_size, n_cells)
@@ -1261,9 +1259,9 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     del batch_embeddings, batch_predictions, batch_probs
                     
                     # Update progress: 40% -> 90% during prediction
-                    progress_value = 40 + int(50 * (batch_idx + 1) / n_batches)
+                    progress_state.value = 40 + int(50 * (batch_idx + 1) / n_batches)
                     if (batch_idx + 1) % max(1, n_batches // 10) == 0 or (batch_idx + 1) == n_batches:
-                        print(f"Progress: {progress_value}% (Predicted {end_idx}/{n_cells} cells)")
+                        print(f"Progress: {progress_state.value}% (Predicted {end_idx}/{n_cells} cells)")
                     
                     # Only clear GPU cache if using GPU (XGBoost on GPU)
                     # For CPU-based XGBoost, skip this to save time
@@ -1281,7 +1279,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     if (batch_idx + 1) % 5 == 0:
                         gc.collect()
                 
-                progress_value = 90
+                progress_state.value = 90
                 print(f"Progress: 90% (Completed prediction for {n_cells} cells)")
                 
                 # Update class_colors: prioritize frontend-provided colors, then keep existing colors
@@ -1437,7 +1435,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     if cancel_event.is_set():
         print("[Cell-Classification] Task cancelled before training")
         cancel_event.clear()
-        progress_value = 0
+        progress_state.value = 0
         return None
     
     n_positive = int((sample_weights == 1.0).sum()) if sample_weights is not None else len(y_train)
@@ -1466,10 +1464,10 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     if cancel_event.is_set():
         print("[Cell-Classification] Task cancelled after training")
         cancel_event.clear()
-        progress_value = 0
+        progress_state.value = 0
         return None
     
-    progress_value = 50
+    progress_state.value = 50
     print(f"Progress: 50% (Classifier trained)")
 
     # predict in batches to avoid memory issues
@@ -1521,7 +1519,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         if cancel_event.is_set():
             print(f"[Cell-Classification] Task cancelled during prediction (batch {batch_idx + 1}/{n_batches})")
             cancel_event.clear()  # Reset for next execution
-            progress_value = 0
+            progress_state.value = 0
             return None
         
         end_idx = min(i + batch_size, n_cells)
@@ -1560,9 +1558,9 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         del batch_embeddings, batch_predictions, batch_probs, batch_full
         
         # Update progress: 50% -> 90% during prediction
-        progress_value = 50 + int(40 * (batch_idx + 1) / n_batches)
+        progress_state.value = 50 + int(40 * (batch_idx + 1) / n_batches)
         if (batch_idx + 1) % max(1, n_batches // 10) == 0 or (batch_idx + 1) == n_batches:
-            print(f"Progress: {progress_value}% (Predicted {end_idx}/{n_cells} cells)")
+            print(f"Progress: {progress_state.value}% (Predicted {end_idx}/{n_cells} cells)")
         
         # Only clear GPU cache if using GPU (XGBoost on GPU)
         # For CPU-based XGBoost, skip this to save time
@@ -1580,7 +1578,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         if (batch_idx + 1) % 5 == 0:
             gc.collect()
     
-    progress_value = 90
+    progress_state.value = 90
     print(f"Progress: 90% (Completed prediction for {n_cells} cells)")
 
     # save classifier parameters
@@ -1597,14 +1595,14 @@ def run_classification(args) -> Dict[str, Any]:
         raise ValueError("ZARR_PATH not set => please ensure /read is called first.")
 
     global PLIP_MODELS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS
-    global progress_value, cancel_event, progress_cancelled  # Declare the global variables
+    global cancel_event
 
     result = {"status": "success", "message": "", "classification_count": 0}
     cell_embeddings = None
     class_embeddings_arr = None
     sims_arr = None
 
-    progress_value = 30
+    progress_state.value = 30
     print(f"Progress: 30%")
 
     zf = None
@@ -1615,8 +1613,8 @@ def run_classification(args) -> Dict[str, Any]:
         if cancel_event.is_set():
             print(f"[Cell-Classification] WARNING: Cancel event is set at start of run_classification (unexpected). Clearing it.")
             cancel_event.clear()  # Reset for next execution
-            progress_value = 0
-            progress_cancelled = True
+            progress_state.value = 0
+            progress_state.cancelled = True
             return {
                 "status": "cancelled",
                 "message": "Task was cancelled",
@@ -1661,7 +1659,7 @@ def run_classification(args) -> Dict[str, Any]:
             raise ValueError("embedding dataset not found in h5 file => no cell_embeddings")
         print("Loading embeddings from zarr...")
         cell_embeddings = seg_grp['embeddings'][()]
-        progress_value = 35
+        progress_state.value = 35
         print(f"Progress: 35% (Embeddings loaded, shape: {cell_embeddings.shape})")
     
         # C) supervised or zero-shot
@@ -1705,7 +1703,7 @@ def run_classification(args) -> Dict[str, Any]:
             if classifier_result is None or cancel_event.is_set():
                 print("[Cell-Classification] Task cancelled during or after training")
                 cancel_event.clear()  # Reset for next execution
-                progress_value = 0
+                progress_state.value = 0
                 return {
                     "status": "cancelled",
                     "message": "Task was cancelled",
@@ -1880,7 +1878,7 @@ def run_classification(args) -> Dict[str, Any]:
                 torch.cuda.empty_cache()
             
             # Update progress after similarity computation (write still pending)
-            progress_value = 90
+            progress_state.value = 90
             print("Progress: 90% (Similarities computed for zero-shot)")
 
             # Priority: Use nuclei_colors from frontend (user's current color selection)
@@ -1905,8 +1903,8 @@ def run_classification(args) -> Dict[str, Any]:
         if cancel_event.is_set():
             print("[Cell-Classification] Task cancelled before saving results")
             cancel_event.clear()  # Reset for next execution
-            progress_value = 0
-            progress_cancelled = True
+            progress_state.value = 0
+            progress_state.cancelled = True
             return {
                 "status": "cancelled",
                 "message": "Task was cancelled",
@@ -1914,7 +1912,7 @@ def run_classification(args) -> Dict[str, Any]:
             }
         
         # D) result => cell_classification (common for both supervised and zero-shot)
-        progress_value = 95
+        progress_state.value = 95
         print(f"Progress: 95% (Saving results to zarr...)")
 
         if ZARR_GROUP in zf:
@@ -2055,8 +2053,9 @@ def run_classification(args) -> Dict[str, Any]:
         result["classification_count"] = len(predictions)
         result["message"] = f"Classification completed using {classification_method} in {end_time - start_time:.2f}s"
 
-        progress_value = 100
         print(f"Progress: 100% (Classification completed)")
+        if not progress_state.mark_terminal_and_wait(100, 2.0):
+            print("[SSE] Timed out waiting for progress flush after 100%")
 
         # print H5 structure
         print("H5 structure after classification:")
@@ -2103,10 +2102,10 @@ def run_classification(args) -> Dict[str, Any]:
 
 @app.get("/status")
 async def get_status():
-    if cancel_event.is_set() and execution_active:
-        return {"status": "cancelling", "progress": int(progress_value)}
-    if execution_active:
-        return {"status": "running", "progress": int(progress_value)}
+    if cancel_event.is_set() and progress_state.execution_active:
+        return {"status": "cancelling", "progress": int(progress_state.value)}
+    if progress_state.execution_active:
+        return {"status": "running", "progress": int(progress_state.value)}
     return {"status": "idle"}
 
 @app.get("/logs")
@@ -2395,7 +2394,7 @@ def classifier_save_endpoint(data: Dict[str, Any]):
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event, current_execution_thread, progress_cancelled, execution_active
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event, current_execution_thread
     
     print(f"[Cell-Classification] /execute called - Cancel event state: {cancel_event.is_set()}")
     
@@ -2407,8 +2406,7 @@ def execute_node():
         print(f"[Cell-Classification] /execute: Cancel event was set, cleared it. Starting fresh execution.")
     else:
         print(f"[Cell-Classification] /execute: Cancel event was not set, starting fresh execution.")
-    progress_value = 0
-    execution_active = True
+    progress_state.begin_execution()
     
     try:
         if not IS_MODEL_INITED:
@@ -2423,8 +2421,8 @@ def execute_node():
                 "classification_count": 0
             }
             # Update progress to 100 when skipping
-            progress_value = 100
             print("Progress: 100%")
+            progress_state.mark_terminal_and_wait(100, 2.0)
         else:
             print(f"[Cell-Classification] /execute => run_classification with h5={ZARR_PATH}")
             print(f"[Cell-Classification] ARGS: {ARGS}")
@@ -2437,15 +2435,14 @@ def execute_node():
             
             # Check if task was cancelled
             if out_val.get("status") == "cancelled":
-                # Reset progress on cancellation
-                # Force progress update by ensuring it's different from current value
-                current_progress = progress_value
-                progress_value = 0
-                progress_cancelled = True  # Set cancellation flag
-                # Small delay to allow SSE to pick up the reset
-                if current_progress > 0:
-                    time.sleep(0.2)  # Give SSE stream time to send reset signal
+                progress_state.mark_cancelled()
                 return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
+
+            # Ensure terminal 100 even if run_classification returned via an early path
+            # that did not set it (mirrors scheduler expecting a final tick).
+            if progress_state.value < 100 and not progress_state.cancelled:
+                print("Progress: 100% (execute finalize)")
+                progress_state.mark_terminal_and_wait(100, 2.0)
 
         # Run-summary metadata is written inside cell_classification() (Cell-Classification/metadata
         # group + attrs). The HTTP response below already carries the same out_val for
@@ -2453,7 +2450,7 @@ def execute_node():
 
         return {"status": "ok", "output": out_val}
     finally:
-        execution_active = False
+        progress_state.end_execution()
 
 @app.options("/progress")
 async def progress_options():
@@ -2479,56 +2476,13 @@ def cancel_task():
 @app.get("/progress")
 async def progress():
     """
-    SSE endpoint to provide progress updates
+    SSE endpoint to provide progress updates.
+    Idle terminal state is cleared on connect; stream end does not reset.
     """
-    async def event_generator():
-        global progress_value, progress_cancelled
-        last_value = -1
-        progress_value = 0  # Reset progress to 0 for each new connection
-        progress_cancelled = False  # Reset cancellation flag
-        
-        while progress_value < 100 and not progress_cancelled:
-            # Check if progress changed or if it was reset to 0 (cancellation case)
-            if progress_value != last_value or (progress_value == 0 and last_value > 0) or progress_cancelled:
-                if last_value > progress_value or progress_cancelled:
-                    # Progress decreased (likely reset/cancellation) - send reset signal
-                    if progress_cancelled:
-                        print(f"[SSE] Task cancelled, sending completion signal")
-                    else:
-                        print(f"[SSE] Progress reset detected: {last_value}% -> {progress_value}%")
-                    yield {"data": str(-1)}  # Send reset signal
-                print(f"[SSE] Progress: {progress_value}%")
-                yield {"data": str(progress_value)}
-                last_value = progress_value
-                
-                # If cancelled, break the loop
-                if progress_cancelled:
-                    print("Task cancelled, closing connection.")
-                    await asyncio.sleep(0.5)  # Ensure the client receives the final update
-                    break
-            await asyncio.sleep(0.1)  # Adjust the sleep time as needed
+    return EventSourceResponse(iter_progress_events(progress_state))
 
-        # Ensure the final progress update to 100 is sent (only if not cancelled)
-        if not progress_cancelled and last_value != 100:
-            yield {"data": "100"}
 
-        # Keep the connection open for a short time to ensure the client receives the final update
-        await asyncio.sleep(1)
 
-        # Reset progress to 0 after sending the final update
-        progress_value = 0
-
-    return EventSourceResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS"
-        }
-    )
 
 def main():
     parser = argparse.ArgumentParser()

@@ -661,8 +661,7 @@ async def progress():
 
         await asyncio.sleep(1)
 
-        progress_value = 0
-        progress_cancelled = False
+        # Do not reset here — /execute owns lifecycle; reconnects must not wipe state.
 
     return EventSourceResponse(
         event_generator(),

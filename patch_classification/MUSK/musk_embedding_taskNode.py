@@ -26,6 +26,7 @@ import torch
 import torchvision
 from torchvision import transforms
 from sse_starlette.sse import EventSourceResponse
+from progress_sse import ProgressSSEState, iter_progress_events
 import asyncio
 from tqdm import tqdm
 import threading
@@ -89,13 +90,11 @@ ZARR_PATH = None
 NODE_NAME = None
 DEPENDENCIES = []
 MUSK_MODEL = None
-progress_value = 0  # Global variable to track progress
-progress_complete = False  # Flag to indicate completion
+progress_state = ProgressSSEState()
 last_printed_progress = -1  # Added for the new update_progress function
 ZARR_GROUP = None
 DEP_ZARR_GROUPS = {}
 cancel_event = threading.Event()
-execution_active = False
 
 
 def _check_cancel():
@@ -134,7 +133,7 @@ def _to_float(val, default=None):
 
 def update_progress(value):
     """Update the progress value for the frontend"""
-    global progress_value, last_printed_progress
+    global last_printed_progress
     
     # Initialize last_printed_progress (if not exists)
     if 'last_printed_progress' not in globals():
@@ -142,7 +141,7 @@ def update_progress(value):
         last_printed_progress = -1
 
     _check_cancel()
-    progress_value = value
+    progress_state.value = value
     
     # Only print when progress changes by at least 2% or reaches 100%
     if abs(value - last_printed_progress) >= 2 or value == 100:
@@ -219,7 +218,7 @@ def run_patch_classification(args):
     3. Generate embeddings
     4. Save to zarr file
     """
-    global progress_complete, MUSK_MODEL
+    global MUSK_MODEL
     
     if ZARR_PATH is None or NODE_NAME is None:
         raise ValueError("ZARR_PATH and NODE_NAME must be set before running classification")
@@ -355,9 +354,9 @@ def run_patch_classification(args):
                 'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             })
         
-        # Ensure progress is set to 100 when complete
-        progress_complete = True
         update_progress(100)
+        if not progress_state.mark_terminal_and_wait(100, 2.0):
+            print("[SSE] Timed out waiting for progress flush after 100%")
         
         end_time = time.time()
         print(f"[{NODE_NAME}] Time taken: {end_time - start_time:.2f}s")
@@ -377,10 +376,10 @@ def run_patch_classification(args):
 
 @app.get("/status")
 async def get_status():
-    if cancel_event.is_set() and execution_active:
-        return {"status": "cancelling", "progress": int(progress_value)}
-    if execution_active:
-        return {"status": "running", "progress": int(progress_value)}
+    if cancel_event.is_set() and progress_state.execution_active:
+        return {"status": "cancelling", "progress": int(progress_state.value)}
+    if progress_state.execution_active:
+        return {"status": "running", "progress": int(progress_state.value)}
     return {"status": "idle"}
 
 @app.get("/logs")
@@ -746,8 +745,8 @@ def cancel_task():
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, progress_value, cancel_event, execution_active
-    execution_active = True
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event
+    progress_state.begin_execution()
     try:
         if not IS_MODEL_INITED:
             return {"status": "error", "message": "Please /init first."}
@@ -759,7 +758,6 @@ def execute_node():
             msg = f"Invalid slide path: {getattr(ARGS,'slidepath',None)}"
             print(f"[{NODE_NAME}] {msg}")
             out_val = {"status": "error", "message": msg, "patch_count": 0}
-            progress_value = 100
         else:
             print(f"[{NODE_NAME}] /execute => run_patch_classification with slidepath={ARGS.slidepath}")
             print(f"[{NODE_NAME}] ARGS: {ARGS}")
@@ -776,9 +774,12 @@ def execute_node():
             zf.create_array(node_out_path, data=np.array(out_bytes, dtype=f'S{len(out_bytes)}'))
             time.sleep(1)
 
+        if not progress_state.complete and not progress_state.cancelled:
+            progress_state.mark_terminal_and_wait(100, 2.0)
+
         return {"status": "ok", "output": out_val}
     finally:
-        execution_active = False
+        progress_state.end_execution()
 
 @app.options("/progress")
 async def progress_options():
@@ -787,33 +788,9 @@ async def progress_options():
 
 @app.get("/progress")
 async def progress():
-    """SSE endpoint to provide progress updates"""
-    async def event_generator():
-        global progress_value, progress_complete
-        last_value = -1
-        progress_value = 0  # Reset progress to 0 for each new connection
-        progress_complete = False  # Reset completion flag
-        
-        while not progress_complete and progress_value < 100:
-            if progress_value != last_value:
-                print(f"[SSE] Progress: {progress_value}%")
-                yield {"data": str(progress_value)}
-                last_value = progress_value
-            await asyncio.sleep(0.1)
-        
-        # Ensure final progress update to 100 is sent
-        if last_value != 100:
-            yield {"data": "100"}
-        
-        # Keep connection open briefly to ensure client receives final update
-        await asyncio.sleep(1)
-        
-        # Reset progress state for next run
-        progress_value = 0
-        progress_complete = False
-    
+    """SSE progress. Idle terminal cleared on connect; stream end does not reset."""
     return EventSourceResponse(
-        event_generator(),
+        iter_progress_events(progress_state),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -823,6 +800,8 @@ async def progress():
             "Access-Control-Allow-Methods": "GET, OPTIONS"
         }
     )
+
+
 
 
 def main():

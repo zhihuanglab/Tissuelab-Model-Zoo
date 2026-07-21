@@ -21,6 +21,7 @@ import platform
 import numpy as np
 import cv2
 from sse_starlette.sse import EventSourceResponse
+from progress_sse import ProgressSSEState, iter_progress_events
 import asyncio
 
 import multiprocessing
@@ -98,16 +99,13 @@ IS_MODEL_INITED = False
 ZARR_PATH = None
 NODE_NAME = None
 DEPENDENCIES = []
-progress_value = 0  # Global variable to track progress
-progress_complete = False  # New flag to indicate completion
-progress_cancelled = False
-execution_active = False  # True while /execute is processing
+# Per-folder SSE progress (progress_sse.py). Stream end does not reset.
+progress_state = ProgressSSEState()
 cancel_event = threading.Event()
 
 
 def _mark_sse_cancelled() -> None:
-    global progress_cancelled
-    progress_cancelled = True
+    progress_state.mark_cancelled()
 
 
 def parse_args():
@@ -145,10 +143,9 @@ def print_h5_structure(file_path):
 
 
 def update_progress(value):
-    global progress_value
     if cancel_event.is_set():
         raise CooperativeCancel("cancelled")
-    progress_value = value
+    progress_state.value = value
 
 
 def run_segmentation(args):
@@ -159,7 +156,6 @@ def run_segmentation(args):
     3) according to segmentation, generate embedding
     4) write segmentation + embedding to workflow_data.h5
     """
-    global progress_complete, progress_cancelled, progress_value
 
     if ZARR_PATH is None or NODE_NAME is None:
         raise ValueError("ZARR_PATH and NODE_NAME must be set before running segmentation")
@@ -243,8 +239,9 @@ def run_segmentation(args):
                 node_grp.create_array('probabilities', data=probability)
 
         # Ensure progress is set to 100 after Step C and D are completed
-        progress_complete = True
         update_progress(100)
+        if not progress_state.mark_terminal_and_wait(100, 2.0):
+            print("[SSE] Timed out waiting for progress flush after 100%")
 
         end_time = time.time()
         print(f"Time taken: {end_time - start_time:.2f}s")
@@ -252,9 +249,7 @@ def run_segmentation(args):
         return result
 
     except CooperativeCancel:
-        progress_cancelled = True
-        progress_complete = True
-        progress_value = 0
+        progress_state.mark_cancelled()
         print("[Cell-Segmentation] run_segmentation cancelled by user")
         return {
             "status": "cancelled",
@@ -271,10 +266,10 @@ def run_segmentation(args):
 
 @app.get("/status")
 async def get_status():
-    if cancel_event.is_set() and execution_active:
-        return {"status": "cancelling", "progress": int(progress_value)}
-    if execution_active:
-        return {"status": "running", "progress": int(progress_value)}
+    if cancel_event.is_set() and progress_state.execution_active:
+        return {"status": "cancelling", "progress": int(progress_state.value)}
+    if progress_state.execution_active:
+        return {"status": "running", "progress": int(progress_state.value)}
     return {"status": "idle"}
 
 
@@ -337,23 +332,22 @@ def read_node(data: Dict[str, Any]):
 
 @app.post("/cancel")
 def cancel_task():
-    global cancel_event, progress_cancelled
+    global cancel_event
     cancel_event.set()
-    progress_cancelled = True
+    progress_state.mark_cancelled()
     print("[Cell-Segmentation] /cancel — cancel_event set")
     return {"status": "ok", "message": "Cancel request received; stopping at next checkpoint."}
 
 
 @app.post("/execute")
 def execute_node():
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event, progress_cancelled, execution_active
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, cancel_event
 
     if not IS_MODEL_INITED:
         return {"status": "error", "message": "Please /init first."}
 
+    progress_state.begin_execution()
     cancel_event.clear()
-    progress_cancelled = False
-    execution_active = True
     watcher = CancelWatcher(cancel_event, _mark_sse_cancelled)
     watcher.start()
     try:
@@ -381,48 +375,18 @@ def execute_node():
         return {"status": "ok", "output": out_val}
     finally:
         watcher.stop()
-        execution_active = False
+        progress_state.end_execution()
 
 
 @app.get("/progress")
 async def progress():
     """
-    SSE endpoint to provide progress updates
+    SSE endpoint to provide progress updates.
+    Idle terminal state is cleared on connect; stream end does not reset.
     """
-    async def event_generator():
-        global progress_value, progress_complete, progress_cancelled
-        last_value = -1
-        progress_value = 0
-        progress_complete = False
-        progress_cancelled = False
+    return EventSourceResponse(iter_progress_events(progress_state))
 
-        while True:
-            if progress_value != last_value or (progress_value == 100 and progress_complete) or (progress_value == 0 and last_value > 0) or progress_cancelled:
-                if last_value > progress_value or progress_cancelled:
-                    if progress_cancelled:
-                        print("[SSE] Task cancelled, sending reset signal")
-                    yield {"data": str(-1)}
-                yield {"data": str(progress_value)}
-                last_value = progress_value
 
-                if (progress_value == 100 and progress_complete) or progress_cancelled:
-                    if progress_cancelled:
-                        print("Task cancelled, closing connection.")
-                    else:
-                        print("Progress complete, closing connection.")
-                    await asyncio.sleep(0.5)
-                    break
-
-            await asyncio.sleep(0.1)
-
-        await asyncio.sleep(1)
-
-        progress_value = 0
-        progress_complete = False
-        progress_cancelled = False
-        print("Progress reset to 0.")
-
-    return EventSourceResponse(event_generator())
 
 
 def main():

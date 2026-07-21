@@ -538,10 +538,8 @@ async def progress():
         # Keep the connection open for a short time to ensure the client receives the final update
         await asyncio.sleep(1)
 
-        # Reset progress to 0 and completion flag after sending the final update
-        progress_value = 0
-        progress_complete = False
-        print("Progress reset to 0.")
+        # Do not reset here — /execute owns lifecycle; reconnects must not wipe state.
+        print("Progress stream closed.")
 
     return EventSourceResponse(event_generator())
 
