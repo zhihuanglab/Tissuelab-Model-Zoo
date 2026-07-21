@@ -261,6 +261,9 @@ def run_segmentation(args):
         import traceback
         print(f"Error: {str(e)}")
         print(traceback.format_exc())
+        # Close SSE on failure (otherwise stream waits forever for complete/cancelled).
+        if not progress_state.complete and not progress_state.cancelled:
+            progress_state.mark_cancelled()
         return {"status": "error", "message": str(e), "nuclei_count": 0}
 
 
@@ -358,9 +361,18 @@ def execute_node():
                 "message": "no path, skipping.",
                 "nuclei_count": 0
             }
+            progress_state.mark_terminal_and_wait(100, 2.0)
         else:
             print(f"[Cell-Segmentation] /execute => run_segmentation with slidepath={ARGS.slidepath}")
             out_val = run_segmentation(ARGS)
+            if out_val.get("status") == "cancelled":
+                if not progress_state.cancelled:
+                    progress_state.mark_cancelled()
+            elif out_val.get("status") == "error":
+                if not progress_state.complete and not progress_state.cancelled:
+                    progress_state.mark_cancelled()
+            elif not progress_state.complete and not progress_state.cancelled:
+                progress_state.mark_terminal_and_wait(100, 2.0)
 
         # store the result to 'output'
         if ZARR_PATH and os.path.exists(ZARR_PATH):

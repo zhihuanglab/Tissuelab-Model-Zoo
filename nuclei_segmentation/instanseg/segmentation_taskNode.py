@@ -653,6 +653,8 @@ def run_segmentation(args):
     except Exception as e:
         print(f"Error: {str(e)}")
         print(traceback.format_exc())
+        if not progress_state.complete and not progress_state.cancelled:
+            progress_state.mark_cancelled()
         return {"status": "error", "message": str(e), "nuclei_count": 0}
 
 
@@ -906,24 +908,19 @@ def execute_node():
                 "message": "no path, skipping.",
                 "nuclei_count": 0
             }
-            progress_state.value = 100
-            progress_state.complete = True
+            progress_state.mark_terminal_and_wait(100, 2.0)
         else:
             print(f"[InstanSegNode] /execute => run_segmentation with slidepath={ARGS.slidepath}")
             out_val = run_segmentation(ARGS)
             
             # Check if task was cancelled
             if out_val.get("status") == "cancelled":
-                # Reset progress state on cancellation
-                # Force progress update by ensuring it's different from current value
-                current_progress = progress_state.value
-                progress_state.value = 0
-                progress_state.complete = False
-                progress_state.cancelled = True  # Set cancellation flag
-                # Small delay to allow SSE to pick up the reset
-                if current_progress > 0:
-                    time.sleep(0.2)  # Give SSE stream time to send reset signal
+                progress_state.mark_cancelled()
                 return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
+            if out_val.get("status") == "error":
+                if not progress_state.complete and not progress_state.cancelled:
+                    progress_state.mark_cancelled()
+
 
         # Write run metadata to <NODE_NAME>/metadata as a zarr group with attrs.
         # Replaces the historical <NODE_NAME>/output bytes blob.

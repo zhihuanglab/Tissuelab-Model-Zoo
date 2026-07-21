@@ -365,11 +365,14 @@ def run_patch_classification(args):
 
     except CooperativeCancel:
         print(f"[{NODE_NAME}] Cancelled by user")
+        progress_state.mark_cancelled()
         return {"status": "cancelled", "message": "Task was cancelled", "patch_count": 0}
     except Exception as e:
         import traceback
         print(f"[{NODE_NAME}] Error: {str(e)}")
         print(traceback.format_exc())
+        if not progress_state.complete and not progress_state.cancelled:
+            progress_state.mark_cancelled()
         return {"status": "error", "message": str(e), "patch_count": 0}
 
 # === FastAPI Routes ===
@@ -773,6 +776,11 @@ def execute_node():
             out_bytes = out_str.encode("utf-8")
             zf.create_array(node_out_path, data=np.array(out_bytes, dtype=f'S{len(out_bytes)}'))
             time.sleep(1)
+
+        if out_val.get("status") == "cancelled":
+            if not progress_state.cancelled:
+                progress_state.mark_cancelled()
+            return {"status": "cancelled", "output": out_val}
 
         if not progress_state.complete and not progress_state.cancelled:
             progress_state.mark_terminal_and_wait(100, 2.0)

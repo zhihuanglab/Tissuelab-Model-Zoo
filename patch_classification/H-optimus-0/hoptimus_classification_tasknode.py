@@ -1695,6 +1695,7 @@ def run_classification(args) -> Dict[str, Any]:
 
     except CooperativeCancel:
         print(f"[{NODE_NAME}] Classification cancelled by user")
+        progress_state.mark_cancelled()
         return {
             "status": "cancelled",
             "message": "Task was cancelled",
@@ -2163,6 +2164,10 @@ def execute_node():
         # Run-summary (out_val) is already written to Patch-Classification/metadata
         # as group + attrs inside run_classification; the HTTP response below
         # carries it for the caller as well. No need for a separate bytes blob.
+
+        if out_val.get("status") == "cancelled":
+            progress_state.mark_cancelled()
+            return {"status": "cancelled", "output": out_val}
 
         if not progress_state.mark_terminal_and_wait(100, 2.0):
             print("[SSE] Timed out waiting for progress flush after 100%")
