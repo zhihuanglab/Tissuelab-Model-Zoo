@@ -130,6 +130,14 @@ CLASS_OPERATIONS = {}
 # Per-folder SSE progress (progress_sse.py). Stream end does not reset.
 progress_state = ProgressSSEState()
 
+# One-vs-rest mode: each class is an independent binary classifier stored in its
+# own .tlcls file. "multiclass" (default) keeps the historical single softmax head.
+# SAVE_CLASSIFIER_PATHS / CLASSIFIER_PATHS are {class_name: path} dicts sent by the
+# frontend for OvR train / predict respectively.
+CLASSIFIER_MODE = "multiclass"
+SAVE_CLASSIFIER_PATHS = None
+CLASSIFIER_PATHS = None
+
 # global variable for cancellation flag - use threading.Event for thread safety
 import threading
 cancel_event = threading.Event()  # Thread-safe cancellation event
@@ -1590,11 +1598,278 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
 
     return (clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0)
 
+def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_colors, use_supervised, organ=None):
+    """
+    One-vs-rest classification: every class is its own independent binary
+    classifier stored in a separate .tlcls file.
+
+    Train (only when annotations exist): for each class the frontend asked to
+    save (SAVE_CLASSIFIER_PATHS) that also has >=1 positive annotation, fit a
+    binary XGB — positives = cells annotated as that class; negatives = cells
+    annotated as any other class + the shared negative-control vectors + any
+    cells explicitly marked "not this class" (weak, 0.3). Save each to its path.
+
+    Predict: for every class that ends up with a classifier — freshly trained
+    (SAVE_CLASSIFIER_PATHS) or pre-attached (CLASSIFIER_PATHS) — score all cells
+    with predict_proba[:, 1] and drop it into that class's probability column.
+    Classes with no classifier stay at 0 ("没添加就不管"). "Negative control" is
+    the reject bucket: score = 1 - max(class scores), so a cell that no binary
+    claims falls back to it. Final label per cell = argmax across all columns.
+
+    Returns (predictions, prediction_probs, final_class_names, final_class_colors,
+    method) or None. None means "no per-class classifier exists at all" — the
+    caller then runs the existing zero-shot path ("都没有分类器 => 零样本"). None is
+    also returned on cancellation.
+    """
+    global SAVE_CLASSIFIER_PATH, cancel_event
+
+    # Authoritative class ordering — same rule as the multiclass path: panel
+    # order, Negative control forced to index 0.
+    final_class_names = list(nuclei_classes) if nuclei_classes else []
+    if "Negative control" not in final_class_names:
+        final_class_names = ["Negative control"] + final_class_names
+    elif final_class_names[0] != "Negative control":
+        final_class_names = ["Negative control"] + [c for c in final_class_names if c != "Negative control"]
+    frontend_color_map = _build_frontend_color_map(nuclei_classes, nuclei_colors)
+    final_class_colors = [frontend_color_map.get(cn, "#aaaaaa") for cn in final_class_names]
+    name_to_idx = {n: i for i, n in enumerate(final_class_names)}
+    n_cells = int(cell_embeddings.shape[0])
+    print(f"[OvR] one-vs-rest mode, classes={final_class_names}")
+
+    # Darwin-safe single-threaded params (same rationale as train_linear_classifier).
+    import platform as _platform
+    _is_darwin = _platform.system() == 'Darwin'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    xgb_params_bin = {
+        'max_depth': 8, 'tree_method': 'hist', 'device': device,
+        'objective': 'binary:logistic', 'eval_metric': 'logloss',
+        'random_state': 42, 'base_score': 0.5,
+        'n_jobs': 1 if _is_darwin else -1, 'nthread': 1 if _is_darwin else -1,
+    }
+
+    # --- split annotations (same masks as train_linear_classifier) ---
+    if annotations is None:
+        annotations = pd.DataFrame()
+    if annotations.empty:
+        positive_annotations = pd.DataFrame()
+        negative_annotations = pd.DataFrame()
+    else:
+        has_idx = 'cell_class_index' in annotations.columns
+        pos_mask = annotations['class'].notna()
+        if has_idx:
+            ci = pd.to_numeric(annotations['cell_class_index'], errors='coerce')
+            pos_mask = pos_mask | (ci.notna() & (ci >= 0))
+        positive_annotations = annotations[pos_mask].copy()
+        negative_annotations = annotations[~pos_mask].copy()
+
+    X_pos = y_pos = None
+    if not positive_annotations.empty:
+        cell_indices = positive_annotations['cell_ID'].astype(int).values
+        X_pos = cell_embeddings[cell_indices]
+        y_pos = _annotation_labels_to_classifier_indices(positive_annotations, final_class_names, nuclei_classes)
+        valid = y_pos >= 0
+        X_pos, y_pos = X_pos[valid], y_pos[valid]
+
+    # cells explicitly annotated "not <class>" -> hard negatives for that class
+    excl_cells = {}
+    if not negative_annotations.empty and (
+        'exclude_classes' in negative_annotations.columns or 'exclude_class_indices' in negative_annotations.columns
+    ):
+        for _, row in negative_annotations.iterrows():
+            cid = int(row['cell_ID'])
+            ex = row.get('exclude_classes', [])
+            if not isinstance(ex, list) or not ex:
+                inds = row.get('exclude_class_indices', [])
+                if isinstance(inds, list) and nuclei_classes and len(nuclei_classes) > 0:
+                    ex = [nuclei_classes[int(i)] for i in inds if 0 <= int(i) < len(nuclei_classes)]
+            for c in (ex or []):
+                excl_cells.setdefault(str(c), []).append(cid)
+
+    # shared background negatives
+    if not hasattr(train_linear_classifier, '_negative_control_vectors'):
+        base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
+        try:
+            train_linear_classifier._negative_control_vectors = np.load(
+                os.path.join(base_path, "negative_control_example_vectors.npy"))
+        except Exception as e:
+            print(f"[OvR] Could not load negative control vectors: {e}")
+            train_linear_classifier._negative_control_vectors = None
+    nc_vectors = getattr(train_linear_classifier, '_negative_control_vectors', None)
+
+    prediction_probs = np.zeros((n_cells, len(final_class_names)), dtype=np.float32)
+    filled_cols = []  # final indices that received a real classifier score
+
+    # classes the frontend asked to train (default: every non-NC class)
+    trainable = [c for c in final_class_names if c != "Negative control"]
+    if SAVE_CLASSIFIER_PATHS:
+        trainable = [c for c in trainable if c in SAVE_CLASSIFIER_PATHS]
+
+    # === Phase 1: TRAIN — fit one binary per class and SAVE it to disk. ===
+    # No prediction here; every .tlcls (freshly trained or pre-attached) is run
+    # uniformly from disk in Phase 2, so the merge is a single "run each model
+    # once, then combine" pipeline rather than an in-memory/on-disk split.
+    trained_paths = {}  # class_name -> path we just wrote (source of truth for Phase 2)
+    can_train = (
+        use_supervised and X_pos is not None and len(X_pos) > 0 and bool(SAVE_CLASSIFIER_PATHS)
+    )
+    n_train = len(trainable) if can_train else 0
+    for t_i, cls in enumerate(trainable if can_train else []):
+        if cancel_event.is_set():
+            cancel_event.clear(); progress_state.value = 0; return None
+        ci = name_to_idx[cls]
+        pos_sel = (y_pos == ci)
+        if not np.any(pos_sel):
+            print(f"[OvR] skip '{cls}': no positive annotations")
+            continue
+        Xp = X_pos[pos_sel]
+        parts_X = [Xp]
+        parts_y = [np.ones(len(Xp))]
+        parts_w = [np.ones(len(Xp))]
+        other = X_pos[y_pos != ci]  # cells annotated as some other class
+        if len(other):
+            parts_X.append(other); parts_y.append(np.zeros(len(other))); parts_w.append(np.ones(len(other)))
+        if nc_vectors is not None and len(nc_vectors):
+            parts_X.append(nc_vectors); parts_y.append(np.zeros(len(nc_vectors))); parts_w.append(np.ones(len(nc_vectors)))
+        hard_ids = excl_cells.get(cls, [])
+        if hard_ids:
+            hn = cell_embeddings[np.array(hard_ids, dtype=int)]
+            # Explicit "not <cls>" is a full-strength negative for this class's binary
+            # (weight 1.0). The 0.3 weak-negative weight only makes sense in multiclass,
+            # where "not X" is spread as a weak positive to every other class — OvR
+            # never does that, so here it's a direct, confident negative.
+            parts_X.append(hn); parts_y.append(np.zeros(len(hn))); parts_w.append(np.ones(len(hn)))
+        if len(parts_X) < 2:
+            print(f"[OvR] skip '{cls}': no negatives available")
+            continue
+        Xb = np.concatenate(parts_X, axis=0)
+        yb = np.concatenate(parts_y, axis=0).astype(int)
+        wb = np.concatenate(parts_w, axis=0)
+        clf = xgb.XGBClassifier(**xgb_params_bin)
+        clf.fit(Xb, yb, sample_weight=wb)
+        # persist (SAVE_CLASSIFIER_PATH temporarily points at this class file so
+        # save_classifier_params writes the right target + embeds provenance)
+        path = SAVE_CLASSIFIER_PATHS[cls]
+        _dir = os.path.dirname(path)
+        if _dir:
+            os.makedirs(_dir, exist_ok=True)
+        _prev = SAVE_CLASSIFIER_PATH
+        SAVE_CLASSIFIER_PATH = path
+        try:
+            save_classifier_params(clf, ["Negative control", cls],
+                                   ["#aaaaaa", final_class_colors[ci]],
+                                   {'embeddings': Xb, 'labels': yb})
+        finally:
+            SAVE_CLASSIFIER_PATH = _prev
+        trained_paths[cls] = path
+        print(f"[OvR] trained '{cls}': {int(pos_sel.sum())} pos / {len(Xb) - int(pos_sel.sum())} neg -> {path}")
+        progress_state.value = 40 + int(20 * (t_i + 1) / max(1, n_train))
+
+    # === Phase 2: RUN every .tlcls once, from disk, and fill its column. ===
+    # Union of pre-attached (CLASSIFIER_PATHS) and just-trained (trained_paths);
+    # a freshly trained file wins when a class appears in both.
+    predict_map = {}
+    if CLASSIFIER_PATHS:
+        predict_map.update(CLASSIFIER_PATHS)
+    predict_map.update(trained_paths)
+
+    items = [(c, p) for c, p in predict_map.items() if c in name_to_idx]
+    for r_i, (cls, path) in enumerate(items):
+        if cancel_event.is_set():
+            cancel_event.clear(); progress_state.value = 0; return None
+        ci = name_to_idx[cls]
+        if not path or not os.path.exists(path):
+            print(f"[OvR] classifier for '{cls}' not found: {path}")
+            continue
+        try:
+            if os.path.getsize(path) == 0:
+                print(f"[OvR] classifier for '{cls}' is empty (0 bytes), skip")
+                continue
+        except OSError:
+            pass
+        try:
+            clf = xgb.XGBClassifier()
+            clf.load_model(path)
+            prediction_probs[:, ci] = clf.predict_proba(cell_embeddings)[:, 1]
+            filled_cols.append(ci)
+            print(f"[OvR] ran '{cls}' <- {path}")
+        except Exception as e:
+            print(f"[OvR] failed to run '{cls}' from {path}: {e}")
+        progress_state.value = 60 + int(30 * (r_i + 1) / max(1, len(items)))
+
+    if not filled_cols:
+        print("[OvR] no per-class classifiers available => zero-shot fallback")
+        return None
+
+    # === Phase 3: merge — supervised first, zero-shot fallback for the rest ===
+    # Stage A (supervised): a cell is "claimed" if its strongest binary is >= 0.5
+    #   (the binary:logistic decision boundary — the classifier itself saying
+    #   "yes, this class"). Claimed cells take that supervised winner.
+    # Stage B (zero-shot): cells that NO binary claims (all < 0.5) are resolved by
+    #   zero-shot, restricted to the classes that have NO classifier (+ Negative
+    #   control). Supervised and zero-shot never share one argmax, so their score
+    #   scales are never compared against each other.
+    OVR_CLAIM_THRESHOLD = 0.5
+    nc_idx = name_to_idx.get("Negative control")
+    supervised_cols = sorted(filled_cols)
+
+    sup_mat = prediction_probs[:, supervised_cols]           # (n, k) supervised probs
+    sup_max = sup_mat.max(axis=1)
+    sup_win = np.array(supervised_cols)[sup_mat.argmax(axis=1)]
+    claimed = sup_max >= OVR_CLAIM_THRESHOLD
+
+    predictions = np.zeros(n_cells, dtype=np.int32)          # default index 0 (NC)
+    predictions[claimed] = sup_win[claimed]
+
+    unclaimed = ~claimed
+    n_unclaimed = int(unclaimed.sum())
+    if n_unclaimed > 0:
+        # Wipe the (sub-0.5) supervised residue on unclaimed rows so the saved
+        # probability matrix stays coherent with the stage that actually decided
+        # them, then fill the zero-shot columns.
+        rows = np.where(unclaimed)[0]
+        prediction_probs[rows, :] = 0.0
+        unclassified_classes = [
+            c for c in final_class_names
+            if c != "Negative control" and name_to_idx[c] not in filled_cols
+        ]
+        zs_candidates = (["Negative control"] if nc_idx is not None else []) + unclassified_classes
+        did_zeroshot = False
+        if len(unclassified_classes) > 0 and PLIP_MODELS is not None and len(zs_candidates) > 1:
+            try:
+                processor, model, text_projection, device = PLIP_MODELS
+                text_encoder = model.text_model
+                cand_emb = _generate_text_description(
+                    processor, text_encoder, text_projection, zs_candidates, organ, device)
+                sims = np.dot(cell_embeddings[rows], cand_emb.T)          # (n_unclaimed, C)
+                exp = np.exp(sims - sims.max(axis=1, keepdims=True))
+                soft = (exp / exp.sum(axis=1, keepdims=True)).astype(np.float32)
+                cand_cols = [name_to_idx[c] for c in zs_candidates]
+                for j, col in enumerate(cand_cols):
+                    prediction_probs[rows, col] = soft[:, j]
+                predictions[rows] = np.array(cand_cols)[soft.argmax(axis=1)]
+                did_zeroshot = True
+                print(f"[OvR] zero-shot fallback on {n_unclaimed} unclaimed cells over {zs_candidates}")
+            except Exception as e:
+                print(f"[OvR] zero-shot fallback failed ({e}); unclaimed -> Negative control")
+        if not did_zeroshot:
+            # no classifier-less class to zero-shot into (or no PLIP) -> Negative control
+            if nc_idx is not None:
+                prediction_probs[rows, nc_idx] = 1.0
+                predictions[rows] = nc_idx
+            print(f"[OvR] {n_unclaimed} unclaimed cells -> Negative control")
+
+    progress_state.value = 90
+    print(f"[OvR] done: {len(filled_cols)} classifier(s), "
+          f"{int(claimed.sum())} supervised / {n_unclaimed} fallback over {n_cells} cells")
+    return predictions, prediction_probs, final_class_names, final_class_colors, "supervised-ovr"
+
+
 def run_classification(args) -> Dict[str, Any]:
     if ZARR_PATH is None:
         raise ValueError("ZARR_PATH not set => please ensure /read is called first.")
 
     global PLIP_MODELS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS
+    global CLASSIFIER_MODE, SAVE_CLASSIFIER_PATHS, CLASSIFIER_PATHS
     global cancel_event
 
     result = {"status": "success", "message": "", "classification_count": 0}
@@ -1689,9 +1964,26 @@ def run_classification(args) -> Dict[str, Any]:
                 final_class_colors_for_training = [c.decode('utf-8') if hasattr(c, 'decode') else c for c in old_colors]
                 print(f"Using colors from zarr for training: {final_class_colors_for_training}")
         
+        # One-vs-rest short-circuit: each class is its own binary .tlcls. When it
+        # produces results we skip the multiclass/zero-shot dispatch entirely.
+        # Returns None (=> fall through) when the mode is off or no per-class
+        # classifier exists at all (then zero-shot handles it below).
+        ovr_result = None
+        if CLASSIFIER_MODE == "one-vs-rest":
+            ovr_result = run_ovr_classification(
+                cell_embeddings, annotations_data, nuclei_classes, nuclei_colors, use_supervised, organ
+            )
+            if ovr_result is None and cancel_event.is_set():
+                cancel_event.clear()
+                progress_state.value = 0
+                return {"status": "cancelled", "message": "Task was cancelled", "classification_count": 0}
+            if ovr_result is not None:
+                predictions, prediction_probs, final_class_names, final_class_colors, classification_method = ovr_result
+                print(f"One-vs-rest classification completed ({classification_method})")
+
         # Try supervised classification if we have classifier path or annotations
         classifier_result = None
-        if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
+        if ovr_result is None and (CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None)):
             classifier_result = train_linear_classifier(
                 cell_embeddings, 
                 annotations_data, 
@@ -1711,7 +2003,11 @@ def run_classification(args) -> Dict[str, Any]:
                 }
         
         # Check if supervised classification succeeded
-        if classifier_result is not None:
+        if ovr_result is not None:
+            # One-vs-rest already set predictions / prediction_probs /
+            # final_class_names / final_class_colors / classification_method above.
+            pass
+        elif classifier_result is not None:
             clf, class_names, class_colors, predictions, prediction_probs, \
                 coef_, intercept_, train_time, test_time = classifier_result
             classification_method = "supervised"
@@ -2177,7 +2473,13 @@ def init_node():
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
     global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS, LAST_TRAINED_CLF_BUNDLE, ZARR_GROUP
+    global CLASSIFIER_MODE, SAVE_CLASSIFIER_PATHS, CLASSIFIER_PATHS
     LAST_TRAINED_CLF_BUNDLE = None
+    # Reset OvR state each run so a stale mode/paths dict from a previous node
+    # execution never leaks into a plain multiclass run.
+    CLASSIFIER_MODE = "multiclass"
+    SAVE_CLASSIFIER_PATHS = None
+    CLASSIFIER_PATHS = None
     NODE_NAME = data.get("node_name", "NuClass")
     ZARR_GROUP = data.get("zarr_group") or "Cell-Classification"
     DEPENDENCIES = data.get("dependencies", [])
@@ -2220,6 +2522,18 @@ def read_node(data: Dict[str, Any]):
                     CLASSIFIER_PATH = val_json
                 elif k == "save_classifier_path":
                     SAVE_CLASSIFIER_PATH = val_json
+                elif k == "classifier_mode":
+                    # "multiclass" | "one-vs-rest"
+                    if isinstance(val_json, str) and val_json:
+                        CLASSIFIER_MODE = val_json
+                elif k == "classifier_paths":
+                    # OvR predict: {class_name: path} of pre-trained per-class .tlcls
+                    if isinstance(val_json, dict) and val_json:
+                        CLASSIFIER_PATHS = {str(k2): str(v2) for k2, v2 in val_json.items()}
+                elif k == "save_classifier_paths":
+                    # OvR train: {class_name: path} to write each per-class .tlcls to
+                    if isinstance(val_json, dict) and val_json:
+                        SAVE_CLASSIFIER_PATHS = {str(k2): str(v2) for k2, v2 in val_json.items()}
                 elif k == "nuclei_classes":
                     if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.nuclei_classes = val_json

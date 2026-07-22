@@ -122,6 +122,14 @@ CLASSIFIER_PATH = None
 SAVE_CLASSIFIER_PATH = None
 LAST_TRAINED_CLF_BUNDLE = None
 
+# One-vs-rest mode: each class is an independent binary classifier in its own
+# .tlcls file. "multiclass" (default) keeps the single softmax head.
+# SAVE_CLASSIFIER_PATHS / CLASSIFIER_PATHS are {class_name: path} dicts from the FE
+# for OvR train / predict respectively.
+CLASSIFIER_MODE = "multiclass"
+SAVE_CLASSIFIER_PATHS = None
+CLASSIFIER_PATHS = None
+
 # ZARR group controls (populated in /read)
 ZARR_GROUP = None
 DEP_ZARR_GROUPS = {}
@@ -1247,6 +1255,195 @@ def train_linear_classifier(
 
     return (clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0)
 
+def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_colors, use_supervised):
+    """One-vs-rest for patch classification. Each class = an independent binary
+    (binary:logistic) .tlcls. Two-stage merge: a patch is 'claimed' by its strongest
+    binary if >= 0.5 (supervised argmax); patches no binary claims fall back to
+    zero-shot over the classifier-less classes + Negative control (MUSK text
+    similarity). Returns (predictions, prediction_probs, final_class_names,
+    final_class_colors, method) or None to fall through to multiclass/zero-shot.
+    Mirrors the NuClass OvR; patch-specific: `patch_ID` indexing, MUSK zero-shot,
+    no pre-baked NC example vectors."""
+    global SAVE_CLASSIFIER_PATH, progress_value
+
+    final_class_names = list(tissue_classes) if tissue_classes else []
+    if "Negative control" not in final_class_names:
+        final_class_names = ["Negative control"] + final_class_names
+    elif final_class_names[0] != "Negative control":
+        final_class_names = ["Negative control"] + [c for c in final_class_names if c != "Negative control"]
+    mapped = _resolve_colors_for_class_names(final_class_names, tissue_classes, tissue_colors)
+    final_class_colors = mapped if mapped is not None else generate_distinct_colors(final_class_names)
+    name_to_idx = {n: i for i, n in enumerate(final_class_names)}
+    n_cells = int(cell_embeddings.shape[0])
+    print(f"[OvR] one-vs-rest mode, classes={final_class_names}")
+
+    import platform as _platform
+    _is_darwin = _platform.system() == 'Darwin'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    xgb_params_bin = {
+        'max_depth': 8, 'tree_method': 'hist', 'device': device,
+        'objective': 'binary:logistic', 'eval_metric': 'logloss',
+        'random_state': 42, 'base_score': 0.5,
+        'n_jobs': 1 if _is_darwin else -1, 'nthread': 1 if _is_darwin else -1,
+    }
+
+    if annotations is None:
+        annotations = pd.DataFrame()
+    positive_annotations = annotations[annotations['class'].notna()].copy() if not annotations.empty else pd.DataFrame()
+    negative_annotations = annotations[annotations['class'].isna()].copy() if not annotations.empty else pd.DataFrame()
+
+    X_pos = y_pos = None
+    if not positive_annotations.empty:
+        pidx = positive_annotations['patch_ID'].astype(int).values
+        X_pos = cell_embeddings[pidx]
+        y_pos = np.array([name_to_idx.get(str(c), -1) for c in positive_annotations['class'].values])
+        valid = y_pos >= 0
+        X_pos, y_pos = X_pos[valid], y_pos[valid]
+
+    # patches explicitly annotated "not <class>" -> hard negatives for that class
+    excl_cells = {}
+    if not negative_annotations.empty and (
+        'exclude_classes' in negative_annotations.columns or 'exclude_class_indices' in negative_annotations.columns
+    ):
+        for _, row in negative_annotations.iterrows():
+            pid = int(row['patch_ID'])
+            for c in _parse_exclude_list(row, final_class_names):
+                excl_cells.setdefault(str(c), []).append(pid)
+
+    prediction_probs = np.zeros((n_cells, len(final_class_names)), dtype=np.float32)
+    filled_cols = []
+
+    trainable = [c for c in final_class_names if c != "Negative control"]
+    if SAVE_CLASSIFIER_PATHS:
+        trainable = [c for c in trainable if c in SAVE_CLASSIFIER_PATHS]
+
+    # === Phase 1: TRAIN one binary per class, SAVE each to disk. ===
+    trained_paths = {}
+    can_train = use_supervised and X_pos is not None and len(X_pos) > 0 and bool(SAVE_CLASSIFIER_PATHS)
+    n_train = len(trainable) if can_train else 0
+    for t_i, cls in enumerate(trainable if can_train else []):
+        if cancel_event.is_set():
+            cancel_event.clear(); progress_value = 0; return None
+        ci = name_to_idx[cls]
+        pos_sel = (y_pos == ci)
+        if not np.any(pos_sel):
+            print(f"[OvR] skip '{cls}': no positive annotations")
+            continue
+        Xp = X_pos[pos_sel]
+        parts_X = [Xp]; parts_y = [np.ones(len(Xp))]; parts_w = [np.ones(len(Xp))]
+        other = X_pos[y_pos != ci]  # patches annotated as some other class
+        if len(other):
+            parts_X.append(other); parts_y.append(np.zeros(len(other))); parts_w.append(np.ones(len(other)))
+        hard_ids = excl_cells.get(cls, [])
+        if hard_ids:
+            hn = cell_embeddings[np.array(hard_ids, dtype=int)]
+            # Explicit "not <cls>" is a full-strength negative (weight 1.0). OvR never
+            # spreads it as a weak positive (that's multiclass-only), so no 0.3 here.
+            parts_X.append(hn); parts_y.append(np.zeros(len(hn))); parts_w.append(np.ones(len(hn)))
+        if len(parts_X) < 2:
+            print(f"[OvR] skip '{cls}': no negatives available")
+            continue
+        Xb = np.concatenate(parts_X, axis=0)
+        yb = np.concatenate(parts_y, axis=0).astype(int)
+        wb = np.concatenate(parts_w, axis=0)
+        clf = xgb.XGBClassifier(**xgb_params_bin)
+        clf.fit(Xb, yb, sample_weight=wb)
+        path = SAVE_CLASSIFIER_PATHS[cls]
+        _dir = os.path.dirname(path)
+        if _dir:
+            os.makedirs(_dir, exist_ok=True)
+        _prev = SAVE_CLASSIFIER_PATH
+        SAVE_CLASSIFIER_PATH = path
+        try:
+            save_classifier_params(clf, ["Negative control", cls],
+                                   ["#aaaaaa", final_class_colors[ci]],
+                                   {'embeddings': Xb, 'labels': yb})
+        finally:
+            SAVE_CLASSIFIER_PATH = _prev
+        trained_paths[cls] = path
+        print(f"[OvR] trained '{cls}': {int(pos_sel.sum())} pos / {len(Xb) - int(pos_sel.sum())} neg -> {path}")
+        progress_value = 40 + int(20 * (t_i + 1) / max(1, n_train))
+
+    # === Phase 2: RUN every .tlcls once, from disk, fill its column. ===
+    predict_map = {}
+    if CLASSIFIER_PATHS:
+        predict_map.update(CLASSIFIER_PATHS)
+    predict_map.update(trained_paths)
+    items = [(c, p) for c, p in predict_map.items() if c in name_to_idx]
+    for r_i, (cls, path) in enumerate(items):
+        if cancel_event.is_set():
+            cancel_event.clear(); progress_value = 0; return None
+        ci = name_to_idx[cls]
+        if not path or not os.path.exists(path):
+            print(f"[OvR] classifier for '{cls}' not found: {path}"); continue
+        try:
+            if os.path.getsize(path) == 0:
+                print(f"[OvR] classifier for '{cls}' is empty, skip"); continue
+        except OSError:
+            pass
+        try:
+            clf = xgb.XGBClassifier(); clf.load_model(path)
+            prediction_probs[:, ci] = clf.predict_proba(cell_embeddings)[:, 1]
+            filled_cols.append(ci)
+            print(f"[OvR] ran '{cls}' <- {path}")
+        except Exception as e:
+            print(f"[OvR] failed to run '{cls}' from {path}: {e}")
+        progress_value = 60 + int(30 * (r_i + 1) / max(1, len(items)))
+
+    if not filled_cols:
+        print("[OvR] no per-class classifiers available => fall through")
+        return None
+
+    # === Phase 3: merge — supervised claim (>=0.5), zero-shot for the rest. ===
+    OVR_CLAIM_THRESHOLD = 0.5
+    nc_idx = name_to_idx.get("Negative control")
+    supervised_cols = sorted(filled_cols)
+    sup_mat = prediction_probs[:, supervised_cols]
+    sup_max = sup_mat.max(axis=1)
+    sup_win = np.array(supervised_cols)[sup_mat.argmax(axis=1)]
+    claimed = sup_max >= OVR_CLAIM_THRESHOLD
+
+    predictions = np.zeros(n_cells, dtype=np.int32)  # default index 0 (NC)
+    predictions[claimed] = sup_win[claimed]
+
+    unclaimed = ~claimed
+    n_unclaimed = int(unclaimed.sum())
+    if n_unclaimed > 0:
+        rows = np.where(unclaimed)[0]
+        prediction_probs[rows, :] = 0.0
+        unclassified_classes = [
+            c for c in final_class_names
+            if c != "Negative control" and name_to_idx[c] not in filled_cols
+        ]
+        zs_candidates = (["Negative control"] if nc_idx is not None else []) + unclassified_classes
+        did_zeroshot = False
+        if len(unclassified_classes) > 0 and MUSK_MODEL is not None and len(zs_candidates) > 1:
+            try:
+                cand_list = _generate_text_description(zs_candidates)  # list of (1, D)
+                cand_emb = np.concatenate(cand_list, axis=0)           # (C, D)
+                sims = np.dot(cell_embeddings[rows], cand_emb.T)       # (n_unclaimed, C)
+                exp = np.exp(sims - sims.max(axis=1, keepdims=True))
+                soft = (exp / exp.sum(axis=1, keepdims=True)).astype(np.float32)
+                cand_cols = [name_to_idx[c] for c in zs_candidates]
+                for j, col in enumerate(cand_cols):
+                    prediction_probs[rows, col] = soft[:, j]
+                predictions[rows] = np.array(cand_cols)[soft.argmax(axis=1)]
+                did_zeroshot = True
+                print(f"[OvR] zero-shot fallback on {n_unclaimed} unclaimed patches over {zs_candidates}")
+            except Exception as e:
+                print(f"[OvR] zero-shot fallback failed ({e}); unclaimed -> Negative control")
+        if not did_zeroshot:
+            if nc_idx is not None:
+                prediction_probs[rows, nc_idx] = 1.0
+                predictions[rows] = nc_idx
+            print(f"[OvR] {n_unclaimed} unclaimed patches -> Negative control")
+
+    progress_value = 90
+    print(f"[OvR] done: {len(filled_cols)} classifier(s), "
+          f"{int(claimed.sum())} supervised / {n_unclaimed} fallback over {n_cells} patches")
+    return predictions, prediction_probs, final_class_names, final_class_colors, "one-vs-rest"
+
+
 def run_classification(args) -> Dict[str, Any]:
     if ZARR_PATH is None:
         raise ValueError("ZARR_PATH not set => please ensure /read is called first.")
@@ -1418,18 +1615,40 @@ def run_classification(args) -> Dict[str, Any]:
             else:
                 print(f"[{NODE_NAME}] Will use colors from classifier file (CLASSIFIER_PATH set, no valid UI color list)")
 
+        # One-vs-rest short-circuit: each class is its own binary .tlcls. When it
+        # produces results we skip the multiclass/zero-shot dispatch entirely.
+        # Returns None (=> fall through) when the mode is off or no per-class
+        # classifier exists at all.
+        ovr_result = None
+        if CLASSIFIER_MODE == "one-vs-rest":
+            ovr_result = run_ovr_classification(
+                cell_embeddings, annotations_data, tissue_classes,
+                effective_tissue_colors if effective_tissue_colors else tissue_colors,
+                use_supervised,
+            )
+            if ovr_result is None and cancel_event.is_set():
+                cancel_event.clear(); progress_value = 0
+                return {"status": "cancelled", "message": "Task was cancelled", "classification_count": 0}
+            if ovr_result is not None:
+                predictions, prediction_probs, final_class_names, final_class_colors, classification_method = ovr_result
+                print(f"One-vs-rest classification completed ({classification_method})")
+
         # Try supervised classification if we have classifier path or annotations
         classifier_result = None
-        if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None):
+        if ovr_result is None and (CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None)):
             classifier_result = train_linear_classifier(
                 cell_embeddings,
                 annotations_data,
                 effective_tissue_colors if effective_tissue_colors else None,
                 tissue_classes if tissue_classes else None,
             )
-            
+
         # Check if supervised classification succeeded
-        if classifier_result is not None:
+        if ovr_result is not None:
+            # One-vs-rest already set predictions / prediction_probs /
+            # final_class_names / final_class_colors / classification_method.
+            pass
+        elif classifier_result is not None:
             clf, class_names, class_colors, predictions, prediction_probs, \
                 coef_, intercept_, train_time, test_time = classifier_result
             classification_method = "supervised"
@@ -1961,6 +2180,7 @@ def init_node():
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
     global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_GROUP, DEP_ZARR_GROUPS, LAST_TRAINED_CLF_BUNDLE, CLASS_OPERATIONS
+    global CLASSIFIER_MODE, SAVE_CLASSIFIER_PATHS, CLASSIFIER_PATHS
     LAST_TRAINED_CLF_BUNDLE = None
     NODE_NAME = data.get("node_name", "Patch-Classification")
     DEPENDENCIES = data.get("dependencies", [])
@@ -1971,6 +2191,9 @@ def read_node(data: Dict[str, Any]):
     CLASSIFIER_PATH = None
     SAVE_CLASSIFIER_PATH = None
     CLASS_OPERATIONS = {}
+    CLASSIFIER_MODE = "multiclass"
+    SAVE_CLASSIFIER_PATHS = None
+    CLASSIFIER_PATHS = None
 
     print(f"[NODE_NAME] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
     if not ZARR_PATH or not os.path.exists(ZARR_PATH):
@@ -2002,6 +2225,15 @@ def read_node(data: Dict[str, Any]):
                 print(f"[{NODE_NAME}] Set CLASSIFIER_PATH to: {CLASSIFIER_PATH}")
             elif k == "save_classifier_path":
                 SAVE_CLASSIFIER_PATH = val_json
+            elif k == "classifier_mode":
+                if isinstance(val_json, str) and val_json in ("multiclass", "one-vs-rest"):
+                    CLASSIFIER_MODE = val_json
+            elif k == "classifier_paths":
+                if isinstance(val_json, dict):
+                    CLASSIFIER_PATHS = {str(k2): str(v2) for k2, v2 in val_json.items()}
+            elif k == "save_classifier_paths":
+                if isinstance(val_json, dict):
+                    SAVE_CLASSIFIER_PATHS = {str(k2): str(v2) for k2, v2 in val_json.items()}
             elif k == "tissue_classes":
                 if isinstance(val_json, list) and len(val_json) > 0:
                     ARGS.tissue_classes = val_json
