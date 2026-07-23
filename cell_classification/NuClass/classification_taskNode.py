@@ -9,8 +9,10 @@ Memory Management:
 - GPU memory is cleared after each inference operation using torch.cuda.empty_cache()
 - Intermediate tensors are explicitly deleted after use
 - Zarr file handles are properly closed after use
-- Garbage collection is called periodically during batch processing
-- GPU operations are synchronized before cleanup to ensure all operations complete
+
+XGBoost (NuClass):
+- Default CPU, n_estimators=50, thread cap 16 (see _build_xgb_params).
+- Overrides: NUCLASS_XGB_DEVICE, NUCLASS_XGB_N_ESTIMATORS, NUCLASS_XGB_NTHREAD.
 """
 # Standard library imports
 import os as _os_early
@@ -458,6 +460,71 @@ def load_structured_nuclei_annotations(zf, annotation_path: str) -> pd.DataFrame
         print(f"[load_structured_nuclei_annotations] Error loading annotations: {e}")
         traceback.print_exc()
         return None
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == '':
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
+
+
+def _resolve_xgb_device() -> str:
+    """Default CPU — full-slide predict is faster on CPU. Opt in with NUCLASS_XGB_DEVICE=cuda."""
+    env = (os.environ.get('NUCLASS_XGB_DEVICE') or '').strip().lower()
+    if env in ('cuda', 'gpu'):
+        return 'cuda'
+    if env == 'cpu':
+        return 'cpu'
+    return 'cpu'
+
+
+def _xgb_nthread() -> int:
+    """Darwin: 1 (fork-safety). Else: NUCLASS_XGB_NTHREAD or min(16, cpu_count)."""
+    import platform as _platform
+    if _platform.system() == 'Darwin':
+        return 1
+    cpus = os.cpu_count() or 4
+    return _env_int('NUCLASS_XGB_NTHREAD', min(16, cpus), minimum=1)
+
+
+def _xgb_n_estimators() -> int:
+    """
+    Boosting rounds. 100 was the historical sklearn default (never tuned here);
+    50 is the measured acceleration default on CMU-1 annotation sizes.
+    Override with NUCLASS_XGB_N_ESTIMATORS.
+    """
+    return _env_int('NUCLASS_XGB_N_ESTIMATORS', 50, minimum=1)
+
+
+def _build_xgb_params(*, binary: bool = False) -> dict:
+    device = _resolve_xgb_device()
+    nthread = _xgb_nthread()
+    n_estimators = _xgb_n_estimators()
+    params = {
+        'n_estimators': n_estimators,
+        'max_depth': 8,
+        'tree_method': 'hist',
+        'device': device,
+        'random_state': 42,
+        'base_score': 0.5,
+        'n_jobs': nthread,
+        'nthread': nthread,
+    }
+    if binary:
+        params['objective'] = 'binary:logistic'
+        params['eval_metric'] = 'logloss'
+    else:
+        params['eval_metric'] = 'mlogloss'
+    print(
+        f"[Cell-Classification] XGB params: device={device} max_depth=8 "
+        f"n_estimators={n_estimators} nthread={nthread}/{os.cpu_count() or '?'} "
+        f"binary={binary}"
+    )
+    return params
 
 
 def _log_annotation_counts_per_class(class_names, positive_annotations, negative_annotations, nuclei_classes=None):
@@ -924,25 +991,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     class_ops = _normalize_class_operations(CLASS_OPERATIONS)
     effective_renames = [] if _has_rename_cycle(class_ops.get("renames", [])) else class_ops.get("renames", [])
     
-    # update XGBoost parameter settings
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # On macOS the libomp runtime is not fork-safe — letting xgboost spawn
-    # multiple OpenMP threads inside a forked task-node process crashes the
-    # worker silently with "leaked semaphore objects" right after fit() starts.
-    # Pin to single-threaded training to keep the worker stable; throughput is
-    # still acceptable for the cell-counts we operate on.
-    import platform as _platform
-    _is_darwin = _platform.system() == 'Darwin'
-    xgb_params = {
-        'max_depth': 8,
-        'tree_method': 'hist',
-        'device': device,
-        'eval_metric': 'mlogloss',
-        'random_state': 42,
-        'base_score': 0.5,  # Initial value for XGBoost, must be in (0,1) for logistic loss
-        'n_jobs': 1 if _is_darwin else -1,
-        'nthread': 1 if _is_darwin else -1,
-    }
+    xgb_params = _build_xgb_params(binary=False)
 
     if annotations is None:
         print("No annotations provided")
@@ -1270,22 +1319,6 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     progress_state.value = 40 + int(50 * (batch_idx + 1) / n_batches)
                     if (batch_idx + 1) % max(1, n_batches // 10) == 0 or (batch_idx + 1) == n_batches:
                         print(f"Progress: {progress_state.value}% (Predicted {end_idx}/{n_cells} cells)")
-                    
-                    # Only clear GPU cache if using GPU (XGBoost on GPU)
-                    # For CPU-based XGBoost, skip this to save time
-                    if torch.cuda.is_available():
-                        # Only clear cache if we're actually using GPU (XGBoost with device='cuda')
-                        # For CPU XGBoost, this is unnecessary and wastes time
-                        try:
-                            if hasattr(clf, 'get_booster') and clf.get_booster().attributes().get('device', 'cpu') == 'cuda':
-                                torch.cuda.empty_cache()
-                        except:
-                            # If we can't determine device, conservatively clear cache
-                            torch.cuda.empty_cache()
-                    
-                    # Force garbage collection every 5 batches (more frequent for large batches)
-                    if (batch_idx + 1) % 5 == 0:
-                        gc.collect()
                 
                 progress_state.value = 90
                 print(f"Progress: 90% (Completed prediction for {n_cells} cells)")
@@ -1569,22 +1602,6 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         progress_state.value = 50 + int(40 * (batch_idx + 1) / n_batches)
         if (batch_idx + 1) % max(1, n_batches // 10) == 0 or (batch_idx + 1) == n_batches:
             print(f"Progress: {progress_state.value}% (Predicted {end_idx}/{n_cells} cells)")
-        
-        # Only clear GPU cache if using GPU (XGBoost on GPU)
-        # For CPU-based XGBoost, skip this to save time
-        if torch.cuda.is_available():
-            # Only clear cache if we're actually using GPU (XGBoost with device='cuda')
-            # For CPU XGBoost, this is unnecessary and wastes time
-            try:
-                if hasattr(clf, 'get_booster') and clf.get_booster().attributes().get('device', 'cpu') == 'cuda':
-                    torch.cuda.empty_cache()
-            except:
-                # If we can't determine device, conservatively clear cache
-                torch.cuda.empty_cache()
-        
-        # Force garbage collection every 5 batches (more frequent for large batches)
-        if (batch_idx + 1) % 5 == 0:
-            gc.collect()
     
     progress_state.value = 90
     print(f"Progress: 90% (Completed prediction for {n_cells} cells)")
@@ -1636,16 +1653,7 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     n_cells = int(cell_embeddings.shape[0])
     print(f"[OvR] one-vs-rest mode, classes={final_class_names}")
 
-    # Darwin-safe single-threaded params (same rationale as train_linear_classifier).
-    import platform as _platform
-    _is_darwin = _platform.system() == 'Darwin'
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    xgb_params_bin = {
-        'max_depth': 8, 'tree_method': 'hist', 'device': device,
-        'objective': 'binary:logistic', 'eval_metric': 'logloss',
-        'random_state': 42, 'base_score': 0.5,
-        'n_jobs': 1 if _is_darwin else -1, 'nthread': 1 if _is_darwin else -1,
-    }
+    xgb_params_bin = _build_xgb_params(binary=True)
 
     # --- split annotations (same masks as train_linear_classifier) ---
     if annotations is None:
