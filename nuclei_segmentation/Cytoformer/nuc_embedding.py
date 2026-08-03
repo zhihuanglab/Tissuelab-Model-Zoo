@@ -34,7 +34,7 @@ from scipy.ndimage import zoom
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 # PLIP (transformers) was the original embedder; the Cytoformer node uses the
-# fine-tuned UNI2 encoder (cytoformer_embed.CytoEmbedder) instead, so transformers
+# fine-tuned H-optimus encoder (cytoformer_embed.CytoEmbedder) instead, so transformers
 # is no longer imported here.
 
 # Local imports
@@ -79,11 +79,11 @@ class NucleiPatchDataset(Dataset):
             'processor_pil_to_numpy_time': 0.0,  # Time for PIL to numpy conversion
             'processor_stack_time': 0.0,  # Time for stacking arrays (vectorized path)
             'processor_astype_time': 0.0,  # Time for type conversion (uint8 to float32)
-            'processor_normalize_time': 0.0,  # Time for UNI2 (ImageNet) normalization (direct from uint8)
+            'processor_normalize_time': 0.0,  # Time for H-optimus normalization (direct from uint8)
             'processor_transpose_in_convert_time': 0.0,  # Time for transpose during convert (HWC->CHW)
             'processor_convert_normalize_time': 0.0,  # Total time for type conversion and normalization
             'processor_transpose_time': 0.0,  # Time for final transpose check (should be minimal now)
-            'processor_norm_time': 0.0,  # Time for UNI2 (ImageNet) normalization
+            'processor_norm_time': 0.0,  # Time for H-optimus normalization
             'processor_total_time': 0.0,  # Total processor time
             'total_calls': 0,
             'slide_open_time': 0.0  # Time spent opening slide objects
@@ -1858,15 +1858,16 @@ class NucleiPatchDataset(Dataset):
             print(f"[DEBUG] Failed to save processed patch {idx}: {str(e)}")
             traceback.print_exc()
 
-# Pre-compute UNI2 (ImageNet) normalization constants (module-level for reuse)
+# Pre-compute H-optimus normalization constants (module-level for reuse)
 # For uint8 input [0, 255], directly apply the backbone norm: (x - mean*255) / (std*255).
-# Cytoformer's UNI2 encoder was trained with ImageNet mean/std (NOT CLIP), so the
-# per-cell patch normalization uses UNI2 values here (see common.BACKBONE_NORM['uni2']).
-_NORM_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_NORM_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+# Cytoformer's backbone is the fine-tuned H-optimus-0, which ships its OWN mean/std
+# (NOT ImageNet/CLIP), so the per-cell patch normalization uses those values here —
+# must match common.BACKBONE_NORM['hoptimus'] (the same norm used at training time).
+_NORM_MEAN = np.array([0.707223, 0.578729, 0.703617], dtype=np.float32)
+_NORM_STD = np.array([0.211883, 0.230117, 0.177517], dtype=np.float32)
 # Pre-compute constants for uint8 input (no need for /255 step)
-_NORM_MEAN_UINT8 = _NORM_MEAN * 255.0  # UNI2 mean scaled to uint8 range
-_NORM_STD_UINT8 = _NORM_STD * 255.0    # UNI2 std scaled to uint8 range
+_NORM_MEAN_UINT8 = _NORM_MEAN * 255.0  # H-optimus mean scaled to uint8 range
+_NORM_STD_UINT8 = _NORM_STD * 255.0    # H-optimus std scaled to uint8 range
 _NORM_INV_STD_UINT8 = 1.0 / _NORM_STD_UINT8  # Pre-compute division constant
 _NORM_MEAN_TIMES_INV_STD_UINT8 = _NORM_MEAN_UINT8 * _NORM_INV_STD_UINT8
 
@@ -1875,7 +1876,7 @@ _NORM_MEAN_TENSOR = None  # Will be initialized on first use
 _NORM_STD_TENSOR = None   # Will be initialized on first use
 
 def _normalize_norm_gpu(tensor, device):
-    """Normalize with the backbone (UNI2 = ImageNet) mean/std on GPU using PyTorch.
+    """Normalize with the backbone (H-optimus) mean/std on GPU using PyTorch.
     
     Args:
         tensor: torch.Tensor of shape (N, C, H, W) with float32 values [0, 255] (already converted from uint8)
@@ -1892,7 +1893,7 @@ def _normalize_norm_gpu(tensor, device):
         _NORM_STD_TENSOR = torch.tensor(_NORM_STD_UINT8, device=device, dtype=torch.float32).view(1, 3, 1, 1)
     
     # OPTIMIZATION: Tensor is already float32 on GPU, so just normalize directly
-    # UNI2 (ImageNet) normalization: (x - mean) / std
+    # H-optimus normalization: (x - mean) / std
     # PyTorch will fuse these operations automatically on GPU
     # Using in-place operations where possible for better memory efficiency
     normalized = (tensor - _NORM_MEAN_TENSOR) / _NORM_STD_TENSOR
@@ -2238,8 +2239,8 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
         # If return_uint8, use uint8 dtype (faster, less memory), else use float32 for normalized data
         batch_array = np.empty((num_images, 3, h, w), dtype=np.uint8 if return_uint8 else np.float32, order='C')
         
-        # OPTIMIZATION 2: Direct UNI2 (ImageNet) normalization from uint8 (no intermediate /255 step)
-        # We skip the * inv_255 normalization since UNI2 norm will handle it
+        # OPTIMIZATION 2: Direct H-optimus normalization from uint8 (no intermediate /255 step)
+        # We skip the * inv_255 normalization since H-optimus norm will handle it
         
         # OPTIMIZATION: Vectorized batch processing when possible
         # Check if all images are numpy arrays (can be fully vectorized)
@@ -2313,12 +2314,12 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                             transposed = stacked.transpose(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
                             batch_array[:] = transposed  # Copy into pre-allocated array
                         else:
-                            # OPTIMIZATION: Merge astype and UNI2 (ImageNet) normalization - single batch conversion
+                            # OPTIMIZATION: Merge astype and H-optimus normalization - single batch conversion
                             # Convert entire batch once, then process all channels (more efficient than per-channel conversion)
                             normalize_start = time.time()
                             # Single astype for entire batch (more efficient than per-channel)
                             float_batch = stacked.astype(np.float32)
-                            # Vectorized UNI2 (ImageNet) normalization for all channels
+                            # Vectorized H-optimus normalization for all channels
                             np.multiply(float_batch[:, :, :, 0], _NORM_INV_STD_UINT8[0], out=batch_array[:, 0])
                             batch_array[:, 0] -= _NORM_MEAN_TIMES_INV_STD_UINT8[0]
                             np.multiply(float_batch[:, :, :, 1], _NORM_INV_STD_UINT8[1], out=batch_array[:, 1])
@@ -2339,7 +2340,7 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                             transposed = stacked[:, :, :, :3].transpose(0, 3, 1, 2)  # (N, H, W, 3) -> (N, 3, H, W)
                             batch_array[:] = transposed  # Copy into pre-allocated array
                         else:
-                            # OPTIMIZATION: Merge astype and UNI2 (ImageNet) normalization - single batch conversion
+                            # OPTIMIZATION: Merge astype and H-optimus normalization - single batch conversion
                             normalize_start = time.time()
                             float_batch = stacked[:, :, :, :3].astype(np.float32)
                             np.multiply(float_batch[:, :, :, 0], _NORM_INV_STD_UINT8[0], out=batch_array[:, 0])
@@ -2356,7 +2357,7 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                     elif len(stacked.shape) == 3 and stacked.shape[1:] == (h, w):
                         # Grayscale 2D - direct write using out parameter (zero-copy)
                         convert_start = time.time()
-                        # OPTIMIZATION: Merge astype and UNI2 (ImageNet) normalization - single batch conversion
+                        # OPTIMIZATION: Merge astype and H-optimus normalization - single batch conversion
                         normalize_start = time.time()
                         float_batch = stacked.astype(np.float32)
                         np.multiply(float_batch, _NORM_INV_STD_UINT8[0], out=batch_array[:, 0])
@@ -2373,7 +2374,7 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                     elif stacked.shape[1:] == (h, w, 1):
                         # Grayscale 3D - direct write using out parameter (zero-copy)
                         convert_start = time.time()
-                        # OPTIMIZATION: Merge astype and UNI2 (ImageNet) normalization - single batch conversion
+                        # OPTIMIZATION: Merge astype and H-optimus normalization - single batch conversion
                         normalize_start = time.time()
                         float_batch = stacked[:, :, :, 0].astype(np.float32)
                         np.multiply(float_batch, _NORM_INV_STD_UINT8[0], out=batch_array[:, 0])
@@ -2411,7 +2412,7 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                         pil_conversion_time += time.time() - conv_start
                     
                     # Fast path: Standard RGB image (most common case - optimize this path)
-                    # OPTIMIZATION: Merge astype and UNI2 (ImageNet) normalization
+                    # OPTIMIZATION: Merge astype and H-optimus normalization
                     if arr_uint8.shape == (h, w, 3):
                         normalize_start = time.time()
                         float_img = arr_uint8.astype(np.float32)
@@ -2427,7 +2428,7 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     elif arr_uint8.ndim == 2:
-                        # Grayscale - merge astype and UNI2 (ImageNet) normalization
+                        # Grayscale - merge astype and H-optimus normalization
                         normalize_start = time.time()
                         float_img = arr_uint8.astype(np.float32)
                         np.multiply(float_img, _NORM_INV_STD_UINT8[0], out=batch_array[i, 0])
@@ -2442,7 +2443,7 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     elif arr_uint8.shape[2] == 4:
-                        # RGBA - merge astype and UNI2 (ImageNet) normalization
+                        # RGBA - merge astype and H-optimus normalization
                         normalize_start = time.time()
                         float_img = arr_uint8[:, :, :3].astype(np.float32)
                         np.multiply(float_img[:, :, 0], _NORM_INV_STD_UINT8[0], out=batch_array[i, 0])
@@ -2457,7 +2458,7 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     elif arr_uint8.shape[0] == h and arr_uint8.shape[1] == w and arr_uint8.shape[2] >= 3:
-                        # Multi-channel (>=3) - merge astype and UNI2 (ImageNet) normalization
+                        # Multi-channel (>=3) - merge astype and H-optimus normalization
                         normalize_start = time.time()
                         float_img = arr_uint8[:, :, :3].astype(np.float32)
                         np.multiply(float_img[:, :, 0], _NORM_INV_STD_UINT8[0], out=batch_array[i, 0])
@@ -2472,11 +2473,11 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                             perf_stats['processor_normalize_time'] += normalize_time
                             perf_stats['processor_transpose_in_convert_time'] += 0.0  # No copy needed
                     else:
-                        # Edge case: fallback to standard conversion with UNI2 (ImageNet) normalization
+                        # Edge case: fallback to standard conversion with H-optimus normalization
                         arr_float = np.array(img, dtype=np.float32)
-                        # Apply UNI2 (ImageNet) normalization directly (no /255 step)
+                        # Apply H-optimus normalization directly (no /255 step)
                         if arr_float.max() > 1.0:
-                            # uint8 input - apply UNI2 norm directly
+                            # uint8 input - apply H-optimus norm directly
                             arr_float[:, :, 0] = (arr_float[:, :, 0] - _NORM_MEAN_UINT8[0]) / _NORM_STD_UINT8[0]
                             arr_float[:, :, 1] = (arr_float[:, :, 1] - _NORM_MEAN_UINT8[1]) / _NORM_STD_UINT8[1]
                             arr_float[:, :, 2] = (arr_float[:, :, 2] - _NORM_MEAN_UINT8[2]) / _NORM_STD_UINT8[2]
@@ -2491,11 +2492,11 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
                             # Fallback: try to reshape
                             batch_array[i] = arr_float.reshape(3, h, w) if arr_float.size == 3*h*w else arr_float[:3].reshape(3, h, w)
                 except Exception:
-                    # Ultimate fallback: standard conversion with UNI2 (ImageNet) normalization
+                    # Ultimate fallback: standard conversion with H-optimus normalization
                     arr_float = np.array(img, dtype=np.float32)
-                    # Apply UNI2 (ImageNet) normalization directly (no /255 step)
+                    # Apply H-optimus normalization directly (no /255 step)
                     if arr_float.max() > 1.0:
-                        # uint8 input - apply UNI2 norm directly
+                        # uint8 input - apply H-optimus norm directly
                         if arr_float.ndim == 3 and arr_float.shape[2] >= 3:
                             arr_float[:, :, 0] = (arr_float[:, :, 0] - _NORM_MEAN_UINT8[0]) / _NORM_STD_UINT8[0]
                             arr_float[:, :, 1] = (arr_float[:, :, 1] - _NORM_MEAN_UINT8[1]) / _NORM_STD_UINT8[1]
@@ -2531,10 +2532,10 @@ def _fast_batch_preprocess(images, use_torchvision=True, perf_stats=None, return
         if perf_stats is not None:
             perf_stats['processor_transpose_time'] += transpose_end - transpose_start
         
-        # OPTIMIZATION: UNI2 (ImageNet) normalization is already done during conversion above
-        # No separate UNI2 (ImageNet) normalization step needed - already applied directly from uint8
+        # OPTIMIZATION: H-optimus normalization is already done during conversion above
+        # No separate H-optimus normalization step needed - already applied directly from uint8
         if perf_stats is not None:
-            # UNI2 norm time is now included in normalize_time
+            # H-optimus norm time is now included in normalize_time
             perf_stats['processor_norm_time'] += 0.0
         
         return batch_array
@@ -2705,16 +2706,16 @@ class NucleiEmbedding:
         self.init_model()
 
     def init_model(self):
-        # Cytoformer segmentation node: the embedding is the fine-tuned UNI2 image
+        # Cytoformer segmentation node: the embedding is the fine-tuned H-optimus image
         # feature (feat_norm(encoder) -> 1536-d), NOT PLIP. We keep exactly the
         # StarDist segmentation pipeline; only the feature extractor is swapped.
-        print("Loading Cytoformer UNI2 embedder...")
+        print("Loading Cytoformer H-optimus embedder...")
         from cytoformer_embed import CytoEmbedder
 
         self.cyto = CytoEmbedder(self.device)
         # These were the PLIP components; all forward sites now use self.cyto, so
         # keep them None. processor=None routes every patch through the raw (else)
-        # branch, which the GPU UNI2 normalization then handles.
+        # branch, which the GPU H-optimus normalization then handles.
         self.processor = None
         self.model = None
         self.image_projection = None
@@ -2754,7 +2755,7 @@ class NucleiEmbedding:
                         # Using 'max-autotune' mode for best performance (longer compile time but faster inference)
                         # Fallback to 'default' if max-autotune fails
                         try:
-                            # Cytoformer node: compile the UNI2 encoder (the only
+                            # Cytoformer node: compile the H-optimus encoder (the only
                             # heavy forward now); there is no separate projection.
                             self.cyto.encoder = torch.compile(
                                 self.cyto.encoder,
@@ -2829,7 +2830,7 @@ class NucleiEmbedding:
                     
                     # OPTIMIZATION: Use torch.inference_mode() instead of no_grad() for faster inference
                     with torch.inference_mode():
-                        # Cytoformer UNI2 embedding for all z-layers of this cell
+                        # Cytoformer H-optimus embedding for all z-layers of this cell
                         # (embed_prenorm handles autocast/inference internally).
                         embeddings = self.cyto.embed_prenorm(cell_tensor)
 
@@ -2876,7 +2877,7 @@ class NucleiEmbedding:
             
             # OPTIMIZATION: Use torch.inference_mode() instead of no_grad() for faster inference
             with torch.inference_mode():
-                # Cytoformer UNI2 embedding (embed_prenorm wraps autocast/inference).
+                # Cytoformer H-optimus embedding (embed_prenorm wraps autocast/inference).
                 embeddings = self.cyto.embed_prenorm(processed_batch)
                 # Keep as float32 for numerical consistency with original implementation
                 # L2 normalization will be done in generate_embeddings postprocessing

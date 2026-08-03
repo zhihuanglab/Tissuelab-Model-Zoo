@@ -1,7 +1,7 @@
 """Cytoformer per-organ zero-shot head for the classification node.
 
 The Cytoformer segmentation node writes 1536-d image features into
-Cell-Segmentation/embeddings (feat_norm(uni_encoder(patch))). This module loads
+Cell-Segmentation/embeddings (feat_norm(encoder(patch))). This module loads
 ONLY the per-organ classification head from best.pth and applies it to those
 pre-computed features, so no image encoder is needed here.
 
@@ -58,7 +58,7 @@ class CytoHead:
     """Loads Cytoformer's per-organ head and predicts cell types from 1536-d
     Cell-Segmentation embeddings. No image encoder is loaded."""
 
-    def __init__(self, device=None, backbone: str = "uni2"):
+    def __init__(self, device=None, backbone: str = "hoptimus"):
         import common  # Cytoformer model_code
         from model import CellClassifier
 

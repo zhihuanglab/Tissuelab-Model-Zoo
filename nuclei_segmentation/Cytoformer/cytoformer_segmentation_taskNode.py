@@ -48,7 +48,7 @@ os.environ["TF_INTRA_OP_PARALLELISM_THREADS"] = "16"
 # NOTE: `from nuc_seg import SlideSegmentation` is imported lazily inside the
 # segmentation branch below. nuc_seg pulls in stardist + tensorflow at import
 # time; when a slide already has segmentation (the common Cytoformer case: reuse
-# geometry, only re-extract UNI2 embeddings) that heavy stack is never needed, so
+# geometry, only re-extract H-optimus embeddings) that heavy stack is never needed, so
 # deferring the import lets an embedding-only run work without stardist/tensorflow.
 from nuc_embedding import NucleiEmbedding
 
