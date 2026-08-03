@@ -1,0 +1,30 @@
+setuptools
+numpy==1.26.4
+matplotlib==3.5.2
+pandas==1.4.3
+opencv-python==4.6.0.66
+scipy==1.11.0
+tiffslide==1.5.0
+multiprocess==0.70.17
+zarr==3.1.5
+# Match the cloud stardist env. Keep xgboost in the 2.0–3.0 range: these load
+# the legacy `binf` classifiers AND rebuild XGBClassifier.n_classes_ from the
+# booster on load. 1.7.x loads binf but does NOT rebuild n_classes_ (breaks
+# predict_proba on a loaded classifier); 3.1+ drops binf loading entirely.
+xgboost==2.1.4
+scikit-learn==1.2.1
+tqdm==4.64.1
+natsort==8.2.0
+requests==2.28.2
+# transformers is no longer used (PLIP text zero-shot was replaced by the
+# Cytoformer per-organ head); kept only if other node code still imports it.
+transformers
+timm>=1.0.0  # UNI2-h backbone definition, needed to construct the per-organ head
+sse-starlette
+fastapi
+uvicorn
+h5py
+tissuelab_sdk==0.1.12
+torch
+stardist
+# Also, please manually install torch (GPU): pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 && pip install timm
