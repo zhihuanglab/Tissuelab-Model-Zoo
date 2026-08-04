@@ -1,16 +1,15 @@
 torch==2.0.1
-numpy==1.26.4
+numpy>=2.0,<2.5
 torchvision==0.15.2
 timm==0.9.8
 Pillow
 blobfile
 mypy
-numpy
 pytest
 requests
 einops
 tensorboardX
-scipy
+scipy>=1.13.0
 ftfy
 opencv-python
 sentencepiece
@@ -24,7 +23,7 @@ accelerate
 fairscale
 ruamel.yaml
 wandb
-pandas
+pandas>=2.1.0
 future
 scikit-survival
 torchmetrics==0.7.3
@@ -34,3 +33,4 @@ pycocoevalcap
 webdataset>=0.2.31
 huggingface-hub
 safetensors
+scikit-learn>=1.3.0,<1.6

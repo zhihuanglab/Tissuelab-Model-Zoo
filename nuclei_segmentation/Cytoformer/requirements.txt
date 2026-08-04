@@ -1,42 +1,49 @@
 setuptools
-numpy==1.26.4
-matplotlib>=3.7.0
-pandas>=2.0.0
+# numba (via stardist) requires numpy<2.5; zarr/scipy are fine with 2.x.
+numpy>=2.0,<2.5
+matplotlib>=3.8.0
+pandas>=2.1.0
 opencv-python>=4.8.0
-scipy>=1.11.0
-tiffslide==1.5.0
-# tiffslide 1.5.0 references tifffile.TIFF.RESUNIT, removed in tifffile>=2025.x.
-# Newer tifffile makes tiffslide crash -> wrapper fallback hides the pyramid and
-# forces a full-resolution thumbnail read (multi-minute stall). Pin to a version
-# that still exposes RESUNIT so the pyramid loads.
-tifffile<2025
-multiprocess==0.70.17
-# Pin to match the cloud stardist env. 2.0–3.0 range loads legacy `binf`
-# classifiers and rebuilds n_classes_ on load; 1.7.x breaks predict on a
-# loaded model, 3.1+ can't load binf at all.
-xgboost==2.1.4
-scikit-learn>=1.3.0
-tqdm==4.64.1
-natsort==8.2.0
+scipy>=1.13.0
+# Align with NuClass/StarDist. tiffslide 3.x needs tifffile>=2025; do NOT keep
+# the old tifffile<2025 pin used with tiffslide 1.5.0.
+tiffslide==3.0.0
+multiprocess
+zarr==3.1.5
+# Align with NuClass / patch classifiers / Ctrl-Service. 3.0.x still loads
+# legacy `binf` and rebuilds XGBClassifier.n_classes_ on load. 1.7.x loads
+# binf but does NOT rebuild n_classes_ (breaks predict_proba); 3.1+ drops
+# binf loading entirely. 3.0.5 is the highest binf-capable release.
+xgboost==3.0.5
+# Cap below 1.6: sklearn 1.6+ drops class-level `_estimator_type`, which
+# breaks xgboost 3.0.5's XGBClassifier.save_model.
+scikit-learn>=1.3.0,<1.6
+tqdm>=4.66.0
+natsort>=8.4.0
+requests>=2.31.0
 colorama>=0.4.6  # For better Unicode support on Windows
 einops>=0.7.0  # Required for transformers
 
 # Dependencies for feature pre-calculation:
 tensorflow==2.14.0; platform_system != "Darwin"  # for Windows and Linux
 tensorflow==2.16.1; platform_system == "Darwin"  # for macOS
-stardist==0.9.1
+stardist>=0.9.1
 fastdist==1.1.6
-sse-starlette
-fastapi
-uvicorn
+sse-starlette>=3.4.0
+fastapi>=0.141.0
+uvicorn[standard]>=0.52.0
 # transformers is no longer used for embedding (PLIP was replaced by the
 # fine-tuned UNI2 encoder); kept only if other node code still imports it.
 transformers
 timm>=1.0.0  # UNI2-h (vit_giant_patch14_224) backbone for the Cytoformer embedder
-tissuelab_sdk==0.1.12
+h5py
 czifile
 pydicom
+# Keep torch/torchvision paired (nuc_embedding imports torchvision.transforms).
+# Default PyPI macOS/CPU builds; for CUDA:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 torch
+torchvision
 # Windows-only dependencies; skip on macOS
 pywin32; platform_system == "Windows"
 pylibCZIrw; platform_system == "Windows"
