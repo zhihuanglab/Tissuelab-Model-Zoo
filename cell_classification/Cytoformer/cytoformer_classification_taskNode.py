@@ -1908,11 +1908,37 @@ def run_classification(args) -> Dict[str, Any]:
                 "Cell-Segmentation/embeddings array is reserved for PLIP/NuClass."
             )
         print("Loading embeddings from zarr...")
-        cell_embeddings = seg_grp[CYTOFORMER_EMBEDDING_DATASET][()]
+        embeddings_arr = seg_grp[CYTOFORMER_EMBEDDING_DATASET]
+        cell_embeddings = embeddings_arr[()]
         if cell_embeddings.ndim != 2 or cell_embeddings.shape[1] != 1536:
             raise ValueError(
                 f"Cytoformer classification requires [N, 1536] embeddings; "
                 f"{CYTOFORMER_EMBEDDING_DATASET} has shape {cell_embeddings.shape}."
+            )
+        if cell_embeddings.shape[0] <= 0:
+            raise ValueError("Cytoformer embeddings are empty; re-run Cytoformer cell segmentation.")
+        if "centroids" not in seg_grp:
+            raise ValueError("Cell-Segmentation/centroids is required for Cytoformer classification.")
+        centroid_count = int(seg_grp["centroids"].shape[0])
+        if centroid_count != cell_embeddings.shape[0]:
+            raise ValueError(
+                "Cytoformer embeddings are not aligned with the current segmentation: "
+                f"{cell_embeddings.shape[0]} embeddings for {centroid_count} centroids. "
+                "Re-run Cytoformer cell segmentation."
+            )
+        embedding_model = str(embeddings_arr.attrs.get("embedding_model") or "").casefold()
+        embedding_backbone = str(
+            embeddings_arr.attrs.get("embedding_backbone") or ""
+        ).casefold()
+        embedding_dim = int(embeddings_arr.attrs.get("embedding_dim") or 0)
+        if (
+            embedding_model != "cytoformer"
+            or embedding_backbone != "h-optimus-0"
+            or embedding_dim != 1536
+        ):
+            raise ValueError(
+                "Invalid Cytoformer embedding metadata; expected "
+                "Cytoformer/H-optimus-0/1536. Re-run Cytoformer cell segmentation."
             )
         progress_state.value = 35
         print(f"Progress: 35% (Embeddings loaded, shape: {cell_embeddings.shape})")
