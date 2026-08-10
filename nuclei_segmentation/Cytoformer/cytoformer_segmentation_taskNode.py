@@ -98,6 +98,10 @@ NODE_NAME = None
 # /read payload `zarr_group`.
 ZARR_GROUP = "Cell-Segmentation"
 DEPENDENCIES = []
+EMBEDDING_MODEL = "Cytoformer"
+EMBEDDING_BACKBONE = "H-optimus-0"
+EMBEDDING_DIM = 1536
+EMBEDDING_DATASET = "cytoformer_embeddings"
 # Per-folder SSE progress (progress_sse.py). Stream end does not reset.
 progress_state = ProgressSSEState()
 
@@ -108,6 +112,32 @@ cancel_event = threading.Event()  # Thread-safe cancellation event
 class CancellationException(Exception):
     """Exception raised when task is cancelled"""
     pass
+
+
+def _embedding_cache_is_compatible(embeddings_arr, expected_count: int) -> bool:
+    """Only reuse a cache compatible with Cytoformer's 1536-d feature contract."""
+    shape = tuple(embeddings_arr.shape)
+    if shape != (expected_count, EMBEDDING_DIM):
+        return False
+    source = embeddings_arr.attrs.get("embedding_model")
+    return str(source or "").casefold() == EMBEDDING_MODEL.casefold()
+
+
+def _write_embedding_metadata(seg_group, embeddings_arr) -> None:
+    """Write JSON-compatible attrs supported by Zarr v2 and v3."""
+    metadata = {
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_backbone": EMBEDDING_BACKBONE,
+        "embedding_dim": EMBEDDING_DIM,
+    }
+    seg_group.attrs.update({
+        "cytoformer_embedding_dataset": EMBEDDING_DATASET,
+        "cytoformer_embedding_model": EMBEDDING_MODEL,
+        "cytoformer_embedding_backbone": EMBEDDING_BACKBONE,
+        "cytoformer_embedding_dim": EMBEDDING_DIM,
+    })
+    embeddings_arr.attrs.update(metadata)
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -567,10 +597,10 @@ def run_segmentation(args):
             else:
                 # Segmentation was skipped (using existing data), check if embedding exists and matches
                 zf_embed = zarr.open_group(ZARR_PATH, mode='a')
-                if ZARR_GROUP in zf_embed and 'embeddings' in zf_embed[ZARR_GROUP]:
+                if ZARR_GROUP in zf_embed and EMBEDDING_DATASET in zf_embed[ZARR_GROUP]:
                     try:
-                        existing_len = zf_embed[ZARR_GROUP]['embeddings'].shape[0]
-                        if existing_len == len(centroids):
+                        existing_embeddings = zf_embed[ZARR_GROUP][EMBEDDING_DATASET]
+                        if _embedding_cache_is_compatible(existing_embeddings, len(centroids)):
                             have_cached_embedding = True
                             print("found existing embeddings in store => skip embedding calculation")
                     except Exception:
@@ -601,7 +631,19 @@ def run_segmentation(args):
                 
                 ne = NucleiEmbedding(args, centroids, contours=contours_for_embedding, progress_callback=embed_progress_with_cancel)
                 try:
-                    ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{ZARR_GROUP}/embeddings")
+                    ne.generate_embeddings(
+                        zarr_path=ZARR_PATH,
+                        dataset_path=f"{ZARR_GROUP}/{EMBEDDING_DATASET}",
+                    )
+                    zf_metadata = zarr.open_group(ZARR_PATH, mode='a')
+                    seg_group = zf_metadata[ZARR_GROUP]
+                    embeddings_arr = seg_group[EMBEDDING_DATASET]
+                    if tuple(embeddings_arr.shape) != (len(centroids), EMBEDDING_DIM):
+                        raise ValueError(
+                            f"Cytoformer produced embeddings with shape {embeddings_arr.shape}; "
+                            f"expected ({len(centroids)}, {EMBEDDING_DIM})."
+                        )
+                    _write_embedding_metadata(seg_group, embeddings_arr)
                 except CancellationException:
                     print("[Cell-Segmentation] Embedding cancelled by user")
                     cancel_event.clear()
@@ -863,7 +905,8 @@ def execute_node():
                 'message': out_val.get('message', ''),
                 'nuclei_count': int(out_val.get('nuclei_count', 0)),
                 'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                'has_embeddings': 'embeddings' in seg_grp,
+                'has_embeddings': EMBEDDING_DATASET in seg_grp,
+                'embedding_dataset': f"{ZARR_GROUP}/{EMBEDDING_DATASET}",
                 'has_probabilities': 'probabilities' in seg_grp,
             })
 
