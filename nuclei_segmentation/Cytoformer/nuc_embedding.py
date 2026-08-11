@@ -24,10 +24,8 @@ os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM", "0")
 
 # Third-party imports
 import cv2
-import multiprocess as mp
 import numpy as np
 import torch
-import torchvision.transforms as transforms
 import zarr
 from PIL import Image, ImageDraw
 from scipy.ndimage import zoom

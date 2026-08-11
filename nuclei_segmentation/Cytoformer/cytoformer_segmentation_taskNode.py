@@ -5,23 +5,16 @@ Segmentation Node for nuclei segmentation + embedding generation
 """
 # Standard library imports
 import argparse
-import asyncio
-import collections
-import glob
 import json
 import logging
 import multiprocessing
-import multiprocess
 import os
-import platform
 import threading
 import time
-import traceback
 from pathlib import Path
 from typing import Dict, Any
 
 # Third-party imports
-import cv2
 import numpy as np
 import requests
 import torch
@@ -37,8 +30,6 @@ warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 from progress_sse import ProgressSSEState, iter_progress_events
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
 
 # Set TensorFlow environment variables before importing TensorFlow-dependent modules
 os.environ["TF_INTER_OP_PARALLELISM_THREADS"] = "2"
@@ -962,7 +953,6 @@ def main():
     # Add this line to support multiprocessing in PyInstaller packaged executables
     if __name__ == "__main__":
         multiprocessing.freeze_support()
-        multiprocess.freeze_support()
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8005, help='port')

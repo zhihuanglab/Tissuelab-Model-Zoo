@@ -15,13 +15,10 @@ import uvicorn
 import requests
 import platform
 import numpy as np
-import pandas as pd
-import cv2
 from sse_starlette.sse import EventSourceResponse
 import asyncio
 
 import multiprocessing
-import multiprocess
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -646,7 +643,6 @@ def main():
     # Support for PyInstaller packaged executables with multiprocessing
     if __name__ == "__main__":
         multiprocessing.freeze_support()
-        multiprocess.freeze_support()
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8022, help='port')

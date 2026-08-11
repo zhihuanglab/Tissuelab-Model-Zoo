@@ -25,7 +25,6 @@ from progress_sse import ProgressSSEState, iter_progress_events
 import asyncio
 
 import multiprocessing
-import multiprocess
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -405,7 +404,6 @@ def main():
     # Required for multiprocessing when frozen (e.g. PyInstaller one-file/one-dir builds).
     if __name__ == "__main__":
         multiprocessing.freeze_support()
-        multiprocess.freeze_support()
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8011, help='port')
