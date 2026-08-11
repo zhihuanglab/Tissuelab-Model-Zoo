@@ -24,9 +24,9 @@ requests>=2.31.0
 colorama>=0.4.6  # For better Unicode support on Windows
 einops>=0.7.0  # Required for transformers
 
-# Dependencies for feature pre-calculation:
-tensorflow==2.14.0; platform_system != "Darwin"  # for Windows and Linux
-tensorflow==2.16.1; platform_system == "Darwin"  # for macOS
+# Dependencies for feature pre-calculation / StarDist.
+# Lower bound 2.14 (works on py3.11); pip will resolve to 2.20+ on py3.13 automatically.
+tensorflow>=2.14.0
 stardist>=0.9.1
 fastdist==1.1.6
 sse-starlette>=3.4.0
