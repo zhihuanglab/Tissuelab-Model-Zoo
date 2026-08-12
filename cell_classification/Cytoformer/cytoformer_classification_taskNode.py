@@ -24,7 +24,7 @@ Memory Management:
 import os as _os_early
 import platform as _platform_early
 
-# macOS hardening: libomp / Accelerate are NOT fork-safe. xgboost / sklearn /
+# macOS hardening: libomp / Accelerate are NOT fork-safe. xgboost /
 # numpy spawn worker threads on import; if those threads exist before this
 # task-node process is forked from the supervisor, training crashes silently
 # (manifests as `resource_tracker: leaked semaphore objects` and the worker
@@ -38,12 +38,10 @@ if _platform_early.system() == 'Darwin':
     _os_early.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
 
 import argparse
-import asyncio
 import base64
 import collections
 import colorsys
 import gc
-import glob
 import io
 import json
 import logging
@@ -62,7 +60,6 @@ import numpy as np
 import pandas as pd
 import requests
 import torch
-import torch.nn as nn
 import uvicorn
 import xgboost as xgb
 import zarr
@@ -76,11 +73,8 @@ warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 from progress_sse import ProgressSSEState, iter_progress_events
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from sklearn.linear_model import LogisticRegression
-# Cytoformer classification uses the fine-tuned UNI2 per-organ head for zero-shot
-# (cytoformer_head.CytoHead), not PLIP text encoding, so transformers is not imported.
+# Cytoformer classification uses the fine-tuned H-optimus-0 per-organ head for
+# zero-shot (cytoformer_head.CytoHead), not PLIP text encoding.
 
 app = FastAPI()
 
@@ -156,7 +150,6 @@ SAVE_CLASSIFIER_PATHS = None
 CLASSIFIER_PATHS = None
 
 # global variable for cancellation flag - use threading.Event for thread safety
-import threading
 cancel_event = threading.Event()  # Thread-safe cancellation event
 current_execution_thread = None  # Track current execution thread for cancellation
 
@@ -822,6 +815,16 @@ def load_classifier_params(zarr_path):
             train_data = np.load(train_data_bytes)
             train_embeddings = train_data['embeddings']
             train_labels = train_data['labels']
+            if (
+                train_embeddings is not None
+                and getattr(train_embeddings, "ndim", 0) == 2
+                and train_embeddings.shape[1] != 1536
+            ):
+                print(
+                    f"Classifier embedding dim {train_embeddings.shape[1]} != 1536 "
+                    f"(Cytoformer); ignoring CLASSIFIER_PATH={CLASSIFIER_PATH}"
+                )
+                return None
             
             # print the number of samples for each class
             print("\nloaded training data:")
@@ -1931,14 +1934,16 @@ def run_classification(args) -> Dict[str, Any]:
             embeddings_arr.attrs.get("embedding_backbone") or ""
         ).casefold()
         embedding_dim = int(embeddings_arr.attrs.get("embedding_dim") or 0)
+        embedding_norm = str(embeddings_arr.attrs.get("embedding_norm") or "").casefold()
         if (
             embedding_model != "cytoformer"
             or embedding_backbone != "h-optimus-0"
             or embedding_dim != 1536
+            or embedding_norm != "feat_norm"
         ):
             raise ValueError(
                 "Invalid Cytoformer embedding metadata; expected "
-                "Cytoformer/H-optimus-0/1536. Re-run Cytoformer cell segmentation."
+                "Cytoformer/H-optimus-0/1536/feat_norm. Re-run Cytoformer cell segmentation."
             )
         progress_state.value = 35
         print(f"Progress: 35% (Embeddings loaded, shape: {cell_embeddings.shape})")
@@ -2474,12 +2479,16 @@ def read_node(data: Dict[str, Any]):
     global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS, LAST_TRAINED_CLF_BUNDLE, ZARR_GROUP
     global CLASSIFIER_MODE, SAVE_CLASSIFIER_PATHS, CLASSIFIER_PATHS, CYTO_CONF_THRESHOLD
     LAST_TRAINED_CLF_BUNDLE = None
-    # Reset OvR state each run so a stale mode/paths dict from a previous node
-    # execution never leaks into a plain multiclass run.
+    # Reset per-run globals so a previous classifier/organ does not leak into
+    # a later zero-shot call whose userData omits those keys.
+    CLASSIFIER_PATH = None
+    SAVE_CLASSIFIER_PATH = None
     CLASSIFIER_MODE = "multiclass"
     SAVE_CLASSIFIER_PATHS = None
     CLASSIFIER_PATHS = None
-    NODE_NAME = data.get("node_name", "Cytoformer")
+    CYTO_CONF_THRESHOLD = 0.5
+    ARGS = argparse.Namespace(slidepath="", organ=None, nuclei_classes=[])
+    NODE_NAME = data.get("node_name", "CytoformerClassification")
     ZARR_GROUP = data.get("zarr_group") or "Cell-Classification"
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
@@ -2491,11 +2500,6 @@ def read_node(data: Dict[str, Any]):
     if not ZARR_PATH or not os.path.exists(ZARR_PATH):
         print("[Cell-Classification] no h5 => skip read.")
         return {"status": "ok", "message": "no H5 file found."}
-
-    if ARGS is None:
-        # No generic default classes: Cytoformer's classes come from the organ
-        # (read from userData below, then derived at the end of /read).
-        ARGS = argparse.Namespace(slidepath="", organ=None, nuclei_classes=[])
 
     zf = None
     try:
@@ -2522,9 +2526,9 @@ def read_node(data: Dict[str, Any]):
                     except (TypeError, ValueError):
                         print(f"[Cell-Classification] bad {k}={val_json}, keeping {CYTO_CONF_THRESHOLD}")
                 elif k == "classifier_path":
-                    CLASSIFIER_PATH = val_json
+                    CLASSIFIER_PATH = val_json or None
                 elif k == "save_classifier_path":
-                    SAVE_CLASSIFIER_PATH = val_json
+                    SAVE_CLASSIFIER_PATH = val_json or None
                 elif k == "classifier_mode":
                     # "multiclass" | "one-vs-rest"
                     if isinstance(val_json, str) and val_json:
@@ -2818,7 +2822,7 @@ async def progress():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8006, help='port')
-    parser.add_argument('--name', type=str, default='Cytoformer', help='node name')
+    parser.add_argument('--name', type=str, default='CytoformerClassification', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args = parser.parse_args()
 

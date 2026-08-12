@@ -10,7 +10,6 @@ Created on Feb 03 2025
 from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 import gc
-import importlib
 import importlib.util  # Used for VIPS_AVAILABLE check
 import os
 import pathlib
@@ -2857,8 +2856,8 @@ class NucleiEmbedding:
             # Concatenate all cell embeddings
             final_embeddings = torch.cat(all_cell_embeddings, dim=0)
             
-            # Keep as float32 for numerical consistency with original implementation
-            # L2 normalization will be done in generate_embeddings postprocessing
+            # Keep as float32. Do not L2-normalize: the Cytoformer head was trained
+            # on feat_norm(encoder(x)) (LayerNorm), not unit-length vectors.
             final_embeddings = final_embeddings.to(dtype=torch.float32)
             final_embeddings = final_embeddings.detach().cpu().numpy()
             
@@ -2877,8 +2876,7 @@ class NucleiEmbedding:
             with torch.inference_mode():
                 # Cytoformer H-optimus embedding (embed_prenorm wraps autocast/inference).
                 embeddings = self.cyto.embed_prenorm(processed_batch)
-                # Keep as float32 for numerical consistency with original implementation
-                # L2 normalization will be done in generate_embeddings postprocessing
+                # Keep as float32. Do not L2-normalize: the head expects feat_norm features.
                 embeddings = embeddings.to(dtype=torch.float32)
 
                 embeddings = embeddings.detach().cpu().numpy()
@@ -3403,12 +3401,9 @@ class NucleiEmbedding:
 
                         # Get embeddings
                         batch_embeddings = self.embed_batch(processed_batch, is_zstack=False)
-                        
-                        # Normalize and convert to float16
-                        norms = np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
-                        norms = np.where(norms > 0, norms, 1)  # Avoid division by zero
-                        batch_embeddings = batch_embeddings / norms
-                        batch_embeddings = batch_embeddings.astype(np.float16)
+                        # Persist feat_norm features as float16. L2 would break the
+                        # per-organ head (trained on LayerNorm, not unit vectors).
+                        batch_embeddings = batch_embeddings.astype(np.float16, copy=False)
                         
                         # Write to temporary layer dataset
                         batch_size_actual = batch_embeddings.shape[0]
@@ -3594,24 +3589,16 @@ class NucleiEmbedding:
                     # 3. Minimize synchronization points
                     postprocess_start = time.time()
                     if torch.is_tensor(batch_embeddings):
-                        # Keep as float32 for numerical consistency with original implementation
                         batch_embeddings = batch_embeddings.to(dtype=torch.float32)
-                        
-                        # L2 normalization: embeddings / ||embeddings|| (matches server version)
-                        batch_embeddings = batch_embeddings / torch.norm(batch_embeddings, dim=1, keepdim=True)
                         batch_embeddings = batch_embeddings.detach().cpu().numpy()
                     elif isinstance(batch_embeddings, np.ndarray):
-                        # Ensure float32 dtype
                         if batch_embeddings.dtype != np.float32:
                             batch_embeddings = batch_embeddings.astype(np.float32, copy=False)
-                        
-                        # L2 normalization: embeddings / ||embeddings|| (matches server version)
-                        batch_embeddings = batch_embeddings / np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
                     perf_stats['postprocessing_time'] += time.time() - postprocess_start
                     
                     # I/O operations
                     io_start = time.time()
-                    # Convert to float16 before saving (matches server version)
+                    # Persist feat_norm features as float16 (head expects LayerNorm, not L2).
                     if isinstance(batch_embeddings, np.ndarray):
                         batch_embeddings = batch_embeddings.astype(np.float16, copy=False)
                     

@@ -13,7 +13,7 @@ Uncertain cells (prob < threshold) are routed to a "Negative control" class by
 the caller.
 
 Weights: Cytoformer best.pth (same file as the segmentation node). Resolution:
-    $CYTOFORMER_WEIGHTS  ->  ./cytoformer_model/best.pth  ->  ./model/best.pth
+    $CYTOFORMER_WEIGHTS  ->  checkpoints/best.pth  ->  ./cytoformer_model/best.pth
 best.pth is {"model_state_dict": ...} with torch.compile "_orig_mod." prefixes,
 so we strip those before loading (otherwise the head loads as random weights).
 """

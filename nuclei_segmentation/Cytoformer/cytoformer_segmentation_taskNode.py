@@ -5,12 +5,14 @@ Segmentation Node for nuclei segmentation + embedding generation
 """
 # Standard library imports
 import argparse
+import collections
 import json
 import logging
 import multiprocessing
 import os
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Dict, Any
 
@@ -92,6 +94,7 @@ DEPENDENCIES = []
 EMBEDDING_MODEL = "Cytoformer"
 EMBEDDING_BACKBONE = "H-optimus-0"
 EMBEDDING_DIM = 1536
+EMBEDDING_NORM = "feat_norm"
 EMBEDDING_DATASET = "cytoformer_embeddings"
 # Per-folder SSE progress (progress_sse.py). Stream end does not reset.
 progress_state = ProgressSSEState()
@@ -106,12 +109,27 @@ class CancellationException(Exception):
 
 
 def _embedding_cache_is_compatible(embeddings_arr, expected_count: int) -> bool:
-    """Only reuse a cache compatible with Cytoformer's 1536-d feature contract."""
+    """Only reuse a cache that matches Cytoformer's feat_norm 1536-d contract.
+
+    `embedding_norm=feat_norm` invalidates older L2-normalized stores so the
+    per-organ head sees the same LayerNorm features it was trained on.
+    """
     shape = tuple(embeddings_arr.shape)
     if shape != (expected_count, EMBEDDING_DIM):
         return False
-    source = embeddings_arr.attrs.get("embedding_model")
-    return str(source or "").casefold() == EMBEDDING_MODEL.casefold()
+    model = str(embeddings_arr.attrs.get("embedding_model") or "").casefold()
+    backbone = str(embeddings_arr.attrs.get("embedding_backbone") or "").casefold()
+    try:
+        dim = int(embeddings_arr.attrs.get("embedding_dim") or 0)
+    except (TypeError, ValueError):
+        dim = 0
+    norm = str(embeddings_arr.attrs.get("embedding_norm") or "").casefold()
+    return (
+        model == EMBEDDING_MODEL.casefold()
+        and backbone == EMBEDDING_BACKBONE.casefold()
+        and dim == EMBEDDING_DIM
+        and norm == EMBEDDING_NORM.casefold()
+    )
 
 
 def _write_embedding_metadata(seg_group, embeddings_arr) -> None:
@@ -120,12 +138,14 @@ def _write_embedding_metadata(seg_group, embeddings_arr) -> None:
         "embedding_model": EMBEDDING_MODEL,
         "embedding_backbone": EMBEDDING_BACKBONE,
         "embedding_dim": EMBEDDING_DIM,
+        "embedding_norm": EMBEDDING_NORM,
     }
     seg_group.attrs.update({
         "cytoformer_embedding_dataset": EMBEDDING_DATASET,
         "cytoformer_embedding_model": EMBEDDING_MODEL,
         "cytoformer_embedding_backbone": EMBEDDING_BACKBONE,
         "cytoformer_embedding_dim": EMBEDDING_DIM,
+        "cytoformer_embedding_norm": EMBEDDING_NORM,
     })
     embeddings_arr.attrs.update(metadata)
 
@@ -133,7 +153,7 @@ def _write_embedding_metadata(seg_group, embeddings_arr) -> None:
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8005, help='port')
-    parser.add_argument('--name', type=str, default='StarDist', help='node name')
+    parser.add_argument('--name', type=str, default='Cytoformer', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
 
     # ===  segmentation + embedding parameters ===
@@ -593,6 +613,7 @@ def run_segmentation(args):
                         existing_embeddings = zf_embed[ZARR_GROUP][EMBEDDING_DATASET]
                         if _embedding_cache_is_compatible(existing_embeddings, len(centroids)):
                             have_cached_embedding = True
+                            _write_embedding_metadata(zf_embed[ZARR_GROUP], existing_embeddings)
                             print("found existing embeddings in store => skip embedding calculation")
                     except Exception:
                         have_cached_embedding = False
@@ -956,7 +977,7 @@ def main():
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8005, help='port')
-    parser.add_argument('--name', type=str, default='StarDist', help='node name')
+    parser.add_argument('--name', type=str, default='Cytoformer', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args, unknown = parser.parse_known_args()
 
