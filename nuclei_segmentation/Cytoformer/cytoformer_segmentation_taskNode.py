@@ -966,7 +966,7 @@ async def progress():
     SSE endpoint to provide progress updates.
     Idle terminal state is cleared on connect; stream end does not reset.
     """
-    return EventSourceResponse(iter_progress_events(progress_state))
+    return EventSourceResponse(iter_progress_events(progress_state, quiet=True))
 
 
 

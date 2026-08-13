@@ -780,7 +780,7 @@ async def progress_options():
 async def progress():
     """SSE progress. Idle terminal cleared on connect; stream end does not reset."""
     return EventSourceResponse(
-        iter_progress_events(progress_state),
+        iter_progress_events(progress_state, quiet=True),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

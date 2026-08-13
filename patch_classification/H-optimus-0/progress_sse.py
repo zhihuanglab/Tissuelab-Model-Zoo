@@ -95,12 +95,17 @@ async def iter_progress_events(
     *,
     keepalive_sec: float = 2.0,
     log_prefix: str = "[SSE]",
+    quiet: bool = False,
 ) -> AsyncIterator[dict]:
-    """Async generator body for EventSourceResponse(/progress)."""
+    """Async generator body for EventSourceResponse(/progress).
+
+    quiet=True: skip per-tick Progress prints (CellCast keeps tqdm on one line).
+    """
     state._add_client()
     try:
         if state.clear_stale_if_idle():
-            print(f"{log_prefix} Clearing stale terminal progress before next execution.")
+            if not quiet:
+                print(f"{log_prefix} Clearing stale terminal progress before next execution.")
 
         last_value = -1
         last_emit = time.monotonic()
@@ -122,12 +127,13 @@ async def iter_progress_events(
 
             if changed or keepalive:
                 if changed and (last_value > value or cancelled):
-                    if cancelled:
-                        print(f"{log_prefix} Task cancelled, sending reset signal")
-                    else:
-                        print(f"{log_prefix} Progress reset: {last_value}% -> {value}%")
+                    if not quiet:
+                        if cancelled:
+                            print(f"{log_prefix} Task cancelled, sending reset signal")
+                        else:
+                            print(f"{log_prefix} Progress reset: {last_value}% -> {value}%")
                     yield {"data": str(-1)}
-                if changed:
+                if changed and not quiet:
                     print(f"{log_prefix} Progress: {value}%")
                 yield {"data": str(value)}
                 last_value = value
@@ -135,7 +141,8 @@ async def iter_progress_events(
 
                 if cancelled:
                     state.notify_flushed()
-                    print(f"{log_prefix} Task cancelled, closing connection.")
+                    if not quiet:
+                        print(f"{log_prefix} Task cancelled, closing connection.")
                     await asyncio.sleep(0.5)
                     break
 
@@ -149,17 +156,20 @@ async def iter_progress_events(
             # Close after execute finishes so final 100% is not raced against HTTP return.
             if value >= 100 and complete and not active:
                 if last_value != 100:
-                    print(f"{log_prefix} Progress: 100%")
+                    if not quiet:
+                        print(f"{log_prefix} Progress: 100%")
                     yield {"data": "100"}
                     last_value = 100
                 state.notify_flushed()
-                print(f"{log_prefix} Progress complete, closing connection.")
+                if not quiet:
+                    print(f"{log_prefix} Progress complete, closing connection.")
                 await asyncio.sleep(0.5)
                 break
 
             await asyncio.sleep(0.1)
 
         await asyncio.sleep(1)
-        print(f"{log_prefix} Progress stream closed.")
+        if not quiet:
+            print(f"{log_prefix} Progress stream closed.")
     finally:
         state._remove_client()
