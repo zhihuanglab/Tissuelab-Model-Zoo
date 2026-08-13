@@ -18,13 +18,18 @@ import cv2
 import gc
 import json
 import os
-import importlib.util
 import tiffslide
 from collections import OrderedDict
 import platform
 
+try:
+    import pyvips
+    _VIPS_AVAILABLE = True
+except ImportError:
+    pyvips = None
+    _VIPS_AVAILABLE = False
+
 _WSI_EXTS = {'.tif', '.tiff', '.svs', '.ndpi', '.btf', '.qptiff', '.scn', '.mrxs', '.bif'}
-_VIPS_AVAILABLE = importlib.util.find_spec("pyvips") is not None
 
 
 def _open_tiffslide(path):
@@ -39,15 +44,97 @@ def _open_tiffslide(path):
     return tiffslide.TiffSlide(path, tifffile_options={'is_shaped': False})
 
 
+# Minimum thumbnail pixels along one side of a level-0 patch. 12x12 with
+# tissue_threshold=0.1 still has ~14 tissue pixels; below ~8 occupancy is noisy.
+_MIN_PX_PER_PATCH = 12
+_MAX_THUMB_PIXELS = 16_000_000  # mask RAM / OpenCV budget
+_MAX_THUMB_SIDE = 32766
+_SAFE_LEVEL_PIXELS = 32_000_000
+
+
 def _is_wsi_path(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in _WSI_EXTS
+
+
+def _is_pyramid_like(dim, W0, H0):
+    """True if `dim` looks like a downsampled copy of level-0, not a label/macro."""
+    w, h = int(dim[0]), int(dim[1])
+    if w < 8 or h < 8 or W0 < 1 or H0 < 1:
+        return False
+    ds_x = W0 / float(w)
+    ds_y = H0 / float(h)
+    return abs(ds_x - ds_y) <= 0.2 * max(ds_x, ds_y)
+
+
+def _patch_size_or_default(patch_size):
+    return max(int(patch_size) if patch_size else 224, 1)
+
+
+def _level_downsample(dim, W0, H0):
+    w, h = int(dim[0]), int(dim[1])
+    ds = max(W0 / float(max(w, 1)), H0 / float(max(h, 1)))
+    return ds, w, h
+
+
+def _thumbnail_target_ds(W0, H0, patch_size=None):
+    """Downsample for tile/get_thumbnail output: min px/patch, then RAM/side caps."""
+    ps = _patch_size_or_default(patch_size)
+    ds = max(float(ps) / float(_MIN_PX_PER_PATCH), 1.0)
+    area = float(max(int(W0), 1)) * float(max(int(H0), 1))
+    if area / (ds * ds) > _MAX_THUMB_PIXELS:
+        ds = max(ds, (area / float(_MAX_THUMB_PIXELS)) ** 0.5)
+    tw = max(1.0, float(W0) / ds)
+    th = max(1.0, float(H0) / ds)
+    side = max(tw, th)
+    if side > _MAX_THUMB_SIDE:
+        ds *= side / float(_MAX_THUMB_SIDE)
+    return ds
+
+
+def _thumbnail_size(W0, H0, patch_size=None):
+    ds = _thumbnail_target_ds(W0, H0, patch_size)
+    tw = max(1, int(round(W0 / ds)))
+    th = max(1, int(round(H0 / ds)))
+    return tw, th, ds
+
+
+def _pick_thumbnail_level(level_dimensions, patch_size=None):
+    """Cheapest pyramid level that still resolves a patch well enough.
+
+    A level is eligible if it is a real pyramid step, fits in RAM, and a
+    ``patch_size`` tile covers at least ``_MIN_PX_PER_PATCH`` thumbnail
+    pixels. Among those, pick the fewest pixels to read (coarsest). If none
+    qualify, use the RAM-safe level with the most pixels-per-patch.
+    """
+    W0 = int(level_dimensions[0][0])
+    H0 = int(level_dimensions[0][1])
+    ps = _patch_size_or_default(patch_size)
+    good = []
+    fallback = []
+    for i, d in enumerate(level_dimensions):
+        if not _is_pyramid_like(d, W0, H0):
+            continue
+        ds, w, h = _level_downsample(d, W0, H0)
+        pixels = w * h
+        if pixels > _SAFE_LEVEL_PIXELS:
+            continue
+        ppp = ps / ds
+        fallback.append((-ppp, pixels, i, d))
+        if ppp >= _MIN_PX_PER_PATCH:
+            good.append((pixels, i, d))
+    if good:
+        good.sort()
+        return good[0][1], good[0][2]
+    if fallback:
+        fallback.sort()
+        return fallback[0][2], fallback[0][3]
+    return 0, level_dimensions[0]
 
 
 class _VipsSlide:
     """tiffslide-compatible wrapper: pyvips reads, tifffile only for pyramid discovery."""
 
     def __init__(self, path):
-        import pyvips
         self.path = path
         self._images = {}
         probe = pyvips.Image.new_from_file(path)
@@ -60,7 +147,6 @@ class _VipsSlide:
 
     @staticmethod
     def _discover_levels(path, probe, is_openslide):
-        import pyvips
         if is_openslide:
             n = int(probe.get("openslide.level-count"))
             return tuple(
@@ -85,7 +171,6 @@ class _VipsSlide:
         return tuple(dims)
 
     def _level_image(self, level):
-        import pyvips
         img = self._images.get(level)
         if img is not None:
             return img
@@ -126,6 +211,31 @@ class _VipsSlide:
             arr = padded
         return Image.fromarray(arr)
 
+    def get_thumbnail(self, size):
+        """OpenSlide-compatible thumbnail: fit within (width, height), keep aspect.
+
+        ``no_rotate=True`` is required. Default thumbnail autorotates from EXIF,
+        which would misalign the tissue mask with ``read_region`` coordinates.
+        Do not stretch to the exact tuple -- OpenSlide also returns fit-within.
+        """
+        tw, th = max(1, int(size[0])), max(1, int(size[1]))
+        v = pyvips.Image.thumbnail(self.path, tw, height=th, no_rotate=True)
+        if v.bands >= 3 and str(v.interpretation).lower() not in ("srgb", "rgb"):
+            try:
+                v = v.colourspace("srgb")
+            except Exception:
+                pass
+        if str(v.format) != "uchar":
+            v = v.cast("uchar")
+        arr = np.frombuffer(v.write_to_memory(), dtype=np.uint8).reshape(
+            v.height, v.width, v.bands
+        )
+        if arr.ndim == 2 or arr.shape[2] == 1:
+            arr = np.repeat(arr if arr.ndim == 3 else arr[:, :, None], 3, axis=2)
+        else:
+            arr = arr[:, :, :3]
+        return Image.fromarray(arr)
+
     def close(self):
         self._images.clear()
 
@@ -135,12 +245,14 @@ def _open_wsi(path):
     if _VIPS_AVAILABLE:
         try:
             slide = _VipsSlide(path)
-            print(f"[WSI] pyvips {slide.dimensions} levels={slide.level_count}")
+            print(f"[WSI] pyvips {slide.dimensions} levels={slide.level_count} "
+                  f"pyramid={list(slide.level_dimensions)}")
             return slide
         except Exception as e:
             print(f"[WSI] pyvips failed ({e}); falling back to tiffslide")
     slide = _open_tiffslide(path)
-    print(f"[WSI] tiffslide {slide.dimensions} levels={slide.level_count}")
+    print(f"[WSI] tiffslide {slide.dimensions} levels={slide.level_count} "
+          f"pyramid={list(slide.level_dimensions)}")
     return slide
 
 
@@ -777,46 +889,97 @@ class MUSK:
         return patch_embeddings
 
     def _read_level_thumbnail(self, slide, level, dim,
-                              max_long_side=4096, safe_block=8192):
+                              patch_size=None, safe_block=2048):
         """Return a downscaled RGB thumbnail of `slide` without OOM risk.
 
-        `dim` is the (width, height) of pyramid `level`. For an ordinary
-        pyramidal slide the chosen level is already small and is read in a
-        single `read_region` call -- identical to the previous behaviour.
-
-        For a non-pyramidal slide `level` collapses to 0 and `dim` can be the
-        full multi-gigapixel image; reading that whole would allocate hundreds
-        of GiB of RGBA and get the process OOM-killed. In that case level 0 is
-        read in `safe_block`-sized tiles, each downscaled on the fly and
-        stitched into a thumbnail whose long side is `max_long_side`. Peak
-        extra RAM is then one tile (~safe_block**2 * 4 bytes).
+        Output size follows the patch-size ratio (not a fixed long-side cap),
+        so a tall slide keeps a usable short side. Reads the cheapest
+        pyramid `level` that still resolves a patch; never tile-reads
+        full-resolution level 0 when a coarser pyramid exists. Native
+        level pixels are kept unless they exceed the RAM/side caps.
         """
         from PIL import Image as _Image
         W, H = int(dim[0]), int(dim[1])
-        if max(W, H) <= max_long_side:
-            return slide.read_region((0, 0), level, (W, H)).convert("RGB")
         W0 = int(slide.level_dimensions[0][0])
         H0 = int(slide.level_dimensions[0][1])
-        scale = max_long_side / float(max(W0, H0))
-        tw = max(1, int(round(W0 * scale)))
-        th = max(1, int(round(H0 * scale)))
-        print(f"[MUSK] Large/non-pyramidal slide ({W0}x{H0}); tile-reading a "
-              f"{tw}x{th} tissue-mask thumbnail to avoid an OOM.", flush=True)
+        n_levels = len(slide.level_dimensions)
+        tw, th, target_ds = _thumbnail_size(W0, H0, patch_size)
+        ds = max(W0 / float(max(W, 1)), H0 / float(max(H, 1)))
+
+        if W * H <= _SAFE_LEVEL_PIXELS:
+            try:
+                print(f"[MUSK] Reading tissue-mask from level {level} "
+                      f"({W}x{H} -> {tw}x{th}, src_ds~{ds:.1f} target_ds~{target_ds:.1f})",
+                      flush=True)
+                img = slide.read_region((0, 0), level, (W, H)).convert("RGB")
+                if (img.size[0] * img.size[1] > _MAX_THUMB_PIXELS
+                        or max(img.size) > _MAX_THUMB_SIDE):
+                    img = img.resize((tw, th), _Image.BILINEAR)
+                return img
+            except Exception as e:
+                print(f"[MUSK] Level {level} thumbnail read failed ({e})",
+                      flush=True)
+
+        getter = getattr(slide, "get_thumbnail", None)
+        vips_thumb = callable(getter) and hasattr(slide, "path")
+        if callable(getter) and vips_thumb:
+            try:
+                print(f"[MUSK] Thumbnail {tw}x{th} via get_thumbnail "
+                      f"(slide {W0}x{H0}, {n_levels} levels)", flush=True)
+                return getter((tw, th)).convert("RGB")
+            except Exception as e:
+                print(f"[MUSK] get_thumbnail failed ({e}); trying pyramid levels",
+                      flush=True)
+
+        for i in range(level, -1, -1):
+            lw = int(slide.level_dimensions[i][0])
+            lh = int(slide.level_dimensions[i][1])
+            if lw * lh > _SAFE_LEVEL_PIXELS or not _is_pyramid_like((lw, lh), W0, H0):
+                continue
+            try:
+                print(f"[MUSK] Reading tissue-mask thumbnail from pyramid "
+                      f"level {i} ({lw}x{lh} -> {tw}x{th})", flush=True)
+                img = slide.read_region((0, 0), i, (lw, lh)).convert("RGB")
+                if (img.size[0] * img.size[1] > _MAX_THUMB_PIXELS
+                        or max(img.size) > _MAX_THUMB_SIDE):
+                    img = img.resize((tw, th), _Image.BILINEAR)
+                return img
+            except Exception as e:
+                print(f"[MUSK] Level {i} thumbnail read failed ({e})", flush=True)
+
+        src_level = n_levels - 1
+        src_w = int(slide.level_dimensions[src_level][0])
+        src_h = int(slide.level_dimensions[src_level][1])
+        lvl_sx = W0 / float(src_w)
+        lvl_sy = H0 / float(src_h)
+        out_sx = tw / float(src_w)
+        out_sy = th / float(src_h)
+        n_tiles = (((src_w + safe_block - 1) // safe_block)
+                   * ((src_h + safe_block - 1) // safe_block))
+        print(f"[MUSK] Tile-reading tissue-mask thumbnail from level {src_level} "
+              f"({src_w}x{src_h} -> {tw}x{th}, {n_tiles} tiles of {safe_block})",
+              flush=True)
         thumb = np.zeros((th, tw, 3), dtype=np.uint8)
-        for by in range(0, H0, safe_block):
-            bh = min(safe_block, H0 - by)
-            ty0 = int(by * scale)
-            ty1 = min(th, max(ty0 + 1, int((by + bh) * scale)))
-            for bx in range(0, W0, safe_block):
-                bw = min(safe_block, W0 - bx)
-                tx0 = int(bx * scale)
-                tx1 = min(tw, max(tx0 + 1, int((bx + bw) * scale)))
-                block = slide.read_region((bx, by), 0, (bw, bh)).convert("RGB")
+        done = 0
+        for by in range(0, src_h, safe_block):
+            bh = min(safe_block, src_h - by)
+            ty0 = int(by * out_sy)
+            ty1 = min(th, max(ty0 + 1, int((by + bh) * out_sy)))
+            for bx in range(0, src_w, safe_block):
+                bw = min(safe_block, src_w - bx)
+                tx0 = int(bx * out_sx)
+                tx1 = min(tw, max(tx0 + 1, int((bx + bw) * out_sx)))
+                loc = (int(bx * lvl_sx), int(by * lvl_sy))
+                block = slide.read_region(loc, src_level, (bw, bh)).convert("RGB")
                 block = block.resize((tx1 - tx0, ty1 - ty0), _Image.BILINEAR)
                 thumb[ty0:ty1, tx0:tx1] = np.asarray(block)
+                done += 1
+                if done == 1 or done % 8 == 0 or done == n_tiles:
+                    print(f"[MUSK] Thumbnail tiles {done}/{n_tiles}", flush=True)
         return _Image.fromarray(thumb)
 
-    def get_tissue_mask(self, slide, edge_width_ratio=0.04, min_area=None, debug_dir=None):
+    def get_tissue_mask(self, slide, edge_width_ratio=0.04, min_area=None, debug_dir=None,
+                          patch_size=None):
         """
         Generate a filled tissue mask for a whole-slide image.
 
@@ -846,17 +1009,23 @@ class MUSK:
                     debug_dir = os.path.join(os.path.dirname(__file__), debug_dir)
                 os.makedirs(debug_dir, exist_ok=True)
 
-            # ---------------------------------------------------------------------
-            # 1. Read a thumbnail image at the coarsest reasonable level
-            # ---------------------------------------------------------------------
-            level = min(3, len(slide.level_dimensions) - 1)
-            dim = slide.level_dimensions[level]
-            # `_read_level_thumbnail` reads `dim` in one shot when it is small
-            # (the usual pyramidal case) but tile-reads + downscales when it is
-            # a multi-gigapixel non-pyramidal slide -- so this never allocates
-            # hundreds of GiB nor triggers the OOM killer.
-            temp_thumb = self._read_level_thumbnail(slide, level, dim,
-                                                    max_long_side=4096)
+            level, dim = _pick_thumbnail_level(
+                slide.level_dimensions, patch_size=patch_size)
+            tw, th, target_ds = _thumbnail_size(
+                int(slide.level_dimensions[0][0]),
+                int(slide.level_dimensions[0][1]),
+                patch_size,
+            )
+            ds = max(
+                int(slide.level_dimensions[0][0]) / float(dim[0]),
+                int(slide.level_dimensions[0][1]) / float(dim[1]),
+            )
+            print(f"[MUSK] Tissue-mask source: level {level} {tuple(int(x) for x in dim)} "
+                  f"of {len(slide.level_dimensions)} levels, "
+                  f"src_ds~{ds:.1f} -> {tw}x{th} (target_ds~{target_ds:.1f})",
+                  flush=True)
+            temp_thumb = self._read_level_thumbnail(
+                slide, level, dim, patch_size=patch_size)
             gray = np.array(ImageOps.grayscale(temp_thumb))
             h,  w = gray.shape
 
@@ -1027,7 +1196,7 @@ class MUSK:
             #     return None, []
             
             t_r0 = time.time()
-            mask = self.get_tissue_mask(slide, debug_dir=None)
+            mask = self.get_tissue_mask(slide, debug_dir=None, patch_size=patch_size)
             # Keep the mask at thumbnail resolution. Upsampling it to full
             # level-0 resolution would allocate tens of GiB for a multi-
             # gigapixel slide; WsiPatchDataset rescales coordinates instead.
