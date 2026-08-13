@@ -1327,7 +1327,7 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
     n_train = len(trainable) if can_train else 0
     for t_i, cls in enumerate(trainable if can_train else []):
         if cancel_event.is_set():
-            cancel_event.clear(); progress_value = 0; return None
+            raise CooperativeCancel("cancelled")
         ci = name_to_idx[cls]
         pos_sel = (y_pos == ci)
         if not np.any(pos_sel):
@@ -1376,7 +1376,7 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
     items = [(c, p) for c, p in predict_map.items() if c in name_to_idx]
     for r_i, (cls, path) in enumerate(items):
         if cancel_event.is_set():
-            cancel_event.clear(); progress_value = 0; return None
+            raise CooperativeCancel("cancelled")
         ci = name_to_idx[cls]
         if not path or not os.path.exists(path):
             print(f"[OvR] classifier for '{cls}' not found: {path}"); continue

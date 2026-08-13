@@ -268,12 +268,16 @@ def run_patch_classification(args):
             
             # Define progress callback function
             def progress_callback(stage, payload):
-                if stage == "encode":
-                    try:
-                        percent = int(payload)
-                        update_progress(min(99, max(1, percent)))
-                    except Exception:
-                        pass
+                # Must not swallow CooperativeCancel — that is how /cancel stops
+                # the DataLoader loop. Only payload parsing is best-effort.
+                _check_cancel()
+                if stage != "encode":
+                    return
+                try:
+                    percent = int(payload)
+                except (TypeError, ValueError):
+                    return
+                update_progress(min(99, max(1, percent)))
             
             # Determine mask export path (same folder as ZARR)
             mask_export_path = None

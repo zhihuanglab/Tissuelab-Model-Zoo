@@ -1164,6 +1164,8 @@ class MUSK:
             return final_mask
 
         except Exception as e:
+            if type(e).__name__ == "CooperativeCancel":
+                raise
             print(f"Error generating clean tissue mask: {str(e)}")
             import traceback
             traceback.print_exc()
@@ -1236,6 +1238,8 @@ class MUSK:
             
             t_r0 = time.time()
             mask = self.get_tissue_mask(slide, debug_dir=None, patch_size=patch_size)
+            if progress_callback:
+                progress_callback("encode", 1)
             # Keep the mask at thumbnail resolution. Upsampling it to full
             # level-0 resolution would allocate tens of GiB for a multi-
             # gigapixel slide; WsiPatchDataset rescales coordinates instead.
@@ -1247,6 +1251,8 @@ class MUSK:
                 except Exception:
                     pass
         except Exception as open_err:
+            if type(open_err).__name__ == "CooperativeCancel":
+                raise
             if _is_wsi_path(wsi_path):
                 self.logger.error(
                     f"Failed to open WSI (PIL fallback skipped for WSI): {open_err}"
@@ -1273,6 +1279,8 @@ class MUSK:
                 #     except Exception:
                 #         pass
             except Exception as pil_err:
+                if type(pil_err).__name__ == "CooperativeCancel":
+                    raise
                 self.logger.error(f"Failed to open image as WSI and as PIL: {open_err} | {pil_err}")
                 return None, []
         
@@ -1325,6 +1333,9 @@ class MUSK:
                     except Exception:
                         print(f"[loader] batch {batch_count + 1}: wait {wait_s:.3f}s")
                 batch_count += 1
+                if progress_callback:
+                    n_batches = max(len(loader), 1)
+                    progress_callback("encode", int((batch_count - 1) / n_batches * 100))
 
                 # Encode
                 t_e0 = time.time() if profile else None
