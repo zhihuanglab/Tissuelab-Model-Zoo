@@ -13,8 +13,9 @@ import os
 import threading
 import time
 import traceback
+import warnings
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict
 
 # Third-party imports
 import numpy as np
@@ -23,15 +24,15 @@ import torch
 import uvicorn
 import zarr
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from sse_starlette.sse import EventSourceResponse
+from zarr.errors import UnstableSpecificationWarning
+
+from progress_sse import ProgressSSEState, iter_progress_events
 
 # Silence zarr v3 "unstable data type" warnings (structured arrays + fixed-length
 # string/bytes dtypes used by our schema). No cross-library portability needed.
-import warnings
-from zarr.errors import UnstableSpecificationWarning
 warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
-from fastapi.middleware.cors import CORSMiddleware
-from sse_starlette.sse import EventSourceResponse
-from progress_sse import ProgressSSEState, iter_progress_events
 
 # Set TensorFlow environment variables before importing TensorFlow-dependent modules
 os.environ["TF_INTER_OP_PARALLELISM_THREADS"] = "2"

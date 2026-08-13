@@ -20,7 +20,6 @@ Memory Management:
 - Garbage collection is called periodically during batch processing
 - GPU operations are synchronized before cleanup to ensure all operations complete
 """
-# Standard library imports
 import os as _os_early
 import platform as _platform_early
 
@@ -37,6 +36,7 @@ if _platform_early.system() == 'Darwin':
     _os_early.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
     _os_early.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
 
+# Standard library imports
 import argparse
 import base64
 import collections
@@ -51,9 +51,10 @@ import sys
 import threading
 import time
 import traceback
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict
 
 # Third-party imports
 import numpy as np
@@ -64,17 +65,16 @@ import uvicorn
 import xgboost as xgb
 import zarr
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from sse_starlette.sse import EventSourceResponse
+from zarr.errors import UnstableSpecificationWarning
+
+from cytoformer_head import CytoHead, NEG_CONTROL_COLOR, NEG_CONTROL_NAME
+from progress_sse import ProgressSSEState, iter_progress_events
 
 # Silence zarr v3 "unstable data type" warnings (structured arrays + fixed-length
 # string/bytes dtypes used by our schema). No cross-library portability needed.
-import warnings
-from zarr.errors import UnstableSpecificationWarning
 warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
-from fastapi.middleware.cors import CORSMiddleware
-from sse_starlette.sse import EventSourceResponse
-from progress_sse import ProgressSSEState, iter_progress_events
-# Cytoformer classification uses the fine-tuned H-optimus-0 per-organ head for
-# zero-shot (cytoformer_head.CytoHead), not PLIP text encoding.
 
 app = FastAPI()
 
@@ -123,6 +123,11 @@ NODE_NAME = None
 ZARR_GROUP = "Cell-Classification"
 DEPENDENCIES = []
 CYTOFORMER_EMBEDDING_DATASET = "cytoformer_embeddings"
+# Must match nuclei_segmentation/Cytoformer writers (compared case-insensitively).
+EMBEDDING_MODEL = "Cytoformer"
+EMBEDDING_BACKBONE = "H-optimus-0"
+EMBEDDING_DIM = 1536
+EMBEDDING_NORM = "feat_norm"
 
 # Cytoformer per-organ zero-shot head (cytoformer_head.CytoHead), loaded once at
 # /init. Supervised / active-learning (XGBoost .tlcls) runs on the same 1536-d
@@ -131,8 +136,6 @@ CYTO_HEAD = None
 # Cells whose top-class softmax probability is below this go to "Negative control"
 # (the "uncertain -> negative control" rule). Overridable via userData.
 CYTO_CONF_THRESHOLD = 0.5
-NEG_CONTROL_NAME = "Negative control"
-NEG_CONTROL_COLOR = "#7f7f7f"
 CLASSIFIER_PATH = None
 SAVE_CLASSIFIER_PATH = None
 LAST_TRAINED_CLF_BUNDLE = None
@@ -180,6 +183,7 @@ def _normalize_class_operations(raw_ops):
             if name:
                 ops["adds"].append({"name": name, "color": color})
     return ops
+
 
 def _has_rename_cycle(renames):
     if not renames:
@@ -611,7 +615,6 @@ def load_checkpoint_at_init():
         print("Cytoformer head already loaded in memory => skip")
         return
 
-    from cytoformer_head import CytoHead
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[Cell-Classification] Loading Cytoformer per-organ head..., device={device}")
     CYTO_HEAD = CytoHead(device=device)
@@ -625,7 +628,7 @@ def generate_distinct_colors(nuclei_classes: list[str]) -> list[str]:
     for i, nuclei_class in enumerate(nuclei_classes):
         # Use gray color for "other" and "negative control"
         if nuclei_class.lower() == "other" or nuclei_class.lower() == "negative control":
-            colors.append("#aaaaaa")
+            colors.append(NEG_CONTROL_COLOR)
             continue
         golden_ratio = 0.618033988749895
         hue = (i * golden_ratio) % 1
@@ -1885,19 +1888,37 @@ def run_classification(args) -> Dict[str, Any]:
         if eff_renames_run:
             _persist_nuclei_rename_to_user_annotation(zf, eff_renames_run, nuclei_classes, nuclei_colors)
 
-        # A) check annotation
+        # A) annotations — present does NOT imply supervised. Organ zero-shot
+        # ignores leftover User-Annotations unless the workflow asked for AL.
         annotations_data = None
-        use_supervised = False
+        has_annotations = False
         if 'User-Annotations' in zf and 'cell' in zf['User-Annotations']:
             annotations_data = load_structured_nuclei_annotations(zf, 'User-Annotations/cell')
             if annotations_data is not None and not annotations_data.empty:
-                use_supervised = True
+                has_annotations = True
             else:
                 annotations_data = None
-                use_supervised = False
-        else:
+        use_supervised = has_annotations and bool(getattr(args, "use_supervised", False))
+        if has_annotations and not use_supervised:
+            print(
+                "[Cell-Classification] User-Annotations present but use_supervised=false; "
+                "ignoring leftover labels and running organ zero-shot."
+            )
             annotations_data = None
-            use_supervised = False
+        elif use_supervised and annotations_data is not None and nuclei_classes:
+            allowed = {str(n) for n in nuclei_classes}
+            if "class" in annotations_data.columns:
+                is_pos = annotations_data["class"].notna()
+                pos_match = is_pos & annotations_data["class"].astype(str).isin(allowed)
+                if int(pos_match.sum()) == 0:
+                    print(
+                        "[Cell-Classification] User-Annotations do not match the organ "
+                        "class list; ignoring leftover labels and running organ zero-shot."
+                    )
+                    use_supervised = False
+                    annotations_data = None
+                else:
+                    annotations_data = annotations_data[pos_match | ~is_pos]
         
         # B) Read Cytoformer's dedicated 1536-d features. The generic
         # Cell-Segmentation/embeddings dataset belongs to PLIP/NuClass.
@@ -1913,9 +1934,9 @@ def run_classification(args) -> Dict[str, Any]:
         print("Loading embeddings from zarr...")
         embeddings_arr = seg_grp[CYTOFORMER_EMBEDDING_DATASET]
         cell_embeddings = embeddings_arr[()]
-        if cell_embeddings.ndim != 2 or cell_embeddings.shape[1] != 1536:
+        if cell_embeddings.ndim != 2 or cell_embeddings.shape[1] != EMBEDDING_DIM:
             raise ValueError(
-                f"Cytoformer classification requires [N, 1536] embeddings; "
+                f"Cytoformer classification requires [N, {EMBEDDING_DIM}] embeddings; "
                 f"{CYTOFORMER_EMBEDDING_DATASET} has shape {cell_embeddings.shape}."
             )
         if cell_embeddings.shape[0] <= 0:
@@ -1936,14 +1957,15 @@ def run_classification(args) -> Dict[str, Any]:
         embedding_dim = int(embeddings_arr.attrs.get("embedding_dim") or 0)
         embedding_norm = str(embeddings_arr.attrs.get("embedding_norm") or "").casefold()
         if (
-            embedding_model != "cytoformer"
-            or embedding_backbone != "h-optimus-0"
-            or embedding_dim != 1536
-            or embedding_norm != "feat_norm"
+            embedding_model != EMBEDDING_MODEL.casefold()
+            or embedding_backbone != EMBEDDING_BACKBONE.casefold()
+            or embedding_dim != EMBEDDING_DIM
+            or embedding_norm != EMBEDDING_NORM.casefold()
         ):
             raise ValueError(
                 "Invalid Cytoformer embedding metadata; expected "
-                "Cytoformer/H-optimus-0/1536/feat_norm. Re-run Cytoformer cell segmentation."
+                f"{EMBEDDING_MODEL}/{EMBEDDING_BACKBONE}/{EMBEDDING_DIM}/{EMBEDDING_NORM}. "
+                "Re-run Cytoformer cell segmentation."
             )
         progress_state.value = 35
         print(f"Progress: 35% (Embeddings loaded, shape: {cell_embeddings.shape})")
@@ -2487,7 +2509,7 @@ def read_node(data: Dict[str, Any]):
     SAVE_CLASSIFIER_PATHS = None
     CLASSIFIER_PATHS = None
     CYTO_CONF_THRESHOLD = 0.5
-    ARGS = argparse.Namespace(slidepath="", organ=None, nuclei_classes=[])
+    ARGS = argparse.Namespace(slidepath="", organ=None, nuclei_classes=[], use_supervised=False)
     NODE_NAME = data.get("node_name", "CytoformerClassification")
     ZARR_GROUP = data.get("zarr_group") or "Cell-Classification"
     DEPENDENCIES = data.get("dependencies", [])
@@ -2519,6 +2541,9 @@ def read_node(data: Dict[str, Any]):
                     ARGS.slidepath = val_json
                 elif k == "organ":
                     ARGS.organ = val_json
+                elif k == "use_supervised":
+                    # tasks.py writes bools as str(True)/str(False), not JSON true/false.
+                    ARGS.use_supervised = str(val_json).lower() == "true"
                 elif k in ("confidence_threshold", "conf_threshold"):
                     # "uncertain -> Negative control" cutoff for zero-shot.
                     try:

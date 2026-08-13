@@ -17,9 +17,130 @@ import cv2
 import gc
 import json
 import os
+import importlib.util
 import tiffslide
 from collections import OrderedDict
 import platform
+
+_WSI_EXTS = {'.tif', '.tiff', '.svs', '.ndpi', '.btf', '.qptiff', '.scn', '.mrxs', '.bif'}
+_VIPS_AVAILABLE = importlib.util.find_spec("pyvips") is not None
+
+
+def _open_tiffslide(path):
+    """Open a slide with tiffslide, disabling tifffile's 'shaped series' detector.
+
+    Some exported pyramidal TIFFs copy '{"shape": [H, W, 3]}' into every page's
+    ImageDescription. tifffile then routes them through the shaped-series parser,
+    whose keyframe check raises 'incompatible keyframe' on the differently-sized
+    pyramid levels. The caller used to fall back to PIL, which cannot stream
+    gigapixel TIFFs. is_shaped=False forces generic pyramid parsing.
+    """
+    return tiffslide.TiffSlide(path, tifffile_options={'is_shaped': False})
+
+
+def _is_wsi_path(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in _WSI_EXTS
+
+
+class _VipsSlide:
+    """tiffslide-compatible wrapper: pyvips reads, tifffile only for pyramid discovery."""
+
+    def __init__(self, path):
+        import pyvips
+        self.path = path
+        self._images = {}
+        probe = pyvips.Image.new_from_file(path)
+        self._is_openslide = "openslide.level-count" in probe.get_fields()
+        self.level_dimensions = self._discover_levels(path, probe, self._is_openslide)
+        self.dimensions = self.level_dimensions[0]
+        self.level_count = len(self.level_dimensions)
+        self.properties = {"vendor": "pyvips"}
+        del probe
+
+    @staticmethod
+    def _discover_levels(path, probe, is_openslide):
+        import pyvips
+        if is_openslide:
+            n = int(probe.get("openslide.level-count"))
+            return tuple(
+                (im.width, im.height)
+                for im in (pyvips.Image.new_from_file(path, level=i) for i in range(n))
+            )
+        try:
+            import tifffile
+            dims = []
+            with tifffile.TiffFile(path, is_shaped=False) as tf:
+                for page in tf.pages:
+                    dims.append((int(page.imagewidth), int(page.imagelength)))
+            if dims:
+                return tuple(dims)
+        except Exception:
+            pass
+        n_pages = int(probe.get("n-pages")) if probe.get_typeof("n-pages") else 1
+        dims = [(probe.width, probe.height)]
+        for i in range(1, n_pages):
+            im = pyvips.Image.new_from_file(path, page=i)
+            dims.append((im.width, im.height))
+        return tuple(dims)
+
+    def _level_image(self, level):
+        import pyvips
+        img = self._images.get(level)
+        if img is not None:
+            return img
+        if self._is_openslide:
+            img = pyvips.Image.new_from_file(self.path, level=level, access="random")
+        else:
+            img = pyvips.Image.new_from_file(self.path, page=level, access="random")
+        if img.bands >= 3 and str(img.interpretation).lower() not in ("srgb", "rgb"):
+            try:
+                img = img.colourspace("srgb")
+            except Exception:
+                pass
+        self._images[level] = img
+        return img
+
+    def read_region(self, location, level, size):
+        x, y = location
+        w, h = int(size[0]), int(size[1])
+        lw, lh = self.level_dimensions[level]
+        scale = self.dimensions[0] / float(lw)
+        sx = max(0, min(int(x / scale), max(0, lw - 1)))
+        sy = max(0, min(int(y / scale), max(0, lh - 1)))
+        sw = max(1, min(w, lw - sx))
+        sh = max(1, min(h, lh - sy))
+        region = self._level_image(level).crop(sx, sy, sw, sh)
+        if str(region.format) != "uchar":
+            region = region.cast("uchar")
+        arr = np.frombuffer(region.write_to_memory(), dtype=np.uint8).reshape(
+            sh, sw, region.bands
+        )
+        if arr.ndim == 2 or arr.shape[2] == 1:
+            arr = np.repeat(arr if arr.ndim == 3 else arr[:, :, None], 3, axis=2)
+        else:
+            arr = arr[:, :, :3]
+        if sw < w or sh < h:
+            padded = np.zeros((h, w, 3), dtype=np.uint8)
+            padded[:sh, :sw] = arr
+            arr = padded
+        return Image.fromarray(arr)
+
+    def close(self):
+        self._images.clear()
+
+
+def _open_wsi(path):
+    """Open a WSI: pyvips first (same as the viewer / nuclei embedding), tiffslide fallback."""
+    if _VIPS_AVAILABLE:
+        try:
+            slide = _VipsSlide(path)
+            print(f"[WSI] pyvips {slide.dimensions} levels={slide.level_count}")
+            return slide
+        except Exception as e:
+            print(f"[WSI] pyvips failed ({e}); falling back to tiffslide")
+    slide = _open_tiffslide(path)
+    print(f"[WSI] tiffslide {slide.dimensions} levels={slide.level_count}")
+    return slide
 
 
 class WsiPatchDataset(torch.utils.data.Dataset):
@@ -84,15 +205,19 @@ class WsiPatchDataset(torch.utils.data.Dataset):
         if self._slide_local is None and self._fallback_image_local is None:
             if self.use_tiffslide:
                 try:
-                    s = tiffslide.TiffSlide(self.wsi_path)
+                    s = _open_wsi(self.wsi_path)
                     if self.wsi_cache_mb and hasattr(s, 'with_cache'):
                         try:
                             s = s.with_cache(size_mb=self.wsi_cache_mb)
                         except Exception:
                             pass
                     self._slide_local = s
-                except Exception:
+                except Exception as e:
                     self._slide_local = None
+                    if _is_wsi_path(self.wsi_path):
+                        raise RuntimeError(
+                            f"Failed to open WSI: {self.wsi_path}"
+                        ) from e
                     try:
                         self._fallback_image_local = Image.open(self.wsi_path).convert("RGB")
                     except Exception:
@@ -559,7 +684,7 @@ class MUSK:
         # Open WSI file
         try:
             if use_tiffslide:
-                slide = slide_library.TiffSlide(wsi_path)
+                slide = _open_wsi(wsi_path)
             else:
                 slide = slide_library.OpenSlide(wsi_path)
         except Exception as e:
@@ -869,11 +994,11 @@ class MUSK:
                 'final_cat_s': 0.0,
             }
         
-        # Try WSI via tiffslide; fallback to PIL for regular images (e.g., JPG/PNG)
+        # Try WSI via tiffslide; fallback to PIL only for regular images (e.g., JPG/PNG)
         slide = None
         fallback_image = None
         try:
-            slide = tiffslide.TiffSlide(wsi_path)
+            slide = _open_wsi(wsi_path)
             if wsi_cache_mb and hasattr(slide, 'with_cache'):
                 try:
                     slide = slide.with_cache(size_mb=int(wsi_cache_mb))
@@ -906,6 +1031,11 @@ class MUSK:
                 except Exception:
                     pass
         except Exception as open_err:
+            if _is_wsi_path(wsi_path):
+                self.logger.error(
+                    f"Failed to open WSI (PIL fallback skipped for WSI): {open_err}"
+                )
+                return None, []
             try:
                 fallback_image = Image.open(wsi_path).convert("RGB")
                 width, height = fallback_image.size

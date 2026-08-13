@@ -29,7 +29,7 @@ if _MODEL_CODE not in sys.path:
     sys.path.insert(0, _MODEL_CODE)
 
 NEG_CONTROL_NAME = "Negative control"
-NEG_CONTROL_COLOR = "#7f7f7f"
+NEG_CONTROL_COLOR = "#aaaaaa"
 
 
 def _resolve_weights() -> str:
