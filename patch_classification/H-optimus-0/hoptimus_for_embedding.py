@@ -239,20 +239,50 @@ class _VipsSlide:
         self._images.clear()
 
 
-def _open_wsi(path):
-    """Open a WSI: pyvips first (same as the viewer / nuclei embedding), tiffslide fallback."""
+def _open_wsi(path, verbose=None):
+    """Open a WSI: pyvips first (same as the viewer / nuclei embedding), tiffslide fallback.
+
+    DataLoader workers each reopen the slide; log only from the main process.
+    """
+    if verbose is None:
+        try:
+            verbose = torch.utils.data.get_worker_info() is None
+        except Exception:
+            verbose = True
     if _VIPS_AVAILABLE:
         try:
             slide = _VipsSlide(path)
-            print(f"[WSI] pyvips {slide.dimensions} levels={slide.level_count} "
-                  f"pyramid={list(slide.level_dimensions)}")
+            if verbose:
+                print(f"[WSI] pyvips {slide.dimensions} levels={slide.level_count} "
+                      f"pyramid={list(slide.level_dimensions)}", flush=True)
             return slide
         except Exception as e:
-            print(f"[WSI] pyvips failed ({e}); falling back to tiffslide")
+            if verbose:
+                print(f"[WSI] pyvips failed ({e}); falling back to tiffslide",
+                      flush=True)
     slide = _open_tiffslide(path)
-    print(f"[WSI] tiffslide {slide.dimensions} levels={slide.level_count} "
-          f"pyramid={list(slide.level_dimensions)}")
+    if verbose:
+        print(f"[WSI] tiffslide {slide.dimensions} levels={slide.level_count} "
+              f"pyramid={list(slide.level_dimensions)}", flush=True)
     return slide
+
+
+_MAX_LOADER_WORKERS = 4
+
+
+def _resolve_loader_workers(requested):
+    """Keep workers at 0 unless explicitly requested.
+
+    Patch decode is cheap next to the encoder. DataLoader processes ignore
+    SIGINT and make cancel wait on worker teardown.
+    """
+    if platform.system() == 'Windows':
+        return 0
+    try:
+        requested = int(requested)
+    except (TypeError, ValueError):
+        requested = 0
+    return max(0, min(requested, _MAX_LOADER_WORKERS))
 
 
 class WsiPatchDataset(torch.utils.data.Dataset):
@@ -1122,22 +1152,10 @@ class MUSK:
                           profile: bool = False,
                           wsi_cache_mb: int = 0,
                           macro_tile_factor: int = 16,
-                          loader_workers: int = 32,
+                          loader_workers: int = 0,
                           prefetch_factor: int = 2):
         """Process entire WSI by dividing it into patches using streaming approach"""
-        
-        # On Windows, set loader_workers to 0 to avoid multiprocessing issues
-        if platform.system() == 'Windows':
-            loader_workers = 0
-        # On macOS, cap workers to avoid libomp + fork() crashes and exceeding
-        # the system's suggested worker count. Default 32 was triggering
-        # "leaked semaphore objects" and DataLoader rationality warnings.
-        elif platform.system() == 'Darwin':
-            try:
-                cpu = os.cpu_count() or 4
-            except Exception:
-                cpu = 4
-            loader_workers = min(int(loader_workers), max(2, cpu // 2), 8)
+        loader_workers = _resolve_loader_workers(loader_workers)
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {device}")
@@ -1265,7 +1283,7 @@ class MUSK:
         all_embeddings = []
         all_coordinates = []
 
-        print("Starting DataLoader streaming of patches...")
+        print(f"Starting DataLoader streaming of patches (workers={loader_workers})...")
         batch_count = 0
         prev_end = time.time()
         with torch.no_grad():
