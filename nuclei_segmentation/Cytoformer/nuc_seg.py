@@ -1311,6 +1311,8 @@ class SlideSegmentation():
                 return
                 
             except Exception as e:
+                if type(e).__name__ in ("CancellationException", "CooperativeCancel"):
+                    raise
                 print(f"Error processing image directly: {str(e)}")
                 import traceback
                 print(traceback.format_exc())
@@ -1642,6 +1644,8 @@ class SlideSegmentation():
                 total_nuclei = len(self.final_points)
                 
             except Exception as e:
+                if type(e).__name__ in ("CancellationException", "CooperativeCancel"):
+                    raise
                 print(f"Failed to generate final_points: {str(e)}")
                 import traceback
                 print(traceback.format_exc())

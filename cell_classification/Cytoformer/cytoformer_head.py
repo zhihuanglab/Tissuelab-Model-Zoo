@@ -1,7 +1,7 @@
 """Cytoformer per-organ zero-shot head for the classification node.
 
 The Cytoformer segmentation node writes 1536-d image features into
-Cell-Segmentation/embeddings (feat_norm(encoder(patch))). This module loads
+Cell-Segmentation/cytoformer_embeddings (feat_norm(encoder(patch))). This module loads
 ONLY the per-organ classification head from best.pth and applies it to those
 pre-computed features, so no image encoder is needed here.
 
@@ -13,7 +13,7 @@ Uncertain cells (prob < threshold) are routed to a "Negative control" class by
 the caller.
 
 Weights: Cytoformer best.pth (same file as the segmentation node). Resolution:
-    $CYTOFORMER_WEIGHTS  ->  ./cytoformer_model/best.pth  ->  ./model/best.pth
+    $CYTOFORMER_WEIGHTS  ->  checkpoints/best.pth  ->  ./cytoformer_model/best.pth
 best.pth is {"model_state_dict": ...} with torch.compile "_orig_mod." prefixes,
 so we strip those before loading (otherwise the head loads as random weights).
 """
@@ -29,7 +29,7 @@ if _MODEL_CODE not in sys.path:
     sys.path.insert(0, _MODEL_CODE)
 
 NEG_CONTROL_NAME = "Negative control"
-NEG_CONTROL_COLOR = "#7f7f7f"
+NEG_CONTROL_COLOR = "#aaaaaa"
 
 
 def _resolve_weights() -> str:
@@ -105,7 +105,7 @@ class CytoHead:
     # ---- prediction --------------------------------------------------------
     @torch.inference_mode()
     def predict(self, features: np.ndarray, organ: str, chunk: int = 200000):
-        """features: [N, 1536] (Cell-Segmentation/embeddings). Returns
+        """features: [N, 1536] (Cell-Segmentation/cytoformer_embeddings). Returns
         (pred_global_names: np.ndarray[str] [N], prob: np.ndarray[float32] [N]).
         Predictions are always one of the organ's cell types (the head masks
         out-of-organ classes with -1e4)."""

@@ -3,8 +3,8 @@
 """
 Cytoformer cell-classification node.
 
-Zero-shot: the fine-tuned UNI2 per-organ head (cytoformer_head.CytoHead) is applied
-to the pre-computed 1536-d Cell-Segmentation/embeddings written by the Cytoformer
+Zero-shot: the H-optimus-0 per-organ head (cytoformer_head.CytoHead) is applied
+to the pre-computed 1536-d Cell-Segmentation/cytoformer_embeddings written by the Cytoformer
 segmentation node. The input is just the ORGAN; the cell types are fixed per organ
 (organ_to_celltypes) and low-confidence cells are routed to "Negative control".
 
@@ -20,11 +20,10 @@ Memory Management:
 - Garbage collection is called periodically during batch processing
 - GPU operations are synchronized before cleanup to ensure all operations complete
 """
-# Standard library imports
 import os as _os_early
 import platform as _platform_early
 
-# macOS hardening: libomp / Accelerate are NOT fork-safe. xgboost / sklearn /
+# macOS hardening: libomp / Accelerate are NOT fork-safe. xgboost /
 # numpy spawn worker threads on import; if those threads exist before this
 # task-node process is forked from the supervisor, training crashes silently
 # (manifests as `resource_tracker: leaked semaphore objects` and the worker
@@ -37,13 +36,12 @@ if _platform_early.system() == 'Darwin':
     _os_early.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
     _os_early.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
 
+# Standard library imports
 import argparse
-import asyncio
 import base64
 import collections
 import colorsys
 import gc
-import glob
 import io
 import json
 import logging
@@ -53,34 +51,30 @@ import sys
 import threading
 import time
 import traceback
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict
 
 # Third-party imports
 import numpy as np
 import pandas as pd
 import requests
 import torch
-import torch.nn as nn
 import uvicorn
 import xgboost as xgb
 import zarr
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from sse_starlette.sse import EventSourceResponse
+from zarr.errors import UnstableSpecificationWarning
+
+from cytoformer_head import CytoHead, NEG_CONTROL_COLOR, NEG_CONTROL_NAME
+from progress_sse import ProgressSSEState, iter_progress_events
 
 # Silence zarr v3 "unstable data type" warnings (structured arrays + fixed-length
 # string/bytes dtypes used by our schema). No cross-library portability needed.
-import warnings
-from zarr.errors import UnstableSpecificationWarning
 warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
-from fastapi.middleware.cors import CORSMiddleware
-from sse_starlette.sse import EventSourceResponse
-from progress_sse import ProgressSSEState, iter_progress_events
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from sklearn.linear_model import LogisticRegression
-# Cytoformer classification uses the fine-tuned UNI2 per-organ head for zero-shot
-# (cytoformer_head.CytoHead), not PLIP text encoding, so transformers is not imported.
 
 app = FastAPI()
 
@@ -128,6 +122,12 @@ NODE_NAME = None
 # the backend can override via /read payload `zarr_group`.
 ZARR_GROUP = "Cell-Classification"
 DEPENDENCIES = []
+CYTOFORMER_EMBEDDING_DATASET = "cytoformer_embeddings"
+# Must match nuclei_segmentation/Cytoformer writers (compared case-insensitively).
+EMBEDDING_MODEL = "Cytoformer"
+EMBEDDING_BACKBONE = "H-optimus-0"
+EMBEDDING_DIM = 1536
+EMBEDDING_NORM = "feat_norm"
 
 # Cytoformer per-organ zero-shot head (cytoformer_head.CytoHead), loaded once at
 # /init. Supervised / active-learning (XGBoost .tlcls) runs on the same 1536-d
@@ -136,8 +136,6 @@ CYTO_HEAD = None
 # Cells whose top-class softmax probability is below this go to "Negative control"
 # (the "uncertain -> negative control" rule). Overridable via userData.
 CYTO_CONF_THRESHOLD = 0.5
-NEG_CONTROL_NAME = "Negative control"
-NEG_CONTROL_COLOR = "#7f7f7f"
 CLASSIFIER_PATH = None
 SAVE_CLASSIFIER_PATH = None
 LAST_TRAINED_CLF_BUNDLE = None
@@ -155,7 +153,6 @@ SAVE_CLASSIFIER_PATHS = None
 CLASSIFIER_PATHS = None
 
 # global variable for cancellation flag - use threading.Event for thread safety
-import threading
 cancel_event = threading.Event()  # Thread-safe cancellation event
 current_execution_thread = None  # Track current execution thread for cancellation
 
@@ -186,6 +183,7 @@ def _normalize_class_operations(raw_ops):
             if name:
                 ops["adds"].append({"name": name, "color": color})
     return ops
+
 
 def _has_rename_cycle(renames):
     if not renames:
@@ -607,7 +605,8 @@ def load_checkpoint_at_init():
     """
     Load the Cytoformer per-organ head at /init stage into global CYTO_HEAD.
     Only the head is needed here (the 1536-d image features are pre-computed by
-    the Cytoformer segmentation node and live in Cell-Segmentation/embeddings).
+    the Cytoformer segmentation node and live in
+    Cell-Segmentation/cytoformer_embeddings).
     Active-learning / supervised runs (XGBoost .tlcls) use those same embeddings
     and need no model here.
     """
@@ -616,7 +615,6 @@ def load_checkpoint_at_init():
         print("Cytoformer head already loaded in memory => skip")
         return
 
-    from cytoformer_head import CytoHead
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[Cell-Classification] Loading Cytoformer per-organ head..., device={device}")
     CYTO_HEAD = CytoHead(device=device)
@@ -630,7 +628,7 @@ def generate_distinct_colors(nuclei_classes: list[str]) -> list[str]:
     for i, nuclei_class in enumerate(nuclei_classes):
         # Use gray color for "other" and "negative control"
         if nuclei_class.lower() == "other" or nuclei_class.lower() == "negative control":
-            colors.append("#aaaaaa")
+            colors.append(NEG_CONTROL_COLOR)
             continue
         golden_ratio = 0.618033988749895
         hue = (i * golden_ratio) % 1
@@ -820,6 +818,16 @@ def load_classifier_params(zarr_path):
             train_data = np.load(train_data_bytes)
             train_embeddings = train_data['embeddings']
             train_labels = train_data['labels']
+            if (
+                train_embeddings is not None
+                and getattr(train_embeddings, "ndim", 0) == 2
+                and train_embeddings.shape[1] != 1536
+            ):
+                print(
+                    f"Classifier embedding dim {train_embeddings.shape[1]} != 1536 "
+                    f"(Cytoformer); ignoring CLASSIFIER_PATH={CLASSIFIER_PATH}"
+                )
+                return None
             
             # print the number of samples for each class
             print("\nloaded training data:")
@@ -1664,7 +1672,8 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     n_train = len(trainable) if can_train else 0
     for t_i, cls in enumerate(trainable if can_train else []):
         if cancel_event.is_set():
-            cancel_event.clear(); progress_state.value = 0; return None
+            progress_state.value = 0
+            return None
         ci = name_to_idx[cls]
         pos_sel = (y_pos == ci)
         if not np.any(pos_sel):
@@ -1724,7 +1733,8 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     items = [(c, p) for c, p in predict_map.items() if c in name_to_idx]
     for r_i, (cls, path) in enumerate(items):
         if cancel_event.is_set():
-            cancel_event.clear(); progress_state.value = 0; return None
+            progress_state.value = 0
+            return None
         ci = name_to_idx[cls]
         if not path or not os.path.exists(path):
             print(f"[OvR] classifier for '{cls}' not found: {path}")
@@ -1880,28 +1890,85 @@ def run_classification(args) -> Dict[str, Any]:
         if eff_renames_run:
             _persist_nuclei_rename_to_user_annotation(zf, eff_renames_run, nuclei_classes, nuclei_colors)
 
-        # A) check annotation
+        # A) annotations — present does NOT imply supervised. Organ zero-shot
+        # ignores leftover User-Annotations unless the workflow asked for AL.
         annotations_data = None
-        use_supervised = False
+        has_annotations = False
         if 'User-Annotations' in zf and 'cell' in zf['User-Annotations']:
             annotations_data = load_structured_nuclei_annotations(zf, 'User-Annotations/cell')
             if annotations_data is not None and not annotations_data.empty:
-                use_supervised = True
+                has_annotations = True
             else:
                 annotations_data = None
-                use_supervised = False
-        else:
+        use_supervised = has_annotations and bool(getattr(args, "use_supervised", False))
+        if has_annotations and not use_supervised:
+            print(
+                "[Cell-Classification] User-Annotations present but use_supervised=false; "
+                "ignoring leftover labels and running organ zero-shot."
+            )
             annotations_data = None
-            use_supervised = False
+        elif use_supervised and annotations_data is not None and nuclei_classes:
+            allowed = {str(n) for n in nuclei_classes}
+            if "class" in annotations_data.columns:
+                is_pos = annotations_data["class"].notna()
+                pos_match = is_pos & annotations_data["class"].astype(str).isin(allowed)
+                if int(pos_match.sum()) == 0:
+                    print(
+                        "[Cell-Classification] User-Annotations do not match the organ "
+                        "class list; ignoring leftover labels and running organ zero-shot."
+                    )
+                    use_supervised = False
+                    annotations_data = None
+                else:
+                    annotations_data = annotations_data[pos_match | ~is_pos]
         
-        # B) read embedding => "Cell-Segmentation/embeddings"
+        # B) Read Cytoformer's dedicated 1536-d features. The generic
+        # Cell-Segmentation/embeddings dataset belongs to PLIP/NuClass.
         if 'Cell-Segmentation' not in zf:
             raise ValueError("no Cell-Segmentation group found in h5 file")
         seg_grp = zf['Cell-Segmentation']
-        if 'embeddings' not in seg_grp:
-            raise ValueError("embedding dataset not found in h5 file => no cell_embeddings")
+        if CYTOFORMER_EMBEDDING_DATASET not in seg_grp:
+            raise ValueError(
+                "Cytoformer embeddings not found. Run Cytoformer cell segmentation "
+                "to create Cell-Segmentation/cytoformer_embeddings; "
+                "Cell-Segmentation/embeddings array is reserved for PLIP/NuClass."
+            )
         print("Loading embeddings from zarr...")
-        cell_embeddings = seg_grp['embeddings'][()]
+        embeddings_arr = seg_grp[CYTOFORMER_EMBEDDING_DATASET]
+        cell_embeddings = embeddings_arr[()]
+        if cell_embeddings.ndim != 2 or cell_embeddings.shape[1] != EMBEDDING_DIM:
+            raise ValueError(
+                f"Cytoformer classification requires [N, {EMBEDDING_DIM}] embeddings; "
+                f"{CYTOFORMER_EMBEDDING_DATASET} has shape {cell_embeddings.shape}."
+            )
+        if cell_embeddings.shape[0] <= 0:
+            raise ValueError("Cytoformer embeddings are empty; re-run Cytoformer cell segmentation.")
+        if "centroids" not in seg_grp:
+            raise ValueError("Cell-Segmentation/centroids is required for Cytoformer classification.")
+        centroid_count = int(seg_grp["centroids"].shape[0])
+        if centroid_count != cell_embeddings.shape[0]:
+            raise ValueError(
+                "Cytoformer embeddings are not aligned with the current segmentation: "
+                f"{cell_embeddings.shape[0]} embeddings for {centroid_count} centroids. "
+                "Re-run Cytoformer cell segmentation."
+            )
+        embedding_model = str(embeddings_arr.attrs.get("embedding_model") or "").casefold()
+        embedding_backbone = str(
+            embeddings_arr.attrs.get("embedding_backbone") or ""
+        ).casefold()
+        embedding_dim = int(embeddings_arr.attrs.get("embedding_dim") or 0)
+        embedding_norm = str(embeddings_arr.attrs.get("embedding_norm") or "").casefold()
+        if (
+            embedding_model != EMBEDDING_MODEL.casefold()
+            or embedding_backbone != EMBEDDING_BACKBONE.casefold()
+            or embedding_dim != EMBEDDING_DIM
+            or embedding_norm != EMBEDDING_NORM.casefold()
+        ):
+            raise ValueError(
+                "Invalid Cytoformer embedding metadata; expected "
+                f"{EMBEDDING_MODEL}/{EMBEDDING_BACKBONE}/{EMBEDDING_DIM}/{EMBEDDING_NORM}. "
+                "Re-run Cytoformer cell segmentation."
+            )
         progress_state.value = 35
         print(f"Progress: 35% (Embeddings loaded, shape: {cell_embeddings.shape})")
     
@@ -2436,12 +2503,16 @@ def read_node(data: Dict[str, Any]):
     global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS, LAST_TRAINED_CLF_BUNDLE, ZARR_GROUP
     global CLASSIFIER_MODE, SAVE_CLASSIFIER_PATHS, CLASSIFIER_PATHS, CYTO_CONF_THRESHOLD
     LAST_TRAINED_CLF_BUNDLE = None
-    # Reset OvR state each run so a stale mode/paths dict from a previous node
-    # execution never leaks into a plain multiclass run.
+    # Reset per-run globals so a previous classifier/organ does not leak into
+    # a later zero-shot call whose userData omits those keys.
+    CLASSIFIER_PATH = None
+    SAVE_CLASSIFIER_PATH = None
     CLASSIFIER_MODE = "multiclass"
     SAVE_CLASSIFIER_PATHS = None
     CLASSIFIER_PATHS = None
-    NODE_NAME = data.get("node_name", "Cytoformer")
+    CYTO_CONF_THRESHOLD = 0.5
+    ARGS = argparse.Namespace(slidepath="", organ=None, nuclei_classes=[], use_supervised=False)
+    NODE_NAME = data.get("node_name", "CytoformerClassification")
     ZARR_GROUP = data.get("zarr_group") or "Cell-Classification"
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
@@ -2453,11 +2524,6 @@ def read_node(data: Dict[str, Any]):
     if not ZARR_PATH or not os.path.exists(ZARR_PATH):
         print("[Cell-Classification] no h5 => skip read.")
         return {"status": "ok", "message": "no H5 file found."}
-
-    if ARGS is None:
-        # No generic default classes: Cytoformer's classes come from the organ
-        # (read from userData below, then derived at the end of /read).
-        ARGS = argparse.Namespace(slidepath="", organ=None, nuclei_classes=[])
 
     zf = None
     try:
@@ -2477,6 +2543,9 @@ def read_node(data: Dict[str, Any]):
                     ARGS.slidepath = val_json
                 elif k == "organ":
                     ARGS.organ = val_json
+                elif k == "use_supervised":
+                    # tasks.py writes bools as str(True)/str(False), not JSON true/false.
+                    ARGS.use_supervised = str(val_json).lower() == "true"
                 elif k in ("confidence_threshold", "conf_threshold"):
                     # "uncertain -> Negative control" cutoff for zero-shot.
                     try:
@@ -2484,9 +2553,9 @@ def read_node(data: Dict[str, Any]):
                     except (TypeError, ValueError):
                         print(f"[Cell-Classification] bad {k}={val_json}, keeping {CYTO_CONF_THRESHOLD}")
                 elif k == "classifier_path":
-                    CLASSIFIER_PATH = val_json
+                    CLASSIFIER_PATH = val_json or None
                 elif k == "save_classifier_path":
-                    SAVE_CLASSIFIER_PATH = val_json
+                    SAVE_CLASSIFIER_PATH = val_json or None
                 elif k == "classifier_mode":
                     # "multiclass" | "one-vs-rest"
                     if isinstance(val_json, str) and val_json:
@@ -2772,7 +2841,7 @@ async def progress():
     SSE endpoint to provide progress updates.
     Idle terminal state is cleared on connect; stream end does not reset.
     """
-    return EventSourceResponse(iter_progress_events(progress_state))
+    return EventSourceResponse(iter_progress_events(progress_state, quiet=True))
 
 
 
@@ -2780,7 +2849,7 @@ async def progress():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8006, help='port')
-    parser.add_argument('--name', type=str, default='Cytoformer', help='node name')
+    parser.add_argument('--name', type=str, default='CytoformerClassification', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args = parser.parse_args()
 

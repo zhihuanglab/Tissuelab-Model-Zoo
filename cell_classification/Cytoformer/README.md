@@ -1,4 +1,11 @@
-# Cell classification using PLIP-cell-zeroshot
+# Cytoformer cell classification
+
+Zero-shot classification uses Cytoformer's fine-tuned H-optimus-0 features
+(1536 dimensions) and per-organ classification head. The required embeddings
+are produced by the Cytoformer segmentation node and stored at
+`Cell-Segmentation/cytoformer_embeddings`.
+`Cell-Segmentation/embeddings` remains dedicated to PLIP/NuClass and is not
+used as a Cytoformer fallback.
 
 ## Getting Started
 

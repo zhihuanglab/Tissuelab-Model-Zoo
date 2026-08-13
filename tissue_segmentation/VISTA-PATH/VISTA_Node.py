@@ -124,6 +124,16 @@ progress_value = 0  # SSE progress
 total_patches = 0  # total number of patches to process
 processed_patches = 0  # number of patches that have been processed
 execution_active = False
+cancel_event = threading.Event()
+
+
+class CooperativeCancel(Exception):
+    """Cooperative stop requested via POST /cancel; raise at explicit checkpoints."""
+
+
+def _check_cancel():
+    if cancel_event.is_set():
+        raise CooperativeCancel("cancelled")
 
 
 PASEG_MODEL: Optional[PASeg] = None
@@ -957,6 +967,7 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         total_patches_overall = 0
         
         for current_tissue in tissue_run_list:
+            _check_cancel()
             # Tiling coordinates come from the patch station (guaranteed to exist, checked above):
             #   - tissue_class matches a Patch-Classification class -> only those patches
             #   - otherwise -> all patches from Patch-Segmentation/coordinates
@@ -984,6 +995,7 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             if mask_node_coords is not None:
                 # Use MaskNode coordinates directly
                 for coord in mask_node_coords:
+                    _check_cancel()
                     x0, y0, x1, y1 = coord
                     # Calculate actual patch size from coordinates
                     actual_patch_w = int(x1 - x0)
@@ -1007,6 +1019,7 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                     
                     # Process batch when full or last patch
                     if len(batch_imgs) >= batch_size or idx == total_patches - 1:
+                        _check_cancel()
                         # Run inference
                         with torch.no_grad():
                             amp_ctx = torch.autocast(
@@ -1142,6 +1155,8 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         
         return result
         
+    except CooperativeCancel:
+        raise
     except Exception as e:
         print(f"[{NODE_NAME}] Error in sequential segmentation: {e}")
         import traceback
@@ -1155,6 +1170,8 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
 
 @app.get("/status")
 async def get_status():
+    if cancel_event.is_set() and execution_active:
+        return {"status": "cancelling", "progress": int(progress_value)}
     if execution_active:
         return {"status": "running", "progress": int(progress_value)}
     return {"status": "idle"}
@@ -1463,19 +1480,28 @@ def read_node(data: Dict[str, Any]):
     print(f"[{NODE_NAME}] /read done => SLIDE_PATH={SLIDE_PATH}")
     return {"status": "ok", "message": f"[{NODE_NAME}] read done"}
 
+@app.post("/cancel")
+def cancel_task():
+    global cancel_event
+    cancel_event.set()
+    print(f"[{NODE_NAME}] /cancel")
+    return {"status": "ok", "message": "Cancel request received."}
+
+
 @app.post("/execute")
 def execute_node():
     """
     execute the segmentation.
     if slide_path is provided and zarr does not exist, tiling will be performed first.
     """
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, PASEG_MODEL, progress_value, SLIDE_PATH, ZARR_GROUP, ACTUAL_ZARR_GROUP, total_patches, processed_patches, execution_active
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, PASEG_MODEL, progress_value, SLIDE_PATH, ZARR_GROUP, ACTUAL_ZARR_GROUP, total_patches, processed_patches, execution_active, cancel_event
     execution_active = True
     try:
         # reset progress at the start
         progress_value = 0
         total_patches = 0
         processed_patches = 0
+        cancel_event.clear()
 
         if not IS_MODEL_INITED:
             return {"status": "error", "message": "Please /init first."}
@@ -1515,6 +1541,9 @@ def execute_node():
             try:
                 out = run_segmentation_sequential(ARGS)
                 print(f"[{NODE_NAME}] Segmentation completed")
+            except CooperativeCancel:
+                print(f"[{NODE_NAME}] Cancelled by user")
+                out = {"status": "cancelled", "message": "Task was cancelled", "num_patches": 0}
             except Exception as e:
                 progress_value = 100
                 print(f"[{NODE_NAME}] Error during segmentation: {e}")
@@ -1542,6 +1571,8 @@ def execute_node():
             zf.create_array(node_out_path, data=out_array)
 
         progress_value = 0  # 归零，上一个人 execute 结束
+        if out.get("status") == "cancelled":
+            return {"status": "cancelled", "output": out}
         return {"status": "ok", "output": out}
     finally:
         execution_active = False

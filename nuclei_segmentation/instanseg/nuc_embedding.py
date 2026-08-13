@@ -3495,6 +3495,8 @@ class NucleiEmbedding:
             pbar = tqdm(total=num_cells, desc="Fusing layers")
             
             for start_idx in range(0, num_cells, fusion_batch_size):
+                if self.progress_callback:
+                    self.progress_callback(int(90 + ((start_idx / max(num_cells, 1)) * 10)))
                 end_idx = min(start_idx + fusion_batch_size, num_cells)
                 
                 # Load embeddings from all layers for this batch of cells
@@ -3611,6 +3613,11 @@ class NucleiEmbedding:
                     
                     perf_stats['preprocessing_time'] += time.time() - preprocess_start
                     
+                    # Honour /cancel before starting another GPU batch.
+                    if self.progress_callback:
+                        n = max(len(dataset), 1)
+                        self.progress_callback(int((total_processed / n) * 100))
+
                     # Model inference
                     model_start = time.time()
                     batch_embeddings = self.embed_batch(processed_batch, is_zstack=False)

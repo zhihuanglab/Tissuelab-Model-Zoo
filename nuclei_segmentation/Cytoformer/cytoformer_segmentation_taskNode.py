@@ -5,40 +5,34 @@ Segmentation Node for nuclei segmentation + embedding generation
 """
 # Standard library imports
 import argparse
-import asyncio
 import collections
-import glob
 import json
 import logging
 import multiprocessing
-import multiprocess
 import os
-import platform
 import threading
 import time
 import traceback
+import warnings
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict
 
 # Third-party imports
-import cv2
 import numpy as np
 import requests
 import torch
 import uvicorn
 import zarr
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from sse_starlette.sse import EventSourceResponse
+from zarr.errors import UnstableSpecificationWarning
+
+from progress_sse import ProgressSSEState, iter_progress_events
 
 # Silence zarr v3 "unstable data type" warnings (structured arrays + fixed-length
 # string/bytes dtypes used by our schema). No cross-library portability needed.
-import warnings
-from zarr.errors import UnstableSpecificationWarning
 warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
-from fastapi.middleware.cors import CORSMiddleware
-from sse_starlette.sse import EventSourceResponse
-from progress_sse import ProgressSSEState, iter_progress_events
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
 
 # Set TensorFlow environment variables before importing TensorFlow-dependent modules
 os.environ["TF_INTER_OP_PARALLELISM_THREADS"] = "2"
@@ -98,6 +92,11 @@ NODE_NAME = None
 # /read payload `zarr_group`.
 ZARR_GROUP = "Cell-Segmentation"
 DEPENDENCIES = []
+EMBEDDING_MODEL = "Cytoformer"
+EMBEDDING_BACKBONE = "H-optimus-0"
+EMBEDDING_DIM = 1536
+EMBEDDING_NORM = "feat_norm"
+EMBEDDING_DATASET = "cytoformer_embeddings"
 # Per-folder SSE progress (progress_sse.py). Stream end does not reset.
 progress_state = ProgressSSEState()
 
@@ -109,10 +108,53 @@ class CancellationException(Exception):
     """Exception raised when task is cancelled"""
     pass
 
+
+def _embedding_cache_is_compatible(embeddings_arr, expected_count: int) -> bool:
+    """Only reuse a cache that matches Cytoformer's feat_norm 1536-d contract.
+
+    `embedding_norm=feat_norm` invalidates older L2-normalized stores so the
+    per-organ head sees the same LayerNorm features it was trained on.
+    """
+    shape = tuple(embeddings_arr.shape)
+    if shape != (expected_count, EMBEDDING_DIM):
+        return False
+    model = str(embeddings_arr.attrs.get("embedding_model") or "").casefold()
+    backbone = str(embeddings_arr.attrs.get("embedding_backbone") or "").casefold()
+    try:
+        dim = int(embeddings_arr.attrs.get("embedding_dim") or 0)
+    except (TypeError, ValueError):
+        dim = 0
+    norm = str(embeddings_arr.attrs.get("embedding_norm") or "").casefold()
+    return (
+        model == EMBEDDING_MODEL.casefold()
+        and backbone == EMBEDDING_BACKBONE.casefold()
+        and dim == EMBEDDING_DIM
+        and norm == EMBEDDING_NORM.casefold()
+    )
+
+
+def _write_embedding_metadata(seg_group, embeddings_arr) -> None:
+    """Write JSON-compatible attrs supported by Zarr v2 and v3."""
+    metadata = {
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_backbone": EMBEDDING_BACKBONE,
+        "embedding_dim": EMBEDDING_DIM,
+        "embedding_norm": EMBEDDING_NORM,
+    }
+    seg_group.attrs.update({
+        "cytoformer_embedding_dataset": EMBEDDING_DATASET,
+        "cytoformer_embedding_model": EMBEDDING_MODEL,
+        "cytoformer_embedding_backbone": EMBEDDING_BACKBONE,
+        "cytoformer_embedding_dim": EMBEDDING_DIM,
+        "cytoformer_embedding_norm": EMBEDDING_NORM,
+    })
+    embeddings_arr.attrs.update(metadata)
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8005, help='port')
-    parser.add_argument('--name', type=str, default='StarDist', help='node name')
+    parser.add_argument('--name', type=str, default='Cytoformer', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
 
     # ===  segmentation + embedding parameters ===
@@ -567,11 +609,12 @@ def run_segmentation(args):
             else:
                 # Segmentation was skipped (using existing data), check if embedding exists and matches
                 zf_embed = zarr.open_group(ZARR_PATH, mode='a')
-                if ZARR_GROUP in zf_embed and 'embeddings' in zf_embed[ZARR_GROUP]:
+                if ZARR_GROUP in zf_embed and EMBEDDING_DATASET in zf_embed[ZARR_GROUP]:
                     try:
-                        existing_len = zf_embed[ZARR_GROUP]['embeddings'].shape[0]
-                        if existing_len == len(centroids):
+                        existing_embeddings = zf_embed[ZARR_GROUP][EMBEDDING_DATASET]
+                        if _embedding_cache_is_compatible(existing_embeddings, len(centroids)):
                             have_cached_embedding = True
+                            _write_embedding_metadata(zf_embed[ZARR_GROUP], existing_embeddings)
                             print("found existing embeddings in store => skip embedding calculation")
                     except Exception:
                         have_cached_embedding = False
@@ -601,7 +644,19 @@ def run_segmentation(args):
                 
                 ne = NucleiEmbedding(args, centroids, contours=contours_for_embedding, progress_callback=embed_progress_with_cancel)
                 try:
-                    ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{ZARR_GROUP}/embeddings")
+                    ne.generate_embeddings(
+                        zarr_path=ZARR_PATH,
+                        dataset_path=f"{ZARR_GROUP}/{EMBEDDING_DATASET}",
+                    )
+                    zf_metadata = zarr.open_group(ZARR_PATH, mode='a')
+                    seg_group = zf_metadata[ZARR_GROUP]
+                    embeddings_arr = seg_group[EMBEDDING_DATASET]
+                    if tuple(embeddings_arr.shape) != (len(centroids), EMBEDDING_DIM):
+                        raise ValueError(
+                            f"Cytoformer produced embeddings with shape {embeddings_arr.shape}; "
+                            f"expected ({len(centroids)}, {EMBEDDING_DIM})."
+                        )
+                    _write_embedding_metadata(seg_group, embeddings_arr)
                 except CancellationException:
                     print("[Cell-Segmentation] Embedding cancelled by user")
                     cancel_event.clear()
@@ -863,7 +918,8 @@ def execute_node():
                 'message': out_val.get('message', ''),
                 'nuclei_count': int(out_val.get('nuclei_count', 0)),
                 'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                'has_embeddings': 'embeddings' in seg_grp,
+                'has_embeddings': EMBEDDING_DATASET in seg_grp,
+                'embedding_dataset': f"{ZARR_GROUP}/{EMBEDDING_DATASET}",
                 'has_probabilities': 'probabilities' in seg_grp,
             })
 
@@ -910,7 +966,7 @@ async def progress():
     SSE endpoint to provide progress updates.
     Idle terminal state is cleared on connect; stream end does not reset.
     """
-    return EventSourceResponse(iter_progress_events(progress_state))
+    return EventSourceResponse(iter_progress_events(progress_state, quiet=True))
 
 
 
@@ -919,11 +975,10 @@ def main():
     # Add this line to support multiprocessing in PyInstaller packaged executables
     if __name__ == "__main__":
         multiprocessing.freeze_support()
-        multiprocess.freeze_support()
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8005, help='port')
-    parser.add_argument('--name', type=str, default='StarDist', help='node name')
+    parser.add_argument('--name', type=str, default='Cytoformer', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
     args, unknown = parser.parse_known_args()
 
