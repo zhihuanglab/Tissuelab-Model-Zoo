@@ -124,6 +124,10 @@ progress_value = 0  # SSE progress
 total_patches = 0  # total number of patches to process
 processed_patches = 0  # number of patches that have been processed
 execution_active = False
+# Terminal flag for the /progress SSE stream. Read by event_generator, so it
+# must exist at import time — `global` alone does not create it, and reading it
+# unset raised NameError on every idle connection.
+progress_complete = False
 cancel_event = threading.Event()
 
 
@@ -1106,11 +1110,12 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                 sub = _sanitize_class_name(tissue_display)
                 tissue_grp = masks_grp.create_group(sub)
                 binary_mask = (full_mask > 0).astype(bool)
+                # No dtype= alongside data=: zarr 3 rejects the pair outright
+                # (it takes the dtype from the array). binary_mask is already bool.
                 tissue_grp.create_array(
                     "mask",
                     data=binary_mask,
                     chunks=(min(1024, level_height), min(1024, level_width)),
-                    dtype=bool,
                     compressors=[zarr.codecs.BloscCodec(cname='zstd', clevel=3)]
                 )
                 print(f"[{NODE_NAME}] Mask saved: masks/{sub}/mask {level_height}x{level_width} (bool)")
@@ -1377,8 +1382,9 @@ def init_node():
     """
     print(f"[/init => slide_path={SLIDE_PATH}") 
 
-    global IS_MODEL_INITED, PASEG_MODEL, progress_value, NODE_NAME
+    global IS_MODEL_INITED, PASEG_MODEL, progress_value, NODE_NAME, progress_complete
     progress_value = 0  # 归零，下一个人开始 init
+    progress_complete = False
     node_name = NODE_NAME if NODE_NAME else "SegNode"
     if not IS_MODEL_INITED:
         IS_MODEL_INITED = True
@@ -1494,11 +1500,12 @@ def execute_node():
     execute the segmentation.
     if slide_path is provided and zarr does not exist, tiling will be performed first.
     """
-    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, PASEG_MODEL, progress_value, SLIDE_PATH, ZARR_GROUP, ACTUAL_ZARR_GROUP, total_patches, processed_patches, execution_active, cancel_event
+    global IS_MODEL_INITED, ARGS, ZARR_PATH, NODE_NAME, PASEG_MODEL, progress_value, SLIDE_PATH, ZARR_GROUP, ACTUAL_ZARR_GROUP, total_patches, processed_patches, execution_active, cancel_event, progress_complete
     execution_active = True
     try:
         # reset progress at the start
         progress_value = 0
+        progress_complete = False
         total_patches = 0
         processed_patches = 0
         cancel_event.clear()
@@ -1570,7 +1577,11 @@ def execute_node():
             out_array = np.frombuffer(out_bytes, dtype=f'S{len(out_bytes)}')
             zf.create_array(node_out_path, data=out_array)
 
-        progress_value = 0  # 归零，上一个人 execute 结束
+        # Hold the terminal state instead of zeroing it: the SSE poller ticks at
+        # 10Hz and would otherwise miss the 100 entirely, leaving the stream open
+        # forever. event_generator clears it before the next execution starts.
+        progress_value = 100
+        progress_complete = True
         if out.get("status") == "cancelled":
             return {"status": "cancelled", "output": out}
         return {"status": "ok", "output": out}

@@ -1,0 +1,35 @@
+# VISTA-PATH task node.
+#
+# transformers is pinned hard: 5.x changed
+# Mask2FormerSinePositionEmbedding.forward from (x, mask) to
+# (shape, device, dtype, mask), and checkpoints/pytorch_model.bin is a state
+# dict of the 4.46.1 module layout. huggingface-hub and tokenizers are pinned
+# with it because transformers runs its own dependency_versions_check at import
+# and refuses to load against the 1.x / 0.22 line.
+torch==2.4.0
+torchvision==0.19.0
+transformers==4.46.1
+huggingface-hub==0.26.2
+tokenizers==0.20.3
+accelerate==0.26.0
+safetensors>=0.4.1
+
+# Matches the pin used by app/service and the other task nodes.
+zarr==3.1.5
+
+numpy
+pillow
+pandas
+matplotlib
+scikit-image
+scikit-learn
+opencv-python
+albumentations
+pycocotools
+openslide-python
+tiffslide
+
+fastapi
+uvicorn
+sse-starlette
+requests
