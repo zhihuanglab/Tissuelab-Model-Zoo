@@ -13,6 +13,11 @@ Memory Management:
 - GPU operations are synchronized before cleanup to ensure all operations complete
 """
 
+# macOS: torch and xgboost each bundle an OpenMP runtime; running both in one process
+# segfaults inside xgboost parallel regions. Serialize OMP before any import loads libomp.
+import os as _os
+_os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
+_os.environ.setdefault('OMP_NUM_THREADS', '1')
 import argparse
 import os
 import sys
@@ -443,6 +448,12 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         try:
             print("Loading classifier parameters...")
             loaded_params = load_classifier_params(CLASSIFIER_PATH)
+            if loaded_params is not None and loaded_params[3] is not None \
+                    and loaded_params[3].shape[1] != cell_embeddings.shape[1]:
+                print(f"Saved classifier was trained on {loaded_params[3].shape[1]}-d embeddings but this slide has "
+                      f"{cell_embeddings.shape[1]}-d embeddings (different embedding model); discarding saved "
+                      f"classifier and training from scratch on current annotations.")
+                loaded_params = None
             if loaded_params is not None:
                 clf, class_names, class_colors, prev_embeddings, prev_labels = loaded_params
                 print(f"Loaded existing classifier parameters, classes: {class_names}")
@@ -562,7 +573,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 
                 # predict in batches to avoid memory issues
                 # Optimize batch_size: use larger batches if memory allows (100k for embeddings)
-                batch_size = 100000  # Increased from 50k for better performance
+                batch_size = 20000  # Increased from 50k for better performance
                 n_cells = cell_embeddings.shape[0]
                 
                 predictions = np.zeros(n_cells, dtype=np.int32)
@@ -664,20 +675,32 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     y_train = pd.Categorical(annotations['cell_class'], categories=class_names).codes
 
     if "Negative control" not in annotations["cell_class"].values.astype(str):
-        print("Found annotations, but there is no 'Negative control' class, we will use negative_control_example_vectors.npy as negative control")
-        # Cache negative control vectors in memory
-        if not hasattr(train_linear_classifier, '_negative_control_vectors'):
+        emb_dim = int(cell_embeddings.shape[1])
+        neg_fname = "negative_control_example_vectors.npy" if emb_dim == 768 \
+            else f"negative_control_example_vectors_{emb_dim}d.npy"
+        print(f"Found annotations, but there is no 'Negative control' class, we will use {neg_fname} as negative control")
+        # Cache negative control vectors in memory (keyed by embedding dim)
+        _neg_cache = getattr(train_linear_classifier, '_negative_control_cache', None)
+        if _neg_cache is None:
+            _neg_cache = {}
+            train_linear_classifier._negative_control_cache = _neg_cache
+        if emb_dim not in _neg_cache:
             base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
-            neg_control_path = os.path.join(base_path, "negative_control_example_vectors.npy")
+            neg_control_path = os.path.join(base_path, neg_fname)
             print(f"Loading negative control vectors from: {neg_control_path}")
             try:
-                train_linear_classifier._negative_control_vectors = np.load(neg_control_path)
+                _vecs = np.load(neg_control_path)
+                if _vecs.shape[1] != emb_dim:
+                    print(f"Warning: negative control vectors are {_vecs.shape[1]}-d but embeddings are "
+                          f"{emb_dim}-d; skipping negative control injection")
+                    _vecs = None
+                _neg_cache[emb_dim] = _vecs
             except Exception as e:
                 print(f"Warning: Could not load negative control vectors: {e}")
-                train_linear_classifier._negative_control_vectors = None # Set to None if loading fails
+                _neg_cache[emb_dim] = None # Set to None if loading fails
 
-        if train_linear_classifier._negative_control_vectors is not None:
-            negative_control_vectors = train_linear_classifier._negative_control_vectors
+        if _neg_cache[emb_dim] is not None:
+            negative_control_vectors = _neg_cache[emb_dim]
             print(f"negative_control_vectors: {negative_control_vectors.shape}")
             X_train = np.concatenate([negative_control_vectors, X_train], axis=0)
             # Add label 0 for negative control vectors (index 0 in class_names = "Negative control")
@@ -693,7 +716,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
 
     # predict in batches to avoid memory issues
     # Optimize batch_size: use larger batches if memory allows (100k for embeddings)
-    batch_size = 100000  # Increased from 50k for better performance
+    batch_size = 20000  # Increased from 50k for better performance
     n_cells = cell_embeddings.shape[0]
     
     predictions = np.zeros(n_cells, dtype=np.int32)
@@ -945,6 +968,12 @@ def run_classification(args) -> Dict[str, Any]:
                                                           nuclei_classes, organ, device)
 
             # Compute all similarities at once
+            if cell_embeddings.shape[1] != class_embeddings_arr.shape[1]:
+                raise ValueError(
+                    f"Zero-shot classification unavailable: cell embeddings are {cell_embeddings.shape[1]}-d but "
+                    f"PLIP text embeddings are {class_embeddings_arr.shape[1]}-d. These embeddings come from a "
+                    f"non-PLIP model with no matching text encoder; annotate cells to use supervised "
+                    f"classification instead.")
             sims_arr = np.dot(cell_embeddings, class_embeddings_arr.T)
             predictions = np.argmax(sims_arr, axis=1)
             prediction_probs = None # For zero-shot, raw similarity scores might be more informative
@@ -977,7 +1006,18 @@ def run_classification(args) -> Dict[str, Any]:
         print(f"Progress: 95% (Saving results to zarr...)")
         
         if NODE_NAME in zf:
-            del zf[NODE_NAME]
+            try:
+                del zf[NODE_NAME]
+            except FileNotFoundError as e:
+                # Handle macOS metadata files (._*) that may cause deletion issues
+                # This can happen when zarr tries to delete directories containing macOS metadata files
+                # The error is non-fatal - we can continue and recreate the group
+                print(f"Warning: Error deleting {NODE_NAME} group (likely macOS metadata file issue): {e}")
+                print(f"Continuing with group recreation...")
+            except Exception as e:
+                # Log other errors but don't fail - we'll recreate the group anyway
+                print(f"Warning: Error deleting {NODE_NAME} group: {e}")
+                print(f"Continuing with group recreation...")
         grp_cls = zf.require_group(NODE_NAME)
 
         grp_cls.create_dataset('nuclei_class_id', data=predictions.astype(np.int32))
@@ -1185,7 +1225,16 @@ def execute_node():
             zf = zarr.open_group(ZARR_PATH, mode='a')
             out_ds = f"{NODE_NAME}/output"
             if out_ds in zf:
-                del zf[out_ds]
+                try:
+                    del zf[out_ds]
+                except FileNotFoundError as e:
+                    # Handle macOS metadata files (._*) that may cause deletion issues
+                    print(f"Warning: Error deleting {out_ds} dataset (likely macOS metadata file issue): {e}")
+                    print(f"Continuing with dataset recreation...")
+                except Exception as e:
+                    # Log other errors but don't fail - we'll recreate the dataset anyway
+                    print(f"Warning: Error deleting {out_ds} dataset: {e}")
+                    print(f"Continuing with dataset recreation...")
             out_str = json.dumps(out_val, ensure_ascii=False)
             out_bytes = out_str.encode("utf-8")
             zf.require_dataset(out_ds, shape=(), dtype=f'S{len(out_bytes)}', data=out_bytes)

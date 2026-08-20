@@ -69,6 +69,7 @@ a = Analysis(
         # Include entire checkpoints directory so runtime lookup finds the right file
         ('checkpoints', 'checkpoints'),
         ('negative_control_example_vectors.npy', '.'),
+        ('negative_control_example_vectors_2048d.npy', '.'),
         ('negative_control_examples', 'negative_control_examples'),
         # Windows-only imagecodecs .pyd files intentionally omitted on macOS
         *stardist_datas,

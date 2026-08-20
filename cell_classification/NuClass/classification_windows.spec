@@ -60,6 +60,7 @@ a = Analysis(
         # Include entire checkpoints directory so runtime lookup finds the right file
         ('checkpoints', 'checkpoints'),
         ('negative_control_example_vectors.npy', '.'),
+        ('negative_control_example_vectors_2048d.npy', '.'),
         ('negative_control_examples', 'negative_control_examples'),
         # Removed 'safe_h5_utils.py' - no longer used in classification_taskNode.py (replaced by zarr)
         ("Resources\\imagecodecs\\_zlib.cp39-win_amd64.pyd", "imagecodecs"),
