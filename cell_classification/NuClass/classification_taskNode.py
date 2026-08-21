@@ -118,6 +118,9 @@ NODE_NAME = None
 # Defaults to "Cell-Classification" (the canonical group for NucleiClassify);
 # the backend can override via /read payload `zarr_group`.
 ZARR_GROUP = "Cell-Classification"
+# Per-cell PLIP 768-d embeddings written by the nuclei-segmentation nodes.
+# Legacy name: Cell-Segmentation/embeddings now holds Cytoformer 1536-d features.
+EMBEDDING_DATASET = "embeddings_old"
 DEPENDENCIES = []
 
 # new global variable for PLIP model
@@ -1928,14 +1931,18 @@ def run_classification(args) -> Dict[str, Any]:
             annotations_data = None
             use_supervised = False
         
-        # B) read embedding => "Cell-Segmentation/embeddings"
+        # B) read embedding => "Cell-Segmentation/embeddings_old"
+        # PLIP 768-d store. The plain `embeddings` slot now holds Cytoformer
+        # 1536-d features consumed by CytoformerClassification instead.
         if 'Cell-Segmentation' not in zf:
             raise ValueError("no Cell-Segmentation group found in h5 file")
         seg_grp = zf['Cell-Segmentation']
-        if 'embeddings' not in seg_grp:
-            raise ValueError("embedding dataset not found in h5 file => no cell_embeddings")
+        if EMBEDDING_DATASET not in seg_grp:
+            raise ValueError(
+                f"{EMBEDDING_DATASET} dataset not found in h5 file => no cell_embeddings"
+            )
         print("Loading embeddings from zarr...")
-        cell_embeddings = seg_grp['embeddings'][()]
+        cell_embeddings = seg_grp[EMBEDDING_DATASET][()]
         progress_state.value = 35
         print(f"Progress: 35% (Embeddings loaded, shape: {cell_embeddings.shape})")
     

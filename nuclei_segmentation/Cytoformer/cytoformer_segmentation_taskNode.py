@@ -96,7 +96,10 @@ EMBEDDING_MODEL = "Cytoformer"
 EMBEDDING_BACKBONE = "H-optimus-0"
 EMBEDDING_DIM = 1536
 EMBEDDING_NORM = "feat_norm"
-EMBEDDING_DATASET = "cytoformer_embeddings"
+# Canonical per-cell embedding slot. Cytoformer 1536-d features now own
+# Cell-Segmentation/embeddings; the legacy PLIP 768-d store moved to
+# Cell-Segmentation/embeddings_old.
+EMBEDDING_DATASET = "embeddings"
 # Per-folder SSE progress (progress_sse.py). Stream end does not reset.
 progress_state = ProgressSSEState()
 

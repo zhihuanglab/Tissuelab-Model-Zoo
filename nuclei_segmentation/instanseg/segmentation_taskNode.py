@@ -99,6 +99,9 @@ NODE_NAME = None
 # "Cell-Segmentation" (canonical NucleiSeg group); backend can override via
 # /read payload `zarr_group`.
 ZARR_GROUP = "Cell-Segmentation"
+# PLIP 768-d per-cell embeddings. Legacy name: the canonical
+# Cell-Segmentation/embeddings slot now holds Cytoformer 1536-d features.
+EMBEDDING_DATASET = "embeddings_old"
 DEPENDENCIES = []
 # Per-folder SSE progress (progress_sse.py). Stream end does not reset.
 progress_state = ProgressSSEState()
@@ -546,9 +549,9 @@ def run_segmentation(args):
             zf = zarr.open_group(ZARR_PATH, mode='a')
             have_cached_embedding = False
 
-            if ZARR_GROUP in zf and 'embeddings' in zf[ZARR_GROUP]:
+            if ZARR_GROUP in zf and EMBEDDING_DATASET in zf[ZARR_GROUP]:
                 try:
-                    existing_len = zf[ZARR_GROUP]['embeddings'].shape[0]
+                    existing_len = zf[ZARR_GROUP][EMBEDDING_DATASET].shape[0]
                     if existing_len == len(centroids):
                         have_cached_embedding = True
                         print("[EMBED LOG] Found existing embeddings in store => skip embedding calculation.")
@@ -586,7 +589,7 @@ def run_segmentation(args):
                 try:
                     ne.generate_embeddings(
                         zarr_path=ZARR_PATH,
-                        dataset_path=f"{ZARR_GROUP}/embeddings"
+                        dataset_path=f"{ZARR_GROUP}/{EMBEDDING_DATASET}"
                     )
                 except CancellationException:
                     print("[InstanSegNode] Embedding cancelled by user")
@@ -629,8 +632,8 @@ def run_segmentation(args):
                 if f"{ZARR_GROUP}/contours" in zf:
                     contours_ds = zf[f"{ZARR_GROUP}/contours"]
                     print(f"[ZARR VERIFY] Contours: {contours_ds.shape} (fixed-length format)")
-                if f"{ZARR_GROUP}/embeddings" in zf:
-                    embedding_ds = zf[f"{ZARR_GROUP}/embeddings"]
+                if f"{ZARR_GROUP}/{EMBEDDING_DATASET}" in zf:
+                    embedding_ds = zf[f"{ZARR_GROUP}/{EMBEDDING_DATASET}"]
                     print(f"[ZARR VERIFY] Embedding: {embedding_ds.shape}")
                 if f"{ZARR_GROUP}/probabilities" in zf:
                     prob_ds = zf[f"{ZARR_GROUP}/probabilities"]
@@ -936,7 +939,7 @@ def execute_node():
                 'message': out_val.get('message', ''),
                 'nuclei_count': int(out_val.get('nuclei_count', 0)),
                 'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                'has_embeddings': 'embeddings' in seg_grp,
+                'has_embeddings': EMBEDDING_DATASET in seg_grp,
                 'has_probabilities': 'probabilities' in seg_grp,
             })
 

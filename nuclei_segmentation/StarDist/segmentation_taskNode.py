@@ -93,6 +93,9 @@ NODE_NAME = None
 # "Cell-Segmentation" (canonical NucleiSeg group); backend can override via
 # /read payload `zarr_group`.
 ZARR_GROUP = "Cell-Segmentation"
+# PLIP 768-d per-cell embeddings. Legacy name: the canonical
+# Cell-Segmentation/embeddings slot now holds Cytoformer 1536-d features.
+EMBEDDING_DATASET = "embeddings_old"
 DEPENDENCIES = []
 # Per-folder SSE progress (progress_sse.py). Stream end does not reset.
 progress_state = ProgressSSEState()
@@ -561,9 +564,9 @@ def run_segmentation(args):
             else:
                 # Segmentation was skipped (using existing data), check if embedding exists and matches
                 zf_embed = zarr.open_group(ZARR_PATH, mode='a')
-                if ZARR_GROUP in zf_embed and 'embeddings' in zf_embed[ZARR_GROUP]:
+                if ZARR_GROUP in zf_embed and EMBEDDING_DATASET in zf_embed[ZARR_GROUP]:
                     try:
-                        existing_len = zf_embed[ZARR_GROUP]['embeddings'].shape[0]
+                        existing_len = zf_embed[ZARR_GROUP][EMBEDDING_DATASET].shape[0]
                         if existing_len == len(centroids):
                             have_cached_embedding = True
                             print("found existing embeddings in store => skip embedding calculation")
@@ -595,7 +598,7 @@ def run_segmentation(args):
                 
                 ne = NucleiEmbedding(args, centroids, contours=contours_for_embedding, progress_callback=embed_progress_with_cancel)
                 try:
-                    ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{ZARR_GROUP}/embeddings")
+                    ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{ZARR_GROUP}/{EMBEDDING_DATASET}")
                 except CancellationException:
                     print("[Cell-Segmentation] Embedding cancelled by user")
                     cancel_event.clear()
@@ -857,7 +860,7 @@ def execute_node():
                 'message': out_val.get('message', ''),
                 'nuclei_count': int(out_val.get('nuclei_count', 0)),
                 'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                'has_embeddings': 'embeddings' in seg_grp,
+                'has_embeddings': EMBEDDING_DATASET in seg_grp,
                 'has_probabilities': 'probabilities' in seg_grp,
             })
 

@@ -97,6 +97,9 @@ ARGS = None
 IS_MODEL_INITED = False
 ZARR_PATH = None
 NODE_NAME = None
+# PLIP 768-d per-cell embeddings. Legacy name: the canonical
+# Cell-Segmentation/embeddings slot now holds Cytoformer 1536-d features.
+EMBEDDING_DATASET = "embeddings_old"
 DEPENDENCIES = []
 # Per-folder SSE progress (progress_sse.py). Stream end does not reset.
 progress_state = ProgressSSEState()
@@ -211,9 +214,9 @@ def run_segmentation(args):
         if centroids is not None:
             have_cached_embedding = False
             zf = zarr.open_group(ZARR_PATH, mode='a')
-            if NODE_NAME in zf and 'embeddings' in zf[NODE_NAME]:
+            if NODE_NAME in zf and EMBEDDING_DATASET in zf[NODE_NAME]:
                 try:
-                    if zf[NODE_NAME]['embeddings'].shape[0] == len(centroids):
+                    if zf[NODE_NAME][EMBEDDING_DATASET].shape[0] == len(centroids):
                         have_cached_embedding = True
                         print("found existing embeddings => skip embedding calculation")
                 except Exception:
@@ -222,7 +225,7 @@ def run_segmentation(args):
             if not have_cached_embedding:
                 print("no cached embeddings => generate new embeddings directly into Zarr")
                 ne = NucleiEmbedding(args, centroids, progress_callback=update_progress, cancel_checker=cancel_checker)
-                ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{NODE_NAME}/embeddings")
+                ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{NODE_NAME}/{EMBEDDING_DATASET}")
 
         # Step D: write segmentation to workflow Zarr (embedding already written if generated)
         if centroids is not None:
