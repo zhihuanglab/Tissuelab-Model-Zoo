@@ -816,6 +816,23 @@ def run_classification(args) -> Dict[str, Any]:
             raise ValueError("embedding dataset not found in h5 file => no cell_embeddings")
         print("Loading embeddings from zarr...")
         cell_embeddings = seg_grp['embedding'][()]
+        # Optional contour-morphology block (SegmentationNode/morphology, N x 6, micron units).
+        # Opt-in via the array attr `use_in_embedding`; standardized with the stored cohort
+        # constants and appended as a third block -> 2048 + 6 = 2054 dims. The raw embedding
+        # array on disk is never modified.
+        try:
+            if 'morphology' in seg_grp:
+                _morph = seg_grp['morphology']
+                _mattrs = dict(_morph.attrs)
+                if _mattrs.get('use_in_embedding') and _morph.shape[0] == cell_embeddings.shape[0]:
+                    _mean = np.asarray(_mattrs['zscore_mean'], dtype=np.float32)
+                    _std = np.asarray(_mattrs['zscore_std'], dtype=np.float32)
+                    _scale = float(_mattrs.get('block_scale', 1.0 / np.sqrt(_morph.shape[1])))
+                    _block = ((np.asarray(_morph[()], dtype=np.float32) - _mean) / _std) * _scale
+                    cell_embeddings = np.hstack([np.asarray(cell_embeddings, dtype=np.float32), _block])
+                    print(f"Appended morphology block ({_morph.shape[1]} feats, block_scale={_scale:.4f}) -> {cell_embeddings.shape[1]}-d")
+        except Exception as _me:
+            print(f"Warning: morphology block not applied: {_me}")
         progress_value = 35
         print(f"Progress: 35% (Embeddings loaded, shape: {cell_embeddings.shape})")
     
