@@ -925,6 +925,103 @@ def _get_all_patch_coords(zf):
         return None
 
 
+class _TileCachedReader:
+    """Read patches through the slide's own tiles instead of one read_region each.
+
+    The level-0 page of these slides is tiled at 4096x4096 JPEG: a 512x512
+    read_region() has to decode a whole 16-megapixel tile and then throws ~98% of
+    it away. Measured on a 25784x72272 slide that is 37 ms per patch, 98% of all
+    non-inference time, and it does not parallelise (the decode is the cost, not
+    the concurrency: threads gave 1.1x, tiffslide's decode threads made it 2.7x
+    worse). Visiting patches tile by tile and slicing them out of one decoded tile
+    measured 1.7 ms per patch -- 21x faster, with byte-identical pixels.
+
+    Anything that does not fit the fast path falls back to a plain read_region():
+    untiled files, patches straddling a tile boundary, levels above 0, or tiles too
+    large to hold. Patch order does not affect the result -- each patch writes into
+    its own region of the mask -- so re-ordering is safe.
+    """
+
+    _MAX_TILE_BYTES = 256 << 20   # a tile bigger than this is not worth holding
+    _MAX_CACHE_BYTES = 256 << 20  # total budget for cached tiles
+    _MAX_CACHED_TILES = 4         # a 2x2 neighbourhood covers any straddling patch
+
+    def __init__(self, slide, level: int = 0):
+        self._slide = slide
+        self._level = level
+        self._tile_w = self._tile_h = 0
+        if level == 0:
+            try:
+                page = slide.ts_tifffile.pages[0]
+                if page.is_tiled:
+                    tw, th = int(page.tilewidth), int(page.tilelength)
+                    if tw > 0 and th > 0 and tw * th * 3 <= self._MAX_TILE_BYTES:
+                        self._tile_w, self._tile_h = tw, th
+            except Exception as e:
+                print(f"[{NODE_NAME}] tile geometry unavailable ({e}); reading patch by patch")
+        self._cache = collections.OrderedDict()
+        # A patch that straddles a boundary is assembled from up to a 2x2 tile
+        # neighbourhood, so keep that many when the budget allows.
+        tile_bytes = max(1, self._tile_w * self._tile_h * 3)
+        self._cache_size = max(1, min(self._MAX_CACHED_TILES, self._MAX_CACHE_BYTES // tile_bytes))
+        self.tile_reads = 0
+        self.direct_reads = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self._tile_w > 0
+
+    def describe(self) -> str:
+        if not self.enabled:
+            return "per-patch reads (slide is not tiled)"
+        return (f"tile-cached reads ({self._tile_w}x{self._tile_h} tiles, cache {self._cache_size}, "
+                f"{self.tile_reads} tile decodes, {self.direct_reads} direct reads)")
+
+    def sort_by_tile(self, coords):
+        """Reorder patches so every patch of a tile is visited while it is cached."""
+        if not self.enabled or len(coords) == 0:
+            return coords
+        return coords[np.lexsort((coords[:, 0] // self._tile_w, coords[:, 1] // self._tile_h))]
+
+    def read(self, x: int, y: int, w: int, h: int):
+        """Return the requested region as an RGB PIL image."""
+        if self.enabled and x >= 0 and y >= 0:
+            tx0 = (x // self._tile_w) * self._tile_w
+            ty0 = (y // self._tile_h) * self._tile_h
+            tx1 = ((x + w - 1) // self._tile_w) * self._tile_w
+            ty1 = ((y + h - 1) // self._tile_h) * self._tile_h
+            n_tiles = ((tx1 - tx0) // self._tile_w + 1) * ((ty1 - ty0) // self._tile_h + 1)
+            if n_tiles <= self._cache_size:
+                # Straddling patches are stitched from the tiles they overlap rather
+                # than falling back to a read_region that re-decodes the same tiles.
+                out = np.empty((h, w, 3), dtype=np.uint8)
+                for ty in range(ty0, ty1 + 1, self._tile_h):
+                    for tx in range(tx0, tx1 + 1, self._tile_w):
+                        tile = self._tile(tx, ty)
+                        sx0, sx1 = max(x, tx), min(x + w, tx + self._tile_w)
+                        sy0, sy1 = max(y, ty), min(y + h, ty + self._tile_h)
+                        out[sy0 - y:sy1 - y, sx0 - x:sx1 - x] = tile[sy0 - ty:sy1 - ty, sx0 - tx:sx1 - tx]
+                return Image.fromarray(out)
+        self.direct_reads += 1
+        return self._slide.read_region((x, y), self._level, (w, h)).convert("RGB")
+
+    def _tile(self, tx: int, ty: int):
+        cached = self._cache.get((tx, ty))
+        if cached is not None:
+            self._cache.move_to_end((tx, ty))
+            return cached
+        self.tile_reads += 1
+        arr = np.asarray(
+            self._slide.read_region(
+                (tx, ty), self._level, (self._tile_w, self._tile_h)
+            ).convert("RGB")
+        )
+        self._cache[(tx, ty)] = arr
+        while len(self._cache) > self._cache_size:
+            self._cache.popitem(last=False)
+        return arr
+
+
 class _TissueMaskWriter:
     """Write one dense level-0 tissue mask to zarr at a time, then let it go.
 
@@ -1102,6 +1199,7 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         # being collected here: peak memory stays at one mask regardless of how many
         # tissues were selected.
         mask_writer = _TissueMaskWriter(level_width, level_height)
+        tile_reader = _TileCachedReader(slide, level)
         total_patches_overall = 0
         
         for current_tissue in tissue_run_list:
@@ -1114,8 +1212,12 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             if mask_node_coords is None:
                 mask_node_coords = _get_all_patch_coords(zf_check)
                 coord_source = "Patch-Segmentation"
+            # Visit patches tile by tile: decoding one 4096x4096 JPEG per patch was
+            # 98% of the non-inference time. Order does not affect the result.
+            mask_node_coords = tile_reader.sort_by_tile(mask_node_coords)
             total_patches = len(mask_node_coords)
-            print(f"[{NODE_NAME}] Tissue {current_tissue!r}: {total_patches} patches from {coord_source}")
+            print(f"[{NODE_NAME}] Tissue {current_tissue!r}: {total_patches} patches from "
+                  f"{coord_source}, {tile_reader.describe()}")
 
             # VISTA v2 is text-conditioned: the prompt must name the tissue being
             # segmented, or the model produces the wrong class. Update it per tissue.
@@ -1143,10 +1245,9 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                     base_x = int(x0 * downsample_x)
                     base_y = int(y0 * downsample_y)
                     
-                    patch_pil = slide.read_region(
-                        (base_x, base_y), level, (actual_patch_w, actual_patch_h)
+                    patch_pil = tile_reader.read(
+                        base_x, base_y, actual_patch_w, actual_patch_h
                     )
-                    patch_pil = patch_pil.convert("RGB")
                     
                     # Resize to patch_size if needed (for consistent model input)
                     if actual_patch_w != patch_size or actual_patch_h != patch_size:
