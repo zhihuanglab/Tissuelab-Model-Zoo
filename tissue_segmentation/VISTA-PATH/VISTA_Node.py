@@ -925,6 +925,107 @@ def _get_all_patch_coords(zf):
         return None
 
 
+class _TissueMaskWriter:
+    """Write one dense level-0 tissue mask to zarr at a time, then let it go.
+
+    A level-0 mask for a 25784x72272 slide is ~1.9 GB. Collecting every tissue's
+    mask and saving them all at the end made peak memory scale with the number of
+    tissues selected (measured on that slide: 5.6 GiB for one tissue, 9.1 GiB for
+    two). Writing each mask as soon as its tissue finishes keeps the peak at a
+    single mask no matter how many tissues are requested.
+
+    The uint8 -> bool conversion is done one chunk-row at a time for the same
+    reason: `(full_mask > 0)` in one go materialises a second full-slide array.
+
+    The destination group is (re)created on the first write rather than up front,
+    so a failure during the first tissue's inference leaves the previous run's
+    results intact instead of deleting them and then dying.
+
+    NOTE: DZI overlay-pyramid generation intentionally skipped. The overlay renders
+    from the full-resolution `mask` (get_segmentation_mask crops the viewport), so
+    the pyramid was never read - and building it (thousands of 1024x1024 RGBA tiles
+    per tissue on a whole-slide mask, single-threaded) was the slow step that made
+    VISTA look stuck. generate_dzi_tiles_to_zarr is kept for a future async path.
+    """
+
+    _ROW_BLOCK = 1024  # matches the mask chunk height, so writes stay chunk-aligned
+
+    def __init__(self, level_width: int, level_height: int):
+        self._width = level_width
+        self._height = level_height
+        self._enabled = bool(ZARR_PATH and os.path.exists(ZARR_PATH))
+        self._masks_grp = None
+        self._used_subs = set()
+        self._complete = False
+        self.out_grp = None
+        self.class_names: List[str] = []
+
+    def _ensure_group(self):
+        if self.out_grp is not None:
+            return
+        zf = open_zarr(ZARR_PATH, "a")
+        # Rebuild fresh so stale masks/classes from a prior run don't linger
+        if TISSUE_SEG_GROUP in zf:
+            del zf[TISSUE_SEG_GROUP]
+        self.out_grp = zf.create_group(TISSUE_SEG_GROUP)
+        self._masks_grp = self.out_grp.create_group("masks")
+
+    def _unique_sub(self, tissue_display: str) -> str:
+        # Two tissues can sanitize to the same subgroup name ("lymph node" and
+        # "lymph_node"); de-duplicate instead of letting create_group raise.
+        sub = _sanitize_class_name(tissue_display)
+        if sub in self._used_subs:
+            suffix = 2
+            while f"{sub}_{suffix}" in self._used_subs:
+                suffix += 1
+            sub = f"{sub}_{suffix}"
+        self._used_subs.add(sub)
+        return sub
+
+    def write(self, tissue_display: str, full_mask) -> None:
+        """Persist one tissue's dense uint8 mask as masks/<tissue>/mask (bool)."""
+        self.class_names.append(tissue_display)
+        if not self._enabled:
+            return
+        self._ensure_group()
+        sub = self._unique_sub(tissue_display)
+        tissue_grp = self._masks_grp.create_group(sub)
+        arr = tissue_grp.create_array(
+            "mask",
+            shape=(self._height, self._width),
+            dtype=bool,
+            chunks=(min(self._ROW_BLOCK, self._height), min(1024, self._width)),
+            compressors=[zarr.codecs.BloscCodec(cname='zstd', clevel=3)],
+        )
+        for y0 in range(0, self._height, self._ROW_BLOCK):
+            y1 = min(y0 + self._ROW_BLOCK, self._height)
+            arr[y0:y1, :] = full_mask[y0:y1, :] > 0
+        print(f"[{NODE_NAME}] Mask saved: masks/{sub}/mask {self._height}x{self._width} (bool)")
+
+    def mark_complete(self) -> None:
+        """Call once classes/ and userData/ are written: the group is now consistent."""
+        self._complete = True
+
+    def discard_if_incomplete(self) -> None:
+        """Drop a half-written group after a cancel or a crash.
+
+        Masks are written per tissue, so an interrupted multi-tissue run would
+        otherwise leave masks/ populated with no classes/ beside them - worse for a
+        consumer than no group at all. Nothing was created yet if the run died
+        before the first tissue finished, in which case the previous run's results
+        are still there and must be left alone.
+        """
+        if self.out_grp is None or self._complete:
+            return
+        try:
+            zf = open_zarr(ZARR_PATH, "a")
+            if TISSUE_SEG_GROUP in zf:
+                del zf[TISSUE_SEG_GROUP]
+            print(f"[{NODE_NAME}] Run did not finish; removed incomplete {TISSUE_SEG_GROUP}")
+        except Exception as e:
+            print(f"[{NODE_NAME}] Could not remove incomplete {TISSUE_SEG_GROUP}: {e}")
+
+
 def run_segmentation_sequential(args) -> Dict[str, Any]:
     """
     Sequential tiling and inference: process each patch one by one.
@@ -942,6 +1043,7 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         raise ImportError("tiffslide is required for WSI tiling")
     
     slide = None
+    mask_writer = None
     try:
         # Open slide
         print(f"[{NODE_NAME}] Opening WSI: {SLIDE_PATH}")
@@ -995,7 +1097,11 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         num_classes = int(getattr(PASEG_MODEL, "num_classes", 2))
         batch_size = _INFER_BATCH_SIZE
         
-        masks_to_save = []  # list of (save_key, full_mask)
+        # Each tissue's mask is a dense level-0 array (a 25k x 72k slide is ~1.9 GB),
+        # so masks are written to zarr and released one tissue at a time instead of
+        # being collected here: peak memory stays at one mask regardless of how many
+        # tissues were selected.
+        mask_writer = _TissueMaskWriter(level_width, level_height)
         total_patches_overall = 0
         
         for current_tissue in tissue_run_list:
@@ -1106,65 +1212,27 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                     
                     idx += 1
             
-            # Record this tissue's dense full mask; saved under masks/<tissue>/ below
+            # Write this tissue out now and drop it: holding every tissue's mask until
+            # the end is what made peak memory scale with the tissue count.
             tissue_display = current_tissue if current_tissue else "default"
-            # No .copy(): full_mask is re-allocated at the top of every tissue
-            # iteration, and a whole-slide level-0 mask is large enough that the
-            # extra copy is a real memory cost.
-            masks_to_save.append((tissue_display, full_mask))
+            mask_writer.write(tissue_display, full_mask)
+            full_mask = None
             total_patches_overall += total_patches
         
         progress_value = 90
         print(f"[{NODE_NAME}] Progress: 90% - All patches processed, saving masks to zarr...")
         
-        # Save masks under the unified Tissue-Segmentation structure (TissueSeg factory):
+        # masks/<tissue>/mask was written per tissue above; finish the group with the
+        # ordered class metadata and provenance:
         #   Tissue-Segmentation/
-        #     classes/{name,color}           ordered class metadata (cell/patch convention)
-        #     masks/<tissue>/{mask, dzi/}     dense bool mask + derived overlay pyramid
+        #     classes/{name,color}        ordered class metadata (cell/patch convention)
+        #     masks/<tissue>/mask         dense bool mask
         #     userData/{path,model,tissue_class,config}
-        if ZARR_PATH and os.path.exists(ZARR_PATH) and masks_to_save:
-            zf = open_zarr(ZARR_PATH, "a")
-
-            # Rebuild fresh so stale masks/classes from a prior run don't linger
-            if TISSUE_SEG_GROUP in zf:
-                del zf[TISSUE_SEG_GROUP]
-            out_grp = zf.create_group(TISSUE_SEG_GROUP)
-            masks_grp = out_grp.create_group("masks")
-
-            class_names = [disp for disp, _ in masks_to_save]
+        out_grp = mask_writer.out_grp
+        class_names = mask_writer.class_names
+        if out_grp is not None:
             # Use the panel's per-tissue colors (aligned by name); palette fills any gaps.
             class_colors = _resolve_colors_for_class_names(class_names, TISSUE_CLASSES, TISSUE_COLORS)
-
-            # Two tissues can sanitize to the same subgroup name ("lymph node" and
-            # "lymph_node"); de-duplicate instead of letting create_group raise after
-            # the previous run's group has already been deleted.
-            used_subs = set()
-            for i, (tissue_display, full_mask) in enumerate(masks_to_save):
-                sub = _sanitize_class_name(tissue_display)
-                if sub in used_subs:
-                    suffix = 2
-                    while f"{sub}_{suffix}" in used_subs:
-                        suffix += 1
-                    sub = f"{sub}_{suffix}"
-                used_subs.add(sub)
-                tissue_grp = masks_grp.create_group(sub)
-                binary_mask = (full_mask > 0).astype(bool)
-                # No dtype= alongside data=: zarr 3 rejects the pair outright
-                # (it takes the dtype from the array). binary_mask is already bool.
-                tissue_grp.create_array(
-                    "mask",
-                    data=binary_mask,
-                    chunks=(min(1024, level_height), min(1024, level_width)),
-                    compressors=[zarr.codecs.BloscCodec(cname='zstd', clevel=3)]
-                )
-                print(f"[{NODE_NAME}] Mask saved: masks/{sub}/mask {level_height}x{level_width} (bool)")
-
-                # NOTE: DZI overlay-pyramid generation intentionally skipped. The overlay
-                # renders from the full-resolution `mask` (get_segmentation_mask crops the
-                # viewport), so the pyramid was never read — and building it (thousands of
-                # 1024x1024 RGBA tiles per tissue on a whole-slide mask, single-threaded)
-                # was the slow step that made VISTA look stuck. generate_dzi_tiles_to_zarr
-                # is kept for a future async/lazy tile-rendering path.
 
             # classes/name + classes/color (same convention as cell/patch lineage)
             classes_grp = out_grp.create_group("classes")
@@ -1184,10 +1252,11 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                 "level": level,
                 "model_type": getattr(args, "model_type", getattr(args, "default_text", "")),
             }, ensure_ascii=False))
+            mask_writer.mark_complete()
             print(f"[{NODE_NAME}] Saved {len(class_names)} class(es) to {TISSUE_SEG_GROUP}: {class_names}")
         
         progress_value = 100
-        saved_keys = [k for k, _ in masks_to_save]
+        saved_keys = list(class_names)
         print(f"[{NODE_NAME}] Complete! Processed {total_patches_overall} patches, masks saved: {saved_keys}")
         
         result = {
@@ -1215,6 +1284,8 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                 slide.close()
             except Exception:
                 pass
+        if mask_writer is not None:
+            mask_writer.discard_if_incomplete()
 
 
 
