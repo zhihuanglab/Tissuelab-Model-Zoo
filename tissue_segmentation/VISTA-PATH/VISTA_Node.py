@@ -54,6 +54,18 @@ except ImportError:
     HAS_TIFFSLIDE = False
     print("[WARN] tiffslide not installed, WSI tiling will not work")
 
+
+def _open_tiffslide(path):
+    """Open a slide with tiffslide, disabling tifffile's 'shaped series' detector.
+
+    Some exported pyramidal TIFFs carry a shaped-series marker in their
+    ImageDescription. tifffile then routes them through the shaped-series parser,
+    whose keyframe check raises 'incompatible keyframe' on the differently-sized
+    pyramid levels -> tiffslide cannot open the file at all. is_shaped=False
+    forces generic pyramid parsing.
+    """
+    return tiffslide.TiffSlide(path, tifffile_options={'is_shaped': False})
+
 Image.MAX_IMAGE_PIXELS = None
 
 # ======================= Logger & FastAPI =======================
@@ -256,7 +268,7 @@ def tile_slide_incrementally(
         zarr_path = os.path.abspath(zarr_path)
 
         print(f"[INFO] Opening WSI: {wsi_path}")
-        slide = tiffslide.open_slide(wsi_path)
+        slide = _open_tiffslide(wsi_path)
         level_dims = slide.level_dimensions
         if level < 0 or level >= slide.level_count:
             raise ValueError(f"Invalid level={level}. Slide has {slide.level_count} levels.")
@@ -411,7 +423,7 @@ def create_segnode_zarr(
     zarr_path = os.path.abspath(zarr_path)
 
     print(f"[INFO] Opening WSI: {wsi_path}")
-    slide = tiffslide.open_slide(wsi_path)
+    slide = _open_tiffslide(wsi_path)
     level_dims = slide.level_dimensions
     if level < 0 or level >= slide.level_count:
         raise ValueError(f"Invalid level={level}. Slide has {slide.level_count} levels.")
@@ -913,10 +925,11 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
     if not HAS_TIFFSLIDE:
         raise ImportError("tiffslide is required for WSI tiling")
     
+    slide = None
     try:
         # Open slide
         print(f"[{NODE_NAME}] Opening WSI: {SLIDE_PATH}")
-        slide = tiffslide.open_slide(SLIDE_PATH)
+        slide = _open_tiffslide(SLIDE_PATH)
         
         # Fixed internal settings (module constants). The patch grid comes from the
         # patch station; each patch is fed to the model at this uniform size.
@@ -952,7 +965,6 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                    f"coordinates from a patch-embedding node; run that first.")
             print(msg)
             progress_value = 100
-            slide.close()
             return {"status": "ok", "message": msg, "num_patches": 0, "num_objects": 0}
 
         # Get downsample factor
@@ -1080,10 +1092,11 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             
             # Record this tissue's dense full mask; saved under masks/<tissue>/ below
             tissue_display = current_tissue if current_tissue else "default"
-            masks_to_save.append((tissue_display, full_mask.copy()))
+            # No .copy(): full_mask is re-allocated at the top of every tissue
+            # iteration, and a whole-slide level-0 mask is large enough that the
+            # extra copy is a real memory cost.
+            masks_to_save.append((tissue_display, full_mask))
             total_patches_overall += total_patches
-        
-        slide.close()
         
         progress_value = 90
         print(f"[{NODE_NAME}] Progress: 90% - All patches processed, saving masks to zarr...")
@@ -1106,8 +1119,18 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             # Use the panel's per-tissue colors (aligned by name); palette fills any gaps.
             class_colors = _resolve_colors_for_class_names(class_names, TISSUE_CLASSES, TISSUE_COLORS)
 
+            # Two tissues can sanitize to the same subgroup name ("lymph node" and
+            # "lymph_node"); de-duplicate instead of letting create_group raise after
+            # the previous run's group has already been deleted.
+            used_subs = set()
             for i, (tissue_display, full_mask) in enumerate(masks_to_save):
                 sub = _sanitize_class_name(tissue_display)
+                if sub in used_subs:
+                    suffix = 2
+                    while f"{sub}_{suffix}" in used_subs:
+                        suffix += 1
+                    sub = f"{sub}_{suffix}"
+                used_subs.add(sub)
                 tissue_grp = masks_grp.create_group(sub)
                 binary_mask = (full_mask > 0).astype(bool)
                 # No dtype= alongside data=: zarr 3 rejects the pair outright
@@ -1167,6 +1190,15 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         import traceback
         traceback.print_exc()
         raise
+    finally:
+        # This node is a long-lived service: a failed run must not leak the slide's
+        # file handle / mmap, or repeated failures exhaust them. (zarr 3 groups hold
+        # no handle to release, so only the slide needs this.)
+        if slide is not None:
+            try:
+                slide.close()
+            except Exception:
+                pass
 
 
 
