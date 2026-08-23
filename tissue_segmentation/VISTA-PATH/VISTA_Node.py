@@ -48,6 +48,7 @@ import requests
 
 try:
     import tiffslide
+    import tifffile
     from tqdm import tqdm
     HAS_TIFFSLIDE = True
 except ImportError:
@@ -56,15 +57,30 @@ except ImportError:
 
 
 def _open_tiffslide(path):
-    """Open a slide with tiffslide, disabling tifffile's 'shaped series' detector.
+    """Open a WSI with tiffslide, working around pyramids that mislabel themselves.
 
-    Some exported pyramidal TIFFs carry a shaped-series marker in their
-    ImageDescription. tifffile then routes them through the shaped-series parser,
-    whose keyframe check raises 'incompatible keyframe' on the differently-sized
-    pyramid levels -> tiffslide cannot open the file at all. is_shaped=False
-    forces generic pyramid parsing.
+    Some exported pyramidal TIFFs stamp a shaped-series marker
+    ('{"shape": [H, W, 3]}') into *every* level's ImageDescription. tifffile then
+    routes the file through the shaped-series parser, whose keyframe check rejects
+    the differently-sized levels -> RuntimeError "incompatible keyframe" as soon as
+    the metadata is touched. is_shaped=False forces generic pyramid parsing, which
+    reads the file correctly.
+
+    The condition is checked instead of caught, because is_shaped=False must not
+    become the default: same-sized pages with a shaped marker (z-stacks, channel
+    stacks) are a *genuine* shaped series, and generic parsing would mis-group them.
+    Reading page shapes only touches the TIFF headers -- a couple of milliseconds,
+    and it does not trigger the series detection that raises.
     """
-    return tiffslide.TiffSlide(path, tifffile_options={'is_shaped': False})
+    with tifffile.TiffFile(path) as tf:
+        mislabeled_pyramid = tf.is_shaped and len({page.shape for page in tf.pages}) > 1
+    if mislabeled_pyramid:
+        print(f"[{NODE_NAME}] {os.path.basename(path)}: pyramid levels carry a shaped-series "
+              f"marker; parsing with is_shaped=False")
+    return tiffslide.TiffSlide(
+        path, tifffile_options={"is_shaped": False} if mislabeled_pyramid else {}
+    )
+
 
 Image.MAX_IMAGE_PIXELS = None
 
