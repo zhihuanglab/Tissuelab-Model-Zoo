@@ -96,7 +96,7 @@ EMBEDDING_MODEL = "Cytoformer"
 EMBEDDING_BACKBONE = "H-optimus-0"
 EMBEDDING_DIM = 1536
 EMBEDDING_NORM = "feat_norm"
-EMBEDDING_DATASET = "cytoformer_embeddings"
+EMBEDDING_DATASET = "embeddings"
 # Per-folder SSE progress (progress_sse.py). Stream end does not reset.
 progress_state = ProgressSSEState()
 

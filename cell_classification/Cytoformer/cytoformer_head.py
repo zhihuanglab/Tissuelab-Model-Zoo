@@ -1,7 +1,7 @@
 """Cytoformer per-organ zero-shot head for the classification node.
 
 The Cytoformer segmentation node writes 1536-d image features into
-Cell-Segmentation/cytoformer_embeddings (feat_norm(encoder(patch))). This module loads
+Cell-Segmentation/embeddings (feat_norm(encoder(patch))). This module loads
 ONLY the per-organ classification head from best.pth and applies it to those
 pre-computed features, so no image encoder is needed here.
 
@@ -105,7 +105,7 @@ class CytoHead:
     # ---- prediction --------------------------------------------------------
     @torch.inference_mode()
     def predict(self, features: np.ndarray, organ: str, chunk: int = 200000):
-        """features: [N, 1536] (Cell-Segmentation/cytoformer_embeddings). Returns
+        """features: [N, 1536] (Cell-Segmentation/embeddings). Returns
         (pred_global_names: np.ndarray[str] [N], prob: np.ndarray[float32] [N]).
         Predictions are always one of the organ's cell types (the head masks
         out-of-organ classes with -1e4)."""

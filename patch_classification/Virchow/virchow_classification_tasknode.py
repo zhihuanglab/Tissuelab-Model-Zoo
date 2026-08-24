@@ -139,6 +139,10 @@ CLASSIFIER_PATHS = None
 
 # ZARR group controls (populated in /read)
 ZARR_GROUP = None
+# Patch-Segmentation/embeddings is shared by every patch embedding node (MUSK
+# 1024-d, H-optimus-0 1536-d, Virchow 2560-d), so the feature width is the only
+# thing that identifies the producer. Virchow writes 2560.
+EMBEDDING_DIM = 2560
 DEP_ZARR_GROUPS = {}
 
 # --------------- utils functions ---------------
@@ -1583,6 +1587,17 @@ def run_classification(args) -> Dict[str, Any]:
             expected_locations.extend([f"own group '{ZARR_GROUP}'", "Patch-Segmentation"])
             error_msg += " or ".join(sorted(list(set(expected_locations))))
             raise ValueError(error_msg + " => no cell_embeddings")
+
+        # The embedding group is shared across patch models; the feature width is
+        # what tells them apart. Fail loudly instead of feeding another model's
+        # features into this node's classifier / text prototypes.
+        if cell_embeddings.ndim != 2 or cell_embeddings.shape[1] != EMBEDDING_DIM:
+            raise ValueError(
+                f"[{NODE_NAME}] requires [N, {EMBEDDING_DIM}] embeddings; "
+                f"'{embedding_source_group}/embeddings' has shape {cell_embeddings.shape}. "
+                "Those features were produced by a different patch embedding model "
+                f"=> re-run the {NODE_NAME} embedding node."
+            )
 
         # C) supervised or zero-shot
         tissue_classes = getattr(args, "tissue_classes", [])

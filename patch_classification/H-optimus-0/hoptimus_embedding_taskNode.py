@@ -93,6 +93,10 @@ MUSK_MODEL = None
 progress_state = ProgressSSEState()
 last_printed_progress = -1  # Added for the new update_progress function
 ZARR_GROUP = None
+# Patch-Segmentation/embeddings is shared by every patch embedding node (MUSK
+# 1024-d, H-optimus-0 1536-d, Virchow 2560-d), so the feature width is the only
+# thing that identifies the producer. H-optimus-0 writes 1536.
+EMBEDDING_DIM = 1536
 DEP_ZARR_GROUPS = {}
 cancel_event = threading.Event()
 
@@ -236,19 +240,30 @@ def run_patch_classification(args):
                                 y_diff = np.min(np.diff(np.sort(unique_y)))
                                 stored_patch_size = int(y_diff)
                         
-                        # Only use existing embeddings if patch_size matches
-                        if stored_patch_size is not None and stored_patch_size == args.patch_size:
+                        # A matching patch_size is not enough: the group is shared,
+                        # so embeddings left by another patch model would be reused
+                        # here and silently classified as if they were ours.
+                        stored_dim = int(embeddings.shape[1]) if getattr(embeddings, "ndim", 0) == 2 else None
+
+                        # Only use existing embeddings if patch_size and feature dim match
+                        if (
+                            stored_patch_size is not None
+                            and stored_patch_size == args.patch_size
+                            and stored_dim == EMBEDDING_DIM
+                        ):
                             # Patch size matches, use existing embeddings
                             ALREADY_HAVE_EMBEDDINGS = True
                             print(f"[{NODE_NAME}] Using existing embeddings from {ZARR_GROUP} (patch_size={stored_patch_size}) => skip processing")
                             result["message"] = "Using existing embeddings"
                             result["patch_count"] = len(embeddings)
                         else:
-                            # Patch size doesn't match or couldn't be determined, need to re-process
+                            # Patch size / feature dim doesn't match or couldn't be determined, need to re-process
                             if stored_patch_size is None:
                                 print(f"[{NODE_NAME}] Could not determine patch_size from coordinates")
-                            else:
+                            elif stored_patch_size != args.patch_size:
                                 print(f"[{NODE_NAME}] Patch size mismatch: stored={stored_patch_size}, current={args.patch_size}")
+                            else:
+                                print(f"[{NODE_NAME}] Embedding dim mismatch: stored={stored_dim}, expected={EMBEDDING_DIM} => embeddings came from another patch model")
                             print(f"[{NODE_NAME}] Will delete old embeddings and re-process...")
                             # Reset to trigger re-processing
                             embeddings = None
