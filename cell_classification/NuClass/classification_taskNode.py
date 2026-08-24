@@ -119,6 +119,11 @@ NODE_NAME = None
 # the backend can override via /read payload `zarr_group`.
 ZARR_GROUP = "Cell-Classification"
 DEPENDENCIES = []
+EMBEDDING_DATASET = "embeddings"
+# Cell-Segmentation/embeddings is shared by every segmentation node, so the only
+# thing that identifies the producer is the feature width. PLIP's projection dim
+# is its vision hidden size (768 for vinid/plip); Cytoformer writes 1536.
+EMBEDDING_DIM = 768
 
 # new global variable for PLIP model
 PLIP_MODELS = None  # tuple: (processor, model, text_projection, device)
@@ -847,8 +852,13 @@ def remember_classifier_bundle_for_save(clf, class_names, class_colors, embeddin
     )
 
 
-def load_classifier_params(zarr_path):
-    """Load classifier parameters and training data from XGBoost model file"""
+def load_classifier_params(zarr_path, expected_embedding_dim: int = None):
+    """Load classifier parameters and training data from XGBoost model file.
+
+    expected_embedding_dim: when given, a bundle trained on a different feature
+    dimension (e.g. a Cytoformer 1536-d .tlcls) is rejected instead of blowing up
+    later in the vstack against the current embeddings.
+    """
     global CLASSIFIER_PATH
     if CLASSIFIER_PATH is None:
         print("No classifier_path specified, skipping loading classifier parameters")
@@ -887,6 +897,18 @@ def load_classifier_params(zarr_path):
             train_data = np.load(train_data_bytes)
             train_embeddings = train_data['embeddings']
             train_labels = train_data['labels']
+            if (
+                expected_embedding_dim is not None
+                and train_embeddings is not None
+                and getattr(train_embeddings, "ndim", 0) == 2
+                and train_embeddings.shape[1] != expected_embedding_dim
+            ):
+                print(
+                    f"Classifier embedding dim {train_embeddings.shape[1]} != "
+                    f"{expected_embedding_dim} (current embeddings); "
+                    f"ignoring CLASSIFIER_PATH={CLASSIFIER_PATH}"
+                )
+                return None
             
             # print the number of samples for each class
             print("\nloaded training data:")
@@ -976,7 +998,12 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     if CLASSIFIER_PATH is not None:
         try:
             print("Loading classifier parameters...")
-            loaded_params = load_classifier_params(CLASSIFIER_PATH)
+            loaded_params = load_classifier_params(
+                CLASSIFIER_PATH,
+                expected_embedding_dim=(
+                    cell_embeddings.shape[1] if getattr(cell_embeddings, "ndim", 0) == 2 else None
+                ),
+            )
             if loaded_params is not None:
                 clf, class_names, class_colors, prev_embeddings, prev_labels = loaded_params
                 old_class_names = class_names.copy()
@@ -1932,10 +1959,20 @@ def run_classification(args) -> Dict[str, Any]:
         if 'Cell-Segmentation' not in zf:
             raise ValueError("no Cell-Segmentation group found in h5 file")
         seg_grp = zf['Cell-Segmentation']
-        if 'embeddings' not in seg_grp:
+        if EMBEDDING_DATASET not in seg_grp:
             raise ValueError("embedding dataset not found in h5 file => no cell_embeddings")
         print("Loading embeddings from zarr...")
-        cell_embeddings = seg_grp['embeddings'][()]
+        cell_embeddings = seg_grp[EMBEDDING_DATASET][()]
+        # The slot is shared: reject another model's features here rather than
+        # letting them fail as an opaque shape mismatch in the dot product below.
+        if cell_embeddings.ndim != 2 or cell_embeddings.shape[1] != EMBEDDING_DIM:
+            raise ValueError(
+                f"NuClass requires [N, {EMBEDDING_DIM}] PLIP embeddings; "
+                f"Cell-Segmentation/embeddings has shape {cell_embeddings.shape}. "
+                "Those features came from another model (Cytoformer writes 1536) — "
+                "re-run a PLIP cell segmentation (StarDist/CellPose/InstanSeg), or "
+                "use that model's own classification node."
+            )
         progress_state.value = 35
         print(f"Progress: 35% (Embeddings loaded, shape: {cell_embeddings.shape})")
     
