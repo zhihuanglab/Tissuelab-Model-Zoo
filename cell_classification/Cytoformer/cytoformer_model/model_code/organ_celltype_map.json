@@ -23,7 +23,6 @@
     "Bone_cell",
     "Cardiomyocyte",
     "Cholangiocyte",
-    "Chondrocyte",
     "Ductal",
     "Endothelium",
     "Epithelium",
@@ -43,7 +42,7 @@
     "melanocytic",
     "tumor"
   ],
-  "n_global": 23,
+  "n_global": 22,
   "organ_to_celltypes": {
     "bone": [
       "Bone_cell",
@@ -115,7 +114,6 @@
       "tumor"
     ],
     "lung": [
-      "Chondrocyte",
       "Endothelium",
       "Epithelium",
       "Lymphocyte",
@@ -192,7 +190,7 @@
     "heart": 4,
     "kidney": 7,
     "liver": 7,
-    "lung": 8,
+    "lung": 7,
     "lymph_node": 7,
     "ovary": 7,
     "pancreas": 9,
