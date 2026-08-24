@@ -4,7 +4,7 @@
 Cytoformer cell-classification node.
 
 Zero-shot: the H-optimus-0 per-organ head (cytoformer_head.CytoHead) is applied
-to the pre-computed 1536-d Cell-Segmentation/cytoformer_embeddings written by the Cytoformer
+to the pre-computed 1536-d Cell-Segmentation/embeddings written by the Cytoformer
 segmentation node. The input is just the ORGAN; the cell types are fixed per organ
 (organ_to_celltypes) and low-confidence cells are routed to "Negative control".
 
@@ -122,7 +122,7 @@ NODE_NAME = None
 # the backend can override via /read payload `zarr_group`.
 ZARR_GROUP = "Cell-Classification"
 DEPENDENCIES = []
-CYTOFORMER_EMBEDDING_DATASET = "cytoformer_embeddings"
+EMBEDDING_DATASET = "embeddings"
 # Must match nuclei_segmentation/Cytoformer writers (compared case-insensitively).
 EMBEDDING_MODEL = "Cytoformer"
 EMBEDDING_BACKBONE = "H-optimus-0"
@@ -606,7 +606,7 @@ def load_checkpoint_at_init():
     Load the Cytoformer per-organ head at /init stage into global CYTO_HEAD.
     Only the head is needed here (the 1536-d image features are pre-computed by
     the Cytoformer segmentation node and live in
-    Cell-Segmentation/cytoformer_embeddings).
+    Cell-Segmentation/embeddings).
     Active-learning / supervised runs (XGBoost .tlcls) use those same embeddings
     and need no model here.
     """
@@ -1922,24 +1922,24 @@ def run_classification(args) -> Dict[str, Any]:
                 else:
                     annotations_data = annotations_data[pos_match | ~is_pos]
         
-        # B) Read Cytoformer's dedicated 1536-d features. The generic
-        # Cell-Segmentation/embeddings dataset belongs to PLIP/NuClass.
+        # B) Read the 1536-d features from the canonical Cell-Segmentation/embeddings
+        # slot. Every segmentation node writes there; the attrs/shape checks below
+        # reject a store still holding another model's embeddings.
         if 'Cell-Segmentation' not in zf:
             raise ValueError("no Cell-Segmentation group found in h5 file")
         seg_grp = zf['Cell-Segmentation']
-        if CYTOFORMER_EMBEDDING_DATASET not in seg_grp:
+        if EMBEDDING_DATASET not in seg_grp:
             raise ValueError(
-                "Cytoformer embeddings not found. Run Cytoformer cell segmentation "
-                "to create Cell-Segmentation/cytoformer_embeddings; "
-                "Cell-Segmentation/embeddings array is reserved for PLIP/NuClass."
+                "Cell-Segmentation/embeddings not found. "
+                "Run Cytoformer cell segmentation to create it."
             )
         print("Loading embeddings from zarr...")
-        embeddings_arr = seg_grp[CYTOFORMER_EMBEDDING_DATASET]
+        embeddings_arr = seg_grp[EMBEDDING_DATASET]
         cell_embeddings = embeddings_arr[()]
         if cell_embeddings.ndim != 2 or cell_embeddings.shape[1] != EMBEDDING_DIM:
             raise ValueError(
                 f"Cytoformer classification requires [N, {EMBEDDING_DIM}] embeddings; "
-                f"{CYTOFORMER_EMBEDDING_DATASET} has shape {cell_embeddings.shape}."
+                f"{EMBEDDING_DATASET} has shape {cell_embeddings.shape}."
             )
         if cell_embeddings.shape[0] <= 0:
             raise ValueError("Cytoformer embeddings are empty; re-run Cytoformer cell segmentation.")
