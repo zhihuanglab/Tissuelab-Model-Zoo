@@ -2403,10 +2403,17 @@ def run_classification(args) -> Dict[str, Any]:
                     name_to_new_idx = {n: i for i, n in enumerate(final_class_names)}
 
                     def hex_to_int(hex_color):
-                        hex_color = hex_color.lstrip('#')
-                        if len(hex_color) == 6:
+                        # -1 for anything unusable, like the seg service's
+                        # equivalent. int() raises on a 6-char non-hex string, and
+                        # letting that escape would skip the whole colour/index
+                        # update below.
+                        hex_color = str(hex_color or '').lstrip('#')
+                        if len(hex_color) != 6:
+                            return -1
+                        try:
                             return int(hex_color, 16)
-                        return -1
+                        except ValueError:
+                            return -1
 
                     all_annotations = annotations_dataset[:]
                     updated_count = 0
@@ -2438,6 +2445,15 @@ def run_classification(args) -> Dict[str, Any]:
                         if class_name in class_name_to_color:
                             new_color_hex = class_name_to_color[class_name]
                             new_color_int = hex_to_int(new_color_hex)
+                            if new_color_int < 0:
+                                # -1 in the colour column is the seg service's
+                                # sentinel for "this row is not a real annotation".
+                                # Writing it here would silently retire every cell
+                                # the user labelled as this class, so an unusable
+                                # colour falls back to a visible one instead.
+                                print(f"Class '{class_name}' has no usable colour "
+                                      f"({new_color_hex!r}); keeping annotations visible with #808080")
+                                new_color_int = 0x808080
                             class_mask = (all_annotations['class'] == class_idx)
                             if np.any(class_mask):
                                 all_annotations['color'][class_mask] = new_color_int
