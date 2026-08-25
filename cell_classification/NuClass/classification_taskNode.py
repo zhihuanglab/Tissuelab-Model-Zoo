@@ -527,29 +527,13 @@ def _log_annotation_counts_per_class(class_names, positive_annotations, negative
     if not negative_annotations.empty:
         has_exclude = 'exclude_classes' in negative_annotations.columns or 'exclude_class_indices' in negative_annotations.columns
         if has_exclude:
-            for idx, row in negative_annotations.iterrows():
-                exclude_indices = []
-                # Same precedence as _build_negative_training_samples: the names the
-                # User-Annotations palette resolved, then the raw indices.
-                exclude_classes_list = row.get('exclude_classes', [])
-                if isinstance(exclude_classes_list, list):
-                    for cls in exclude_classes_list:
-                        if cls in class_names:
-                            exclude_indices.append(class_names.index(cls))
-                if not exclude_indices and pd.notna(row.get('exclude_class_indices')):
-                    inds = row['exclude_class_indices']
-                    if isinstance(inds, list):
-                        if nuclei_classes and len(nuclei_classes) > 0:
-                            for i in inds:
-                                i = int(i)
-                                if 0 <= i < len(nuclei_classes):
-                                    cn = nuclei_classes[i]
-                                    if cn in class_names:
-                                        exclude_indices.append(class_names.index(cn))
-                        else:
-                            exclude_indices = [int(i) for i in inds if 0 <= int(i) < len(class_names)]
-                for ci in exclude_indices:
-                    weak_counts[class_names[ci]] += 1
+            # Same precedence as _build_negative_training_samples: the names the
+            # User-Annotations palette resolved, then the raw indices.
+            fallback = nuclei_classes if nuclei_classes else class_names
+            for names, inds in _exclude_columns(negative_annotations):
+                for cls in _resolve_excluded_names(names, inds, fallback):
+                    if cls in weak_counts:
+                        weak_counts[cls] += 1
     print("[Cell-Classification] Per-class annotation counts (positive = marked as this class, weak = 'not this type'):")
     for c in class_names:
         print(f"  {c}: positive={pos_counts[c]}, weak={weak_counts[c]}")
@@ -588,30 +572,28 @@ def _build_negative_training_samples(cell_embeddings, negative_annotations, clas
     """
     if negative_annotations.empty or not ('exclude_classes' in negative_annotations.columns or 'exclude_class_indices' in negative_annotations.columns):
         return None, None, None
-    negative_X, negative_y, negative_weights = [], [], []
-    for idx, row in negative_annotations.iterrows():
-        cell_id = int(row['cell_ID'])
-        exclude_classes_list = row.get('exclude_classes', [])
-        if not isinstance(exclude_classes_list, list) or not exclude_classes_list:
-            inds = row.get('exclude_class_indices', [])
-            if isinstance(inds, list):
-                if nuclei_classes and len(nuclei_classes) > 0:
-                    exclude_classes_list = [nuclei_classes[int(i)] for i in inds if 0 <= int(i) < len(nuclei_classes)]
-                else:
-                    exclude_classes_list = [class_names[int(i)] for i in inds if 0 <= int(i) < len(class_names)]
-        if not exclude_classes_list:
+    fallback = nuclei_classes if nuclei_classes else class_names
+    index_of = {name: i for i, name in enumerate(class_names)}
+    eligible = [c for c in class_names if c != "Negative control"]
+    # Collect (cell, class) pairs first and gather the embeddings once. Appending
+    # a row per (cell x non-excluded class) built a Python list tens of thousands
+    # of entries long before copying it into one array; the gather does the copy
+    # directly.
+    rows, labels = [], []
+    cell_ids = negative_annotations['cell_ID'].astype(int).tolist()
+    for cell_id, (names, inds) in zip(cell_ids, _exclude_columns(negative_annotations)):
+        excluded = set(_resolve_excluded_names(names, inds, fallback))
+        if not excluded:
             continue
-        non_excluded = [c for c in class_names if c not in exclude_classes_list and c != "Negative control"]
-        if len(non_excluded) > 0:
-            emb = cell_embeddings[cell_id]
-            for cls in non_excluded:
-                cls_idx = class_names.index(cls)
-                negative_X.append(emb)
-                negative_y.append(cls_idx)
-                negative_weights.append(0.3)
-    if len(negative_X) == 0:
+        targets = [index_of[c] for c in eligible if c not in excluded]
+        if not targets:
+            continue
+        rows.extend([cell_id] * len(targets))
+        labels.extend(targets)
+    if not rows:
         return None, None, None
-    return np.array(negative_X), np.array(negative_y), np.array(negative_weights)
+    negative_X = cell_embeddings[np.asarray(rows, dtype=int)]
+    return negative_X, np.asarray(labels, dtype=int), np.full(len(labels), 0.3)
 
 
 def _log_training_data_counts(class_names, y_train, n_positive):
@@ -640,19 +622,36 @@ def _annotation_labels_to_classifier_indices(annotations, class_names, nuclei_cl
     """
     n = len(annotations)
     y = np.full(n, -1, dtype=np.int32)
-    for i, (_, row) in enumerate(annotations.iterrows()):
-        # Name first: cell_class_index indexes the User-Annotations palette, and the
-        # panel's nuclei_classes is a different list whenever the user trimmed or
-        # reordered classes — indexing it would relabel cells into the wrong class.
-        if pd.notna(row.get('class')) and row['class'] in class_names:
-            y[i] = class_names.index(row['class'])
-        if y[i] < 0 and pd.isna(row.get('class')) and pd.notna(row.get('cell_class_index')) \
-                and nuclei_classes and len(nuclei_classes) > 0:
-            ann_idx = int(row['cell_class_index'])
-            if 0 <= ann_idx < len(nuclei_classes):
-                class_name = nuclei_classes[ann_idx]
-                if class_name in class_names:
-                    y[i] = class_names.index(class_name)
+    if n == 0:
+        return y
+    index_of = {name: i for i, name in enumerate(class_names)}
+    cols = annotations.columns
+
+    # Name first: cell_class_index indexes the User-Annotations palette, and the
+    # panel's nuclei_classes is a different list whenever the user trimmed or
+    # reordered classes — indexing it would relabel cells into the wrong class.
+    # Series.map does the whole column in one go; iterrows() built a Series per
+    # row and cost ~285 ms on 20k annotations.
+    named = annotations['class'] if 'class' in cols else None
+    if named is not None:
+        mapped = named.map(index_of)
+        hit = mapped.notna().to_numpy()
+        if hit.any():
+            y[hit] = mapped[hit].to_numpy().astype(np.int32)
+
+    # Index fallback, only for rows the palette could not name. Normally none, so
+    # the per-row work below never runs.
+    if not nuclei_classes or 'cell_class_index' not in cols:
+        return y
+    need = y < 0
+    if named is not None:
+        need &= named.isna().to_numpy()
+    if not need.any():
+        return y
+    ann_idx = pd.to_numeric(annotations['cell_class_index'], errors='coerce').to_numpy()
+    need &= np.isfinite(ann_idx) & (ann_idx >= 0) & (ann_idx < len(nuclei_classes))
+    for i in np.flatnonzero(need):
+        y[i] = index_of.get(nuclei_classes[int(ann_idx[i])], -1)
     return y
 
 
