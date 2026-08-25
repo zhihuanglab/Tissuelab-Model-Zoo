@@ -1532,13 +1532,21 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     #      disagrees with the User-Annotations palette can never drop a label.
     # Negative control is always forced to index 0 (matches the negative
     # control vectors injection below).
-    if nuclei_classes and len(nuclei_classes) > 0:
-        class_names = list(nuclei_classes)
-    else:
-        class_names = []
-    for c in list(unique_classes) + list(weak_classes):
+    # A supervised run's taxonomy is what the ANNOTATIONS say, never what the panel
+    # happens to be carrying: the panel's list routinely still holds an earlier
+    # zero-shot run's organ cell types, and emitting those puts classes with zero
+    # training data into the result. nuclei_classes only fixes the ORDER of the
+    # classes that do have evidence.
+    annotated = list(dict.fromkeys(list(unique_classes) + list(weak_classes)))
+    evidence = set(annotated)
+    dropped = [c for c in (nuclei_classes or []) if c not in evidence and c != "Negative control"]
+    class_names = [c for c in (nuclei_classes or []) if c in evidence]
+    for c in annotated:
         if c not in class_names:
             class_names.append(c)
+    if dropped:
+        print(f"[Cell-Classification] Panel classes with no annotations, left out of "
+              f"this supervised run: {dropped}")
     if "Negative control" not in class_names:
         class_names = ["Negative control"] + class_names
         print(f"Added 'Negative control' to class_names (not in panel/annotations): {class_names}")
@@ -2203,13 +2211,19 @@ def run_classification(args) -> Dict[str, Any]:
                 print(f"CLASSIFIER_PATH is set, user provided nuclei_classes: {nuclei_classes}")
                 print(f"Classifier internal order: {class_names}")
                 
-                # Build final class list: user order first, then classifier classes not in user list
+                # Panel ORDER over the classifier's OWN classes, then whatever the
+                # classifier has that the panel does not list. The panel is not a
+                # source of classes here: a name the classifier never learnt cannot
+                # be predicted (its remap column stays 0), and emitting it puts a
+                # zero-cell class in the result — which is how a stale organ preset
+                # kept showing up.
                 user_classes_set = set(nuclei_classes)
+                trained = set(class_names)
                 classifier_classes_not_in_user = [cn for cn in class_names if cn not in user_classes_set]
-                
-                # Final order: user specified classes (in user order) + remaining classifier classes (in classifier order)
-                final_class_names = list(nuclei_classes) + classifier_classes_not_in_user
-                
+                final_class_names = [cn for cn in nuclei_classes if cn in trained] + classifier_classes_not_in_user
+                dropped = [cn for cn in nuclei_classes if cn not in trained]
+                if dropped:
+                    print(f"Panel classes the classifier does not know, left out of the output: {dropped}")
                 print(f"Merged class order (user order + classifier remaining): {final_class_names}")
                 
                 # Build color mapping: prioritize user colors, then classifier colors
@@ -2272,28 +2286,34 @@ def run_classification(args) -> Dict[str, Any]:
                 # trained that the panel does not list. Those must be appended, not
                 # dropped: remap defaults to 0, so a missing class would send every
                 # cell predicted as it straight to "Negative control".
-                user_classes_set = set(nuclei_classes)
-                classifier_classes_not_in_user = [cn for cn in class_names if cn not in user_classes_set]
-                final_class_names = list(nuclei_classes) + classifier_classes_not_in_user
+                # Panel ORDER, but only over the classes the classifier actually
+                # has — class_names is already the evidence-backed set. Emitting
+                # the panel verbatim is what let a stale organ preset reach the
+                # result even though nothing was ever annotated for it.
+                trained = set(class_names)
+                final_class_names = [cn for cn in nuclei_classes if cn in trained]
+                classifier_classes_not_in_user = [cn for cn in class_names if cn not in set(nuclei_classes)]
+                final_class_names += classifier_classes_not_in_user
                 if classifier_classes_not_in_user:
                     print(f"Classifier classes missing from the panel list, appended to output: {classifier_classes_not_in_user}")
                 
-                # Use user input colors if provided and length matches, otherwise use classifier colors
-                # This ensures we use saved colors from classifier (e.g., red) if frontend colors are incomplete (e.g., after reset)
+                # Colours BY NAME over final_class_names. Zipping the panel's colour
+                # array positionally would desync the moment the output is a subset
+                # of the panel, which it now is whenever the panel carries classes
+                # nobody annotated. Panel colour wins, then the classifier's.
                 classifier_color_map = {name: color for name, color in zip(class_names, class_colors)}
-                if nuclei_colors and len(nuclei_colors) == len(nuclei_classes):
-                    final_class_colors = list(nuclei_colors) + [
-                        classifier_color_map.get(cn, "#aaaaaa") for cn in classifier_classes_not_in_user
-                    ]
-                    print(f"Using frontend-provided colors for output: {final_class_colors}")
-                else:
-                    # Map classifier colors to user input order
-                    # This ensures we use saved colors from classifier (e.g., red) instead of incomplete frontend colors
-                    final_class_colors = [classifier_color_map.get(cn, "#aaaaaa") for cn in final_class_names]
-                    if nuclei_colors and len(nuclei_colors) != len(nuclei_classes):
-                        print(f"Frontend colors length mismatch ({len(nuclei_colors)} vs {len(nuclei_classes)}), using classifier colors: {final_class_colors}")
-                    else:
-                        print(f"Using classifier colors mapped to user input order: {final_class_colors}")
+                panel_color_map = (
+                    dict(zip(nuclei_classes, nuclei_colors))
+                    if nuclei_colors and len(nuclei_colors) == len(nuclei_classes)
+                    else {}
+                )
+                if not panel_color_map and nuclei_colors:
+                    print(f"Frontend colors length mismatch ({len(nuclei_colors)} vs {len(nuclei_classes)}), using classifier colors")
+                final_class_colors = [
+                    panel_color_map.get(cn) or classifier_color_map.get(cn) or "#aaaaaa"
+                    for cn in final_class_names
+                ]
+                print(f"Colors for output: {final_class_colors}")
                 
                 # Create mapping from classifier internal indices to output indices
                 classifier_name_to_idx = {name: idx for idx, name in enumerate(class_names)}
