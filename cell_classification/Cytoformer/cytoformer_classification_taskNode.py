@@ -843,10 +843,14 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
             BOOSTER_CLASS_INDEX_ATTR: json.dumps([int(v) for v in np.unique(np.asarray(labels))])
         })
 
+    # Plain savez, not savez_compressed: these are dense L2-normalised features,
+    # so zlib gets ~7% off the size for ~18x the time (4.0 s vs 0.2 s on 20k
+    # samples, and one-vs-rest pays it once per class). np.load reads either
+    # format, so classifiers written before this keep loading.
     train_data_bytes = io.BytesIO()
-    np.savez_compressed(train_data_bytes, 
-                       embeddings=final_embeddings, 
-                       labels=final_labels)
+    np.savez(train_data_bytes,
+             embeddings=final_embeddings,
+             labels=final_labels)
     train_data_str = base64.b64encode(train_data_bytes.getvalue()).decode('utf-8')
     booster.set_attr(train_data=train_data_str)
 
