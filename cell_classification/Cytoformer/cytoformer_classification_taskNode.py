@@ -473,13 +473,8 @@ def load_structured_nuclei_annotations(zf, annotation_path: str) -> pd.DataFrame
         # -1 = unclassified (skip)
         # -2 = exclude class 0, -3 = exclude class 1, etc. (computed from value, no class_names needed)
         #
-        # `class` alone decides — the same rule the seg service uses for the panel
-        # counts and the GT highlight. A colour is presentation: save_annotation
-        # stores -1 for it whenever the caller sent none, and requiring one here
-        # made those labels invisible to this node ONLY. The slide then looked
-        # annotated in the UI while the run fell through to organ zero-shot.
-        positive_mask = cell_class_ids >= 0
-        negative_mask = cell_class_ids <= -2
+        positive_mask = (cell_class_ids >= 0) & (cell_color_data >= 0)
+        negative_mask = (cell_class_ids <= -2) & (cell_color_data >= 0)
         
         positive_indices = np.where(positive_mask)[0]
         negative_indices = np.where(negative_mask)[0]
