@@ -2274,8 +2274,9 @@ def run_classification(args) -> Dict[str, Any]:
                 # the panel verbatim is what let a stale organ preset reach the
                 # result even though nothing was ever annotated for it.
                 trained = set(class_names)
+                panel_set = set(nuclei_classes)
                 final_class_names = [cn for cn in nuclei_classes if cn in trained]
-                classifier_classes_not_in_user = [cn for cn in class_names if cn not in set(nuclei_classes)]
+                classifier_classes_not_in_user = [cn for cn in class_names if cn not in panel_set]
                 final_class_names += classifier_classes_not_in_user
                 if classifier_classes_not_in_user:
                     print(f"Classifier classes missing from the panel list, appended to output: {classifier_classes_not_in_user}")
