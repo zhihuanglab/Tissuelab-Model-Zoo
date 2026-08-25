@@ -275,12 +275,61 @@ def _ordered_annotation_classes(positive_annotations: pd.DataFrame, nuclei_class
             sv = str(v)
             if sv and sv not in ordered:
                 ordered.append(sv)
+        # Index fallback only for rows the User-Annotations palette could not name;
+        # nuclei_classes is the panel list and may not share the palette's order.
         if nuclei_classes and len(nuclei_classes) > 0 and 'cell_class_index' in positive_annotations.columns:
-            for ann_idx in positive_annotations['cell_class_index'].dropna().astype(int):
+            unnamed = positive_annotations[positive_annotations.get("class").isna()] \
+                if "class" in positive_annotations.columns else positive_annotations
+            for ann_idx in unnamed['cell_class_index'].dropna().astype(int):
                 if 0 <= ann_idx < len(nuclei_classes):
                     sv = str(nuclei_classes[ann_idx])
                     if sv and sv not in ordered:
                         ordered.append(sv)
+    return ordered
+
+
+def _exclude_columns(negative_annotations):
+    """Zip the two "not this type" columns as plain Python values, once."""
+    n = len(negative_annotations)
+    cols = negative_annotations.columns
+    names = (negative_annotations['exclude_classes'].tolist()
+             if 'exclude_classes' in cols else [None] * n)
+    inds = (negative_annotations['exclude_class_indices'].tolist()
+            if 'exclude_class_indices' in cols else [None] * n)
+    return zip(names, inds)
+
+
+def _resolve_excluded_names(names, inds, palette):
+    """The class names one "not this type" row excludes.
+
+    The names the User-Annotations palette already resolved win; the raw indices
+    point at that palette, so they are only usable through `palette`.
+    """
+    if isinstance(names, list) and names:
+        return names
+    if isinstance(inds, list) and palette:
+        return [palette[int(i)] for i in inds if 0 <= int(i) < len(palette)]
+    return []
+
+
+def _ordered_exclude_classes(negative_annotations: pd.DataFrame, nuclei_classes=None):
+    """
+    Class names named by "not this type" annotations, first-seen order.
+
+    A weak annotation only means something while its class is part of the
+    taxonomy, and the panel cannot know about it — manual_annotation_counts only
+    counts positives, so a class with weak labels alone arrives trimmed away.
+    """
+    ordered = []
+    if negative_annotations is None or negative_annotations.empty:
+        return ordered
+    # Walk the columns, not iterrows(): building a Series per row costs ~0.6 s on
+    # a slide with 50k "No" marks, and all this needs is the distinct names.
+    for names, inds in _exclude_columns(negative_annotations):
+        for nm in _resolve_excluded_names(names, inds, nuclei_classes):
+            sv = str(nm)
+            if sv and sv not in ordered:
+                ordered.append(sv)
     return ordered
 
 
@@ -328,14 +377,17 @@ def _persist_nuclei_rename_to_user_annotation(zf, effective_renames, nuclei_clas
     if hasattr(ua, "attrs"):
         nc = [str(x) for x in (nuclei_classes or [])]
         old_names, _old_colors = _read_user_cell_palette(ua)
-        if nc and old_names and len(old_names) == len(nc):
+        mapped = [_resolve_rename_terminal(nm, rename_graph) for nm in old_names] if old_names else []
+        # The workflow list is written positionally, so take it only when it IS the
+        # renamed palette. A panel that sends a different list of the same length
+        # would silently relabel every annotation it overwrites.
+        if nc and mapped == nc:
             _write_user_cell_palette(ua, nc, nuclei_colors if nuclei_colors and len(nuclei_colors) == len(nc) else None)
             print(f"[Cell-Classification] user_annotation.attrs cell_class_names synced to workflow list ({len(nc)} classes)")
         elif nc and not old_names:
             _write_user_cell_palette(ua, nc, nuclei_colors if nuclei_colors and len(nuclei_colors) == len(nc) else None)
             print(f"[Cell-Classification] user_annotation.attrs cell_class_names initialized from workflow")
         elif old_names:
-            mapped = [_resolve_rename_terminal(nm, rename_graph) for nm in old_names]
             _write_user_cell_palette(ua, mapped)
             print(f"[Cell-Classification] user_annotation.attrs cell_class_names remapped by rename ops: {mapped}")
 
@@ -410,6 +462,7 @@ def load_structured_nuclei_annotations(zf, annotation_path: str) -> pd.DataFrame
         # Negative: cell_class <= -2 (cell_class = -(2 + excluded_class_index)) -> excluded_class_index = -cell_class - 2
         # -1 = unclassified (skip)
         # -2 = exclude class 0, -3 = exclude class 1, etc. (computed from value, no class_names needed)
+        #
         positive_mask = (cell_class_ids >= 0) & (cell_color_data >= 0)
         negative_mask = (cell_class_ids <= -2) & (cell_color_data >= 0)
         
@@ -475,31 +528,42 @@ def _log_annotation_counts_per_class(class_names, positive_annotations, negative
     if not negative_annotations.empty:
         has_exclude = 'exclude_classes' in negative_annotations.columns or 'exclude_class_indices' in negative_annotations.columns
         if has_exclude:
-            for idx, row in negative_annotations.iterrows():
-                exclude_indices = []
-                if 'exclude_class_indices' in row and pd.notna(row.get('exclude_class_indices')):
-                    inds = row['exclude_class_indices']
-                    if isinstance(inds, list):
-                        if nuclei_classes and len(nuclei_classes) > 0:
-                            for i in inds:
-                                i = int(i)
-                                if 0 <= i < len(nuclei_classes):
-                                    cn = nuclei_classes[i]
-                                    if cn in class_names:
-                                        exclude_indices.append(class_names.index(cn))
-                        else:
-                            exclude_indices = [int(i) for i in inds if 0 <= int(i) < len(class_names)]
-                if not exclude_indices and 'exclude_classes' in row:
-                    exclude_classes_list = row.get('exclude_classes', [])
-                    if isinstance(exclude_classes_list, list):
-                        for cls in exclude_classes_list:
-                            if cls in class_names:
-                                exclude_indices.append(class_names.index(cls))
-                for ci in exclude_indices:
-                    weak_counts[class_names[ci]] += 1
+            # Same precedence as _build_negative_training_samples: the names the
+            # User-Annotations palette resolved, then the raw indices.
+            fallback = nuclei_classes if nuclei_classes else class_names
+            for names, inds in _exclude_columns(negative_annotations):
+                for cls in _resolve_excluded_names(names, inds, fallback):
+                    if cls in weak_counts:
+                        weak_counts[cls] += 1
     print("[Cell-Classification] Per-class annotation counts (positive = marked as this class, weak = 'not this type'):")
     for c in class_names:
         print(f"  {c}: positive={pos_counts[c]}, weak={weak_counts[c]}")
+
+
+def _build_exclude_map(negative_annotations, class_names, nuclei_classes=None):
+    """
+    cell_ID -> class_names indices the user marked "not this type".
+
+    Resolution order matches _build_negative_training_samples: the names the
+    User-Annotations palette gave, then the raw indices via nuclei_classes.
+    exclude_class_indices points at that palette, never at class_names.
+    """
+    exclude_map = {}
+    if negative_annotations is None or negative_annotations.empty:
+        return exclude_map
+    if not ('exclude_classes' in negative_annotations.columns
+            or 'exclude_class_indices' in negative_annotations.columns):
+        return exclude_map
+    # Columns rather than iterrows() — same reason as _ordered_exclude_classes.
+    fallback = nuclei_classes if nuclei_classes else class_names
+    index_of = {name: i for i, name in enumerate(class_names)}
+    cell_ids = negative_annotations['cell_ID'].astype(int).tolist()
+    for cell_id, (names, inds) in zip(cell_ids, _exclude_columns(negative_annotations)):
+        indices = [index_of[c] for c in _resolve_excluded_names(names, inds, fallback)
+                   if c in index_of]
+        if indices:
+            exclude_map[cell_id] = indices
+    return exclude_map
 
 
 def _build_negative_training_samples(cell_embeddings, negative_annotations, class_names, nuclei_classes=None):
@@ -509,30 +573,28 @@ def _build_negative_training_samples(cell_embeddings, negative_annotations, clas
     """
     if negative_annotations.empty or not ('exclude_classes' in negative_annotations.columns or 'exclude_class_indices' in negative_annotations.columns):
         return None, None, None
-    negative_X, negative_y, negative_weights = [], [], []
-    for idx, row in negative_annotations.iterrows():
-        cell_id = int(row['cell_ID'])
-        exclude_classes_list = row.get('exclude_classes', [])
-        if not isinstance(exclude_classes_list, list) or not exclude_classes_list:
-            inds = row.get('exclude_class_indices', [])
-            if isinstance(inds, list):
-                if nuclei_classes and len(nuclei_classes) > 0:
-                    exclude_classes_list = [nuclei_classes[int(i)] for i in inds if 0 <= int(i) < len(nuclei_classes)]
-                else:
-                    exclude_classes_list = [class_names[int(i)] for i in inds if 0 <= int(i) < len(class_names)]
-        if not exclude_classes_list:
+    fallback = nuclei_classes if nuclei_classes else class_names
+    index_of = {name: i for i, name in enumerate(class_names)}
+    eligible = [c for c in class_names if c != "Negative control"]
+    # Collect (cell, class) pairs first and gather the embeddings once. Appending
+    # a row per (cell x non-excluded class) built a Python list tens of thousands
+    # of entries long before copying it into one array; the gather does the copy
+    # directly.
+    rows, labels = [], []
+    cell_ids = negative_annotations['cell_ID'].astype(int).tolist()
+    for cell_id, (names, inds) in zip(cell_ids, _exclude_columns(negative_annotations)):
+        excluded = set(_resolve_excluded_names(names, inds, fallback))
+        if not excluded:
             continue
-        non_excluded = [c for c in class_names if c not in exclude_classes_list and c != "Negative control"]
-        if len(non_excluded) > 0:
-            emb = cell_embeddings[cell_id]
-            for cls in non_excluded:
-                cls_idx = class_names.index(cls)
-                negative_X.append(emb)
-                negative_y.append(cls_idx)
-                negative_weights.append(0.3)
-    if len(negative_X) == 0:
+        targets = [index_of[c] for c in eligible if c not in excluded]
+        if not targets:
+            continue
+        rows.extend([cell_id] * len(targets))
+        labels.extend(targets)
+    if not rows:
         return None, None, None
-    return np.array(negative_X), np.array(negative_y), np.array(negative_weights)
+    negative_X = cell_embeddings[np.asarray(rows, dtype=int)]
+    return negative_X, np.asarray(labels, dtype=int), np.full(len(labels), 0.3)
 
 
 def _log_training_data_counts(class_names, y_train, n_positive):
@@ -554,20 +616,43 @@ def _log_training_data_counts(class_names, y_train, n_positive):
 def _annotation_labels_to_classifier_indices(annotations, class_names, nuclei_classes=None):
     """
     Map annotation rows to classifier class indices (0,1,2,...).
-    Uses stored ID (cell_class_index) + nuclei_classes when available, else class name (cell_class).
+    Uses the class name (resolved from the User-Annotations palette that produced
+    cell_class_index), falling back to cell_class_index + nuclei_classes for rows
+    the palette could not name.
     Returns 1D int array same length as annotations; -1 for invalid/unmapped.
     """
     n = len(annotations)
     y = np.full(n, -1, dtype=np.int32)
-    for i, (_, row) in enumerate(annotations.iterrows()):
-        if 'cell_class_index' in row and pd.notna(row.get('cell_class_index')) and nuclei_classes and len(nuclei_classes) > 0:
-            ann_idx = int(row['cell_class_index'])
-            if 0 <= ann_idx < len(nuclei_classes):
-                class_name = nuclei_classes[ann_idx]
-                if class_name in class_names:
-                    y[i] = class_names.index(class_name)
-        if y[i] < 0 and pd.notna(row.get('class')) and row['class'] in class_names:
-            y[i] = class_names.index(row['class'])
+    if n == 0:
+        return y
+    index_of = {name: i for i, name in enumerate(class_names)}
+    cols = annotations.columns
+
+    # Name first: cell_class_index indexes the User-Annotations palette, and the
+    # panel's nuclei_classes is a different list whenever the user trimmed or
+    # reordered classes — indexing it would relabel cells into the wrong class.
+    # Series.map does the whole column in one go; iterrows() built a Series per
+    # row and cost ~285 ms on 20k annotations.
+    named = annotations['class'] if 'class' in cols else None
+    if named is not None:
+        mapped = named.map(index_of)
+        hit = mapped.notna().to_numpy()
+        if hit.any():
+            y[hit] = mapped[hit].to_numpy().astype(np.int32)
+
+    # Index fallback, only for rows the palette could not name. Normally none, so
+    # the per-row work below never runs.
+    if not nuclei_classes or 'cell_class_index' not in cols:
+        return y
+    need = y < 0
+    if named is not None:
+        need &= named.isna().to_numpy()
+    if not need.any():
+        return y
+    ann_idx = pd.to_numeric(annotations['cell_class_index'], errors='coerce').to_numpy()
+    need &= np.isfinite(ann_idx) & (ann_idx >= 0) & (ann_idx < len(nuclei_classes))
+    for i in np.flatnonzero(need):
+        y[i] = index_of.get(nuclei_classes[int(ann_idx[i])], -1)
     return y
 
 
@@ -717,6 +802,81 @@ def generate_distinct_colors(nuclei_classes: list[str]) -> list[str]:
         colors.append(color)
     return colors
 
+# --- booster label space -----------------------------------------------------
+# XGBoost needs contiguous [0..K-1] labels, but class_names carries every class in
+# the run — "Negative control" is pinned to index 0 even when nobody annotated it.
+# So the booster's columns are a COMPACTED subset of class_names, and the mapping
+# has to travel with the model: without it a reloaded classifier hands back K
+# columns for an N-class list and every downstream index is wrong.
+BOOSTER_CLASS_INDEX_ATTR = "trained_class_indices"
+
+
+def _compact_labels(y_full):
+    """Return (contiguous labels for xgboost, compact column -> class_names index)."""
+    compact_to_full = np.unique(np.asarray(y_full)).astype(int)
+    lut = {int(v): i for i, v in enumerate(compact_to_full)}
+    return np.array([lut[int(v)] for v in y_full], dtype=int), compact_to_full
+
+
+def _booster_class_indices(clf, n_classes, train_labels=None):
+    """
+    class_names index for each predict_proba column of `clf`.
+
+    Reads the mapping persisted at save time; falls back to the saved training
+    labels for models written before it existed, then to identity when the widths
+    already agree (a model whose classes were never compacted).
+    """
+    try:
+        raw = clf.get_booster().attr(BOOSTER_CLASS_INDEX_ATTR)
+    except Exception:
+        raw = None
+    if raw:
+        try:
+            mapped = [int(v) for v in json.loads(raw)]
+            if mapped:
+                return np.array(mapped, dtype=int)
+        except (TypeError, ValueError):
+            print(f"[Cell-Classification] Warning: unreadable {BOOSTER_CLASS_INDEX_ATTR} on classifier")
+    if train_labels is not None and len(train_labels) > 0:
+        return np.unique(np.asarray(train_labels)).astype(int)
+    n_cols = int(getattr(clf, "n_classes_", 0) or len(getattr(clf, "classes_", []) or []))
+    if n_cols and n_cols != n_classes:
+        # Last resort: nothing records which classes this model was trained on and
+        # its width disagrees with the class list, so the columns are being guessed.
+        print(f"[Cell-Classification] Warning: classifier has {n_cols} columns for "
+              f"{n_classes} classes and carries no {BOOSTER_CLASS_INDEX_ATTR}; "
+              f"assuming the first {min(n_cols, n_classes)} classes.")
+    return np.arange(min(n_cols, n_classes) if n_cols else n_classes, dtype=int)
+
+
+def _scatter_to_class_space(batch_probs, class_indices, n_classes):
+    """Widen compact predict_proba columns into the full class_names space."""
+    out = np.zeros((batch_probs.shape[0], n_classes), dtype=np.float32)
+    for col, full_idx in enumerate(class_indices):
+        if col < batch_probs.shape[1] and 0 <= int(full_idx) < n_classes:
+            out[:, int(full_idx)] = batch_probs[:, col]
+    return out
+
+
+def _apply_exclusions(batch_full, exclude_map, offset):
+    """Zero the "not this type" classes for each annotated cell and renormalise.
+
+    Walks the marked cells, not the batch: a slide has a few hundred "No" marks
+    against a 100k-row batch, so scanning every row costs ~10x more for the same
+    result.
+    """
+    end = offset + batch_full.shape[0]
+    for cell_id, excluded in exclude_map.items():
+        if not (offset <= cell_id < end) or not excluded:
+            continue
+        local_idx = cell_id - offset
+        batch_full[local_idx, excluded] = 0.0
+        prob_sum = batch_full[local_idx].sum()
+        if prob_sum > 0:
+            batch_full[local_idx] /= prob_sum
+    return batch_full
+
+
 def save_classifier_params(clf, class_names, class_colors, train_data, max_samples_per_class=100000000000000):
     """Embed training metadata into the booster; optionally write XGBoost model to SAVE_CLASSIFIER_PATH."""
     global SAVE_CLASSIFIER_PATH, LAST_TRAINED_CLF_BUNDLE
@@ -750,11 +910,21 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
     booster = clf.get_booster()
     booster.set_attr(class_names=json.dumps(class_names))
     booster.set_attr(class_colors=json.dumps(class_colors))
+    # The booster's columns are the compacted label set; record which class_names
+    # index each one means so a reload can widen predict_proba correctly.
+    if len(labels) > 0:
+        booster.set_attr(**{
+            BOOSTER_CLASS_INDEX_ATTR: json.dumps([int(v) for v in np.unique(np.asarray(labels))])
+        })
 
+    # Plain savez, not savez_compressed: these are dense L2-normalised features,
+    # so zlib gets ~7% off the size for ~18x the time (4.0 s vs 0.2 s on 20k
+    # samples, and one-vs-rest pays it once per class). np.load reads either
+    # format, so classifiers written before this keep loading.
     train_data_bytes = io.BytesIO()
-    np.savez_compressed(train_data_bytes, 
-                       embeddings=final_embeddings, 
-                       labels=final_labels)
+    np.savez(train_data_bytes,
+             embeddings=final_embeddings,
+             labels=final_labels)
     train_data_str = base64.b64encode(train_data_bytes.getvalue()).decode('utf-8')
     booster.set_attr(train_data=train_data_str)
 
@@ -1008,6 +1178,9 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 clf, class_names, class_colors, prev_embeddings, prev_labels = loaded_params
                 old_class_names = class_names.copy()
                 print(f"Loaded existing classifier parameters, classes: {class_names}")
+                # Which class_names index each predict_proba column means. The
+                # retrain / warm-start branches below replace it when they refit.
+                _clf_class_indices = _booster_class_indices(clf, len(class_names), prev_labels)
                 # Update progress after loading classifier
                 progress_state.value = 40
                 print(f"Progress: 40% (Classifier loaded)")
@@ -1048,7 +1221,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                                     new_class_colors.append(class_colors[old_idx])
                                 else:
                                     new_class_colors.append("#aaaaaa")
-                            elif cn in ann_color_map:
+                            elif ann_color_map.get(cn):   # "" when no colour was stored
                                 new_class_colors.append(ann_color_map[cn])
                             else:
                                 new_class_colors.append("#aaaaaa")
@@ -1106,18 +1279,19 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
                         neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names, nuclei_classes)
+                        sample_weights_inc = None
                         if neg_X is not None:
                             print(f"Adding {len(neg_X)} negative training samples (weighted 0.3) for retrain")
                             X_train = np.concatenate([X_train, neg_X], axis=0)
                             y_train = np.concatenate([y_train, neg_y], axis=0)
                             sample_weights_inc = np.concatenate([np.ones(n_pos), neg_w])
-                            _log_training_data_counts(class_names, y_train, n_pos)
-                            clf = xgb.XGBClassifier(**xgb_params)
-                            clf.fit(X_train, y_train, sample_weight=sample_weights_inc)
-                        else:
-                            _log_training_data_counts(class_names, y_train, n_pos)
-                            clf = xgb.XGBClassifier(**xgb_params)
-                            clf.fit(X_train, y_train)
+                        _log_training_data_counts(class_names, y_train, n_pos)
+                        # A merged class list can leave gaps (a class with no samples
+                        # yet); xgboost rejects non-contiguous labels, so compact them
+                        # and keep the column -> class_names mapping.
+                        y_fit, _clf_class_indices = _compact_labels(y_train)
+                        clf = xgb.XGBClassifier(**xgb_params)
+                        clf.fit(X_train, y_fit, sample_weight=sample_weights_inc)
                         
                         # Check for cancellation after retraining
                         if cancel_event.is_set():
@@ -1185,18 +1359,28 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
                         neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names, nuclei_classes)
+                        sample_weights_inc = None
                         if neg_X is not None:
                             print(f"Adding {len(neg_X)} negative training samples (weighted 0.3) for incremental training")
                             X_train = np.concatenate([X_train, neg_X], axis=0)
                             y_train = np.concatenate([y_train, neg_y], axis=0)
                             sample_weights_inc = np.concatenate([np.ones(n_pos), neg_w])
-                            _log_training_data_counts(class_names, y_train, n_pos)
-                            existing_booster = clf.get_booster()
-                            clf.fit(X_train, y_train, xgb_model=existing_booster, sample_weight=sample_weights_inc)
+                        _log_training_data_counts(class_names, y_train, n_pos)
+                        # A warm start has to speak the booster's own (compacted) label
+                        # space and cannot grow it. Labels it never saw — a class that
+                        # had no samples last round — force a full refit instead.
+                        booster_lut = {int(v): c for c, v in enumerate(_clf_class_indices)}
+                        unseen = [int(v) for v in np.unique(y_train) if int(v) not in booster_lut]
+                        if unseen:
+                            print(f"Classes {[class_names[i] for i in unseen if i < len(class_names)]} are new to the "
+                                  f"booster; retraining from scratch instead of warm start")
+                            y_fit, _clf_class_indices = _compact_labels(y_train)
+                            clf = xgb.XGBClassifier(**xgb_params)
+                            clf.fit(X_train, y_fit, sample_weight=sample_weights_inc)
                         else:
-                            _log_training_data_counts(class_names, y_train, n_pos)
+                            y_fit = np.array([booster_lut[int(v)] for v in y_train], dtype=int)
                             existing_booster = clf.get_booster()
-                            clf.fit(X_train, y_train, xgb_model=existing_booster)
+                            clf.fit(X_train, y_fit, xgb_model=existing_booster, sample_weight=sample_weights_inc)
                         
                         # Check for cancellation after incremental training
                         if cancel_event.is_set():
@@ -1226,37 +1410,11 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 n_batches = (n_cells + batch_size - 1) // batch_size
                 print(f"Starting prediction for {n_cells} cells in {n_batches} batches (batch_size={batch_size})...")
                 
-                # Build exclude_map from negative annotations when using loaded classifier (so "not class" marks take effect)
-                # exclude_class_indices are in user (nuclei_classes) order; map to classifier (class_names) order
-                exclude_map = {}
-                if has_negative_examples and not negative_annotations.empty:
-                    for idx, row in negative_annotations.iterrows():
-                        cell_id = int(row['cell_ID'])
-                        exclude_indices = []
-                        if 'exclude_class_indices' in row and pd.notna(row.get('exclude_class_indices')):
-                            inds = row['exclude_class_indices']
-                            if isinstance(inds, list):
-                                if nuclei_classes and len(nuclei_classes) > 0:
-                                    # Annotation indices are in user (nuclei_classes) order → map to classifier indices
-                                    for i in inds:
-                                        i = int(i)
-                                        if 0 <= i < len(nuclei_classes):
-                                            class_name = nuclei_classes[i]
-                                            if class_name in class_names:
-                                                exclude_indices.append(class_names.index(class_name))
-                                else:
-                                    # Fallback: treat as classifier indices (when orders match)
-                                    exclude_indices = [int(i) for i in inds if 0 <= int(i) < len(class_names)]
-                        if not exclude_indices and 'exclude_classes' in row:
-                            exclude_classes_list = row.get('exclude_classes', [])
-                            if isinstance(exclude_classes_list, list):
-                                for cls in exclude_classes_list:
-                                    if cls in class_names:
-                                        exclude_indices.append(class_names.index(cls))
-                        if exclude_indices:
-                            exclude_map[cell_id] = exclude_indices
-                    if exclude_map:
-                        print(f"[Cell-Classification] Will enforce exclusion for {len(exclude_map)} cells during prediction (classifier path)")
+                # Hard "not this type" constraints, in class_names index space.
+                exclude_map = _build_exclude_map(negative_annotations, class_names, nuclei_classes) \
+                    if has_negative_examples else {}
+                if exclude_map:
+                    print(f"[Cell-Classification] Will enforce exclusion for {len(exclude_map)} cells during prediction (classifier path)")
                 if not annotations.empty:
                     _log_annotation_counts_per_class(class_names, positive_annotations, negative_annotations, nuclei_classes=nuclei_classes)
                 
@@ -1274,24 +1432,19 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     # OPTIMIZATION: Only call predict_proba once, then extract predictions from probabilities
                     # This avoids duplicate forward passes through the model
                     batch_probs = clf.predict_proba(batch_embeddings)
-                    # Apply exclude_classes constraints from "not class" annotations
+                    # The booster's columns are its compacted label set, not
+                    # class_names positions — widen before doing anything with them.
+                    batch_full = _scatter_to_class_space(batch_probs, _clf_class_indices, len(class_names))
                     if exclude_map:
-                        for local_idx in range(len(batch_probs)):
-                            global_idx = i + local_idx
-                            if global_idx in exclude_map:
-                                exclude_indices = exclude_map[global_idx]
-                                batch_probs[local_idx, exclude_indices] = 0.0
-                                prob_sum = batch_probs[local_idx].sum()
-                                if prob_sum > 0:
-                                    batch_probs[local_idx] /= prob_sum
-                    batch_predictions = np.argmax(batch_probs, axis=1).astype(np.int32)
+                        batch_full = _apply_exclusions(batch_full, exclude_map, i)
+                    batch_predictions = np.argmax(batch_full, axis=1).astype(np.int32)
                     
                     # Store results
                     predictions[i:end_idx] = batch_predictions
-                    prediction_probs[i:end_idx] = batch_probs
+                    prediction_probs[i:end_idx] = batch_full
                     
                     # Clear batch data from memory
-                    del batch_embeddings, batch_predictions, batch_probs
+                    del batch_embeddings, batch_predictions, batch_probs, batch_full
                     
                     # Update progress: 40% -> 90% during prediction
                     progress_state.value = 40 + int(50 * (batch_idx + 1) / n_batches)
@@ -1366,32 +1519,26 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     if has_negative_examples:
         print(f"[Cell-Classification] Negative annotations with exclude constraints: {len(negative_annotations)} cells ('not this type')")
     
-    unique_classes = list(positive_annotations['class'].dropna().unique()) if not positive_annotations.empty else []
-    if not positive_annotations.empty and 'cell_class_index' in positive_annotations.columns and nuclei_classes and len(nuclei_classes) > 0:
-        for ann_idx in positive_annotations['cell_class_index'].dropna().astype(int):
-            if 0 <= ann_idx < len(nuclei_classes):
-                unique_classes.append(nuclei_classes[ann_idx])
-        unique_classes = list(dict.fromkeys(unique_classes))
+    unique_classes = _ordered_annotation_classes(positive_annotations, nuclei_classes)
+    weak_classes = _ordered_exclude_classes(negative_annotations, nuclei_classes) if has_negative_examples else []
 
     if len(unique_classes) < 1 and not has_negative_examples:
         raise ValueError("Need at least 1 class in annotation or negative examples => fallback to zero-shot")
 
     # Build class_names. Source priority:
-    #   1. The panel's nuclei_classes (authoritative — preserves every class
-    #      the user configured, even ones without any annotation yet, so
-    #      Cell-Classification/classes stays aligned with the panel and the
-    #      int indices in User-Annotations/cell don't drift between runs).
-    #   2. Fall back to annotation order if nuclei_classes wasn't supplied.
+    #   1. The panel's nuclei_classes — it fixes the ORDER, and keeps a class the
+    #      user configured but has not annotated yet.
+    #   2. Annotation classes not in the panel list are appended, so a panel that
+    #      disagrees with the User-Annotations palette can never drop a label.
     # Negative control is always forced to index 0 (matches the negative
     # control vectors injection below).
     if nuclei_classes and len(nuclei_classes) > 0:
         class_names = list(nuclei_classes)
-        # Append any annotation classes not in the panel list (defensive only).
-        for c in unique_classes:
-            if c not in class_names:
-                class_names.append(c)
     else:
-        class_names = list(unique_classes)
+        class_names = []
+    for c in list(unique_classes) + list(weak_classes):
+        if c not in class_names:
+            class_names.append(c)
     if "Negative control" not in class_names:
         class_names = ["Negative control"] + class_names
         print(f"Added 'Negative control' to class_names (not in panel/annotations): {class_names}")
@@ -1406,7 +1553,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     for cn in class_names:
         if cn in frontend_color_map:
             class_colors.append(frontend_color_map[cn])
-        elif cn in class_colors_map:
+        elif class_colors_map.get(cn):        # "" when the annotation carried no colour
             class_colors.append(class_colors_map[cn])
         else:
             class_colors.append("#aaaaaa")
@@ -1434,11 +1581,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
             y_train = np.concatenate([y_train, neg_y], axis=0)
             sample_weights = np.concatenate([np.ones(n_pos), neg_w])
 
-    _pos_class_names = list(positive_annotations["class"].dropna().astype(str)) if not positive_annotations.empty else []
-    if "cell_class_index" in positive_annotations.columns and nuclei_classes and len(nuclei_classes) > 0:
-        for i in positive_annotations["cell_class_index"].dropna().astype(int):
-            if 0 <= i < len(nuclei_classes):
-                _pos_class_names.append(nuclei_classes[i])
+    _pos_class_names = _ordered_annotation_classes(positive_annotations, nuclei_classes)
     if "Negative control" not in _pos_class_names:
         print("Found annotations, but there is no 'Negative control' class, we will use negative_control_example_vectors.npy as negative control")
         # Cache negative control vectors in memory
@@ -1481,10 +1624,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     # Tumor=2 but no Lymphocytes=1), remap to [0..K-1] for the fit and
     # remember the inverse mapping so prediction columns can be scattered back
     # into the full class_names index space below.
-    unique_y_panel = np.unique(y_train)
-    _compact_to_panel = unique_y_panel.astype(int)
-    _panel_to_compact = {int(p): c for c, p in enumerate(_compact_to_panel)}
-    y_train_compact = np.array([_panel_to_compact[int(v)] for v in y_train], dtype=int)
+    y_train_compact, _clf_class_indices = _compact_labels(y_train)
 
     clf = xgb.XGBClassifier(**xgb_params)
     print("Training new classifier...")
@@ -1516,38 +1656,14 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     n_batches = (n_cells + batch_size - 1) // batch_size
     print(f"Starting prediction for {n_cells} cells in {n_batches} batches (batch_size={batch_size})...")
     
-    # Build exclude_classes mapping from negative annotations for hard constraint enforcement
-    exclude_map = {}  # cell_id -> list of excluded class indices (panel space)
-    if has_negative_examples and not negative_annotations.empty:
-        for idx, row in negative_annotations.iterrows():
-            cell_id = int(row['cell_ID'])
-            exclude_indices = []
-            if 'exclude_class_indices' in row and pd.notna(row.get('exclude_class_indices')):
-                inds = row['exclude_class_indices']
-                if isinstance(inds, list):
-                    exclude_indices = [int(i) for i in inds if 0 <= int(i) < len(class_names)]
-            if not exclude_indices and 'exclude_classes' in row:
-                exclude_classes_list = row.get('exclude_classes', [])
-                if isinstance(exclude_classes_list, list):
-                    for cls in exclude_classes_list:
-                        if cls in class_names:
-                            exclude_indices.append(class_names.index(cls))
-            if exclude_indices:
-                exclude_map[cell_id] = exclude_indices
+    # Hard "not this type" constraints, in class_names index space.
+    exclude_map = _build_exclude_map(negative_annotations, class_names, nuclei_classes) \
+        if has_negative_examples else {}
+    if exclude_map:
+        print(f"[Cell-Classification] Will enforce exclusion for {len(exclude_map)} cells during prediction")
 
-        if exclude_map:
-            print(f"[Cell-Classification] Will enforce exclusion for {len(exclude_map)} cells during prediction")
-
-    # XGBoost's predict_proba returns columns in clf.classes_ order (compact
-    # label space). Map back to the full panel index space via _compact_to_panel
-    # so prediction_probs columns are always (sample, panel_class_idx).
-    _clf_compact_classes = np.array(clf.classes_, dtype=int)
-    _clf_panel_classes = np.array(
-        [int(_compact_to_panel[c]) for c in _clf_compact_classes],
-        dtype=int,
-    )
     if not annotations.empty:
-        _log_annotation_counts_per_class(class_names, positive_annotations, negative_annotations, nuclei_classes=None)
+        _log_annotation_counts_per_class(class_names, positive_annotations, negative_annotations, nuclei_classes=nuclei_classes)
     
     for batch_idx, i in enumerate(range(0, n_cells, batch_size)):
         # Check for cancellation during prediction (before each batch)
@@ -1564,25 +1680,12 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         # This avoids duplicate forward passes through the model
         batch_probs = clf.predict_proba(batch_embeddings)
 
-        # Apply exclude_classes constraints (panel indices → compact columns).
+        # Widen the booster's compact columns into class_names space first, so the
+        # exclusions and the argmax both work in one index space. Classes with no
+        # training data stay 0 — they were never learned anyway.
+        batch_full = _scatter_to_class_space(batch_probs, _clf_class_indices, len(class_names))
         if exclude_map:
-            for local_idx in range(len(batch_probs)):
-                global_idx = i + local_idx
-                if global_idx in exclude_map:
-                    excluded_orig = exclude_map[global_idx]
-                    excluded_cols = [j for j, c in enumerate(_clf_panel_classes) if c in excluded_orig]
-                    if excluded_cols:
-                        batch_probs[local_idx, excluded_cols] = 0.0
-                        prob_sum = batch_probs[local_idx].sum()
-                        if prob_sum > 0:
-                            batch_probs[local_idx] /= prob_sum
-
-        # Scatter batch_probs columns (XGBoost compact order) into full panel columns.
-        # Missing-from-training classes stay 0 — they were never learned anyway.
-        batch_full = np.zeros((batch_probs.shape[0], prediction_probs.shape[1]), dtype=np.float32)
-        for j, cls_id in enumerate(_clf_panel_classes):
-            if 0 <= int(cls_id) < prediction_probs.shape[1]:
-                batch_full[:, int(cls_id)] = batch_probs[:, j]
+            batch_full = _apply_exclusions(batch_full, exclude_map, i)
         batch_predictions = np.argmax(batch_full, axis=1).astype(np.int32)
 
         # Store results
@@ -1652,7 +1755,28 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
 
     # Authoritative class ordering — same rule as the multiclass path: panel
     # order, Negative control forced to index 0.
+    # --- split annotations (same masks as train_linear_classifier) ---
+    if annotations is None:
+        annotations = pd.DataFrame()
+    if annotations.empty:
+        positive_annotations = pd.DataFrame()
+        negative_annotations = pd.DataFrame()
+    else:
+        has_idx = 'cell_class_index' in annotations.columns
+        pos_mask = annotations['class'].notna()
+        if has_idx:
+            ci = pd.to_numeric(annotations['cell_class_index'], errors='coerce')
+            pos_mask = pos_mask | (ci.notna() & (ci >= 0))
+        positive_annotations = annotations[pos_mask].copy()
+        negative_annotations = annotations[~pos_mask].copy()
+
     final_class_names = list(nuclei_classes) if nuclei_classes else []
+    # Then any class the annotations name that the panel left out — dropping those
+    # would send every cell predicted as one of them to index 0.
+    for c in (_ordered_annotation_classes(positive_annotations, nuclei_classes)
+              + _ordered_exclude_classes(negative_annotations, nuclei_classes)):
+        if c not in final_class_names:
+            final_class_names.append(c)
     if "Negative control" not in final_class_names:
         final_class_names = ["Negative control"] + final_class_names
     elif final_class_names[0] != "Negative control":
@@ -1673,21 +1797,6 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
         'random_state': 42, 'base_score': 0.5,
         'n_jobs': 1 if _is_darwin else -1, 'nthread': 1 if _is_darwin else -1,
     }
-
-    # --- split annotations (same masks as train_linear_classifier) ---
-    if annotations is None:
-        annotations = pd.DataFrame()
-    if annotations.empty:
-        positive_annotations = pd.DataFrame()
-        negative_annotations = pd.DataFrame()
-    else:
-        has_idx = 'cell_class_index' in annotations.columns
-        pos_mask = annotations['class'].notna()
-        if has_idx:
-            ci = pd.to_numeric(annotations['cell_class_index'], errors='coerce')
-            pos_mask = pos_mask | (ci.notna() & (ci >= 0))
-        positive_annotations = annotations[pos_mask].copy()
-        negative_annotations = annotations[~pos_mask].copy()
 
     X_pos = y_pos = None
     if not positive_annotations.empty:
@@ -1891,6 +2000,38 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     print(f"[OvR] done: {len(filled_cols)} classifier(s), "
           f"{int(claimed.sum())} supervised / {n_unclaimed} fallback over {n_cells} cells")
     return predictions, prediction_probs, final_class_names, final_class_colors, "supervised-ovr"
+
+
+def _pin_negative_control_first(predictions, prediction_probs, class_names, class_colors):
+    """
+    Move "Negative control" to index 0, carrying predictions and probability
+    columns with it.
+
+    One-vs-rest, organ zero-shot and the trainer's own class_names all pin it
+    there, but the supervised output order comes from the panel, which does not
+    have to. Leaving it unpinned makes index 0 mean different things depending on
+    which path produced the run. A no-op when it is already first or absent.
+    """
+    if not class_names or "Negative control" not in class_names:
+        return predictions, prediction_probs, class_names, class_colors
+    if class_names[0] == "Negative control":
+        return predictions, prediction_probs, class_names, class_colors
+
+    nc_idx = class_names.index("Negative control")
+    order = [nc_idx] + [i for i in range(len(class_names)) if i != nc_idx]
+    new_names = [class_names[i] for i in order]
+    new_colors = (
+        [class_colors[i] for i in order]
+        if class_colors is not None and len(class_colors) == len(class_names)
+        else class_colors
+    )
+    remap = np.empty(len(class_names), dtype=np.int32)
+    for new_idx, old_idx in enumerate(order):
+        remap[old_idx] = new_idx
+    new_predictions = remap[np.asarray(predictions)]
+    new_probs = prediction_probs[:, order] if prediction_probs is not None else None
+    print(f"[Cell-Classification] Pinned '{"Negative control"}' to index 0: {new_names}")
+    return new_predictions, new_probs, new_names, new_colors
 
 
 def run_classification(args) -> Dict[str, Any]:
@@ -2127,52 +2268,49 @@ def run_classification(args) -> Dict[str, Any]:
                 print(f"Using classifier's classes and colors (CLASSIFIER_PATH is set, no user input): {final_class_names}")
             # Map classifier outputs to user input order if user provided nuclei_classes (only when no classifier loaded)
             elif nuclei_classes and len(nuclei_classes) > 0:
-                # Use user input order for final output
-                final_class_names = nuclei_classes
+                # User input order for final output, then any class the classifier
+                # trained that the panel does not list. Those must be appended, not
+                # dropped: remap defaults to 0, so a missing class would send every
+                # cell predicted as it straight to "Negative control".
+                user_classes_set = set(nuclei_classes)
+                classifier_classes_not_in_user = [cn for cn in class_names if cn not in user_classes_set]
+                final_class_names = list(nuclei_classes) + classifier_classes_not_in_user
+                if classifier_classes_not_in_user:
+                    print(f"Classifier classes missing from the panel list, appended to output: {classifier_classes_not_in_user}")
                 
                 # Use user input colors if provided and length matches, otherwise use classifier colors
                 # This ensures we use saved colors from classifier (e.g., red) if frontend colors are incomplete (e.g., after reset)
+                classifier_color_map = {name: color for name, color in zip(class_names, class_colors)}
                 if nuclei_colors and len(nuclei_colors) == len(nuclei_classes):
-                    final_class_colors = nuclei_colors
+                    final_class_colors = list(nuclei_colors) + [
+                        classifier_color_map.get(cn, "#aaaaaa") for cn in classifier_classes_not_in_user
+                    ]
                     print(f"Using frontend-provided colors for output: {final_class_colors}")
                 else:
                     # Map classifier colors to user input order
                     # This ensures we use saved colors from classifier (e.g., red) instead of incomplete frontend colors
-                    classifier_color_map = {name: color for name, color in zip(class_names, class_colors)}
-                    final_class_colors = []
-                    for cls_name in nuclei_classes:
-                        if cls_name in classifier_color_map:
-                            final_class_colors.append(classifier_color_map[cls_name])
-                        else:
-                            # Default color for classes not in classifier
-                            final_class_colors.append("#aaaaaa")
+                    final_class_colors = [classifier_color_map.get(cn, "#aaaaaa") for cn in final_class_names]
                     if nuclei_colors and len(nuclei_colors) != len(nuclei_classes):
                         print(f"Frontend colors length mismatch ({len(nuclei_colors)} vs {len(nuclei_classes)}), using classifier colors: {final_class_colors}")
                     else:
                         print(f"Using classifier colors mapped to user input order: {final_class_colors}")
                 
-                # Create mapping from classifier internal indices to user input indices
+                # Create mapping from classifier internal indices to output indices
                 classifier_name_to_idx = {name: idx for idx, name in enumerate(class_names)}
                 remap = np.zeros(len(class_names), dtype=np.int32)
-                for user_idx, cls_name in enumerate(nuclei_classes):
+                for out_idx, cls_name in enumerate(final_class_names):
                     if cls_name in classifier_name_to_idx:
-                        classifier_idx = classifier_name_to_idx[cls_name]
-                        remap[classifier_idx] = user_idx
+                        remap[classifier_name_to_idx[cls_name]] = out_idx
                 
-                # Remap predictions to user input order
-                remapped_predictions = remap[predictions]
-                predictions = remapped_predictions
+                # Remap predictions to output order
+                predictions = remap[predictions]
                 
-                # Remap prediction_probs columns to user input order
+                # Remap prediction_probs columns to output order
                 if prediction_probs is not None:
-                    remapped_probs = np.zeros((prediction_probs.shape[0], len(nuclei_classes)), dtype=np.float32)
-                    for user_idx, cls_name in enumerate(nuclei_classes):
+                    remapped_probs = np.zeros((prediction_probs.shape[0], len(final_class_names)), dtype=np.float32)
+                    for out_idx, cls_name in enumerate(final_class_names):
                         if cls_name in classifier_name_to_idx:
-                            classifier_idx = classifier_name_to_idx[cls_name]
-                            remapped_probs[:, user_idx] = prediction_probs[:, classifier_idx]
-                        else:
-                            # Set probability to 0 for classes not in classifier
-                            remapped_probs[:, user_idx] = 0.0
+                            remapped_probs[:, out_idx] = prediction_probs[:, classifier_name_to_idx[cls_name]]
                     prediction_probs = remapped_probs
             else:
                 # No user input, but still prioritize frontend-provided colors if available (and length matches)
@@ -2205,7 +2343,13 @@ def run_classification(args) -> Dict[str, Any]:
             # Compute all similarities at once
             sims_arr = np.dot(cell_embeddings, class_embeddings_arr.T)
             predictions = np.argmax(sims_arr, axis=1)
-            prediction_probs = None # For zero-shot, raw similarity scores might be more informative
+            # Softmax the similarities here rather than at write time, so there is
+            # exactly one [N, K] matrix flowing to the writer. It has to travel with
+            # `predictions` through the Negative-control pinning below; leaving it as
+            # a separate `sims_arr` would write its columns in the pre-pin order.
+            exp_sims = np.exp(sims_arr - np.max(sims_arr, axis=1, keepdims=True))
+            prediction_probs = (exp_sims / np.sum(exp_sims, axis=1, keepdims=True)).astype(np.float32)
+            del exp_sims
             
             # Clear class_embeddings_arr immediately after use to free memory
             class_embeddings_arr = None
@@ -2233,6 +2377,12 @@ def run_classification(args) -> Dict[str, Any]:
                 # Last resort: Generate distinct colors
                 final_class_colors = generate_distinct_colors(nuclei_classes)
             final_class_names = nuclei_classes
+
+        # Index 0 means "Negative control" for every path, so the class_indices
+        # written below carry the same meaning whichever one produced them.
+        predictions, prediction_probs, final_class_names, final_class_colors = \
+            _pin_negative_control_first(predictions, prediction_probs,
+                                        final_class_names, final_class_colors)
 
         # Check for cancellation before saving results
         if cancel_event.is_set():
@@ -2277,10 +2427,17 @@ def run_classification(args) -> Dict[str, Any]:
                     name_to_new_idx = {n: i for i, n in enumerate(final_class_names)}
 
                     def hex_to_int(hex_color):
-                        hex_color = hex_color.lstrip('#')
-                        if len(hex_color) == 6:
+                        # -1 for anything unusable, like the seg service's
+                        # equivalent. int() raises on a 6-char non-hex string, and
+                        # letting that escape would skip the whole colour/index
+                        # update below.
+                        hex_color = str(hex_color or '').lstrip('#')
+                        if len(hex_color) != 6:
+                            return -1
+                        try:
                             return int(hex_color, 16)
-                        return -1
+                        except ValueError:
+                            return -1
 
                     all_annotations = annotations_dataset[:]
                     updated_count = 0
@@ -2290,10 +2447,17 @@ def run_classification(args) -> Dict[str, Any]:
                         remapped = old_classes.copy()
                         for old_idx, old_name in enumerate(old_names):
                             new_idx = name_to_new_idx.get(old_name)
+                            # "not this type" rows encode the excluded class as
+                            # -(2 + index); they index the same palette and have to
+                            # move with it, or the constraint silently points at a
+                            # different class after a reorder.
+                            old_weak = -(2 + old_idx)
                             if new_idx is None:
                                 remapped[old_classes == old_idx] = -1
+                                remapped[old_classes == old_weak] = -1
                             elif new_idx != old_idx:
                                 remapped[old_classes == old_idx] = new_idx
+                                remapped[old_classes == old_weak] = -(2 + new_idx)
                         all_annotations['class'] = remapped
                         updated_count += int(np.sum(remapped != old_classes))
                         print(
@@ -2305,6 +2469,15 @@ def run_classification(args) -> Dict[str, Any]:
                         if class_name in class_name_to_color:
                             new_color_hex = class_name_to_color[class_name]
                             new_color_int = hex_to_int(new_color_hex)
+                            if new_color_int < 0:
+                                # -1 in the colour column is the seg service's
+                                # sentinel for "this row is not a real annotation".
+                                # Writing it here would silently retire every cell
+                                # the user labelled as this class, so an unusable
+                                # colour falls back to a visible one instead.
+                                print(f"Class '{class_name}' has no usable colour "
+                                      f"({new_color_hex!r}); keeping annotations visible with #808080")
+                                new_color_int = 0x808080
                             class_mask = (all_annotations['class'] == class_idx)
                             if np.any(class_mask):
                                 all_annotations['color'][class_mask] = new_color_int
@@ -2346,15 +2519,6 @@ def run_classification(args) -> Dict[str, Any]:
         if prediction_probs is not None:
             grp_cls.create_array('probabilities', data=prediction_probs.astype(np.float32))
             print(f"Saved classification probabilities for active learning, shape: {prediction_probs.shape}")
-        elif classification_method == "zero-shot" and 'sims_arr' in locals() and sims_arr is not None:
-            print(f"Converting similarity scores to probabilities, shape: {sims_arr.shape}")
-            exp_sims = np.exp(sims_arr - np.max(sims_arr, axis=1, keepdims=True))
-            pseudo_probs = exp_sims / np.sum(exp_sims, axis=1, keepdims=True)
-            grp_cls.create_array('probabilities', data=pseudo_probs.astype(np.float32))
-            print(
-                f"Saved zero-shot similarity scores as probabilities for active learning, "
-                f"shape: {pseudo_probs.shape}"
-            )
         else:
             print("Warning: No probability data available to save for active learning")
 
