@@ -288,6 +288,30 @@ def _ordered_annotation_classes(positive_annotations: pd.DataFrame, nuclei_class
     return ordered
 
 
+def _exclude_columns(negative_annotations):
+    """Zip the two "not this type" columns as plain Python values, once."""
+    n = len(negative_annotations)
+    cols = negative_annotations.columns
+    names = (negative_annotations['exclude_classes'].tolist()
+             if 'exclude_classes' in cols else [None] * n)
+    inds = (negative_annotations['exclude_class_indices'].tolist()
+            if 'exclude_class_indices' in cols else [None] * n)
+    return zip(names, inds)
+
+
+def _resolve_excluded_names(names, inds, palette):
+    """The class names one "not this type" row excludes.
+
+    The names the User-Annotations palette already resolved win; the raw indices
+    point at that palette, so they are only usable through `palette`.
+    """
+    if isinstance(names, list) and names:
+        return names
+    if isinstance(inds, list) and palette:
+        return [palette[int(i)] for i in inds if 0 <= int(i) < len(palette)]
+    return []
+
+
 def _ordered_exclude_classes(negative_annotations: pd.DataFrame, nuclei_classes=None):
     """
     Class names named by "not this type" annotations, first-seen order.
@@ -299,16 +323,10 @@ def _ordered_exclude_classes(negative_annotations: pd.DataFrame, nuclei_classes=
     ordered = []
     if negative_annotations is None or negative_annotations.empty:
         return ordered
-    for _, row in negative_annotations.iterrows():
-        names = row.get("exclude_classes", [])
-        if not isinstance(names, list) or not names:
-            inds = row.get("exclude_class_indices", [])
-            names = (
-                [nuclei_classes[int(i)] for i in inds if 0 <= int(i) < len(nuclei_classes)]
-                if isinstance(inds, list) and nuclei_classes
-                else []
-            )
-        for nm in names:
+    # Walk the columns, not iterrows(): building a Series per row costs ~0.6 s on
+    # a slide with 50k "No" marks, and all this needs is the distinct names.
+    for names, inds in _exclude_columns(negative_annotations):
+        for nm in _resolve_excluded_names(names, inds, nuclei_classes):
             sv = str(nm)
             if sv and sv not in ordered:
                 ordered.append(sv)
@@ -551,20 +569,15 @@ def _build_exclude_map(negative_annotations, class_names, nuclei_classes=None):
     if not ('exclude_classes' in negative_annotations.columns
             or 'exclude_class_indices' in negative_annotations.columns):
         return exclude_map
-    for _, row in negative_annotations.iterrows():
-        names = row.get('exclude_classes', [])
-        if not isinstance(names, list) or not names:
-            inds = row.get('exclude_class_indices', [])
-            if isinstance(inds, list):
-                if nuclei_classes and len(nuclei_classes) > 0:
-                    names = [nuclei_classes[int(i)] for i in inds if 0 <= int(i) < len(nuclei_classes)]
-                else:
-                    names = [class_names[int(i)] for i in inds if 0 <= int(i) < len(class_names)]
-            else:
-                names = []
-        indices = [class_names.index(c) for c in names if c in class_names]
+    # Columns rather than iterrows() — same reason as _ordered_exclude_classes.
+    fallback = nuclei_classes if nuclei_classes else class_names
+    index_of = {name: i for i, name in enumerate(class_names)}
+    cell_ids = negative_annotations['cell_ID'].astype(int).tolist()
+    for cell_id, (names, inds) in zip(cell_ids, _exclude_columns(negative_annotations)):
+        indices = [index_of[c] for c in _resolve_excluded_names(names, inds, fallback)
+                   if c in index_of]
         if indices:
-            exclude_map[int(row['cell_ID'])] = indices
+            exclude_map[cell_id] = indices
     return exclude_map
 
 
@@ -846,11 +859,17 @@ def _scatter_to_class_space(batch_probs, class_indices, n_classes):
 
 
 def _apply_exclusions(batch_full, exclude_map, offset):
-    """Zero the "not this type" classes for each annotated cell and renormalise."""
-    for local_idx in range(batch_full.shape[0]):
-        excluded = exclude_map.get(offset + local_idx)
-        if not excluded:
+    """Zero the "not this type" classes for each annotated cell and renormalise.
+
+    Walks the marked cells, not the batch: a slide has a few hundred "No" marks
+    against a 100k-row batch, so scanning every row costs ~10x more for the same
+    result.
+    """
+    end = offset + batch_full.shape[0]
+    for cell_id, excluded in exclude_map.items():
+        if not (offset <= cell_id < end) or not excluded:
             continue
+        local_idx = cell_id - offset
         batch_full[local_idx, excluded] = 0.0
         prob_sum = batch_full[local_idx].sum()
         if prob_sum > 0:
