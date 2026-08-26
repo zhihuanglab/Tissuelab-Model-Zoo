@@ -206,6 +206,19 @@ def _sanitize_class_name(name: str) -> str:
     return "_".join(str(name).strip().split()) or "default"
 
 
+# The patch panel always carries "Negative control" as class 0, and the whole
+# class list is handed to this node as the tissue list. It is not a tissue: VISTA
+# v2 is text-conditioned, so segmenting it means prompting "an image of Negative
+# control", which yields a meaningless mask, costs a full inference pass, and
+# adds a mask that the viewer can end up showing by default.
+NEGATIVE_CONTROL_NAME = "negative control"
+
+
+def _is_negative_control(name) -> bool:
+    """Match the UI's 'Negative control' regardless of case / underscores."""
+    return str(name or "").strip().lower().replace("_", " ") == NEGATIVE_CONTROL_NAME
+
+
 def _palette_color(i: int) -> str:
     return _DEFAULT_PALETTE[i % len(_DEFAULT_PALETTE)]
 
@@ -1166,6 +1179,20 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         else:
             _raw_tissue = (TISSUE_CLASS or "").strip()
             tissue_run_list = [s.strip() for s in _raw_tissue.split(",") if s.strip()]
+        requested_count = len(tissue_run_list)
+        skipped = [t for t in tissue_run_list if _is_negative_control(t)]
+        if skipped:
+            tissue_run_list = [t for t in tissue_run_list if not _is_negative_control(t)]
+            print(f"[{NODE_NAME}] Skipping {skipped} - not a tissue to segment")
+        if not tissue_run_list and requested_count:
+            # Every requested class was Negative control: nothing to segment.
+            # Returning here leaves any previous run's masks intact (the writer
+            # only wipes Tissue-Segmentation once it has a mask to write).
+            msg = (f"[{NODE_NAME}] Nothing to segment - the only tissue class is "
+                   f"Negative control. Add the tissue types you want segmented.")
+            print(msg)
+            progress_value = 100
+            return {"status": "ok", "message": msg, "num_patches": 0, "num_objects": 0}
         if not tissue_run_list:
             tissue_run_list = [None]  # backward compat: one run, save "default"
         else:
