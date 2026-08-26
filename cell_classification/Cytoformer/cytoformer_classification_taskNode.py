@@ -2769,11 +2769,19 @@ def read_node(data: Dict[str, Any]):
             del zf
             gc.collect()
 
-    # Cytoformer's class taxonomy is ALWAYS the organ's cell types. The organ is
-    # persisted in the zarr (userData/organ), so both zero-shot and active learning
-    # read it here and derive the class list + colors from it. There is no generic
-    # default class list — the organ is the single source of truth.
-    if getattr(ARGS, "organ", None) and CYTO_HEAD is not None:
+    # The organ supplies a class list only when the caller sent none — a cohort run
+    # or a bare /read, where the organ is the only thing to go on and the run will
+    # be zero-shot anyway (that path derives its own taxonomy from the organ again
+    # further down, so nothing is lost).
+    #
+    # It must NOT overwrite a list the caller did send. This used to be
+    # unconditional on the premise that "the organ is the single source of truth",
+    # which is only true for zero-shot: once the user has annotated, the taxonomy
+    # is their labels. Overwriting here replaced the panel's real classes with the
+    # organ preset before run_classification ever saw them, which is why an organ
+    # picked for one zero-shot run kept resurfacing in every later supervised run.
+    if (getattr(ARGS, "organ", None) and CYTO_HEAD is not None
+            and not getattr(ARGS, "nuclei_classes", None)):
         try:
             _cts = CYTO_HEAD.celltypes_for_organ(ARGS.organ)
             ARGS.nuclei_classes = [NEG_CONTROL_NAME] + list(_cts)
