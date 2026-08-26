@@ -753,6 +753,22 @@ def generate_distinct_colors(nuclei_classes: list[str]) -> list[str]:
 BOOSTER_CLASS_INDEX_ATTR = "trained_class_indices"
 
 
+def _match_booster_device_to_data(clf):
+    """Predict on the device the embeddings already live on.
+
+    The embeddings come out of zarr as a host numpy array. A booster left on
+    cuda cannot consume that directly, so XGBoost silently falls back to
+    building a DMatrix per batch — measured at 3.2x the inplace predict plus a
+    full extra copy of the batch (614 MB for 100k x 1536), before the
+    host->device transfer. Training keeps whatever device it was given; only
+    inference is retargeted, and that does not change the predictions.
+    """
+    try:
+        clf.set_params(device="cpu")
+    except Exception as e:
+        print(f"[Cell-Classification] could not retarget booster to cpu for prediction: {e}")
+
+
 def _compact_labels(y_full):
     """Return (contiguous labels for xgboost, compact column -> class_names index)."""
     compact_to_full = np.unique(np.asarray(y_full)).astype(int)
@@ -1342,6 +1358,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 
                 n_batches = (n_cells + batch_size - 1) // batch_size
                 print(f"Starting prediction for {n_cells} cells in {n_batches} batches (batch_size={batch_size})...")
+                _match_booster_device_to_data(clf)
                 
                 # Hard "not this type" constraints, in class_names index space.
                 exclude_map = _build_exclude_map(negative_annotations, class_names, nuclei_classes) \
@@ -1601,6 +1618,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     
     n_batches = (n_cells + batch_size - 1) // batch_size
     print(f"Starting prediction for {n_cells} cells in {n_batches} batches (batch_size={batch_size})...")
+    _match_booster_device_to_data(clf)
     
     # Hard "not this type" constraints, in class_names index space.
     exclude_map = _build_exclude_map(negative_annotations, class_names, nuclei_classes) \
@@ -1880,6 +1898,7 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
         try:
             clf = xgb.XGBClassifier()
             clf.load_model(path)
+            _match_booster_device_to_data(clf)
             prediction_probs[:, ci] = clf.predict_proba(cell_embeddings)[:, 1]
             filled_cols.append(ci)
             print(f"[OvR] ran '{cls}' <- {path}")
