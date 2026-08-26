@@ -158,6 +158,21 @@ current_execution_thread = None  # Track current execution thread for cancellati
 
 # --------------- utils functions ---------------
 
+class _CancelTrainingCallback(xgb.callback.TrainingCallback):
+    """Let /cancel stop a fit that is already running.
+
+    Nothing else inside training yields: a 4k-annotation fit measured 52 s, and
+    the surrounding cancel checks only bracket it, so a cancel mid-training was
+    invisible until it finished. Returning True from after_iteration ends
+    boosting, which brings the wait down to a single round (~0.9 s measured).
+    The half-trained model is discarded — every caller re-checks cancel_event
+    right after fit and bails out.
+    """
+
+    def after_iteration(self, model, epoch, evals_log):
+        return cancel_event.is_set()
+
+
 def _normalize_class_operations(raw_ops):
     ops = {"renames": [], "adds": []}
     if not isinstance(raw_ops, dict):
@@ -738,6 +753,22 @@ def generate_distinct_colors(nuclei_classes: list[str]) -> list[str]:
 BOOSTER_CLASS_INDEX_ATTR = "trained_class_indices"
 
 
+def _match_booster_device_to_data(clf):
+    """Predict on the device the embeddings already live on.
+
+    The embeddings come out of zarr as a host numpy array. A booster left on
+    cuda cannot consume that directly, so XGBoost silently falls back to
+    building a DMatrix per batch — measured at 3.2x the inplace predict plus a
+    full extra copy of the batch (614 MB for 100k x 1536), before the
+    host->device transfer. Training keeps whatever device it was given; only
+    inference is retargeted, and that does not change the predictions.
+    """
+    try:
+        clf.set_params(device="cpu")
+    except Exception as e:
+        print(f"[Cell-Classification] could not retarget booster to cpu for prediction: {e}")
+
+
 def _compact_labels(y_full):
     """Return (contiguous labels for xgboost, compact column -> class_names index)."""
     compact_to_full = np.unique(np.asarray(y_full)).astype(int)
@@ -1054,6 +1085,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         'base_score': 0.5,  # Initial value for XGBoost, must be in (0,1) for logistic loss
         'n_jobs': 1 if _is_darwin else -1,
         'nthread': 1 if _is_darwin else -1,
+        'callbacks': [_CancelTrainingCallback()],
     }
 
     if annotations is None:
@@ -1294,6 +1326,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             clf.fit(X_train, y_fit, sample_weight=sample_weights_inc)
                         else:
                             y_fit = np.array([booster_lut[int(v)] for v in y_train], dtype=int)
+                            # loaded from disk, so it carries no callbacks of its own
+                            clf.set_params(callbacks=[_CancelTrainingCallback()])
                             existing_booster = clf.get_booster()
                             clf.fit(X_train, y_fit, xgb_model=existing_booster, sample_weight=sample_weights_inc)
                         
@@ -1324,6 +1358,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 
                 n_batches = (n_cells + batch_size - 1) // batch_size
                 print(f"Starting prediction for {n_cells} cells in {n_batches} batches (batch_size={batch_size})...")
+                _match_booster_device_to_data(clf)
                 
                 # Hard "not this type" constraints, in class_names index space.
                 exclude_map = _build_exclude_map(negative_annotations, class_names, nuclei_classes) \
@@ -1440,22 +1475,24 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     if len(unique_classes) < 1 and not has_negative_examples:
         raise ValueError("Need at least 1 class in annotation or negative examples => fallback to zero-shot")
 
-    # Build class_names. Source priority:
-    #   1. The panel's nuclei_classes — it fixes the ORDER, and keeps a class the
-    #      user configured but has not annotated yet. The panel is expected to
-    #      send only the classes belonging to this run (for Cytoformer it sends
-    #      the annotated ones); it is not used to decide which labels are valid.
-    #   2. Annotation classes not in the panel list are appended, so a panel that
-    #      disagrees with the User-Annotations palette can never drop a label.
+    # Build class_names. A supervised run's taxonomy is what the ANNOTATIONS say,
+    # never what the panel happens to be carrying: the panel's list routinely
+    # still holds an earlier zero-shot run's organ cell types, and emitting those
+    # puts classes with zero training data into the result. nuclei_classes only
+    # fixes the ORDER of the classes that do have evidence.
+    #
     # Negative control is always forced to index 0 (matches the negative
     # control vectors injection below).
-    if nuclei_classes and len(nuclei_classes) > 0:
-        class_names = list(nuclei_classes)
-    else:
-        class_names = []
-    for c in list(unique_classes) + list(weak_classes):
+    annotated = list(dict.fromkeys(list(unique_classes) + list(weak_classes)))
+    evidence = set(annotated)
+    dropped = [c for c in (nuclei_classes or []) if c not in evidence and c != "Negative control"]
+    class_names = [c for c in (nuclei_classes or []) if c in evidence]
+    for c in annotated:
         if c not in class_names:
             class_names.append(c)
+    if dropped:
+        print(f"[Cell-Classification] Panel classes with no annotations, left out of "
+              f"this supervised run: {dropped}")
     if "Negative control" not in class_names:
         class_names = ["Negative control"] + class_names
         print(f"Added 'Negative control' to class_names (not in panel/annotations): {class_names}")
@@ -1581,6 +1618,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     
     n_batches = (n_cells + batch_size - 1) // batch_size
     print(f"Starting prediction for {n_cells} cells in {n_batches} batches (batch_size={batch_size})...")
+    _match_booster_device_to_data(clf)
     
     # Hard "not this type" constraints, in class_names index space.
     exclude_map = _build_exclude_map(negative_annotations, class_names, nuclei_classes) \
@@ -1721,6 +1759,7 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
         'objective': 'binary:logistic', 'eval_metric': 'logloss',
         'random_state': 42, 'base_score': 0.5,
         'n_jobs': 1 if _is_darwin else -1, 'nthread': 1 if _is_darwin else -1,
+        'callbacks': [_CancelTrainingCallback()],
     }
 
     X_pos = y_pos = None
@@ -1859,6 +1898,7 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
         try:
             clf = xgb.XGBClassifier()
             clf.load_model(path)
+            _match_booster_device_to_data(clf)
             prediction_probs[:, ci] = clf.predict_proba(cell_embeddings)[:, 1]
             filled_cols.append(ci)
             print(f"[OvR] ran '{cls}' <- {path}")
@@ -2192,13 +2232,19 @@ def run_classification(args) -> Dict[str, Any]:
                 print(f"CLASSIFIER_PATH is set, user provided nuclei_classes: {nuclei_classes}")
                 print(f"Classifier internal order: {class_names}")
                 
-                # Build final class list: user order first, then classifier classes not in user list
+                # Panel ORDER over the classifier's OWN classes, then whatever the
+                # classifier has that the panel does not list. The panel is not a
+                # source of classes here: a name the classifier never learnt cannot
+                # be predicted (its remap column stays 0), and emitting it puts a
+                # zero-cell class in the result — which is how a stale organ preset
+                # kept showing up.
                 user_classes_set = set(nuclei_classes)
+                trained = set(class_names)
                 classifier_classes_not_in_user = [cn for cn in class_names if cn not in user_classes_set]
-                
-                # Final order: user specified classes (in user order) + remaining classifier classes (in classifier order)
-                final_class_names = list(nuclei_classes) + classifier_classes_not_in_user
-                
+                final_class_names = [cn for cn in nuclei_classes if cn in trained] + classifier_classes_not_in_user
+                dropped = [cn for cn in nuclei_classes if cn not in trained]
+                if dropped:
+                    print(f"Panel classes the classifier does not know, left out of the output: {dropped}")
                 print(f"Merged class order (user order + classifier remaining): {final_class_names}")
                 
                 # Build color mapping: prioritize user colors, then classifier colors
@@ -2261,28 +2307,35 @@ def run_classification(args) -> Dict[str, Any]:
                 # trained that the panel does not list. Those must be appended, not
                 # dropped: remap defaults to 0, so a missing class would send every
                 # cell predicted as it straight to "Negative control".
-                user_classes_set = set(nuclei_classes)
-                classifier_classes_not_in_user = [cn for cn in class_names if cn not in user_classes_set]
-                final_class_names = list(nuclei_classes) + classifier_classes_not_in_user
+                # Panel ORDER, but only over the classes the classifier actually
+                # has — class_names is already the evidence-backed set. Emitting
+                # the panel verbatim is what let a stale organ preset reach the
+                # result even though nothing was ever annotated for it.
+                trained = set(class_names)
+                panel_set = set(nuclei_classes)
+                final_class_names = [cn for cn in nuclei_classes if cn in trained]
+                classifier_classes_not_in_user = [cn for cn in class_names if cn not in panel_set]
+                final_class_names += classifier_classes_not_in_user
                 if classifier_classes_not_in_user:
                     print(f"Classifier classes missing from the panel list, appended to output: {classifier_classes_not_in_user}")
                 
-                # Use user input colors if provided and length matches, otherwise use classifier colors
-                # This ensures we use saved colors from classifier (e.g., red) if frontend colors are incomplete (e.g., after reset)
+                # Colours BY NAME over final_class_names. Zipping the panel's colour
+                # array positionally would desync the moment the output is a subset
+                # of the panel, which it now is whenever the panel carries classes
+                # nobody annotated. Panel colour wins, then the classifier's.
                 classifier_color_map = {name: color for name, color in zip(class_names, class_colors)}
-                if nuclei_colors and len(nuclei_colors) == len(nuclei_classes):
-                    final_class_colors = list(nuclei_colors) + [
-                        classifier_color_map.get(cn, "#aaaaaa") for cn in classifier_classes_not_in_user
-                    ]
-                    print(f"Using frontend-provided colors for output: {final_class_colors}")
-                else:
-                    # Map classifier colors to user input order
-                    # This ensures we use saved colors from classifier (e.g., red) instead of incomplete frontend colors
-                    final_class_colors = [classifier_color_map.get(cn, "#aaaaaa") for cn in final_class_names]
-                    if nuclei_colors and len(nuclei_colors) != len(nuclei_classes):
-                        print(f"Frontend colors length mismatch ({len(nuclei_colors)} vs {len(nuclei_classes)}), using classifier colors: {final_class_colors}")
-                    else:
-                        print(f"Using classifier colors mapped to user input order: {final_class_colors}")
+                panel_color_map = (
+                    dict(zip(nuclei_classes, nuclei_colors))
+                    if nuclei_colors and len(nuclei_colors) == len(nuclei_classes)
+                    else {}
+                )
+                if not panel_color_map and nuclei_colors:
+                    print(f"Frontend colors length mismatch ({len(nuclei_colors)} vs {len(nuclei_classes)}), using classifier colors")
+                final_class_colors = [
+                    panel_color_map.get(cn) or classifier_color_map.get(cn) or "#aaaaaa"
+                    for cn in final_class_names
+                ]
+                print(f"Colors for output: {final_class_colors}")
                 
                 # Create mapping from classifier internal indices to output indices
                 classifier_name_to_idx = {name: idx for idx, name in enumerate(class_names)}
@@ -2735,11 +2788,19 @@ def read_node(data: Dict[str, Any]):
             del zf
             gc.collect()
 
-    # Cytoformer's class taxonomy is ALWAYS the organ's cell types. The organ is
-    # persisted in the zarr (userData/organ), so both zero-shot and active learning
-    # read it here and derive the class list + colors from it. There is no generic
-    # default class list — the organ is the single source of truth.
-    if getattr(ARGS, "organ", None) and CYTO_HEAD is not None:
+    # The organ supplies a class list only when the caller sent none — a cohort run
+    # or a bare /read, where the organ is the only thing to go on and the run will
+    # be zero-shot anyway (that path derives its own taxonomy from the organ again
+    # further down, so nothing is lost).
+    #
+    # It must NOT overwrite a list the caller did send. This used to be
+    # unconditional on the premise that "the organ is the single source of truth",
+    # which is only true for zero-shot: once the user has annotated, the taxonomy
+    # is their labels. Overwriting here replaced the panel's real classes with the
+    # organ preset before run_classification ever saw them, which is why an organ
+    # picked for one zero-shot run kept resurfacing in every later supervised run.
+    if (getattr(ARGS, "organ", None) and CYTO_HEAD is not None
+            and not getattr(ARGS, "nuclei_classes", None)):
         try:
             _cts = CYTO_HEAD.celltypes_for_organ(ARGS.organ)
             ARGS.nuclei_classes = [NEG_CONTROL_NAME] + list(_cts)
