@@ -150,6 +150,21 @@ current_execution_thread = None  # Track current execution thread for cancellati
 
 # --------------- utils functions ---------------
 
+class _CancelTrainingCallback(xgb.callback.TrainingCallback):
+    """Let /cancel stop a fit that is already running.
+
+    Nothing else inside training yields: a 4k-annotation fit measured 52 s, and
+    the surrounding cancel checks only bracket it, so a cancel mid-training was
+    invisible until it finished. Returning True from after_iteration ends
+    boosting, which brings the wait down to a single round (~0.9 s measured).
+    The half-trained model is discarded — every caller re-checks cancel_event
+    right after fit and bails out.
+    """
+
+    def after_iteration(self, model, epoch, evals_log):
+        return cancel_event.is_set()
+
+
 def _normalize_class_operations(raw_ops):
     ops = {"renames": [], "adds": []}
     if not isinstance(raw_ops, dict):
@@ -1134,6 +1149,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         'base_score': 0.5,  # Initial value for XGBoost, must be in (0,1) for logistic loss
         'n_jobs': 1 if _is_darwin else -1,
         'nthread': 1 if _is_darwin else -1,
+        'callbacks': [_CancelTrainingCallback()],
     }
 
     if annotations is None:
@@ -1379,6 +1395,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             clf.fit(X_train, y_fit, sample_weight=sample_weights_inc)
                         else:
                             y_fit = np.array([booster_lut[int(v)] for v in y_train], dtype=int)
+                            # loaded from disk, so it carries no callbacks of its own
+                            clf.set_params(callbacks=[_CancelTrainingCallback()])
                             existing_booster = clf.get_booster()
                             clf.fit(X_train, y_fit, xgb_model=existing_booster, sample_weight=sample_weights_inc)
                         
@@ -1804,6 +1822,7 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
         'objective': 'binary:logistic', 'eval_metric': 'logloss',
         'random_state': 42, 'base_score': 0.5,
         'n_jobs': 1 if _is_darwin else -1, 'nthread': 1 if _is_darwin else -1,
+        'callbacks': [_CancelTrainingCallback()],
     }
 
     X_pos = y_pos = None
