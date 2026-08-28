@@ -2076,7 +2076,7 @@ def _pin_negative_control_first(predictions, prediction_probs, class_names, clas
         remap[old_idx] = new_idx
     new_predictions = remap[np.asarray(predictions)]
     new_probs = prediction_probs[:, order] if prediction_probs is not None else None
-    print(f"[Cell-Classification] Pinned '{"Negative control"}' to index 0: {new_names}")
+    print(f"[Cell-Classification] Pinned 'Negative control' to index 0: {new_names}")
     return new_predictions, new_probs, new_names, new_colors
 
 

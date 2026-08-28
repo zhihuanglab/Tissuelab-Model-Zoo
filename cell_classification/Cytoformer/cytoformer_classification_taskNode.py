@@ -123,11 +123,10 @@ NODE_NAME = None
 ZARR_GROUP = "Cell-Classification"
 DEPENDENCIES = []
 EMBEDDING_DATASET = "embeddings"
-# Must match nuclei_segmentation/Cytoformer writers (compared case-insensitively).
-EMBEDDING_MODEL = "Cytoformer"
-EMBEDDING_BACKBONE = "H-optimus-0"
+# Cell-Segmentation/embeddings is shared by every segmentation node, so the
+# feature width is what identifies the producer. PLIP/NuClass writes 768;
+# Cytoformer writes 1536. Must match nuclei_segmentation/Cytoformer.
 EMBEDDING_DIM = 1536
-EMBEDDING_NORM = "feat_norm"
 
 # Cytoformer per-organ zero-shot head (cytoformer_head.CytoHead), loaded once at
 # /init. Supervised / active-learning (XGBoost .tlcls) runs on the same 1536-d
@@ -2097,8 +2096,8 @@ def run_classification(args) -> Dict[str, Any]:
             )
         
         # B) Read the 1536-d features from the canonical Cell-Segmentation/embeddings
-        # slot. Every segmentation node writes there; the attrs/shape checks below
-        # reject a store still holding another model's embeddings.
+        # slot. Every segmentation node writes there; the width and centroid-count
+        # checks below reject a store still holding another model's embeddings.
         if 'Cell-Segmentation' not in zf:
             raise ValueError("no Cell-Segmentation group found in h5 file")
         seg_grp = zf['Cell-Segmentation']
@@ -2124,23 +2123,6 @@ def run_classification(args) -> Dict[str, Any]:
             raise ValueError(
                 "Cytoformer embeddings are not aligned with the current segmentation: "
                 f"{cell_embeddings.shape[0]} embeddings for {centroid_count} centroids. "
-                "Re-run Cytoformer cell segmentation."
-            )
-        embedding_model = str(embeddings_arr.attrs.get("embedding_model") or "").casefold()
-        embedding_backbone = str(
-            embeddings_arr.attrs.get("embedding_backbone") or ""
-        ).casefold()
-        embedding_dim = int(embeddings_arr.attrs.get("embedding_dim") or 0)
-        embedding_norm = str(embeddings_arr.attrs.get("embedding_norm") or "").casefold()
-        if (
-            embedding_model != EMBEDDING_MODEL.casefold()
-            or embedding_backbone != EMBEDDING_BACKBONE.casefold()
-            or embedding_dim != EMBEDDING_DIM
-            or embedding_norm != EMBEDDING_NORM.casefold()
-        ):
-            raise ValueError(
-                "Invalid Cytoformer embedding metadata; expected "
-                f"{EMBEDDING_MODEL}/{EMBEDDING_BACKBONE}/{EMBEDDING_DIM}/{EMBEDDING_NORM}. "
                 "Re-run Cytoformer cell segmentation."
             )
         progress_state.value = 35
