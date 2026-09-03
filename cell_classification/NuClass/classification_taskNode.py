@@ -2547,8 +2547,9 @@ def run_classification(args) -> Dict[str, Any]:
                                 )
 
                     if updated_count > 0:
-                        del zf['User-Annotations/cell']
-                        zf['User-Annotations'].create_array('cell', data=all_annotations)
+                        # In place: delete + create left a window in which any failure
+                        # lost every user annotation on the slide (same fix as Cytoformer).
+                        annotations_dataset[:] = all_annotations
                         print(f"Updated {updated_count} annotation rows after classification write")
         except Exception as e:
             print(f"Warning: Could not update annotation colors/indices: {e}")

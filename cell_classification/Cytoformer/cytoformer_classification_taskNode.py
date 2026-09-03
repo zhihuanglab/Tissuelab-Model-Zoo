@@ -127,6 +127,134 @@ EMBEDDING_DATASET = "embeddings"
 # feature width is what identifies the producer. PLIP/NuClass writes 768;
 # Cytoformer writes 1536. Must match nuclei_segmentation/Cytoformer.
 EMBEDDING_DIM = 1536
+# --- embedding provenance -----------------------------------------------------
+# Two backbones can both emit 1536-d features over the same cells, so width and
+# count cannot tell them apart, and a classifier trained in one space is garbage
+# in the other. The segmentation node stamps the embeddings array with these
+# attrs; classifiers get the same stamp when saved. Files written before the
+# stamp existed are compared by fingerprint instead (see _dead_dims).
+EMBEDDING_MODEL = "Cytoformer"
+EMBEDDING_BACKBONE = "H-optimus-0"
+# model + backbone identify the feature space (the segmentation node also writes
+# dim and norm attrs, but those follow from the backbone).
+PROVENANCE_KEYS = ("embedding_model", "embedding_backbone")
+NODE_STAMP = {"embedding_model": EMBEDDING_MODEL, "embedding_backbone": EMBEDDING_BACKBONE}
+# Rows used for the dead-dimension fingerprint; ~100 already give a stable set.
+FINGERPRINT_ROWS = 3000
+
+# Provenance of the slide currently being classified; set by run_classification
+# once its embeddings pass _validate_embedding_provenance.
+SLIDE_PROVENANCE = None
+
+
+class EmbeddingProvenanceError(ValueError):
+    """Embeddings and classifier (or node) come from different backbones.
+
+    Raised, never swallowed: the generic `except Exception` around classifier
+    loading falls back to training from scratch, which would hide the mismatch.
+    """
+
+
+def _stamp_of(attrs):
+    """{'embedding_model': .., 'embedding_backbone': ..} read from a zarr/booster
+    attrs mapping, or None when unstamped."""
+    attrs = dict(attrs or {})
+    stamp = {k: str(attrs.get(k) or "").strip() for k in PROVENANCE_KEYS}
+    return stamp if any(stamp.values()) else None
+
+
+def _same_stamp(a, b):
+    return all(a[k].casefold() == b[k].casefold() for k in PROVENANCE_KEYS)
+
+
+def _dead_dims(embeddings, std_threshold=0.005):
+    """Indices of near-constant feature dimensions in a (rows, 1536) sample.
+
+    feat_norm is a LayerNorm whose affine weights zero out a fixed set of output
+    dims, so this set is a property of the backbone, not of the slide: two
+    slides from the same backbone share ~90% of it, two backbones share ~2%.
+    Returns None when there are too few rows to measure.
+    """
+    arr = np.asarray(embeddings)
+    if arr.ndim != 2 or arr.shape[0] < 20:
+        return None
+    return set(np.flatnonzero(arr.astype(np.float32).std(axis=0) < std_threshold).tolist())
+
+
+def _fmt(stamp):
+    return ", ".join(f"{k.replace('embedding_', '')}={v!r}" for k, v in stamp.items())
+
+
+def _validate_embedding_provenance(embeddings_arr):
+    """Reject a slide whose embeddings were not produced by this node's backbone."""
+    stamp = _stamp_of(getattr(embeddings_arr, "attrs", None))
+    expected = _stamp_of(NODE_STAMP)
+    hint = "Re-run Cytoformer cell segmentation on this slide to regenerate the embeddings."
+    if stamp is None:
+        raise EmbeddingProvenanceError(
+            f"Cell-Segmentation/{EMBEDDING_DATASET} carries no embedding provenance attrs "
+            "(written by an older Cytoformer/UNI2 build or another model). " + hint)
+    if not _same_stamp(stamp, expected):
+        raise EmbeddingProvenanceError(
+            f"Cell-Segmentation/{EMBEDDING_DATASET} was produced by {_fmt(stamp)}; "
+            f"this node needs {_fmt(expected)}. " + hint)
+
+
+def _slide_provenance(embeddings_arr):
+    """What a classifier is compared against: the slide's stamp and fingerprint
+    (from the first rows only, so this is cheap on a 300k-cell slide)."""
+    return {"stamp": _stamp_of(getattr(embeddings_arr, "attrs", None)),
+            "dead_dims": _dead_dims(embeddings_arr[:FINGERPRINT_ROWS])}
+
+
+def _stamp_classifier_provenance(booster):
+    booster.set_attr(**NODE_STAMP)
+
+
+def _stored_train_data(booster):
+    """(embeddings, labels) that save_classifier_params embedded in the booster,
+    or (None, None) when the classifier carries no training data."""
+    blob = booster.attr("train_data")
+    if not blob:
+        return None, None
+    data = np.load(io.BytesIO(base64.b64decode(blob)))
+    return data["embeddings"], data["labels"]
+
+
+def _check_classifier_matches_slide(booster, path, train_embeddings):
+    """Raise EmbeddingProvenanceError if the classifier was trained in a different
+    embedding space than the slide it is about to be applied to.
+
+    Stamped on both sides: the stamps must agree. Otherwise the fingerprints of
+    the classifier's stored train_data and the slide's embeddings must overlap.
+    With nothing to compare, print a warning and let it run.
+    """
+    slide = SLIDE_PROVENANCE
+    name = os.path.basename(str(path))
+    hint = ("The classifier and this slide's embeddings come from different Cytoformer "
+            "builds; re-run segmentation on the classifier's source slide and retrain it.")
+    if slide is None:
+        print(f"[Cell-Classification] Warning: no slide loaded; cannot verify embedding space of {name}")
+        return
+    clf_stamp = _stamp_of(booster.attributes())
+    if clf_stamp is not None and slide["stamp"] is not None:
+        if not _same_stamp(clf_stamp, slide["stamp"]):
+            raise EmbeddingProvenanceError(
+                f"Classifier {name} was trained on embeddings from {_fmt(clf_stamp)}, "
+                f"but this slide's embeddings are {_fmt(slide['stamp'])}. " + hint)
+        return
+    clf_dead = _dead_dims(train_embeddings[:FINGERPRINT_ROWS]) if train_embeddings is not None else None
+    if clf_dead is None or slide["dead_dims"] is None or len(clf_dead | slide["dead_dims"]) < 10:
+        print(f"[Cell-Classification] Warning: cannot verify embedding space of {name} "
+              "(no provenance attrs and no usable fingerprint)")
+        return
+    overlap = len(clf_dead & slide["dead_dims"]) / len(clf_dead | slide["dead_dims"])
+    if overlap < 0.5:
+        raise EmbeddingProvenanceError(
+            f"Classifier {name} carries no provenance attrs and its training embeddings do not "
+            f"match this slide's embedding layout (fingerprint overlap {overlap:.0%}). " + hint)
+    print(f"[Cell-Classification] {name}: no provenance attrs; fingerprint matches slide ({overlap:.0%})")
+
 
 # Cytoformer per-organ zero-shot head (cytoformer_head.CytoHead), loaded once at
 # /init. Supervised / active-learning (XGBoost .tlcls) runs on the same 1536-d
@@ -867,6 +995,8 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
     booster = clf.get_booster()
     booster.set_attr(class_names=json.dumps(class_names))
     booster.set_attr(class_colors=json.dumps(class_colors))
+    # Which embedding space this classifier belongs to; checked on every load.
+    _stamp_classifier_provenance(booster)
     # The booster's columns are the compacted label set; record which class_names
     # index each one means so a reload can widen predict_proba correctly.
     if len(labels) > 0:
@@ -1006,43 +1136,34 @@ def load_classifier_params(zarr_path):
 
         clf = xgb.XGBClassifier()
         clf.load_model(CLASSIFIER_PATH)
-        
+
         # get class information and training data from model attributes
         booster = clf.get_booster()
         class_names = json.loads(booster.attr('class_names'))
         class_colors = json.loads(booster.attr('class_colors'))
-        
-        # decode training data from base64 string
-        train_data_str = booster.attr('train_data')
-        if train_data_str:
-            train_data_bytes = io.BytesIO(base64.b64decode(train_data_str))
-            train_data = np.load(train_data_bytes)
-            train_embeddings = train_data['embeddings']
-            train_labels = train_data['labels']
-            if (
-                train_embeddings is not None
-                and getattr(train_embeddings, "ndim", 0) == 2
-                and train_embeddings.shape[1] != 1536
-            ):
-                print(
-                    f"Classifier embedding dim {train_embeddings.shape[1]} != 1536 "
-                    f"(Cytoformer); ignoring CLASSIFIER_PATH={CLASSIFIER_PATH}"
-                )
-                return None
-            
-            # print the number of samples for each class
-            print("\nloaded training data:")
-            print(f"total samples: {len(train_labels)}")
-            for i, class_name in enumerate(class_names):
-                class_count = np.sum(train_labels == i)
-                print(f"class '{class_name}': {class_count} samples")
-            print()
-        else:
-            train_embeddings = None
-            train_labels = None
+
+        train_embeddings, train_labels = _stored_train_data(booster)
+        if train_embeddings is not None and train_embeddings.ndim == 2 and train_embeddings.shape[1] != EMBEDDING_DIM:
+            print(f"Classifier embedding dim {train_embeddings.shape[1]} != {EMBEDDING_DIM} "
+                  f"(Cytoformer); ignoring CLASSIFIER_PATH={CLASSIFIER_PATH}")
+            return None
+        # Same width is not the same space: reject a classifier trained on another
+        # backbone's 1536-d features (raises EmbeddingProvenanceError).
+        _check_classifier_matches_slide(booster, CLASSIFIER_PATH, train_embeddings)
+
+        if train_embeddings is None:
             print("No saved training data found")
-        
+        else:
+            print(f"\nloaded training data:\ntotal samples: {len(train_labels)}")
+            for i, class_name in enumerate(class_names):
+                print(f"class '{class_name}': {np.sum(train_labels == i)} samples")
+            print()
+
         return clf, class_names, class_colors, train_embeddings, train_labels
+    except EmbeddingProvenanceError:
+        # Not a "could not parse" case: the file is fine, it is just from another
+        # embedding space. Falling back to "no classifier" would hide that.
+        raise
     except Exception as e:
         print(f"Error loading classifier parameters: {e}")
         return None
@@ -1447,6 +1568,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 remember_classifier_bundle_for_save(clf, class_names, class_colors, td_emb, td_lbl)
 
                 return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
+        except EmbeddingProvenanceError:
+            raise
         except Exception as e:
             print(f"Error loading or updating classifier: {e}")
             # continue to create a new classifier if we have annotations
@@ -1897,10 +2020,14 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
         try:
             clf = xgb.XGBClassifier()
             clf.load_model(path)
+            booster = clf.get_booster()
+            _check_classifier_matches_slide(booster, path, _stored_train_data(booster)[0])
             _match_booster_device_to_data(clf)
             prediction_probs[:, ci] = clf.predict_proba(cell_embeddings)[:, 1]
             filled_cols.append(ci)
             print(f"[OvR] ran '{cls}' <- {path}")
+        except EmbeddingProvenanceError:
+            raise
         except Exception as e:
             print(f"[OvR] failed to run '{cls}' from {path}: {e}")
         progress_state.value = 60 + int(30 * (r_i + 1) / max(1, len(items)))
@@ -2029,7 +2156,7 @@ def run_classification(args) -> Dict[str, Any]:
         raise ValueError("ZARR_PATH not set => please ensure /read is called first.")
 
     global CYTO_HEAD, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS
-    global CLASSIFIER_MODE, SAVE_CLASSIFIER_PATHS, CLASSIFIER_PATHS
+    global CLASSIFIER_MODE, SAVE_CLASSIFIER_PATHS, CLASSIFIER_PATHS, SLIDE_PROVENANCE
     global cancel_event
 
     result = {"status": "success", "message": "", "classification_count": 0}
@@ -2108,6 +2235,10 @@ def run_classification(args) -> Dict[str, Any]:
             )
         print("Loading embeddings from zarr...")
         embeddings_arr = seg_grp[EMBEDDING_DATASET]
+        # Provenance first, before pulling ~1 GB of float16 into memory: the
+        # width/count checks below cannot distinguish an older 1536-d build.
+        _validate_embedding_provenance(embeddings_arr)
+        SLIDE_PROVENANCE = _slide_provenance(embeddings_arr)
         cell_embeddings = embeddings_arr[()]
         if cell_embeddings.ndim != 2 or cell_embeddings.shape[1] != EMBEDDING_DIM:
             raise ValueError(
@@ -2499,8 +2630,12 @@ def run_classification(args) -> Dict[str, Any]:
                                 )
 
                     if updated_count > 0:
-                        del zf['User-Annotations/cell']
-                        zf['User-Annotations'].create_array('cell', data=all_annotations)
+                        # Write back in place. Deleting and re-creating the array
+                        # left a window in which any failure (or a concurrent
+                        # save_annotation re-creating it empty) lost every user
+                        # annotation on the slide; same rows, same dtype, so an
+                        # in-place write needs no such window.
+                        annotations_dataset[:] = all_annotations
                         print(f"Updated {updated_count} annotation rows after classification write")
         except Exception as e:
             print(f"Warning: Could not update annotation colors/indices: {e}")
@@ -2683,8 +2818,9 @@ def init_node():
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
     global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS, LAST_TRAINED_CLF_BUNDLE, ZARR_GROUP
-    global CLASSIFIER_MODE, SAVE_CLASSIFIER_PATHS, CLASSIFIER_PATHS, CYTO_CONF_THRESHOLD
+    global CLASSIFIER_MODE, SAVE_CLASSIFIER_PATHS, CLASSIFIER_PATHS, CYTO_CONF_THRESHOLD, SLIDE_PROVENANCE
     LAST_TRAINED_CLF_BUNDLE = None
+    SLIDE_PROVENANCE = None
     # Reset per-run globals so a previous classifier/organ does not leak into
     # a later zero-shot call whose userData omits those keys.
     CLASSIFIER_PATH = None
@@ -2819,7 +2955,7 @@ def classifier_load_endpoint(data: Dict[str, Any]):
       - node_name (str, optional): defaults to ClassificationNode or existing NODE_NAME
       - persist_to_zarr (bool, optional): write classifier_path (+ save if set) into zarr userData
     """
-    global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_PATH, NODE_NAME
+    global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, ZARR_PATH, NODE_NAME, SLIDE_PROVENANCE
     path = (data.get("classifier_path") or "").strip()
     if not path:
         return {"status": "error", "message": "classifier_path is required"}
@@ -2845,6 +2981,13 @@ def classifier_load_endpoint(data: Dict[str, Any]):
             return {"status": "error", "message": f"Classifier validated but zarr persist failed: {e}"}
 
     try:
+        # Validate against the slide this classifier is being attached to, so a
+        # mismatch is reported when it is picked, not only when the run starts.
+        SLIDE_PROVENANCE = None
+        if ZARR_PATH and os.path.isdir(ZARR_PATH):
+            zf_ = zarr.open_group(ZARR_PATH, mode="r")
+            if "Cell-Segmentation" in zf_ and EMBEDDING_DATASET in zf_["Cell-Segmentation"]:
+                SLIDE_PROVENANCE = _slide_provenance(zf_["Cell-Segmentation"][EMBEDDING_DATASET])
         loaded = load_classifier_params(CLASSIFIER_PATH)
         if loaded is None:
             return {"status": "error", "message": "Could not parse XGBoost model at classifier_path"}
@@ -2991,6 +3134,16 @@ def execute_node():
             if out_val.get("status") == "cancelled":
                 progress_state.mark_cancelled()
                 return {"status": "cancelled", "message": "Task was cancelled", "output": out_val}
+
+            # run_classification swallows its own exceptions into
+            # {"status": "error", "message": ...}. Surface that as a failed
+            # execution instead of wrapping it in "ok": the scheduler marks the
+            # node failed and the viewer shows the message (e.g. an embedding
+            # provenance mismatch) rather than a green 100% with stale results.
+            if out_val.get("status") == "error":
+                err_msg = str(out_val.get("message") or "Classification failed")
+                print(f"[Cell-Classification] /execute => error: {err_msg}")
+                return {"status": "error", "message": err_msg, "output": out_val}
 
             # Ensure terminal 100 even if run_classification returned via an early path
             # that did not set it (mirrors scheduler expecting a final tick).
