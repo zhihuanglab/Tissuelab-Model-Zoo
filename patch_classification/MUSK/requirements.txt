@@ -1,53 +1,34 @@
-numpy>=2.0,<2.5
+# MUSK patch-embedding + classification task node. Python 3.11.
+# Pins match TissueLab/app/service/requirements-packaging.txt where used.
+
+numpy==2.4.6
+Pillow==12.3.0
+opencv-python==5.0.0.93
+zarr==3.1.6
+tifffile==2026.3.3
+tiffslide==3.0.1
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+pydantic==2.13.5
+requests==2.34.2
+xgboost==3.0.5
+pandas==3.0.5
+scikit-image==0.26.0
+sse-starlette==3.4.6
+
 timm==0.9.8
-Pillow
-blobfile
-mypy
-pytest
-requests
 einops
-tensorboardX
-scipy>=1.13.0
-ftfy
-opencv-python
-sentencepiece
 pyarrow
 transformers<5
-pytorch-lightning==2.2.1
-nltk
-rouge
-scikit-image
-accelerate
+sentencepiece
 fairscale
-ruamel.yaml
-wandb
-pandas>=2.1.0
-future
-scikit-survival
-torchmetrics==0.7.3
-h5py
-open_clip_torch>=0.2.1
-pycocoevalcap
-webdataset>=0.2.31
 huggingface-hub
 safetensors
-uvicorn[standard]>=0.52.0
-sse-starlette>=3.4.0
-# Match the cloud musk env. 3.0.x still loads the legacy `binf` classifiers
-# and rebuilds XGBClassifier.n_classes_ on load; do NOT bump to 3.1+ (binf
-# loading was removed there) or down to 1.7.x (loads binf but does not rebuild
-# n_classes_, so predict on a loaded classifier breaks).
-xgboost==3.0.5
-# Cap below 1.6: sklearn 1.6+ drops class-level `_estimator_type`, which breaks
-# xgboost 3.0.5's XGBClassifier.save_model used by this tasknode.
-scikit-learn>=1.3.0,<1.6
-tiffslide==3.0.0
 datasets
-fastapi>=0.141.0
+tqdm>=4.66.0
 
 # Keep torch/torchvision paired (embedding node imports torchvision.transforms).
 # Default PyPI macOS/CPU builds; for CUDA:
 # pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 torch
 torchvision
-

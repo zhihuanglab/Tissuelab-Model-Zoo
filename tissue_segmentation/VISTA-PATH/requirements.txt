@@ -1,4 +1,4 @@
-# VISTA-PATH task node.
+# VISTA-PATH task node. Python 3.11.
 #
 # transformers is pinned hard: 5.x changed
 # Mask2FormerSinePositionEmbedding.forward from (x, mask) to
@@ -6,6 +6,21 @@
 # dict of the 4.46.1 module layout. huggingface-hub and tokenizers are pinned
 # with it because transformers runs its own dependency_versions_check at import
 # and refuses to load against the 1.x / 0.22 line.
+# Pins match TissueLab/app/service/requirements-packaging.txt where used.
+
+numpy==2.4.6
+Pillow==12.3.0
+opencv-python==5.0.0.93
+scipy==1.17.1
+zarr==3.1.6
+tifffile==2026.3.3
+tiffslide==3.0.1
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+pydantic==2.13.5
+requests==2.34.2
+sse-starlette==3.4.6
+
 torch==2.4.0
 torchvision==0.19.0
 transformers==4.46.1
@@ -13,23 +28,4 @@ huggingface-hub==0.26.2
 tokenizers==0.20.3
 accelerate==0.26.0
 safetensors>=0.4.1
-
-# Matches the pin used by app/service and the other task nodes.
-zarr==3.1.5
-
-numpy
-pillow
-pandas
-matplotlib
-scikit-image
-scikit-learn
-opencv-python
-albumentations
-pycocotools
-openslide-python
-tiffslide
-
-fastapi
-uvicorn
-sse-starlette
-requests
+tqdm>=4.66.0

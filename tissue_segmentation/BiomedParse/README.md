@@ -24,16 +24,19 @@ git clone https://github.com/microsoft/BiomedParse.git
 [Notice] If inference_utils/target_dist.json is not cloned correctly, it will be automatically loaded from HuggingFace when needed.
 
 ### Conda Environment Setup
-#### Option 1: Directly build the conda environment
-Under the project directory, run
+
+Python **3.11** is required.
+
+#### Option 1 (recommended): Create a new conda environment from scratch
 ```sh
-conda env create -f environment.yml
+conda create -n biomedparse python=3.11
+conda activate biomedparse
 ```
 
-#### Option 2: Create a new conda environment from scratch
+#### Option 2: Directly build the conda environment
+`environment.yml` is a legacy Python 3.9 pin. Prefer Option 1 for new installs.
 ```sh
-conda create -n biomedparse python=3.9.19
-conda activate biomedparse
+conda env create -f environment.yml
 ```
 
 Install Pytorch
@@ -45,6 +48,31 @@ In case there is issue with detectron2 installation, make sure your pytorch vers
 Install dependencies
 ```sh
 pip install -r assets/requirements/requirements.txt
+# detectron2 setup.py imports torch, so it cannot share the isolated build
+# of the file above. Official main (not the 0.6 xyz fork) matches Pillow 12:
+pip install --no-build-isolation git+https://github.com/facebookresearch/detectron2.git
+```
+
+### libvips / pyvips
+
+WSI formats such as `.svs`, `.ndpi`, `.mrxs`, and JPEG-2000 TIFF need a **full** libvips. `pip install pyvips[binary]` only ships a cut-down libvips (no OpenSlide / JPEG-2000 / HEIF / JXL loaders), so install the system library first, then the Python wrapper.
+
+**macOS**
+```bash
+brew install vips
+pip install pyvips==3.1.1
+```
+
+**Linux (Debian/Ubuntu)**
+```bash
+sudo apt-get install -y libvips-dev
+pip install pyvips==3.1.1
+```
+
+**Windows**
+Download the full `vips-dev-w64-all` build from [libvips Windows releases](https://github.com/libvips/build-win64-mxe/releases), unpack to `C:\vips` (or set `TL_VIPS_DIR`), and add `C:\vips\bin` to `PATH`. Then:
+```bash
+pip install pyvips==3.1.1
 ```
 
 ## Dataset

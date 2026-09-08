@@ -1,3 +1,5 @@
+# Legacy Python 3.9 lockfile. Do not use for new installs.
+# New installs: Python 3.11 + `pip install -r assets/requirements/requirements.txt`
 name: biomedparse
 channels:
   - pytorch

@@ -6,6 +6,11 @@ This guide will help you set up a conda environment for InstanSeg segmentation n
 
 - **Conda** or **Miniconda** installed ([Download here](https://docs.conda.io/en/latest/miniconda.html))
 - **CUDA-capable GPU** (optional but recommended for faster inference)
+- **libvips** (system library) — required for WSI formats such as `.svs` / `.ndpi` / `.mrxs` / JPEG-2000 TIFF. `pip install pyvips[binary]` only ships a cut-down libvips without OpenSlide / JPEG-2000 loaders.
+  - macOS: `brew install vips`
+  - Linux (Debian/Ubuntu): `sudo apt-get install -y libvips-dev`
+  - Windows: unpack the full `vips-dev-w64-all` build from [libvips Windows releases](https://github.com/libvips/build-win64-mxe/releases) to `C:\vips` (or `TL_VIPS_DIR`) and add `C:\vips\bin` to `PATH`
+  - Then: `pip install pyvips==3.1.1`
 
 ## Quick Setup
 
@@ -35,8 +40,8 @@ conda install pytorch torchvision cpuonly -c pytorch
 ### Option 2: Manual Setup
 
 ```bash
-# Create a new conda environment with Python 3.10
-conda create -n instanseg python=3.10 -y
+# Create a new conda environment with Python 3.11
+conda create -n instanseg python=3.11 -y
 conda activate instanseg
 
 # Install core dependencies via conda
@@ -60,7 +65,7 @@ pip install -r requirements.txt
 
 ```bash
 # Create a new conda environment
-conda create -n instanseg python=3.10 -y
+conda create -n instanseg python=3.11 -y
 conda activate instanseg
 
 # Install PyTorch first (choose appropriate version)

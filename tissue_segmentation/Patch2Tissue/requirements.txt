@@ -1,14 +1,15 @@
-# TotalSegmentator task node. Python 3.11.
+# Patch2Tissue task node. Python 3.11.
 # Pins match TissueLab/app/service/requirements-packaging.txt where used.
-# totalsegmentator / dicom2nifti pull torch, scipy, pandas, pydicom.
 
 numpy==2.4.6
+opencv-python==5.0.0.93
+scipy==1.17.1
 zarr==3.1.6
+tifffile==2026.3.3
+tiffslide==3.0.1
 fastapi==0.141.1
 uvicorn[standard]==0.52.4
 pydantic==2.13.5
+requests==2.34.2
 sse-starlette==3.4.6
-nibabel==5.4.2
-
-dicom2nifti>=2.4.0
-totalsegmentator>=1.5.0
+numcodecs
