@@ -51,3 +51,8 @@ open-clip-torch==2.26.1
 # uses Image.BILINEAR) is the compatible source for Python 3.11 / Pillow 12.
 # setup.py imports torch, so this cannot share the isolated `pip install -r`:
 #   pip install --no-build-isolation git+https://github.com/facebookresearch/detectron2.git
+#
+# On Windows that build additionally needs DISTUTILS_USE_SDK=1, CL=/utf-8 and
+# (optionally) TORCH_CUDA_ARCH_LIST, set after vcvars64.bat -- without them it
+# fails inside pybind11/torch headers in ways that look unrelated. See the
+# "Windows: three extra settings the detectron2 build needs" section in README.md.

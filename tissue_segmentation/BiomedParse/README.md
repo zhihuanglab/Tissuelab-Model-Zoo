@@ -35,7 +35,40 @@ pip install -r assets/requirements/requirements.txt
 # of the file above. Official main (not the 0.6 xyz fork) matches Pillow 12:
 pip install --no-build-isolation git+https://github.com/facebookresearch/detectron2.git
 ```
-`requirements.txt` already installs PyTorch (CUDA 12.6 on Linux/Windows, CPU/MPS on macOS). If detectron2 build fails, check that the torch CUDA build matches the machine at https://pytorch.org/.
+`requirements.txt` already installs PyTorch (CUDA 12.6 on Linux/Windows, CPU/MPS on macOS).
+
+#### Windows: three extra settings the detectron2 build needs
+
+On Windows the `pip install --no-build-isolation` line above fails without these
+three environment variables. All three failures surface inside pybind11/torch
+headers and look like bugs in detectron2 or PyTorch; none of them is. Run the
+build from a plain `cmd.exe` (not PowerShell, not Git Bash):
+
+```bat
+REM Locate your Visual Studio install; the path differs per machine:
+REM   "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+
+set DISTUTILS_USE_SDK=1
+set CL=/utf-8
+set TORCH_CUDA_ARCH_LIST=8.6
+
+pip install --no-build-isolation git+https://github.com/facebookresearch/detectron2.git
+```
+
+| Variable | Without it | Why |
+| --- | --- | --- |
+| `DISTUTILS_USE_SDK=1` | `UserWarning: It seems that the VC environment is activated but DISTUTILS_USE_SDK is not set` | `vcvars64.bat` has already activated the VC toolchain, and torch's `cpp_extension` refuses to let setuptools activate it a second time. |
+| `CL=/utf-8` | `error C2001: newline in constant` in `torch/include/pybind11/stl_bind.h` | Those headers are UTF-8, but MSVC decodes them with the system ANSI code page. **Only happens on non-English Windows** (e.g. Chinese, code page 936) -- which is why it never reproduces on English installs or on macOS. `CL` is appended to every `cl.exe` command line, including the ones nvcc issues through `-Xcompiler`. |
+| `TORCH_CUDA_ARCH_LIST` | Compiles kernels for every supported architecture; very slow | Restricts nvcc to your GPU. `8.6` = Ampere (RTX 30xx / A-series); `7.5` Turing (RTX 20xx), `8.9` Ada (RTX 40xx), `9.0` Hopper. Omit to build for all. |
+
+A detectron2 build failure on Windows is almost never a torch/CUDA mismatch, so
+check these three first; only if it still fails is it worth verifying the torch
+CUDA build against the machine at https://pytorch.org/.
+
+Verified on Windows 11, Python 3.11, MSVC 14.44, CUDA 12.9 nvcc, torch
+2.14.0+cu126: detectron2 0.6 builds, and its CUDA kernels (ROIAlign,
+nms_rotated, box_iou_rotated, DeformConv) agree with their CPU results.
 
 ### libvips / pyvips
 
