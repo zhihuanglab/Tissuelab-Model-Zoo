@@ -20,21 +20,14 @@ This guide will help you set up a conda environment for InstanSeg segmentation n
 # Navigate to the instanseg directory
 cd instanseg
 
-# Create the conda environment from environment.yml
+# Create the conda environment from environment.yml (Python 3.11 + deps, no -r)
 conda env create -f environment.yml
 
 # Activate the environment
 conda activate instanseg
 
-# Install PyTorch with CUDA support (if you have an NVIDIA GPU)
-# For CUDA 11.8:
-conda install pytorch torchvision pytorch-cuda=11.8 -c pytorch -c nvidia
-
-# For CUDA 12.1:
-conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia
-
-# For CPU-only (no GPU):
-conda install pytorch torchvision cpuonly -c pytorch
+# Optional: replace the CPU/macOS PyTorch wheels with a CUDA build
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 ```
 
 ### Option 2: Manual Setup
@@ -45,7 +38,7 @@ conda create -n instanseg python=3.11 -y
 conda activate instanseg
 
 # Install core dependencies via conda
-conda install -c conda-forge numpy scipy matplotlib scikit-image scikit-learn pandas tqdm requests -y
+conda install -c conda-forge python=3.11 numpy=2.4.6 pillow=12.3.0 scipy=1.17.1 matplotlib=3.11.1 scikit-image=0.26.0 scikit-learn=1.5.2 tqdm requests=2.34.2 numba gdal -y
 
 # Install PyTorch (choose based on your system)
 # For CUDA 11.8:

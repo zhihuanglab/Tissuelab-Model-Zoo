@@ -27,16 +27,9 @@ git clone https://github.com/microsoft/BiomedParse.git
 
 Python **3.11** is required.
 
-#### Option 1 (recommended): Create a new conda environment from scratch
 ```sh
 conda create -n biomedparse python=3.11
 conda activate biomedparse
-```
-
-#### Option 2: Directly build the conda environment
-`environment.yml` is a legacy Python 3.9 pin. Prefer Option 1 for new installs.
-```sh
-conda env create -f environment.yml
 ```
 
 Install Pytorch
