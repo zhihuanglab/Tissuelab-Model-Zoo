@@ -7,7 +7,7 @@ name = "musk"
 version = "1.0.0"
 description = "MUSK: A Vision-Language Foundation Model for Precision Oncology"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 [project.urls]
 "Homepage" = "https://github.com/lilab-stanford/MUSK"
 "Bug Tracker" = "https://github.com/lilab-stanford/MUSK"

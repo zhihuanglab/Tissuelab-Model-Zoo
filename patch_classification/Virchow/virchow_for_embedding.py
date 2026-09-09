@@ -489,7 +489,7 @@ class MUSK:
                 mlp_ratio=5.3375, img_size=224, init_values=1e-5,
                 num_classes=0, global_pool="", dynamic_img_size=False, reg_tokens=0,
             )
-            sd = torch.load(local_bin, map_location="cpu")
+            sd = torch.load(local_bin, map_location="cpu", weights_only=False)
             if isinstance(sd, dict) and "state_dict" in sd:
                 sd = sd["state_dict"]
             model.load_state_dict(sd, strict=True)

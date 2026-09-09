@@ -70,7 +70,6 @@ from sse_starlette.sse import EventSourceResponse
 from progress_sse import ProgressSSEState, iter_progress_events
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from sklearn.linear_model import LogisticRegression
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
 
 app = FastAPI()

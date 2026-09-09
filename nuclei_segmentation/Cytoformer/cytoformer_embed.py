@@ -70,7 +70,7 @@ class CytoEmbedder:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         weights = _resolve_weights()
         net = CellClassifier(backbone=backbone)
-        ck = torch.load(weights, map_location="cpu")
+        ck = torch.load(weights, map_location="cpu", weights_only=False)
         # best.pth is {"model_state_dict": ...} with torch.compile "_orig_mod."
         # prefixes; strip them or the encoder silently loads as random weights.
         sd = ck.get("model_state_dict", ck.get("state_dict", ck))

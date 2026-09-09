@@ -686,7 +686,7 @@ def get_focal_backbone(cfg):
         filename = cfg['MODEL']['BACKBONE']['PRETRAINED']
         logger.info(f'=> init from {filename}')
         with PathManager.open(filename, "rb") as f:
-            ckpt = torch.load(f)['model']
+            ckpt = torch.load(f, weights_only=False)['model']
         focal.load_weights(ckpt, cfg['MODEL']['BACKBONE']['FOCAL'].get('PRETRAINED_LAYERS', ['*']), cfg['VERBOSE'])
 
     return focal

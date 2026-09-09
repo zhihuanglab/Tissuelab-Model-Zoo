@@ -1,10 +1,18 @@
-fastapi>=0.104.1
-uvicorn[standard]>=0.24.0
-pydantic>=2.4.0
-sse-starlette>=1.6.5
-zarr==3.1.5
-numpy==1.26.4
-nibabel>=5.1.0
+# TotalSegmentator task node. Python 3.11.
+# Pins match TissueLab/app/service/requirements-packaging.txt where used.
+# totalsegmentator / dicom2nifti pull torch, scipy, pandas, pydicom.
+
+numpy==2.4.6
+zarr==3.1.6
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+pydantic==2.13.5
+sse-starlette==3.4.6
+nibabel==5.4.2
+
+# macOS: PyPI CPU/MPS. Linux/Windows: CUDA 12.6 (not PyPI's default CUDA 13).
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.14.0; sys_platform == "darwin"
+torch==2.14.0+cu126; sys_platform != "darwin"
 dicom2nifti>=2.4.0
 totalsegmentator>=1.5.0
-pathlib2>=2.3.7

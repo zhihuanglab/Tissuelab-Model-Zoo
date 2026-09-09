@@ -213,7 +213,7 @@ def load_model_weights(model, device, folder, path=r"../models/", dict = None):
             else:
                 device = 'cpu'
                 print('CUDA not available - attempting to load CPU model')
-        model_dict = torch.load(model_path / "model_weights.pth", map_location=device)
+        model_dict = torch.load(model_path / "model_weights.pth", map_location=device, weights_only=False)
 
     model_dict['model_state_dict'] = remove_module_prefix_from_dict(model_dict['model_state_dict'])
 

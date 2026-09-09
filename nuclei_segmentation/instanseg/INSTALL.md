@@ -6,6 +6,11 @@ This guide will help you set up a conda environment for InstanSeg segmentation n
 
 - **Conda** or **Miniconda** installed ([Download here](https://docs.conda.io/en/latest/miniconda.html))
 - **CUDA-capable GPU** (optional but recommended for faster inference)
+- **libvips** (system library) — required for WSI formats such as `.svs` / `.ndpi` / `.mrxs` / JPEG-2000 TIFF. `pip install pyvips[binary]` only ships a cut-down libvips without OpenSlide / JPEG-2000 loaders.
+  - macOS: `brew install vips`
+  - Linux (Debian/Ubuntu): `sudo apt-get install -y libvips-dev`
+  - Windows: unpack the full `vips-dev-w64-all` build from [libvips Windows releases](https://github.com/libvips/build-win64-mxe/releases) to `C:\vips` (or `TL_VIPS_DIR`) and add `C:\vips\bin` to `PATH`
+  - Then: `pip install pyvips==3.1.1`
 
 ## Quick Setup
 
@@ -15,67 +20,19 @@ This guide will help you set up a conda environment for InstanSeg segmentation n
 # Navigate to the instanseg directory
 cd instanseg
 
-# Create the conda environment from environment.yml
 conda env create -f environment.yml
-
-# Activate the environment
 conda activate instanseg
-
-# Install PyTorch with CUDA support (if you have an NVIDIA GPU)
-# For CUDA 11.8:
-conda install pytorch torchvision pytorch-cuda=11.8 -c pytorch -c nvidia
-
-# For CUDA 12.1:
-conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia
-
-# For CPU-only (no GPU):
-conda install pytorch torchvision cpuonly -c pytorch
 ```
 
-### Option 2: Manual Setup
+### Option 2: requirements.txt
 
 ```bash
-# Create a new conda environment with Python 3.10
-conda create -n instanseg python=3.10 -y
+conda create -n instanseg python=3.11 -y
 conda activate instanseg
-
-# Install core dependencies via conda
-conda install -c conda-forge numpy scipy matplotlib scikit-image scikit-learn pandas tqdm requests -y
-
-# Install PyTorch (choose based on your system)
-# For CUDA 11.8:
-conda install pytorch torchvision pytorch-cuda=11.8 -c pytorch -c nvidia
-
-# For CUDA 12.1:
-conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia
-
-# For CPU-only:
-conda install pytorch torchvision cpuonly -c pytorch
-
-# Install remaining dependencies via pip
 pip install -r requirements.txt
 ```
 
-### Option 3: Using requirements.txt only
-
-```bash
-# Create a new conda environment
-conda create -n instanseg python=3.10 -y
-conda activate instanseg
-
-# Install PyTorch first (choose appropriate version)
-# For CUDA 11.8:
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-
-# For CUDA 12.1:
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-
-# For CPU-only:
-pip install torch torchvision
-
-# Install all other dependencies
-pip install -r requirements.txt
-```
+Linux/Windows NVIDIA: both options install CUDA 12.6 PyTorch. macOS: CPU/MPS.
 
 ## Verify Installation
 
@@ -97,23 +54,13 @@ python -c "from instanseg.inference_class import InstanSeg; print('InstanSeg imp
 
 ## GPU Setup (NVIDIA)
 
-If you have an NVIDIA GPU and want to use CUDA acceleration:
+Option 1 / Option 2 already install CUDA 12.6 PyTorch on Linux and Windows. Verify:
 
-1. **Check CUDA version**:
-   ```bash
-   nvidia-smi
-   ```
-
-2. **Install matching PyTorch CUDA version**:
-   - CUDA 11.8 → `pytorch-cuda=11.8`
-   - CUDA 12.1 → `pytorch-cuda=12.1`
-
-3. **Verify GPU access**:
-   ```python
-   import torch
-   print(torch.cuda.is_available())  # Should print True
-   print(torch.cuda.get_device_name(0))  # Should print your GPU name
-   ```
+```python
+import torch
+print(torch.cuda.is_available())  # Should print True
+print(torch.cuda.get_device_name(0))
+```
 
 ## Troubleshooting
 

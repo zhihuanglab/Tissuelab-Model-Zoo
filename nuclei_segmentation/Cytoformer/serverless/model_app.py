@@ -26,7 +26,7 @@ app = modal.App("stardist-segmentation-v1")
 
 # Base image for CPU functions (segmentation)
 image = (
-    modal.Image.debian_slim(python_version="3.10")
+    modal.Image.debian_slim(python_version="3.11")
     .apt_install(
         "libgl1-mesa-glx",
         "libglib2.0-0",
@@ -92,7 +92,7 @@ image = (
 
 # GPU image for embeddings with CUDA-enabled PyTorch
 gpu_image = (
-    modal.Image.debian_slim(python_version="3.10")
+    modal.Image.debian_slim(python_version="3.11")
     .apt_install(
         "libgl1-mesa-glx",
         "libglib2.0-0",

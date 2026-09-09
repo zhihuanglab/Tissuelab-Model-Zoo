@@ -4,11 +4,16 @@ import torch
 import pickle
 import subprocess
 
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+except ImportError:
+    MPI = None
 import torch.distributed as dist
 
 
 def apply_distributed(opt):
+    if MPI is None or opt.get("world_size", 1) <= 1:
+        return
     if opt['rank'] == 0:
         hostname_cmd = ["hostname -I"]
         result = subprocess.check_output(hostname_cmd, shell=True)

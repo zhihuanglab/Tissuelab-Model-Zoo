@@ -294,7 +294,16 @@ def init_node():
     print(f"[SAM] Using device: {device}")
     model_type = "vit_h"
     checkpoint_path = "sam_vit_h_4b8939.pth"  # default
-    MODEL = sam_model_registry[model_type](checkpoint=checkpoint_path)
+    # segment-anything 1.0 calls torch.load without weights_only; torch 2.6+ defaults True.
+    _orig_load = torch.load
+    def _load_ckpt(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return _orig_load(*args, **kwargs)
+    torch.load = _load_ckpt
+    try:
+        MODEL = sam_model_registry[model_type](checkpoint=checkpoint_path)
+    finally:
+        torch.load = _orig_load
     MODEL.to(device)
     MODEL.eval()
     print_model_devices(MODEL)

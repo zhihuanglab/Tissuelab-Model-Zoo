@@ -8,7 +8,7 @@ def resume_model_from_file(file_path):
     assert os.path.isfile(file_path)
     if '.pkl' in file_path:
         print("Loading models and optimizer from checkpoint '{}'".format(file_path))
-        checkpoint = torch.load(file_path)
+        checkpoint = torch.load(file_path, weights_only=False)
         for k,v in checkpoint.items():
             if k=='model_state':
                 state_dict=checkpoint['model_state']
@@ -20,7 +20,7 @@ def resume_model_from_file(file_path):
               .format(file_path, checkpoint['epoch']))
     elif '.pth' in file_path:
         print("Loading models and optimizer from checkpoint '{}'".format(file_path))
-        state_dict = torch.load(file_path)
+        state_dict = torch.load(file_path, weights_only=False)
         start_epoch=int(file_path.split('.')[0].split('_')[-1]) ##restore training procedure.
     else:
         raise NotImplementedError

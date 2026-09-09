@@ -1,52 +1,59 @@
+# InstanSeg task node. Python 3.11.
+# Scientific stack via conda-forge; remaining packages via pip.
+# Pins match TissueLab/app/service/requirements-packaging.txt where used.
+# tissuelab_sdk 0.1.14 already depends on nibabel and pydicom.
 name: instanseg
 channels:
   - conda-forge
   - pytorch
-  - nvidia  # For CUDA support (if using GPU)
+  - nvidia
 dependencies:
-  - python=3.10
+  - python=3.11
   - pip
-  - numpy>=1.24.0
-  - scipy>=1.11.0
-  - matplotlib>=3.7.0
-  - scikit-image>=0.21.0
-  - scikit-learn>=1.3.0
-  - pandas>=2.0.0
-  - tqdm>=4.64.0
-  - requests>=2.31.0
+  - numpy=2.4.6
+  - pillow=12.3.0
+  - scipy=1.17.1
+  - matplotlib=3.11.1
+  - scikit-learn=1.5.2
+  - scikit-image=0.26.0
+  - tqdm>=4.66.0
+  - requests=2.34.2
+  - numba
+  - gdal
   - pip:
-    # PyTorch - install based on your CUDA version
-    # For CUDA 11.8:
-    # - torch>=2.0.0
-    # - torchvision>=0.15.0
-    # For CPU-only or CUDA 12.1:
-    - torch>=2.0.0
-    - torchvision>=0.15.0
-    
-    # Computer Vision
-    - opencv-python>=4.8.0
-    
-    # Image I/O
-    - tiffslide>=1.5.0
-    - tifffile>=2023.1.0
-    - bioio>=0.4.0  # For bioimageio model support
-    - rasterio>=1.3.0  # For geojson export
-    
-    # Data Storage
-    - zarr==3.1.5
-    
-    # Web Framework
-    - fastapi>=0.104.0
-    - uvicorn[standard]>=0.24.0
-    - sse-starlette>=1.6.5
-    
-    # Utilities
+    # macOS: PyPI CPU/MPS. Linux/Windows: CUDA 12.6 (not PyPI's default CUDA 13).
+    - --extra-index-url https://download.pytorch.org/whl/cu126
+    - torch==2.14.0; sys_platform == "darwin"
+    - torch==2.14.0+cu126; sys_platform != "darwin"
+    - torchvision==0.29.0; sys_platform == "darwin"
+    - torchvision==0.29.0+cu126; sys_platform != "darwin"
+
+    - opencv-python==5.0.0.93
+    - zarr==3.1.6
+    - tifffile==2026.3.3
+    - tiffslide==3.0.1
+
+    - fastapi==0.141.1
+    - uvicorn[standard]==0.52.4
+    - pydantic==2.13.5
+    - sse-starlette==3.4.6
+    - tissuelab_sdk==0.1.14
+
     - multiprocess>=0.70.17
     - fastremap>=1.1.6
-    - geojson>=3.1.0
-    - natsort>=8.2.0
-    
-    # Optional: For advanced features
-    # - bioio-bioformats>=0.1.0  # If using bioformats reader
-    # - slideio>=0.4.0  # Alternative slide reader
+    - einops>=0.7.0
+    - fastdist>=1.1.6
+    - transformers>=4.30.0
 
+    # Imported at module load by instanseg.utils.utils (inference_class → pytorch_utils).
+    - rasterio>=1.4.0
+    - geojson>=3.1.0
+
+    # Optional — not needed for the default TissueLab tasknode path.
+    # - bioio>=0.4.0
+    # - bioio-bioformats>=0.1.0
+    # - cupy-cuda12x>=13.0.0
+    # - pyvips>=2.2.0
+    # - czifile
+    # - slideio>=0.4.0
+    # - stardist>=0.9.1

@@ -22,10 +22,13 @@
 
 import numpy as np
 import numpy
-from scipy.ndimage import _ni_support
-from scipy.ndimage.morphology import distance_transform_edt, binary_erosion, \
-    generate_binary_structure
-from scipy.ndimage.measurements import label, find_objects
+from scipy.ndimage import (
+    distance_transform_edt,
+    binary_erosion,
+    generate_binary_structure,
+    label,
+    find_objects,
+)
 from scipy.stats import pearsonr
 
 
@@ -33,8 +36,8 @@ def dice_sim_coef(result, reference):
     """
     Dice similarity coefficient
     """
-    result = np.atleast_1d(result.astype(np.bool))
-    reference = np.atleast_1d(reference.astype(np.bool))
+    result = np.atleast_1d(result.astype(bool))
+    reference = np.atleast_1d(reference.astype(bool))
     tp = np.count_nonzero(result & reference)
 
     fp = np.count_nonzero(result & ~reference)
@@ -82,8 +85,8 @@ def dc(result, reference):
     -----
     This is a real metric. The binary images can therefore be supplied in any order.
     """
-    result = numpy.atleast_1d(result.astype(numpy.bool))
-    reference = numpy.atleast_1d(reference.astype(numpy.bool))
+    result = numpy.atleast_1d(result.astype(bool))
+    reference = numpy.atleast_1d(reference.astype(bool))
 
     intersection = numpy.count_nonzero(result & reference)
 
@@ -123,8 +126,8 @@ def jc(result, reference):
     -----
     This is a real metric. The binary images can therefore be supplied in any order.
     """
-    result = numpy.atleast_1d(result.astype(numpy.bool))
-    reference = numpy.atleast_1d(reference.astype(numpy.bool))
+    result = numpy.atleast_1d(result.astype(bool))
+    reference = numpy.atleast_1d(reference.astype(bool))
 
     intersection = numpy.count_nonzero(result & reference)
     union = numpy.count_nonzero(result | reference)
@@ -168,8 +171,8 @@ def precision(result, reference):
     .. [1] http://en.wikipedia.org/wiki/Precision_and_recall
     .. [2] http://en.wikipedia.org/wiki/Confusion_matrix#Table_of_confusion
     """
-    result = numpy.atleast_1d(result.astype(numpy.bool))
-    reference = numpy.atleast_1d(reference.astype(numpy.bool))
+    result = numpy.atleast_1d(result.astype(bool))
+    reference = numpy.atleast_1d(reference.astype(bool))
 
     tp = numpy.count_nonzero(result & reference)
     fp = numpy.count_nonzero(result & ~reference)
@@ -216,8 +219,8 @@ def recall(result, reference):
     .. [1] http://en.wikipedia.org/wiki/Precision_and_recall
     .. [2] http://en.wikipedia.org/wiki/Confusion_matrix#Table_of_confusion
     """
-    result = numpy.atleast_1d(result.astype(numpy.bool))
-    reference = numpy.atleast_1d(reference.astype(numpy.bool))
+    result = numpy.atleast_1d(result.astype(bool))
+    reference = numpy.atleast_1d(reference.astype(bool))
 
     tp = numpy.count_nonzero(result & reference)
     fn = numpy.count_nonzero(~result & reference)
@@ -276,8 +279,8 @@ def specificity(result, reference):
     .. [1] https://en.wikipedia.org/wiki/Sensitivity_and_specificity
     .. [2] http://en.wikipedia.org/wiki/Confusion_matrix#Table_of_confusion
     """
-    result = numpy.atleast_1d(result.astype(numpy.bool))
-    reference = numpy.atleast_1d(reference.astype(numpy.bool))
+    result = numpy.atleast_1d(result.astype(bool))
+    reference = numpy.atleast_1d(reference.astype(bool))
 
     tn = numpy.count_nonzero(~result & ~reference)
     fp = numpy.count_nonzero(result & ~reference)
@@ -605,8 +608,8 @@ def ravd(result, reference):
     0.0
 
     """
-    result = numpy.atleast_1d(result.astype(numpy.bool))
-    reference = numpy.atleast_1d(reference.astype(numpy.bool))
+    result = numpy.atleast_1d(result.astype(bool))
+    reference = numpy.atleast_1d(reference.astype(bool))
 
     vol1 = numpy.count_nonzero(result)
     vol2 = numpy.count_nonzero(reference)
@@ -663,8 +666,8 @@ def volumesimilarity(result, reference):
     0.0
 
     """
-    result = numpy.atleast_1d(result.astype(numpy.bool))
-    reference = numpy.atleast_1d(reference.astype(numpy.bool))
+    result = numpy.atleast_1d(result.astype(bool))
+    reference = numpy.atleast_1d(reference.astype(bool))
 
     vol1 = numpy.count_nonzero(result)
     vol2 = numpy.count_nonzero(reference)
@@ -702,8 +705,8 @@ def volume_correlation(results, references):
         The two-side p value.
 
     """
-    results = numpy.atleast_2d(numpy.array(results).astype(numpy.bool))
-    references = numpy.atleast_2d(numpy.array(references).astype(numpy.bool))
+    results = numpy.atleast_2d(numpy.array(results).astype(bool))
+    references = numpy.atleast_2d(numpy.array(references).astype(bool))
 
     results_volumes = [numpy.count_nonzero(r) for r in results]
     references_volumes = [numpy.count_nonzero(r) for r in references]
@@ -737,8 +740,8 @@ def volume_change_correlation(results, references):
         The two-side p value.
 
     """
-    results = numpy.atleast_2d(numpy.array(results).astype(numpy.bool))
-    references = numpy.atleast_2d(numpy.array(references).astype(numpy.bool))
+    results = numpy.atleast_2d(numpy.array(results).astype(bool))
+    references = numpy.atleast_2d(numpy.array(references).astype(bool))
 
     results_volumes = numpy.asarray([numpy.count_nonzero(r) for r in results])
     references_volumes = numpy.asarray(
@@ -1007,8 +1010,8 @@ def __distinct_binary_object_correspondences(reference, result, connectivity=1):
 
     @return (labelmap1, labelmap2, n_lables1, n_labels2, labelmapping2to1)
     """
-    result = numpy.atleast_1d(result.astype(numpy.bool))
-    reference = numpy.atleast_1d(reference.astype(numpy.bool))
+    result = numpy.atleast_1d(result.astype(bool))
+    reference = numpy.atleast_1d(reference.astype(bool))
 
     # binary structure
     footprint = generate_binary_structure(result.ndim, connectivity)
@@ -1063,11 +1066,10 @@ def __surface_distances(result, reference, voxelspacing=None, connectivity=1):
     The distances between the surface voxel of binary objects in result and their
     nearest partner surface voxel of a binary object in reference.
     """
-    result = numpy.atleast_1d(result.astype(numpy.bool))
-    reference = numpy.atleast_1d(reference.astype(numpy.bool))
+    result = numpy.atleast_1d(result.astype(bool))
+    reference = numpy.atleast_1d(reference.astype(bool))
     if voxelspacing is not None:
-        voxelspacing = _ni_support._normalize_sequence(
-            voxelspacing, result.ndim)
+        voxelspacing = [voxelspacing] * result.ndim if not hasattr(voxelspacing, "__iter__") or isinstance(voxelspacing, str) else list(voxelspacing)
         voxelspacing = numpy.asarray(voxelspacing, dtype=numpy.float64)
         if not voxelspacing.flags.contiguous:
             voxelspacing = voxelspacing.copy()

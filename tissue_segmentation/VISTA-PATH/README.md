@@ -60,22 +60,34 @@ VISTA-PATH/
 
 ## Environment
 
-Runs in the existing **`PathSeg`** conda env — **no reconfiguration needed for v2**; the
-required packages (transformers 4.46.1 with `Mask2FormerModel` / `SamModel` /
-`CLIPTextModelWithProjection`, torch 2.4.0) are already installed.
+Python **3.11**. Linux/Windows NVIDIA gets CUDA 12.6 PyTorch from `requirements.txt`; macOS gets CPU/MPS.
 
 ```bash
+conda create -n PathSeg python=3.11
 conda activate PathSeg
+pip install -r requirements.txt
 ```
 
-For reference, the env was created as:
+### libvips / pyvips
 
+WSI formats such as `.svs`, `.ndpi`, `.mrxs`, and JPEG-2000 TIFF need a **full** libvips. `pip install pyvips[binary]` only ships a cut-down libvips (no OpenSlide / JPEG-2000 / HEIF / JXL loaders), so install the system library first, then the Python wrapper.
+
+**macOS**
 ```bash
-conda create -n PathSeg python=3.12
-conda activate PathSeg
-conda install -c conda-forge scikit-image opencv pandas pillow numpy openslide openslide-python albumentations
-conda install pytorch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 pytorch-cuda=11.8 -c pytorch -c nvidia
-pip install transformers==4.46.1 accelerate==0.26.0 pycocotools matplotlib scikit-learn zarr tiffslide
+brew install vips
+pip install pyvips==3.1.1
+```
+
+**Linux (Debian/Ubuntu)**
+```bash
+sudo apt-get install -y libvips-dev
+pip install pyvips==3.1.1
+```
+
+**Windows**
+Download the full `vips-dev-w64-all` build from [libvips Windows releases](https://github.com/libvips/build-win64-mxe/releases), unpack to `C:\vips` (or set `TL_VIPS_DIR`), and add `C:\vips\bin` to `PATH`. Then:
+```bash
+pip install pyvips==3.1.1
 ```
 
 ---
