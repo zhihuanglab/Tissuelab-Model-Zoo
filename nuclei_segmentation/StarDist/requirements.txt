@@ -27,12 +27,31 @@ natsort>=8.4.0
 colorama>=0.4.6
 einops>=0.7.0
 
-# Linux/Windows GPU: CUDA 12 via tensorflow[and-cuda]. macOS: CPU wheel.
+# Linux GPU: CUDA 12 via tensorflow[and-cuda]. macOS/Windows: CPU wheel.
+#
+# GPU acceleration for TensorFlow is NOT supported on Windows. This is not a
+# packaging choice -- there is no combination of versions that enables it:
+#   - The Windows wheel is built without CUDA, so it has no GPU kernels at all
+#     (tf.sysconfig.get_build_info()["is_cuda_build"] is False since TF 2.11).
+#     TensorFlow prints this warning itself at import time.
+#   - The and-cuda extra needs nvidia-nccl-cu12, which NVIDIA does not publish
+#     for Windows, so pip cannot even resolve it there.
+#   - TF 2.10 was the last Windows-GPU release and ships no cp311 wheel, so it
+#     is unreachable on Python 3.11 (it also needs numpy 1.x, protobuf <3.20).
+# Scope: only the StarDist forward pass runs on CPU. torch/torchvision below
+# still use CUDA 12.6, so every other GPU path in this node is unaffected.
 tensorflow==2.21.0; sys_platform == "darwin"
-tensorflow[and-cuda]==2.21.0; sys_platform != "darwin"
+tensorflow[and-cuda]==2.21.0; sys_platform == "linux"
+tensorflow==2.21.0; sys_platform == "win32"
 stardist>=0.9.1
 fastdist==1.1.6
-transformers
+# transformers 5.x is a breaking release: it rewrote several tokenizer
+# classes on top of the `tokenizers` library rather than sentencepiece
+# (verified: XLMRobertaTokenizer(<spm path>) raises TypeError under 5.16.1).
+# This node loads vinid/plip through AutoProcessor /
+# AutoModelForZeroShotImageClassification, so it is held on the 4.x line
+# together with the other task nodes.
+transformers<5
 
 # macOS: PyPI CPU/MPS. Linux/Windows: CUDA 12.6 (not PyPI's default CUDA 13).
 --extra-index-url https://download.pytorch.org/whl/cu126
@@ -40,6 +59,4 @@ torch==2.14.0; sys_platform == "darwin"
 torch==2.14.0+cu126; sys_platform != "darwin"
 torchvision==0.29.0; sys_platform == "darwin"
 torchvision==0.29.0+cu126; sys_platform != "darwin"
-# czifile
-pywin32; platform_system == "Windows"
-pylibCZIrw; platform_system == "Windows"
+

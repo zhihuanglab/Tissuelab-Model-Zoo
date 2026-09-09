@@ -33,7 +33,13 @@ torch==2.14.0+cu126; sys_platform != "darwin"
 torchvision==0.29.0; sys_platform == "darwin"
 torchvision==0.29.0+cu126; sys_platform != "darwin"
 
-transformers>=4.30.0
+# transformers 5.x is a breaking release: it rewrote several tokenizer
+# classes on top of the `tokenizers` library rather than sentencepiece
+# (verified: XLMRobertaTokenizer(<spm path>) raises TypeError under 5.16.1).
+# This node loads vinid/plip through AutoProcessor /
+# AutoModelForZeroShotImageClassification, so it is held on the 4.x line
+# together with the other task nodes.
+transformers>=4.30.0,<5
 
 # Imported at module load by instanseg.utils.utils (inference_class → pytorch_utils).
 rasterio>=1.4.0
