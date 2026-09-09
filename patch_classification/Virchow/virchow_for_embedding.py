@@ -269,27 +269,87 @@ def _open_wsi(path, verbose=None):
 
 
 _MAX_LOADER_WORKERS = 4
+# DataLoader workers when the caller passes None: 0 below 512 px patches
+# (no measurable gain, ~+400 MB per worker), 2 at/above (512: +15%, 1024: +75%).
+_LOADER_WORKERS_MIN_PATCH = 512
+_DEFAULT_LOADER_WORKERS = 2
+
+# Macro tile edge budget in pixels. Measured optimum on a 101k x 74k TCGA slide
+# is 1800-2048 px: smaller tiles pay read_region overhead, larger ones decode
+# mask-rejected blank patches and blow up the 8-slot cache (16 x 1024 px tiles
+# were 805 MB each). At 2048 px a tile is <= 12.6 MB, the cache ~100 MB.
+_MACRO_TILE_PX = 2048
 
 
-def _resolve_loader_workers(requested):
-    """Keep workers at 0 unless explicitly requested.
+def _resolve_macro_tile_factor(patch_size, requested=None):
+    """Macro tile edge in patches: 224 -> 9, 512 -> 4, 1024 -> 2, >= 2048 -> 1."""
+    if requested is not None:
+        return max(1, int(requested))
+    return max(1, _MACRO_TILE_PX // max(1, int(patch_size)))
 
-    Patch decode is cheap next to the encoder. DataLoader processes ignore
-    SIGINT and make cancel wait on worker teardown.
+
+def _resolve_loader_workers(requested=None, patch_size=None):
+    """Clamp workers to [0, _MAX_LOADER_WORKERS]; ``None`` => default by patch size.
+
+    Windows is forced to 0. DataLoader processes ignore SIGINT and make cancel
+    wait on worker teardown, so callers that need a snappier cancel may pass 0.
     """
     if platform.system() == 'Windows':
         return 0
     try:
-        requested = int(requested)
+        requested = int(requested) if requested is not None else None
     except (TypeError, ValueError):
-        requested = 0
+        requested = None
+    if requested is None:
+        return _DEFAULT_LOADER_WORKERS if (patch_size or 0) >= _LOADER_WORKERS_MIN_PATCH else 0
     return max(0, min(requested, _MAX_LOADER_WORKERS))
+
+
+def _tissue_patch_coords(mask, width, height, patch_size, tissue_threshold):
+    """Row-major (N, 4) int64 [x0, y0, x1, y1] of every patch whose mask
+    coverage is >= tissue_threshold.
+
+    ``mask`` may be full-resolution or a thumbnail (scale derived from its
+    shape). Coverage is mean(mask[my0:my1, mx0:mx1]) exactly as the old
+    per-patch loop computed it, evaluated one patch row at a time with a
+    column sum + prefix sum. Integer masks accumulate in int64, so results are
+    bit-identical; ~50x faster than the loop at 224 px.
+    """
+    ps = int(patch_size)
+    mask = np.asarray(mask)
+    mh, mw = mask.shape[:2]
+    if ps <= 0 or mh == 0 or mw == 0:
+        return np.zeros((0, 4), dtype=np.int64)
+    channels = 1
+    if mask.ndim > 2:  # (h, w, c): the loop averaged over channels too
+        channels = int(np.prod(mask.shape[2:]))
+        mask = mask.reshape(mh, mw, channels).sum(axis=2)
+    acc = np.int64 if mask.dtype.kind in 'biu' else np.float64
+    sx, sy = mw / float(width), mh / float(height)
+
+    xs = np.arange(0, width - ps + 1, ps, dtype=np.int64)
+    ys = np.arange(0, height - ps + 1, ps, dtype=np.int64)
+    mx0 = (xs * sx).astype(np.int64)
+    mx1 = np.minimum(np.maximum(mx0 + 1, ((xs + ps) * sx).astype(np.int64)), mw)
+    my0 = (ys * sy).astype(np.int64)
+    my1 = np.minimum(np.maximum(my0 + 1, ((ys + ps) * sy).astype(np.int64)), mh)
+    area_x = (mx1 - mx0) * channels
+
+    out = []
+    for y, r0, r1 in zip(ys.tolist(), my0.tolist(), my1.tolist()):
+        colsum = mask[r0:r1].sum(axis=0, dtype=acc)
+        csum = np.concatenate(([0], np.cumsum(colsum)))
+        coverage = (csum[mx1] - csum[mx0]) / (area_x * (r1 - r0))
+        keep = xs[coverage >= float(tissue_threshold)]
+        if keep.size:
+            out.append(np.stack([keep, np.full_like(keep, y), keep + ps, np.full_like(keep, y + ps)], axis=1))
+    return np.concatenate(out) if out else np.zeros((0, 4), dtype=np.int64)
 
 
 class WsiPatchDataset(torch.utils.data.Dataset):
     def __init__(self, wsi_path: str, mask: np.ndarray, width: int, height: int,
                  patch_size: int, level: int, tissue_threshold: float,
-                 transform=None, macro_tile_factor: int = 1, profile: bool = False,
+                 transform=None, macro_tile_factor: Optional[int] = None, profile: bool = False,
                  use_tiffslide: bool = True, wsi_cache_mb: int = 0,
                  strict_io: bool = True):
         self.wsi_path = wsi_path
@@ -309,7 +369,9 @@ class WsiPatchDataset(torch.utils.data.Dataset):
         self.level = level
         self.tissue_threshold = tissue_threshold
         self.transform = transform
-        self.macro_tile_factor = max(1, int(macro_tile_factor))
+        # Resolve the macro tile size *before* generating coords: the coord
+        # order below depends on it.
+        self.macro_tile_factor = _resolve_macro_tile_factor(patch_size, macro_tile_factor)
         self.profile = profile
         self._macro_cache = OrderedDict()
         self._macro_cache_capacity = 8
@@ -320,25 +382,19 @@ class WsiPatchDataset(torch.utils.data.Dataset):
         # downscaled thumbnail mask. Deriving the scale from mask.shape keeps
         # this correct for both -- and lets a multi-gigapixel slide skip ever
         # materialising a full-resolution mask (tens of GiB of RAM).
-        coords = []
         ps = patch_size
-        mh, mw = mask.shape[:2]
-        sx = (mw / float(width)) if width else 1.0
-        sy = (mh / float(height)) if height else 1.0
-        for y in range(0, height - ps + 1, ps):
-            my0 = int(y * sy)
-            my1 = max(my0 + 1, int((y + ps) * sy))
-            for x in range(0, width - ps + 1, ps):
-                mx0 = int(x * sx)
-                mx1 = max(mx0 + 1, int((x + ps) * sx))
-                # Unify coverage strategies to avoid dependence on source types
-                patch_mask = mask[my0:my1, mx0:mx1]
-                if patch_mask.size == 0:
-                    continue
-                coverage = float(np.mean(patch_mask))
-                if coverage < float(self.tissue_threshold):
-                    continue
-                coords.append((x, y, x + ps, y + ps))
+        # (N, 4) int64 rows of [x0, y0, x1, y1], row-major.
+        coords = _tissue_patch_coords(mask, width, height, ps, self.tissue_threshold)
+
+        # Read order only: group patches by macro tile (stable lexsort keeps
+        # row-major inside a tile) so each tile is decoded once. In row-major
+        # order a slide row spans hundreds of tiles and the 8-slot LRU never
+        # hits. process_whole_wsi restores row-major order before returning,
+        # so the zarr layout is unchanged. PIL fallback never uses macro tiles.
+        if self.use_tiffslide and self.macro_tile_factor > 1:
+            step = self.macro_tile_factor * ps
+            order = np.lexsort((coords[:, 0] // step, coords[:, 1] // step))
+            coords = coords[order]
         self.coords = coords
 
     def __len__(self):
@@ -431,7 +487,7 @@ class WsiPatchDataset(torch.utils.data.Dataset):
             raise RuntimeError("No readable source (slide or fallback image) available in worker")
 
     def __getitem__(self, idx: int):
-        x1, y1, x2, y2 = self.coords[idx]
+        x1, y1, x2, y2 = (int(v) for v in self.coords[idx])
         img = self._read_patch(x1, y1)
         if self.transform is not None:
             tensor = self.transform(img)
@@ -1161,11 +1217,16 @@ class MUSK:
                           tissue_threshold: float = 0.5, progress_callback=None,
                           profile: bool = False,
                           wsi_cache_mb: int = 0,
-                          macro_tile_factor: int = 16,
-                          loader_workers: int = 0,
+                          macro_tile_factor: Optional[int] = None,
+                          loader_workers: Optional[int] = None,
                           prefetch_factor: int = 2):
-        """Process entire WSI by dividing it into patches using streaming approach"""
-        loader_workers = _resolve_loader_workers(loader_workers)
+        """Process entire WSI by dividing it into patches using streaming approach.
+
+        ``macro_tile_factor=None`` sizes macro tiles to ``_MACRO_TILE_PX``;
+        ``loader_workers=None`` picks 0 workers below 512 px patches, else 2.
+        """
+        loader_workers = _resolve_loader_workers(loader_workers, patch_size)
+        macro_tile_factor = _resolve_macro_tile_factor(patch_size, macro_tile_factor)
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {device}")
@@ -1299,7 +1360,8 @@ class MUSK:
         all_embeddings = []
         all_coordinates = []
 
-        print(f"Starting DataLoader streaming of patches (workers={loader_workers})...")
+        print(f"Starting DataLoader streaming of patches (workers={loader_workers}, "
+              f"macro_tile={macro_tile_factor}x{patch_size}px, batch={batch_size}, patches={len(dataset)})...")
         batch_count = 0
         prev_end = time.time()
         with torch.no_grad():
@@ -1353,6 +1415,16 @@ class MUSK:
             final_embeddings = torch.empty((0, self.model.config.hidden_size), device=device, dtype=torch.float32)
         else:
             final_embeddings = torch.cat(all_embeddings, dim=0)
+            # Patches were read in macro-tile order; restore row-major (y, x)
+            # so the returned pairs -- and the zarr layout -- are identical to
+            # the pre-block-order output. Row-major depends only on (slide
+            # size, patch_size, mask), never on the read-path tile budget, so
+            # index-aligned consumers (User-Annotations/patch,
+            # Patch-Classification) never drift.
+            coords_np = np.asarray(all_coordinates, dtype=np.int64).reshape(-1, 4)
+            order = np.lexsort((coords_np[:, 0], coords_np[:, 1]))
+            final_embeddings = final_embeddings[torch.from_numpy(order).to(final_embeddings.device)]
+            all_coordinates = coords_np[order].tolist()
         if profile:
             stats['final_cat_s'] = (time.time() - t_cat0)
             t_cat1 = time.time()
