@@ -1,5 +1,6 @@
 # Ark+ task node. Python 3.11.
-# torch/timm pins match the Swin-Transformer init used by the Ark+ checkpoints.
+# timm==0.5.4 matches the Swin-Transformer init used by the Ark+ checkpoints
+# (later timm changed the architecture and load_state_dict size-mismatches).
 # Pins match TissueLab/app/service/requirements-packaging.txt where used.
 
 numpy==2.4.6
@@ -12,7 +13,11 @@ requests==2.34.2
 pydicom==3.0.2
 sse-starlette==3.4.6
 
-torch==2.5.1
-torchvision==0.20.1
+# macOS: PyPI CPU/MPS. Linux/Windows: CUDA 12.6 (not PyPI's default CUDA 13).
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.14.0; sys_platform == "darwin"
+torch==2.14.0+cu126; sys_platform != "darwin"
+torchvision==0.29.0; sys_platform == "darwin"
+torchvision==0.29.0+cu126; sys_platform != "darwin"
 timm==0.5.4
 tqdm>=4.66.0

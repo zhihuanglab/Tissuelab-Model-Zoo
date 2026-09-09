@@ -167,7 +167,7 @@ class MyRandomExtract(object):
         if self.extract_type == 0:
             # center crop
             x_diff = (x.size(0) - self.size) / 2.
-            x_diff=np.int(x_diff)
+            x_diff=int(x_diff)
             return x [x_diff:x_diff+self.size]
         elif self.extract_type == 1:
             x_diff = abs(x.size(0) - self.size-1)

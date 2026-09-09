@@ -60,22 +60,12 @@ VISTA-PATH/
 
 ## Environment
 
-Runs in the existing **`PathSeg`** conda env — **no reconfiguration needed for v2**; the
-required packages (transformers 4.46.1 with `Mask2FormerModel` / `SamModel` /
-`CLIPTextModelWithProjection`, torch 2.4.0) are already installed.
-
-```bash
-conda activate PathSeg
-```
-
-For reference, the env was created as:
+Python **3.11**. Linux/Windows NVIDIA gets CUDA 12.6 PyTorch from `requirements.txt`; macOS gets CPU/MPS.
 
 ```bash
 conda create -n PathSeg python=3.11
 conda activate PathSeg
-conda install -c conda-forge scikit-image opencv pandas pillow numpy openslide openslide-python albumentations
-conda install pytorch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 pytorch-cuda=11.8 -c pytorch -c nvidia
-pip install transformers==4.46.1 accelerate==0.26.0 pycocotools matplotlib scikit-learn zarr tiffslide
+pip install -r requirements.txt
 ```
 
 ### libvips / pyvips

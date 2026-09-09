@@ -40,15 +40,7 @@ import pyvips
 print(pyvips.version(0), pyvips.version(1), pyvips.version(2))
 ```
 
-On Windows and Linux, we need GPU:
-```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 && pip install transformers
-```
-
-On macOS, we don't need GPU:
-```bash
-pip install torch torchvision torchaudio
-```
+Linux/Windows NVIDIA: the `pip install -r` above already pulls CUDA 12.6 PyTorch (`cu126`). macOS gets CPU/MPS wheels.
 
 To verify GPU:
 ```python

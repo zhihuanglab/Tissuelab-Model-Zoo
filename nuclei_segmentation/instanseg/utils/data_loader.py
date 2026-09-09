@@ -214,7 +214,7 @@ def _read_images_from_pth(data_path= "../datasets", dataset = "segmentation", da
         try:
             complete_dataset = torch.load(path_of_pth,weights_only = False)
         except:
-            complete_dataset = torch.load(path_of_pth)
+            complete_dataset = torch.load(path_of_pth, weights_only=False)
     
 
     data_dicts = {}

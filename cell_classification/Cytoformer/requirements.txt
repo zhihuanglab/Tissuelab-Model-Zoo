@@ -13,6 +13,7 @@ sse-starlette==3.4.6
 
 setuptools
 timm>=1.0.0  # needed to construct CellClassifier when loading the per-organ head
-# Default PyPI macOS/CPU builds; for CUDA:
-# pip install torch --index-url https://download.pytorch.org/whl/cu124
-torch
+# macOS: PyPI CPU/MPS. Linux/Windows: CUDA 12.6 (not PyPI's default CUDA 13).
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.14.0; sys_platform == "darwin"
+torch==2.14.0+cu126; sys_platform != "darwin"

@@ -30,21 +30,12 @@ Python **3.11** is required.
 ```sh
 conda create -n biomedparse python=3.11
 conda activate biomedparse
-```
-
-Install Pytorch
-```sh
-conda install pytorch torchvision torchaudio pytorch-cuda=12.4 -c pytorch -c nvidia
-```
-In case there is issue with detectron2 installation, make sure your pytorch version is compatible with CUDA version on your machine at https://pytorch.org/.
-
-Install dependencies
-```sh
 pip install -r assets/requirements/requirements.txt
 # detectron2 setup.py imports torch, so it cannot share the isolated build
 # of the file above. Official main (not the 0.6 xyz fork) matches Pillow 12:
 pip install --no-build-isolation git+https://github.com/facebookresearch/detectron2.git
 ```
+`requirements.txt` already installs PyTorch (CUDA 12.6 on Linux/Windows, CPU/MPS on macOS). If detectron2 build fails, check that the torch CUDA build matches the machine at https://pytorch.org/.
 
 ### libvips / pyvips
 

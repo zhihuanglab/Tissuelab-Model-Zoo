@@ -14,8 +14,8 @@ author: Chen Chen (cc215@ic.ac.uk)
 ## Environment
 
 - Python 3.11
-- Pytorch 1.6 (_please upgrade your pytorch to the latest version, otherwise it may raise error when loading weights from the saved checkpoints._)
-- CUDA(cuda 10.0)
+- PyTorch 2.14.0 (Linux/Windows: CUDA 12.6; macOS: CPU/MPS)
+- CUDA 12.x (NVIDIA GPU platforms)
 
 ## Dependencies
 

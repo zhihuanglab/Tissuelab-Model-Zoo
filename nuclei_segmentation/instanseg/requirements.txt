@@ -26,10 +26,12 @@ fastdist>=1.1.6
 numba
 tqdm>=4.66.0
 
-# PyTorch — keep torch/torchvision paired.
-# CUDA: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-torch
-torchvision
+# macOS: PyPI CPU/MPS. Linux/Windows: CUDA 12.6 (not PyPI's default CUDA 13).
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.14.0; sys_platform == "darwin"
+torch==2.14.0+cu126; sys_platform != "darwin"
+torchvision==0.29.0; sys_platform == "darwin"
+torchvision==0.29.0+cu126; sys_platform != "darwin"
 
 transformers>=4.30.0
 

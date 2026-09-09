@@ -584,7 +584,7 @@ def get_vit_backbone(cfg):
         assert os.path.isfile(filename), f"=> no checkpoint found at '{filename}'"
         logger.info(f'=> init from {filename}')
         with PathManager.open(filename, "rb") as f:
-            ckpt = torch.load(f)
+            ckpt = torch.load(f, weights_only=False)
         vit.load_weights(ckpt, cfg['MODEL']['BACKBONE']['VIT'].get('PRETRAINED_LAYERS', ['*']), cfg['VERBOSE'])
 
     return vit

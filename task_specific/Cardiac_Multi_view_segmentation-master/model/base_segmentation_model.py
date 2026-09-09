@@ -100,21 +100,21 @@ class SegmentationModel(nn.Module):
                 
                 if '.pkl' in resume_path:
                     try:
-                        self.model.load_state_dict(torch.load(resume_path, map_location=map_location)[
+                        self.model.load_state_dict(torch.load(resume_path, map_location=map_location, weights_only=False)[
                                                    'model_state'], strict=True)
                     except:
                         print('fail to load, loose the constraint')
-                        self.model.load_state_dict(torch.load(resume_path, map_location=map_location)[
+                        self.model.load_state_dict(torch.load(resume_path, map_location=map_location, weights_only=False)[
                                                    'model_state'], strict=False)
                     print('load params from ', resume_path)
                 elif '.pth' in resume_path:
                     try:
                         self.model.load_state_dict(
-                            torch.load(resume_path, map_location=map_location), strict=True)
+                            torch.load(resume_path, map_location=map_location, weights_only=False), strict=True)
                     except:
                         print('fail to load, loose the constraint')
                         self.model.load_state_dict(
-                            torch.load(resume_path, map_location=map_location), strict=False)
+                            torch.load(resume_path, map_location=map_location, weights_only=False), strict=False)
                     print('load params from ', resume_path)
 
                 else:

@@ -49,7 +49,7 @@ def build_uni2(weights_path: Optional[str] = UNI2_WEIGHTS, freeze: bool = False)
     freeze defaults False: the image encoder is finetuned end-to-end."""
     model = timm.create_model("vit_giant_patch14_224", pretrained=False, **UNI2_CFG)
     if weights_path and os.path.exists(weights_path):
-        sd = torch.load(weights_path, map_location="cpu")
+        sd = torch.load(weights_path, map_location="cpu", weights_only=False)
         sd = sd.get("state_dict", sd)
         missing, unexpected = model.load_state_dict(sd, strict=False)
         if missing or unexpected:
@@ -74,7 +74,7 @@ def build_hoptimus(weights_path: Optional[str] = HOPTIMUS_WEIGHTS, freeze: bool 
     model = timm.create_model("vit_giant_patch14_reg4_dinov2", pretrained=False,
                               img_size=224, init_values=1e-5, num_classes=0, dynamic_img_size=False)
     if weights_path and os.path.exists(weights_path):
-        sd = torch.load(weights_path, map_location="cpu")
+        sd = torch.load(weights_path, map_location="cpu", weights_only=False)
         sd = sd.get("state_dict", sd)
         missing, unexpected = model.load_state_dict(sd, strict=False)
         if len(missing) > 4 or unexpected:      # tolerate <=4 (head) missing; error on real mismatch

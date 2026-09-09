@@ -65,7 +65,7 @@ class CytoHead:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         weights = _resolve_weights()
         net = CellClassifier(backbone=backbone)
-        ck = torch.load(weights, map_location="cpu")
+        ck = torch.load(weights, map_location="cpu", weights_only=False)
         sd = ck.get("model_state_dict", ck.get("state_dict", ck))
         sd = _strip_compile_prefix(sd)
         missing, unexpected = net.load_state_dict(sd, strict=False)
