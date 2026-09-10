@@ -139,6 +139,7 @@ SLIDE_PATH = None
 TISSUE_CLASS = None      # legacy: comma-separated tissue names (string)
 TISSUE_CLASSES = None    # panel: list of tissue names (mirrors classification nodes)
 TISSUE_COLORS = None     # panel: list of HEX colors aligned with TISSUE_CLASSES
+WINDOW_SIZE = None       # panel: sliding-window size in level-0 px (None -> _DEFAULT_WINDOW_SIZE)
 IS_MODEL_INITED = False
 
 ZARR_PATH: Optional[str] = None
@@ -186,13 +187,20 @@ def open_zarr(path: str, mode: str = "a"):
 TISSUE_SEG_GROUP = "Tissue-Segmentation"
 MODEL_NAME = "VISTA"
 
-# VISTA's ONLY user-facing parameter is tissue_class. VISTA is a pure downstream
-# consumer: the patch grid + level come entirely from the patch station
-# (Patch-Segmentation/coordinates), which it REQUIRES. These are fixed internal
-# settings, never read from `args`, so external config can't reinject a bad patch_size.
+# VISTA's user-facing parameters are the tissue classes and `window_size`. VISTA is a
+# pure downstream consumer of the patch station (Patch-Segmentation/coordinates), which
+# it REQUIRES: the patch grid says WHERE the tissue is, and VISTA slides its own
+# `window_size` window over the slide, segmenting every window that overlaps a patch
+# of the requested class. The level, model tile and batch size are fixed internal
+# settings, never read from `args`, so the patch-embedding node's `patch_size`
+# (which the panel also forwards) can't be mistaken for VISTA's window.
 _WSI_LEVEL = 0            # patch-station coordinates are level-0 (full-res) bboxes
-_MODEL_TILE = 512         # uniform size each patch is fed to the model at
-_INFER_BATCH_SIZE = 4     # patches per inference batch
+_MODEL_TILE = 512         # uniform size each window is fed to the model at
+_DEFAULT_WINDOW_SIZE = 1024   # window size (level-0 px) when the panel sends none
+_MIN_WINDOW_SIZE = 64
+_MAX_WINDOW_SIZE = 4096
+_MAX_MASK_UPSAMPLE = 2048  # logits are upsampled (bilinear) to at most this before argmax
+_INFER_BATCH_SIZE = 4     # windows per inference batch
 _USE_AMP = True           # mixed precision (no-op on CPU; only affects CUDA)
 # Default overlay palette (HEX); assigned per class when none provided.
 _DEFAULT_PALETTE = [
@@ -938,6 +946,53 @@ def _get_all_patch_coords(zf):
         return None
 
 
+def _coerce_window_size(val) -> int:
+    """Panel `window_size` -> int px, clamped; anything unparsable falls back to the default."""
+    try:
+        n = int(round(float(val)))
+    except (TypeError, ValueError):
+        print(f"[{NODE_NAME}] window_size {val!r} is not a number; using {_DEFAULT_WINDOW_SIZE}")
+        return _DEFAULT_WINDOW_SIZE
+    clamped = max(_MIN_WINDOW_SIZE, min(_MAX_WINDOW_SIZE, n))
+    if clamped != n:
+        print(f"[{NODE_NAME}] window_size {n} clamped to {clamped}")
+    return clamped
+
+
+def _windows_covering(coords, window: int, level_width: int, level_height: int) -> np.ndarray:
+    """
+    Sliding-window grid (size = stride = `window`, level 0) restricted to the windows
+    that overlap at least one of `coords` ([x0, y0, x1, y1] patch bboxes, x1/y1
+    exclusive). A patch on a window's corner is enough: the whole window is then
+    segmented, so the model decides the boundary at window scale instead of the
+    patch grid. Returns (M, 4) int64 window bboxes clipped to the slide, row-major.
+    """
+    coords = np.asarray(coords, dtype=np.int64).reshape(-1, 4)
+    if len(coords) == 0 or window <= 0:
+        return np.zeros((0, 4), dtype=np.int64)
+    # Window-index range each patch touches; an empty/inverted bbox still counts its origin.
+    x_hi = np.maximum(coords[:, 2], coords[:, 0] + 1) - 1
+    y_hi = np.maximum(coords[:, 3], coords[:, 1] + 1) - 1
+    cx0, cx1 = coords[:, 0] // window, x_hi // window
+    cy0, cy1 = coords[:, 1] // window, y_hi // window
+    hit = []
+    for dx in range(int((cx1 - cx0).max()) + 1):
+        for dy in range(int((cy1 - cy0).max()) + 1):
+            m = (cx0 + dx <= cx1) & (cy0 + dy <= cy1)
+            if m.any():
+                hit.append(np.stack([cx0[m] + dx, cy0[m] + dy], axis=1))
+    idx = np.unique(np.concatenate(hit, axis=0), axis=0)
+    # Keep windows that start inside the slide (a patch bbox past the level bounds is dropped).
+    idx = idx[(idx[:, 0] >= 0) & (idx[:, 1] >= 0)
+              & (idx[:, 0] * window < level_width) & (idx[:, 1] * window < level_height)]
+    x0 = idx[:, 0] * window
+    y0 = idx[:, 1] * window
+    out = np.stack([x0, y0,
+                    np.minimum(x0 + window, level_width),
+                    np.minimum(y0 + window, level_height)], axis=1).astype(np.int64)
+    return out[np.lexsort((out[:, 0], out[:, 1]))]
+
+
 class _TileCachedReader:
     """Read patches through the slide's own tiles instead of one read_region each.
 
@@ -1138,9 +1193,11 @@ class _TissueMaskWriter:
 
 def run_segmentation_sequential(args) -> Dict[str, Any]:
     """
-    Sequential tiling and inference: process each patch one by one.
-    If tissue_class contains commas, multiple tissues are run in sequence:
-    each tissue uses Patch-Classification patches if that tissue exists in Patch-Classification, else full grid.
+    Sequential windowed inference. For each tissue, the patch station decides where the
+    tissue is (Patch-Classification patches of that class if the class exists there, else
+    every patch in Patch-Segmentation); VISTA then slides a `window_size` window over the
+    slide and segments every window that overlaps one of those patches.
+    If tissue_class contains commas, multiple tissues are run in sequence.
     Results are written under the unified Tissue-Segmentation group:
       Tissue-Segmentation/masks/<tissue>/{mask, dzi/} + classes/{name,color} + userData.
     """
@@ -1159,11 +1216,17 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         print(f"[{NODE_NAME}] Opening WSI: {SLIDE_PATH}")
         slide = _open_tiffslide(SLIDE_PATH)
         
-        # Fixed internal settings (module constants). The patch grid comes from the
-        # patch station; each patch is fed to the model at this uniform size.
+        # Fixed internal settings (module constants) plus the panel's window size. The
+        # patch station says where the tissue is; each `window`-sized window is fed to
+        # the model at `patch_size` (the model tile) and its mask upsampled back.
         level = _WSI_LEVEL
         use_amp = _USE_AMP
         patch_size = _MODEL_TILE
+        window = int(WINDOW_SIZE) if WINDOW_SIZE else _DEFAULT_WINDOW_SIZE
+        # Upsample the logits (bilinear) rather than the argmax mask (nearest) so a
+        # 1024 window doesn't get 2x2-blocky edges; capped so huge windows stay cheap.
+        mask_size = min(window, _MAX_MASK_UPSAMPLE)
+        print(f"[{NODE_NAME}] window_size={window}px (level {level}), model tile={patch_size}")
         
         level_dims = slide.level_dimensions
         if level < 0 or level >= slide.level_count:
@@ -1239,12 +1302,16 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             if mask_node_coords is None:
                 mask_node_coords = _get_all_patch_coords(zf_check)
                 coord_source = "Patch-Segmentation"
-            # Visit patches tile by tile: decoding one 4096x4096 JPEG per patch was
+            n_patches = len(mask_node_coords)
+            # Slide VISTA's own window over the slide and keep only the windows that
+            # overlap a patch of this tissue; each kept window is segmented whole.
+            window_coords = _windows_covering(mask_node_coords, window, level_width, level_height)
+            # Visit windows tile by tile: decoding one 4096x4096 JPEG per read was
             # 98% of the non-inference time. Order does not affect the result.
-            mask_node_coords = tile_reader.sort_by_tile(mask_node_coords)
-            total_patches = len(mask_node_coords)
-            print(f"[{NODE_NAME}] Tissue {current_tissue!r}: {total_patches} patches from "
-                  f"{coord_source}, {tile_reader.describe()}")
+            window_coords = tile_reader.sort_by_tile(window_coords)
+            total_patches = len(window_coords)
+            print(f"[{NODE_NAME}] Tissue {current_tissue!r}: {n_patches} patches from "
+                  f"{coord_source} -> {total_patches} windows of {window}px, {tile_reader.describe()}")
 
             # VISTA v2 is text-conditioned: the prompt must name the tissue being
             # segmented, or the model produces the wrong class. Update it per tissue.
@@ -1259,86 +1326,85 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             processed_patches = 0
             idx = 0
             
-            if mask_node_coords is not None:
-                # Use MaskNode coordinates directly
-                for coord in mask_node_coords:
+            for coord in window_coords:
+                _check_cancel()
+                x0, y0, x1, y1 = coord
+                # Actual window size (edge windows are clipped to the slide)
+                actual_patch_w = int(x1 - x0)
+                actual_patch_h = int(y1 - y0)
+                    
+                # Read patch from slide
+                base_x = int(x0 * downsample_x)
+                base_y = int(y0 * downsample_y)
+                    
+                patch_pil = tile_reader.read(
+                    base_x, base_y, actual_patch_w, actual_patch_h
+                )
+                    
+                # Resize to patch_size if needed (for consistent model input)
+                if actual_patch_w != patch_size or actual_patch_h != patch_size:
+                    patch_pil = patch_pil.resize((patch_size, patch_size), Image.LANCZOS)
+                    
+                batch_imgs.append(patch_pil)
+                batch_coords.append((x0, y0, x1, y1))  # save patch position
+                    
+                # Process batch when full or last patch
+                if len(batch_imgs) >= batch_size or idx == total_patches - 1:
                     _check_cancel()
-                    x0, y0, x1, y1 = coord
-                    # Calculate actual patch size from coordinates
-                    actual_patch_w = int(x1 - x0)
-                    actual_patch_h = int(y1 - y0)
-                    
-                    # Read patch from slide
-                    base_x = int(x0 * downsample_x)
-                    base_y = int(y0 * downsample_y)
-                    
-                    patch_pil = tile_reader.read(
-                        base_x, base_y, actual_patch_w, actual_patch_h
-                    )
-                    
-                    # Resize to patch_size if needed (for consistent model input)
-                    if actual_patch_w != patch_size or actual_patch_h != patch_size:
-                        patch_pil = patch_pil.resize((patch_size, patch_size), Image.LANCZOS)
-                    
-                    batch_imgs.append(patch_pil)
-                    batch_coords.append((x0, y0, x1, y1))  # save patch position
-                    
-                    # Process batch when full or last patch
-                    if len(batch_imgs) >= batch_size or idx == total_patches - 1:
-                        _check_cancel()
-                        # Run inference
-                        with torch.no_grad():
-                            amp_ctx = torch.autocast(
-                                device_type=("cuda" if PASEG_MODEL.device == "cuda" else "cpu"),
-                                enabled=(use_amp and PASEG_MODEL.device == "cuda"),
-                                dtype=torch.float16 if PASEG_MODEL.device == "cuda" else torch.bfloat16,
-                            )
-                            with amp_ctx:
-                                logits = PASEG_MODEL.inference_forward(batch_imgs)  # (B,C,h,w)
+                    # Run inference
+                    with torch.no_grad():
+                        amp_ctx = torch.autocast(
+                            device_type=("cuda" if PASEG_MODEL.device == "cuda" else "cpu"),
+                            enabled=(use_amp and PASEG_MODEL.device == "cuda"),
+                            dtype=torch.float16 if PASEG_MODEL.device == "cuda" else torch.bfloat16,
+                        )
+                        with amp_ctx:
+                            logits = PASEG_MODEL.inference_forward(batch_imgs)  # (B,C,h,w)
                                 
-                                # Resize if needed
-                                _, _, h, w = logits.shape
-                                if (h, w) != (patch_size, patch_size):
-                                    logits = torch.nn.functional.interpolate(
-                                        logits, size=(patch_size, patch_size), mode="bilinear", align_corners=False
-                                    )
+                            # Upsample logits towards the window size (see mask_size)
+                            _, _, h, w = logits.shape
+                            if (h, w) != (mask_size, mask_size):
+                                logits = torch.nn.functional.interpolate(
+                                    logits, size=(mask_size, mask_size), mode="bilinear", align_corners=False
+                                )
                                 
-                                # Convert to mask (不需要probability)
-                                mask_batch = torch.argmax(logits, dim=1)   # (B,H,W)
+                            # Convert to mask (不需要probability)
+                            mask_batch = torch.argmax(logits, dim=1)   # (B,H,W)
                                 
-                                # Convert to numpy
-                                mask_batch = mask_batch.cpu().numpy().astype(np.uint8)  # (B,H,W)
+                            # Convert to numpy
+                            mask_batch = mask_batch.cpu().numpy().astype(np.uint8)  # (B,H,W)
                         
-                        # Stitch masks into full image
-                        for b_idx in range(len(batch_imgs)):
-                            mask = mask_batch[b_idx]  # (H, W)
-                            patch_x0, patch_y0, patch_x1, patch_y1 = batch_coords[b_idx]
+                    # Stitch masks into full image
+                    for b_idx in range(len(batch_imgs)):
+                        mask = mask_batch[b_idx]  # (H, W)
+                        patch_x0, patch_y0, patch_x1, patch_y1 = batch_coords[b_idx]
                             
-                            # Resize mask back to original patch size if needed
-                            actual_patch_w = patch_x1 - patch_x0
-                            actual_patch_h = patch_y1 - patch_y0
-                            if actual_patch_w != patch_size or actual_patch_h != patch_size:
-                                mask = cv2.resize(mask, (actual_patch_w, actual_patch_h), interpolation=cv2.INTER_NEAREST)
+                        # Resize mask to the window's actual size if needed (edge windows,
+                        # or windows larger than the upsample cap)
+                        actual_patch_w = patch_x1 - patch_x0
+                        actual_patch_h = patch_y1 - patch_y0
+                        if actual_patch_w != mask_size or actual_patch_h != mask_size:
+                            mask = cv2.resize(mask, (actual_patch_w, actual_patch_h), interpolation=cv2.INTER_NEAREST)
                             
-                            # Calculate actual patch size (handle edge cases)
-                            actual_h = min(actual_patch_h, level_height - patch_y0)
-                            actual_w = min(actual_patch_w, level_width - patch_x0)
+                        # Calculate actual patch size (handle edge cases)
+                        actual_h = min(actual_patch_h, level_height - patch_y0)
+                        actual_w = min(actual_patch_w, level_width - patch_x0)
                             
-                            # Stitch mask into full mask
-                            full_mask[patch_y0:patch_y0+actual_h, patch_x0:patch_x0+actual_w] = mask[:actual_h, :actual_w]
+                        # Stitch mask into full mask
+                        full_mask[patch_y0:patch_y0+actual_h, patch_x0:patch_x0+actual_w] = mask[:actual_h, :actual_w]
                         
-                        processed_patches += len(batch_imgs)
+                    processed_patches += len(batch_imgs)
                         
-                        # Update progress (10-90% for patch processing)
-                        progress_value = int(10 + (processed_patches / total_patches) * 80)
-                        if processed_patches % 50 == 0 or processed_patches == total_patches:
-                            print(f"[{NODE_NAME}] Progress: {progress_value}% ({processed_patches}/{total_patches} patches)")
+                    # Update progress (10-90% for patch processing)
+                    progress_value = int(10 + (processed_patches / total_patches) * 80)
+                    if processed_patches % 50 == 0 or processed_patches == total_patches:
+                        print(f"[{NODE_NAME}] Progress: {progress_value}% ({processed_patches}/{total_patches} windows)")
                         
-                        # Clear batch
-                        batch_imgs = []
-                        batch_coords = []
+                    # Clear batch
+                    batch_imgs = []
+                    batch_coords = []
                     
-                    idx += 1
+                idx += 1
             
             # Write this tissue out now and drop it: holding every tissue's mask until
             # the end is what made peak memory scale with the tissue count.
@@ -1375,7 +1441,8 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             _put_str_dataset(user_data_grp, "model", MODEL_NAME)
             _put_str_dataset(user_data_grp, "tissue_class", TISSUE_CLASS or "")
             _put_str_dataset(user_data_grp, "config", json.dumps({
-                "tiling": "patch-station",
+                "tiling": "window-over-patch-station",
+                "window_size": window,
                 "model_tile": patch_size,
                 "level": level,
                 "model_type": getattr(args, "model_type", getattr(args, "default_text", "")),
@@ -1385,7 +1452,7 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         
         progress_value = 100
         saved_keys = list(class_names)
-        print(f"[{NODE_NAME}] Complete! Processed {total_patches_overall} patches, masks saved: {saved_keys}")
+        print(f"[{NODE_NAME}] Complete! Processed {total_patches_overall} windows, masks saved: {saved_keys}")
         
         result = {
             "status": "ok",
@@ -1655,8 +1722,10 @@ def read_node(data: Dict[str, Any]):
           model_path, patch_ids, image_array_path, patch_id_path,
           tissue_classes, tissue_colors, batch_size, num_workers, amp, save_prob, default_text, ...
     """
-    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ZARR_GROUP, DEP_ZARR_GROUPS, ARGS, SLIDE_PATH, ACTUAL_ZARR_GROUP, TISSUE_CLASS, TISSUE_CLASSES, TISSUE_COLORS
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ZARR_GROUP, DEP_ZARR_GROUPS, ARGS, SLIDE_PATH, ACTUAL_ZARR_GROUP, TISSUE_CLASS, TISSUE_CLASSES, TISSUE_COLORS, WINDOW_SIZE
     import argparse
+    # Per-run parameter: never carry a previous run's window into this one.
+    WINDOW_SIZE = None
 
     NODE_NAME = data.get("node_name", "SegNode")
     DEPENDENCIES = data.get("dependencies", [])
@@ -1699,10 +1768,11 @@ def read_node(data: Dict[str, Any]):
     # which also avoids mis-reading our own Tissue-Segmentation/userData output group.
     ACTUAL_ZARR_GROUP = ZARR_GROUP
     _control_keys = {"node_name", "dependencies", "zarr_path", "zarr_group", "dependencies_zarr_groups"}
-    # Params VISTA deliberately ignores: the patch grid + level come from the patch
-    # station (Patch-Segmentation/coordinates) and the model tile / batch size are
-    # fixed module constants (see run_segmentation_sequential). We still setattr them
-    # for provenance, but flag them as ignored in the log so a stray patch_size=224
+    # Params VISTA deliberately ignores: `patch_size` & co. are the patch-embedding
+    # node's grid settings (the panel forwards them); VISTA's own tiling is
+    # `window_size`, and the level / model tile / batch size are fixed module
+    # constants (see run_segmentation_sequential). We still setattr them for
+    # provenance, but flag them as ignored in the log so a stray patch_size=224
     # doesn't read as "VISTA tiled at 224".
     _ignored_keys = {"patch_size", "stride", "level", "tissue_threshold", "batch_size", "num_workers"}
     for k, val in data.items():
@@ -1720,7 +1790,11 @@ def read_node(data: Dict[str, Any]):
             if isinstance(val, list) and len(val) > 0:
                 TISSUE_COLORS = [str(x) for x in val]
                 print(f"[{NODE_NAME}] tissue_colors: {TISSUE_COLORS}")
-        suffix = " (ignored: grid from patch station, tile/batch fixed)" if k in _ignored_keys else ""
+        elif k == "window_size":
+            if val is not None and str(val).strip() != "":
+                WINDOW_SIZE = _coerce_window_size(val)
+                print(f"[{NODE_NAME}] window_size: {WINDOW_SIZE}")
+        suffix = " (ignored: VISTA tiles by window_size; tile/batch fixed)" if k in _ignored_keys else ""
         print(f"[{NODE_NAME}] user param {k} => {val}{suffix}")
         setattr(ARGS, k, val)
 

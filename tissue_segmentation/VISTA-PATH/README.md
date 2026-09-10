@@ -8,7 +8,9 @@ foreground/background mask for that class.
 
 This directory is the **Model-Zoo task node** (`VISTA_Node.py`). It is a pure downstream
 consumer: it reads the patch grid from an upstream patch-embedding node
-(`Patch-Segmentation/coordinates`), runs each patch through the model, and writes a unified
+(`Patch-Segmentation/coordinates`) to learn where each tissue is, slides its own
+`window_size` window (default **1024** px) over the slide, runs every window that overlaps a
+patch of the requested class through the model, and writes a unified
 `Tissue-Segmentation/masks/<tissue>/{mask}` output back into the slide's zarr store.
 
 > Model source of truth (training + standalone WSI inference):
@@ -106,13 +108,23 @@ slide zarr (it never self-tiles); if none exists it returns without producing ma
 ### How inference works
 
 1. The patch grid + level come from `Patch-Segmentation/coordinates` (level-0 bboxes).
-   If `tissue_class` matches a `Patch-Classification` class, only those patches are run;
-   otherwise all patches are run.
-2. Each patch is read from the slide, resized to **512** (`_MODEL_TILE`), and run through
-   the model in batches (`_INFER_BATCH_SIZE = 4`, AMP on CUDA).
-3. Per-patch `argmax` masks are stitched into a full-resolution binary mask per tissue.
-4. Output is written to `Tissue-Segmentation/masks/<tissue>/mask` (bool), plus
-   `classes/{name,color}` and `userData` provenance.
+   If `tissue_class` matches a `Patch-Classification` class, only the patches of that
+   class count as "where the tissue is"; otherwise every patch does.
+2. VISTA slides its own non-overlapping window of `window_size` px (panel parameter
+   **"Patch size"**, default **1024**, clamped to 64–4096) over level 0 and keeps every
+   window that overlaps at least one of those patches — a patch on a window's corner is
+   enough, and the whole window is segmented so the model, not the patch grid, decides the
+   boundary. Windows on the slide edge are clipped.
+3. Each window is read from the slide, resized to **512** (`_MODEL_TILE`), and run through
+   the model in batches (`_INFER_BATCH_SIZE = 4`, AMP on CUDA). The logits are upsampled
+   (bilinear, up to 2048 px) back to the window size before `argmax`.
+4. Per-window masks are stitched into a full-resolution binary mask per tissue.
+5. Output is written to `Tissue-Segmentation/masks/<tissue>/mask` (bool), plus
+   `classes/{name,color}` and `userData` provenance (`config.window_size`).
+
+`window_size` is the only tiling parameter VISTA reads. The `patch_size` / `level` /
+`tissue_threshold` / `batch_size` the shared panel forwards belong to the patch-embedding
+node and are logged as ignored.
 
 ### Text conditioning (important for v2)
 
