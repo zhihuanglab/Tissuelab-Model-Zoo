@@ -116,7 +116,13 @@ def parse_args():
     parser.add_argument('--patch_size', default=224, type=int)
     parser.add_argument('--level', default=0, type=int)
     parser.add_argument('--tissue_threshold', default=0.1, type=float)
-    parser.add_argument('--batch_size', default=4, type=int)
+    # 16: GPU is starved at 4 once reads are block-ordered (~4.2 GB peak on MUSK-large).
+    parser.add_argument('--batch_size', default=16, type=int)
+    # None => by patch size (0 below 512 px, else 2); also settable via zarr userData.
+    parser.add_argument('--loader_workers', default=None, type=int)
+    # Cap torch intra-op threads for CPU preprocessing (an uncapped node grabs
+    # ~32 cores on a 256-core box and starves sibling nodes). 0 => torch default.
+    parser.add_argument('--torch_threads', default=8, type=int)
     parser.add_argument('--model_path', default='hf-hub:bioptimus/H-optimus-0', type=str)
 
     return parser.parse_args()
@@ -313,7 +319,8 @@ def run_patch_classification(args):
                 tissue_threshold=args.tissue_threshold,
                 save_patches=False,
                 output_mask_path=None,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                loader_workers=args.loader_workers,
             )
             
             # Check if patches were found
@@ -619,7 +626,8 @@ def read_node(data: Dict[str, Any]):
             patch_size=224,
             level=0,
             tissue_threshold=0.1,
-            batch_size=4,
+            batch_size=16,
+            loader_workers=None,
             model_path="hf-hub:bioptimus/H-optimus-0"
         )
     
@@ -633,6 +641,7 @@ def read_node(data: Dict[str, Any]):
     print(f"  - level: {ARGS.level}")
     print(f"  - tissue_threshold: {ARGS.tissue_threshold}")
     print(f"  - batch_size: {ARGS.batch_size}")
+    print(f"  - loader_workers: {ARGS.loader_workers} (None => by patch size)")
     
     return {"status": "ok", "message": f"{NODE_NAME} read done"}
 
@@ -681,6 +690,8 @@ def _apply_parameter(param_name: str, param_value):
         "patch_size": lambda v: _set_int_param("patch_size", v, min_val=1),
         "level": lambda v: _set_int_param("level", v, min_val=0),
         "batch_size": lambda v: _set_int_param("batch_size", v, min_val=1),
+        # 0 disables DataLoader workers (faster cancel, fewer cores per instance)
+        "loader_workers": lambda v: _set_int_param("loader_workers", v, min_val=0),
         "tissue_threshold": lambda v: _set_float_param("tissue_threshold", v, min_val=0.0, max_val=1.0),
         "model_path": lambda v: _set_string_param("model_path", v),
     }
@@ -817,6 +828,10 @@ def main():
     args = parse_args()
     global NODE_NAME
     NODE_NAME = args.name
+
+    if args.torch_threads > 0:
+        torch.set_num_threads(args.torch_threads)
+        print(f"[{args.name}] torch intra-op threads capped at {torch.get_num_threads()}")
 
     # Apply log filter to suppress /logs endpoint access logs
     uvicorn_access_logger = logging.getLogger("uvicorn.access")
