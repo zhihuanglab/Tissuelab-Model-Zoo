@@ -16,4 +16,6 @@ nibabel==5.4.2
 torch==2.14.0; sys_platform == "darwin"
 torch==2.14.0+cu126; sys_platform != "darwin"
 dicom2nifti>=2.4.0
-totalsegmentator>=1.5.0
+# Task node + vendored TotalSegmentator-master target v2 (2.11.x API / Dataset291 weights).
+# Cap below 3 so a future v3 release is not pulled by pip.
+totalsegmentator>=2.11,<3
