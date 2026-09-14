@@ -32,6 +32,7 @@ dependencies:
     - zarr==3.1.6
     - tifffile==2026.3.3
     - tiffslide==3.0.1
+    - pyvips==3.2.0
 
     - fastapi==0.141.1
     - uvicorn[standard]==0.52.4
@@ -53,7 +54,6 @@ dependencies:
     # - bioio>=0.4.0
     # - bioio-bioformats>=0.1.0
     # - cupy-cuda12x>=13.0.0
-    # - pyvips>=2.2.0
     # - czifile
     # - slideio>=0.4.0
     # - stardist>=0.9.1

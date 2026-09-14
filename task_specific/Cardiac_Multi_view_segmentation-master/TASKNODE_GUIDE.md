@@ -10,7 +10,7 @@
 
 ### 1. Start the TaskNode Server
 
-Install `pip install -r requirements.txt` (Python 3.11). WSI I/O needs a **full** libvips (not `pyvips[binary]`): macOS `brew install vips`; Linux `sudo apt-get install -y libvips-dev`; Windows unpack `vips-dev-w64-all` to `C:\vips` and put `bin` on `PATH`. Then `pip install pyvips==3.1.1`.
+Install `pip install -r requirements.txt` (Python 3.11). WSI I/O needs a **full** libvips (not `pyvips[binary]`): macOS `brew install vips`; Linux `sudo apt-get install -y libvips-dev`; Windows unpack `vips-dev-w64-all` to `C:\vips` and put `bin` on `PATH`.
 
 ```bash
 cd tissue_segmentation/Cardiac_Multi_view_segmentation-master

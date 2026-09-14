@@ -13,6 +13,7 @@ requests==2.34.2
 pandas==3.0.5
 scikit-image==0.26.0
 sse-starlette==3.4.6
+pyvips==3.2.0
 
 # macOS: PyPI CPU/MPS. Linux/Windows: CUDA 12.6 (not PyPI's default CUDA 13).
 --extra-index-url https://download.pytorch.org/whl/cu126

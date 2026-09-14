@@ -10,7 +10,6 @@ This guide will help you set up a conda environment for InstanSeg segmentation n
   - macOS: `brew install vips`
   - Linux (Debian/Ubuntu): `sudo apt-get install -y libvips-dev`
   - Windows: unpack the full `vips-dev-w64-all` build from [libvips Windows releases](https://github.com/libvips/build-win64-mxe/releases) to `C:\vips` (or `TL_VIPS_DIR`) and add `C:\vips\bin` to `PATH`
-  - Then: `pip install pyvips==3.1.1`
 
 ## Quick Setup
 
