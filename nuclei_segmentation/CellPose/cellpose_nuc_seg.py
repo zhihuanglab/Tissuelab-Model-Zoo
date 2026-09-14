@@ -1,28 +1,36 @@
 # -*- coding: utf-8 -*-
 
-from cellpose import models, utils
+from cellpose.models import CellposeModel
 from cellpose.io import logger_setup
 import numpy as np
 import pandas as pd
 import time
-import copy
-from PIL import Image, ImageOps, ImageDraw
 import cv2
-import skimage
 from tqdm import tqdm
 import os
 from datetime import datetime
-from multiprocessing import Process, Queue, Pool
-from scipy.ndimage import zoom
-from skimage.feature import graycomatrix, graycoprops
-from skimage import draw
-import tensorflow as tf
+from multiprocessing import Queue
 from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
 import tiffslide
-from collections import defaultdict
 import torch
 
 opj = os.path.join
+
+# Cellpose 4 builtin names. v3 nuclei/cyto/cyto2/cyto3 are ignored by v4.
+_CELLPOSE4_MODELS = {"cpsam_v2", "cpsam", "cpdino", "cpdino-vitb"}
+_CELLPOSE3_MODELS = {"nuclei", "cyto", "cyto2", "cyto3"}
+
+
+def _cellpose_pretrained(name):
+    if os.path.exists(name):
+        return name
+    if name in _CELLPOSE4_MODELS:
+        return name
+    if name in _CELLPOSE3_MODELS:
+        print(f"Cellpose 4 ignores model_type={name!r}; using cpsam_v2")
+    else:
+        print(f"Unknown Cellpose model {name!r}; using cpsam_v2")
+    return "cpsam_v2"
 
 class SlideSegmentation():
 
@@ -33,7 +41,7 @@ class SlideSegmentation():
                  prob_thresh=0.3,
                  nms_thresh=0.3,
                  n_tiles=(2,2,1),
-                 cellpose_model='nuclei',  # Changed from stardist_pretrain
+                 cellpose_model='cpsam_v2',
                  isIHC=False,
                  progress_callback=None,
                  cancel_checker=None,
@@ -41,10 +49,8 @@ class SlideSegmentation():
         
         super(SlideSegmentation, self).__init__()
         
-        # Setup logger for Cellpose
         logger_setup()
         
-        # Check GPU availability for Cellpose
         use_gpu = torch.cuda.is_available()
         if use_gpu:
             print(f"GPU found and will be used for Cellpose: {torch.cuda.get_device_name(0)}")
@@ -58,23 +64,9 @@ class SlideSegmentation():
         
         self.wsi_mask = self.simple_get_mask()
         
-        # Initialize Cellpose model
-        print(f"Loading Cellpose model: {cellpose_model}")
-        if cellpose_model == 'nuclei':
-            self.model = models.CellposeModel(gpu=use_gpu, model_type='nuclei')
-        elif cellpose_model == 'cyto':
-            self.model = models.CellposeModel(gpu=use_gpu, model_type='cyto')
-        elif cellpose_model == 'cyto2':
-            self.model = models.CellposeModel(gpu=use_gpu, model_type='cyto2')
-        elif cellpose_model == 'cyto3':
-            self.model = models.CellposeModel(gpu=use_gpu, model_type='cyto3')
-        else:
-            # Try to load custom model
-            if os.path.exists(cellpose_model):
-                self.model = models.CellposeModel(gpu=use_gpu, pretrained_model=cellpose_model)
-            else:
-                print(f"Model {cellpose_model} not found, using default 'nuclei' model")
-                self.model = models.CellposeModel(gpu=use_gpu, model_type='nuclei')
+        pretrained = _cellpose_pretrained(cellpose_model)
+        print(f"Loading Cellpose model: {pretrained}")
+        self.model = CellposeModel(gpu=use_gpu, pretrained_model=pretrained)
         
         # Cellpose parameters
         self.diameter = 30  # Typical nucleus diameter in pixels at 20x magnification
@@ -191,7 +183,6 @@ class SlideSegmentation():
             from PIL import ImageOps
             from skimage import morphology
             from skimage.measure import label, regionprops
-            import imageio
 
             # ---------------------------------------------------------------------
             # 1. Read a thumbnail image at the coarsest reasonable level
@@ -216,6 +207,7 @@ class SlideSegmentation():
             # Set debug directory based on args.debug flag
             debug_dir = None
             if hasattr(self.args, 'debug') and self.args.debug:
+                import imageio
                 debug_dir = os.path.dirname(os.path.splitext(self.args.slidepath)[0])
                 os.makedirs(debug_dir, exist_ok=True)
 
@@ -435,14 +427,13 @@ class SlideSegmentation():
         
         # Run Cellpose
         masks, flows, styles = self.model.eval(
-            img_np, 
+            img_np,
             diameter=self.diameter,
-            channels=[0, 0],  # Grayscale mode (use average of RGB)
             flow_threshold=self.flow_threshold,
             cellprob_threshold=self.cellprob_threshold,
             normalize=True,
             tile_overlap=0.1,
-            resample=True
+            resample=True,
         )
         
         # Convert to StarDist format

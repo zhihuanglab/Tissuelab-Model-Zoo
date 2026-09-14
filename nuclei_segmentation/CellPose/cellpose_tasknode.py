@@ -17,12 +17,9 @@ import warnings
 from zarr.errors import UnstableSpecificationWarning
 warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 import requests
-import platform
 import numpy as np
-import cv2
 from sse_starlette.sse import EventSourceResponse
 from progress_sse import ProgressSSEState, iter_progress_events
-import asyncio
 
 import multiprocessing
 
@@ -117,9 +114,8 @@ def parse_args():
     parser.add_argument('--slidepath', default='', type=str)
     parser.add_argument('--read_image_method', default='tiffslide', type=str,
                         choices=['openslide', 'tiffslide', 'PIL', 'numpy'])
-    parser.add_argument('--cellpose_model', default='nuclei', type=str,
-                        choices=['nuclei', 'cyto', 'cyto2', 'cyto3'],
-                        help='Cellpose model type or path to custom model')
+    parser.add_argument('--cellpose_model', default='cpsam_v2', type=str,
+                        help='Cellpose 4 model (cpsam_v2, cpsam, cpdino, cpdino-vitb) or path to weights')
     parser.add_argument('--isIHC', default=False, type=bool)
 
     return parser.parse_args()
@@ -304,7 +300,7 @@ def read_node(data: Dict[str, Any]):
         ARGS = argparse.Namespace(
             slidepath="",
             read_image_method="tiffslide",
-            cellpose_model="nuclei",
+            cellpose_model="cpsam_v2",
             isIHC=False
         )
 
