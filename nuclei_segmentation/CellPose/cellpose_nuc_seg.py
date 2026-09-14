@@ -1,28 +1,36 @@
 # -*- coding: utf-8 -*-
 
-from cellpose import models, utils
+from cellpose.models import CellposeModel
 from cellpose.io import logger_setup
 import numpy as np
 import pandas as pd
 import time
-import copy
-from PIL import Image, ImageOps, ImageDraw
 import cv2
-import skimage
 from tqdm import tqdm
 import os
 from datetime import datetime
-from multiprocessing import Process, Queue, Pool
-from scipy.ndimage import zoom
-from skimage.feature import graycomatrix, graycoprops
-from skimage import draw
-import tensorflow as tf
+from multiprocessing import Queue
 from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
 import tiffslide
-from collections import defaultdict
 import torch
 
 opj = os.path.join
+
+# Cellpose 4 builtin names. v3 nuclei/cyto/cyto2/cyto3 are ignored by v4.
+_CELLPOSE4_MODELS = {"cpsam_v2", "cpsam", "cpdino", "cpdino-vitb"}
+_CELLPOSE3_MODELS = {"nuclei", "cyto", "cyto2", "cyto3"}
+
+
+def _cellpose_pretrained(name):
+    if os.path.exists(name):
+        return name
+    if name in _CELLPOSE4_MODELS:
+        return name
+    if name in _CELLPOSE3_MODELS:
+        print(f"Cellpose 4 ignores model_type={name!r}; using cpsam_v2")
+    else:
+        print(f"Unknown Cellpose model {name!r}; using cpsam_v2")
+    return "cpsam_v2"
 
 class SlideSegmentation():
 
@@ -33,7 +41,7 @@ class SlideSegmentation():
                  prob_thresh=0.3,
                  nms_thresh=0.3,
                  n_tiles=(2,2,1),
-                 cellpose_model='nuclei',  # Changed from stardist_pretrain
+                 cellpose_model='cpsam_v2',
                  isIHC=False,
                  progress_callback=None,
                  cancel_checker=None,
@@ -41,10 +49,11 @@ class SlideSegmentation():
         
         super(SlideSegmentation, self).__init__()
         
-        # Setup logger for Cellpose
-        logger_setup()
+        try:
+            logger_setup()
+        except Exception as e:
+            print(f"cellpose logger_setup skipped: {e}")
         
-        # Check GPU availability for Cellpose
         use_gpu = torch.cuda.is_available()
         if use_gpu:
             print(f"GPU found and will be used for Cellpose: {torch.cuda.get_device_name(0)}")
@@ -58,23 +67,9 @@ class SlideSegmentation():
         
         self.wsi_mask = self.simple_get_mask()
         
-        # Initialize Cellpose model
-        print(f"Loading Cellpose model: {cellpose_model}")
-        if cellpose_model == 'nuclei':
-            self.model = models.CellposeModel(gpu=use_gpu, model_type='nuclei')
-        elif cellpose_model == 'cyto':
-            self.model = models.CellposeModel(gpu=use_gpu, model_type='cyto')
-        elif cellpose_model == 'cyto2':
-            self.model = models.CellposeModel(gpu=use_gpu, model_type='cyto2')
-        elif cellpose_model == 'cyto3':
-            self.model = models.CellposeModel(gpu=use_gpu, model_type='cyto3')
-        else:
-            # Try to load custom model
-            if os.path.exists(cellpose_model):
-                self.model = models.CellposeModel(gpu=use_gpu, pretrained_model=cellpose_model)
-            else:
-                print(f"Model {cellpose_model} not found, using default 'nuclei' model")
-                self.model = models.CellposeModel(gpu=use_gpu, model_type='nuclei')
+        pretrained = _cellpose_pretrained(cellpose_model)
+        print(f"Loading Cellpose model: {pretrained}")
+        self.model = CellposeModel(gpu=use_gpu, pretrained_model=pretrained)
         
         # Cellpose parameters
         self.diameter = 30  # Typical nucleus diameter in pixels at 20x magnification
@@ -135,7 +130,11 @@ class SlideSegmentation():
 
         try:
             self.slide = tiffslide.TiffSlide(self.args.slidepath)
-            mpp = float(self.slide.properties['tiffslide.mpp-x'])
+            props = self.slide.properties
+            mpp = props.get("tiffslide.mpp-x") or props.get("openslide.mpp-x")
+            if mpp is None:
+                raise KeyError("mpp-x")
+            mpp = float(mpp)
             print("Successfully read file using TiffSlide")
         except Exception as e:
             print(f"TiffSlide failed: {str(e)}")
@@ -191,7 +190,6 @@ class SlideSegmentation():
             from PIL import ImageOps
             from skimage import morphology
             from skimage.measure import label, regionprops
-            import imageio
 
             # ---------------------------------------------------------------------
             # 1. Read a thumbnail image at the coarsest reasonable level
@@ -216,6 +214,7 @@ class SlideSegmentation():
             # Set debug directory based on args.debug flag
             debug_dir = None
             if hasattr(self.args, 'debug') and self.args.debug:
+                import imageio
                 debug_dir = os.path.dirname(os.path.splitext(self.args.slidepath)[0])
                 os.makedirs(debug_dir, exist_ok=True)
 
@@ -314,8 +313,13 @@ class SlideSegmentation():
             print(f"Error generating clean tissue mask: {str(e)}")
             import traceback
             traceback.print_exc()
-            # Return a mask of all 1s when there is an error (consistent with simple_get_mask)
-            return np.ones(dim[::-1], dtype=np.uint8)
+            fallback_dim = locals().get("dim")
+            if fallback_dim is None:
+                try:
+                    fallback_dim = self.slide.level_dimensions[0]
+                except Exception:
+                    fallback_dim = getattr(self.slide, "dimensions", (1, 1))
+            return np.ones(fallback_dim[::-1], dtype=np.uint8)
 
     def cellpose_to_stardist_format(self, masks, flows, img_shape):
         """
@@ -331,6 +335,12 @@ class SlideSegmentation():
             coord: Contour coordinates (N, M, 2) - padded to consistent shape
             prob: Probability/confidence scores (N,)
         """
+        if isinstance(masks, list):
+            masks = masks[0]
+        masks = np.asarray(masks)
+        if masks.ndim > 2:
+            masks = np.squeeze(masks)
+
         # Get unique labels (excluding background 0)
         labels = np.unique(masks)
         labels = labels[labels > 0]
@@ -427,22 +437,26 @@ class SlideSegmentation():
         Returns:
             points, coord, prob in StarDist-like format
         """
-        # Cellpose expects RGB images
-        if len(img_np.shape) == 2:
-            img_np = np.stack([img_np]*3, axis=-1)
-        elif img_np.shape[2] == 1:
-            img_np = np.repeat(img_np, 3, axis=2)
+        # Cellpose 4 wants a 3-channel image.
+        if img_np.ndim == 2:
+            img_np = np.stack([img_np] * 3, axis=-1)
+        elif img_np.ndim == 3:
+            if img_np.shape[2] == 1:
+                img_np = np.repeat(img_np, 3, axis=2)
+            elif img_np.shape[2] > 3:
+                img_np = img_np[:, :, :3]
+        else:
+            raise ValueError(f"Unexpected image shape for Cellpose: {img_np.shape}")
         
         # Run Cellpose
         masks, flows, styles = self.model.eval(
-            img_np, 
+            img_np,
             diameter=self.diameter,
-            channels=[0, 0],  # Grayscale mode (use average of RGB)
             flow_threshold=self.flow_threshold,
             cellprob_threshold=self.cellprob_threshold,
             normalize=True,
             tile_overlap=0.1,
-            resample=True
+            resample=True,
         )
         
         # Convert to StarDist format
@@ -728,7 +742,7 @@ class SlideSegmentation():
         if points_all is None or len(points_all) == 0:
             print("Warning: points_all is empty or has length 0!")
             self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
-            self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
+            self.final_coord = np.array([]).reshape(0, self.global_max_contour_points, 2).astype(np.int32)
             self.prob_all = np.array([])
             total_nuclei = 0
         else:
@@ -765,7 +779,7 @@ class SlideSegmentation():
                 import traceback
                 print(traceback.format_exc())
                 self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
-                self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
+                self.final_coord = np.array([]).reshape(0, self.global_max_contour_points, 2).astype(np.int32)
                 self.prob_all = np.array([])
                 total_nuclei = 0
         
@@ -787,13 +801,9 @@ class SlideSegmentation():
 
         print("---- Segmentation successfully completed ----")
         
-        # Add final validation
         print(f"Final self.final_points: shape={self.final_points.shape if self.final_points is not None else 'None'}")
         if self.final_points is not None and len(self.final_points) > 0:
             print(f"First 5 centroids: \n{self.final_points[:5]}")
-            
-            # Last validation
-            assert len(self.final_points) > 0, "Nuclei detection result is empty, please check"
 
     # Keep all the other methods unchanged
     def post_process_remove_duplicates_fixed(self, debug=True):

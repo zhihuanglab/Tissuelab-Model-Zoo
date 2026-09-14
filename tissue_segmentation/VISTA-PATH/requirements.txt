@@ -15,6 +15,7 @@ scipy==1.17.1
 zarr==3.1.6
 tifffile==2026.3.3
 tiffslide==3.0.1
+pyvips==3.2.0
 fastapi==0.141.1
 uvicorn[standard]==0.52.4
 pydantic==2.13.5
