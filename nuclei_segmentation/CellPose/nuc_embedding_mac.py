@@ -11,15 +11,34 @@ import torch
 from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
 
 from PIL import Image
-import multiprocess as mp
 from tqdm import tqdm
 import zarr
 import os
-from nuc_stat import PILSlide, NumpySlide
 from torch.utils.data import Dataset, DataLoader
 import time
 from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
 import pathlib
+
+
+class PILSlide():
+    def __init__(self, filepath):
+        self.wsi = Image.open(filepath)
+        self.dimensions = self.wsi.size
+
+    def read_region(self, location, level=0, size=(100, 100)):
+        crop_region = (location[0], location[1], location[0] + size[0], location[1] + size[1])
+        return self.wsi.crop(crop_region)
+
+
+class NumpySlide():
+    def __init__(self, filepath):
+        self.wsi = np.array(Image.open(filepath))[..., :3]
+        self.dimensions = (self.wsi.shape[1], self.wsi.shape[0])
+
+    def read_region(self, location, level=0, size=(100, 100)):
+        y1, y2 = location[1], location[1] + size[1]
+        x1, x2 = location[0], location[0] + size[0]
+        return Image.fromarray(self.wsi[y1:y2, x1:x2, :])
 
 # Disable multiprocessing for TensorFlow to avoid conflicts
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -67,20 +86,19 @@ class NucleiPatchDataset(Dataset):
         if read_image_method == 'openslide':
             import openslide
             with openslide.OpenSlide(slide_path) as slide:
-                mpp = float(slide.properties['openslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / mpp
+                mpp = slide.properties.get('openslide.mpp-x')
+                self.magnification = (10.0 / float(mpp)) if mpp else magnification
         elif read_image_method == 'tiffslide':
             import tiffslide
             with tiffslide.TiffSlide(slide_path) as slide:
-                mpp = float(slide.properties['tiffslide.mpp-x'])
-                reference_mpp_1x = 10  # objective magnification
-                self.magnification = reference_mpp_1x / mpp
+                props = slide.properties
+                mpp = props.get('tiffslide.mpp-x') or props.get('openslide.mpp-x')
+                self.magnification = (10.0 / float(mpp)) if mpp else magnification
         else:
-            # Default to provided magnification for PIL and numpy
             self.magnification = magnification
-        
-        # Calculate scale factor based on target magnification (40x)
+
+        if not self.magnification:
+            self.magnification = 40
         self.scale_factor = 40 / self.magnification
         print("Magnification:", self.magnification)
         print("Scale factor:", self.scale_factor)
@@ -156,61 +174,64 @@ class NucleiEmbedding:
         self._cancel_checker = cancel_checker
         
         print("Getting slide magnification...")
-        
-        # Determine file type by extension
+        requested = getattr(self.args, "read_image_method", None)
         file_extension = os.path.splitext(self.args.slidepath)[1].lower()[1:]
-        
-        # Handle different file types
+
         try:
-            if file_extension in ['svs', 'ndpi', 'vms', 'vmu', 'scn', 'mrxs', 'tif', 'tiff', 'bif']:
+            if requested == "tiffslide" or (
+                requested not in ("openslide", "PIL", "numpy")
+                and file_extension in ["svs", "ndpi", "vms", "vmu", "scn", "mrxs", "tif", "tiff", "bif"]
+            ):
+                import tiffslide
+                with tiffslide.TiffSlide(self.args.slidepath) as slide:
+                    props = slide.properties
+                    mpp = props.get("tiffslide.mpp-x") or props.get("openslide.mpp-x")
+                    if mpp is None:
+                        raise KeyError("mpp-x")
+                    self.args.magnification = 10.0 / float(mpp)
+                self.read_image_method = "tiffslide"
+            elif requested == "openslide" or file_extension in ["svs", "ndpi", "vms", "vmu", "scn", "mrxs", "tif", "tiff", "bif"]:
                 try:
                     import openslide
                     with openslide.OpenSlide(self.args.slidepath) as slide:
-                        mpp = float(slide.properties['openslide.mpp-x'])
-                        reference_mpp_1x = 10  # objective magnification
-                        self.args.magnification = reference_mpp_1x / mpp
-                        print("openslide success")
-                    self.read_image_method = 'openslide'
-                except (ImportError, Exception) as e:
-                    print(f"OpenSlide failed: {str(e)}")
+                        mpp = float(slide.properties["openslide.mpp-x"])
+                        self.args.magnification = 10.0 / mpp
+                    self.read_image_method = "openslide"
+                except Exception as e:
+                    print(f"OpenSlide failed: {e}; falling back to tiffslide")
                     import tiffslide
                     with tiffslide.TiffSlide(self.args.slidepath) as slide:
-                        mpp = float(slide.properties['tiffslide.mpp-x'])
-                        reference_mpp_1x = 10  # objective magnification
-                        self.args.magnification = reference_mpp_1x / mpp
-                    self.read_image_method = 'tiffslide'
-            elif file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
-                self.read_image_method = 'PIL'
-                # Use default magnification if provided in args
-                if not hasattr(self.args, 'magnification') or self.args.magnification is None:
-                    self.args.magnification = 40  # Default
-            elif file_extension in ['dcm']:
-                self.read_image_method = 'dicom'
-                if not hasattr(self.args, 'magnification') or self.args.magnification is None:
-                    self.args.magnification = 40  # Default for DICOM
-            elif file_extension in ['npy', 'npz']:
-                self.read_image_method = 'numpy'
-                if not hasattr(self.args, 'magnification') or self.args.magnification is None:
-                    self.args.magnification = 40  # Default for numpy arrays
+                        props = slide.properties
+                        mpp = props.get("tiffslide.mpp-x") or props.get("openslide.mpp-x")
+                        if mpp is None:
+                            raise KeyError("mpp-x")
+                        self.args.magnification = 10.0 / float(mpp)
+                    self.read_image_method = "tiffslide"
+            elif file_extension in ["jpg", "jpeg", "png", "bmp"] or requested == "PIL":
+                self.read_image_method = "PIL"
+                if not getattr(self.args, "magnification", None):
+                    self.args.magnification = 40
+            elif file_extension in ["dcm"]:
+                self.read_image_method = "dicom"
+                if not getattr(self.args, "magnification", None):
+                    self.args.magnification = 40
+            elif file_extension in ["npy", "npz"] or requested == "numpy":
+                self.read_image_method = "numpy"
+                if not getattr(self.args, "magnification", None):
+                    self.args.magnification = 40
             else:
-                # Try TiffSlide as fallback
-                try:
-                    import tiffslide
-                    with tiffslide.TiffSlide(self.args.slidepath) as slide:
-                        mpp = float(slide.properties['tiffslide.mpp-x'])
-                        reference_mpp_1x = 10
-                        self.args.magnification = reference_mpp_1x / mpp
-                    self.read_image_method = 'tiffslide'
-                except Exception:
-                    # Last resort, use PIL
-                    self.read_image_method = 'PIL'
-                    if not hasattr(self.args, 'magnification') or self.args.magnification is None:
-                        self.args.magnification = 40  # Default
+                import tiffslide
+                with tiffslide.TiffSlide(self.args.slidepath) as slide:
+                    props = slide.properties
+                    mpp = props.get("tiffslide.mpp-x") or props.get("openslide.mpp-x")
+                    if mpp is None:
+                        raise KeyError("mpp-x")
+                    self.args.magnification = 10.0 / float(mpp)
+                self.read_image_method = "tiffslide"
         except Exception as e:
             print(f"Error determining file type: {str(e)}")
-            # Fallback to default
-            self.read_image_method = 'PIL'
-            if not hasattr(self.args, 'magnification') or self.args.magnification is None:
+            self.read_image_method = requested or "PIL"
+            if not getattr(self.args, "magnification", None):
                 self.args.magnification = 40
         
         print(f"Using read method: {self.read_image_method} for file: {self.args.slidepath}")
@@ -228,7 +249,7 @@ class NucleiEmbedding:
         cache_dir = os.path.join(os.path.dirname(__file__), 'transformer_cache')
         os.makedirs(cache_dir, exist_ok=True)
         
-        self.processor = AutoProcessor.from_pretrained("vinid/plip", cache_dir=cache_dir, timeout=None)
+        self.processor = AutoProcessor.from_pretrained("vinid/plip", cache_dir=cache_dir)
         self.model = AutoModelForZeroShotImageClassification.from_pretrained("vinid/plip", cache_dir=cache_dir)
         self.model = self.model.to("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -310,6 +331,22 @@ class NucleiEmbedding:
             batch_size = 32
 
         print(f"Generating embeddings using batch size {batch_size} (single-threaded to avoid conflicts)...")
+
+        if zarr_path is None:
+            raise ValueError("zarr_path must be provided to write embeddings directly")
+
+        if self.centroids is None or len(self.centroids) == 0:
+            print("No centroids; writing empty embeddings array")
+            root = zarr.open_group(zarr_path, mode="a")
+            parts = dataset_path.strip("/").split("/")
+            parent = root
+            for group_name in parts[:-1]:
+                parent = parent.require_group(group_name)
+            ds_name = parts[-1]
+            if ds_name in parent:
+                del parent[ds_name]
+            parent.create_array(ds_name, shape=(0, 768), chunks=(1, 768), dtype=np.float16, overwrite=True)
+            return dataset_path
         
         dataset = NucleiPatchDataset(
             slide_path=self.args.slidepath,
@@ -330,8 +367,6 @@ class NucleiEmbedding:
             pin_memory=torch.cuda.is_available()
         )
         
-        if zarr_path is None:
-            raise ValueError("zarr_path must be provided to write embeddings directly")
         print(f"Storing embeddings directly to: {zarr_path}:{dataset_path}")
         total_processed = 0
 
@@ -388,15 +423,17 @@ class NucleiEmbedding:
                     # clean memory
                     del batch_embeddings
                     del processed_batch
-                    torch.cuda.empty_cache()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     
                     # Print progress every 10 batches
                     if batch_idx % 10 == 0:
                         elapsed = time.time() - total_start_time
-                        rate = total_processed / elapsed
-                        eta = (len(dataset) - total_processed) / rate
-                        print(f"\nProcessed {total_processed}/{len(dataset)} nuclei. "
-                              f"Rate: {rate:.1f} nuclei/s. ETA: {eta/60:.1f} min")
+                        if elapsed > 0 and total_processed > 0:
+                            rate = total_processed / elapsed
+                            eta = (len(dataset) - total_processed) / rate
+                            print(f"\nProcessed {total_processed}/{len(dataset)} nuclei. "
+                                  f"Rate: {rate:.1f} nuclei/s. ETA: {eta/60:.1f} min")
                         
                 except Exception as e:
                     print(f"Error processing batch {batch_idx}: {str(e)}")
@@ -407,7 +444,8 @@ class NucleiEmbedding:
         pbar.close()
         total_time = time.time() - total_start_time
         print(f"Total processing time: {total_time:.2f} seconds")
-        print(f"Average rate: {len(dataset)/total_time:.1f} nuclei/second")
+        if total_time > 0 and len(dataset) > 0:
+            print(f"Average rate: {len(dataset)/total_time:.1f} nuclei/second")
         
         print("Embeddings calculation completed and written to Zarr store")
         return dataset_path

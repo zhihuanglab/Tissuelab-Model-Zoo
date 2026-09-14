@@ -100,8 +100,32 @@ progress_state = ProgressSSEState()
 cancel_event = threading.Event()
 
 
+_EMBED_CHECKPOINT = os.path.join(os.path.dirname(__file__), "checkpoints", "checkpoint_step_10000.pt")
+
+
 def _mark_sse_cancelled() -> None:
     progress_state.mark_cancelled()
+
+
+def _persist_segmentation_to_zarr(centroids, contours, probability=None, drop_embeddings=False):
+    """Write segmentation without deleting the node group (keeps embeddings unless drop_embeddings)."""
+    if centroids is None or not ZARR_PATH or not NODE_NAME:
+        return
+    zf = zarr.open_group(ZARR_PATH, mode="a")
+    node_grp = zf.require_group(NODE_NAME)
+    if drop_embeddings and "embeddings" in node_grp:
+        del node_grp["embeddings"]
+    if "centroids" in node_grp:
+        del node_grp["centroids"]
+    node_grp.create_array("centroids", data=centroids)
+    if contours is not None:
+        if "contours" in node_grp:
+            del node_grp["contours"]
+        node_grp.create_array("contours", data=contours)
+    if probability is not None:
+        if "probabilities" in node_grp:
+            del node_grp["probabilities"]
+        node_grp.create_array("probabilities", data=probability)
 
 
 def parse_args():
@@ -175,7 +199,7 @@ def run_segmentation(args):
                 # if already have segmentation => skip cellpose
                 try:
                     centroids = zf[f"{NODE_NAME}/centroids"][()]
-                    contours = zf[f"{NODE_NAME}/contours"][()]
+                    contours = zf[f"{NODE_NAME}/contours"][()] if f"{NODE_NAME}/contours" in zf else None
                     ALREADY_HAVE_SEG = True
                     print("Using existing nuclei segmentation => skip cellpose.")
                     result["message"] = "Using existing nuclei segmentation"
@@ -197,41 +221,61 @@ def run_segmentation(args):
                                    progress_callback=update_progress,
                                    cancel_checker=cancel_checker)
             ss.run_WSI_segmentation()
-            contours = ss.final_coord.astype(np.int32)
-            centroids = ss.final_points.astype(np.int32)
-            probability = ss.prob_all.astype(np.float32)
+            contours = np.asarray(getattr(ss, "final_coord", np.zeros((0, 32, 2))), dtype=np.int32)
+            centroids = np.asarray(getattr(ss, "final_points", np.zeros((0, 2))), dtype=np.int32)
+            probability = np.asarray(getattr(ss, "prob_all", np.array([])), dtype=np.float32)
             result["nuclei_count"] = len(centroids)
             result["message"] = "Segmentation completed successfully"
+            # Persist before embedding so a later PLIP/checkpoint failure does not lose segmentation.
+            _persist_segmentation_to_zarr(centroids, contours, probability, drop_embeddings=True)
 
-        # Step C: generate embedding directly to Zarr if not cached
-        if centroids is not None:
+        # Step C: embeddings (skip empty / missing checkpoint rather than failing after a long seg run)
+        if centroids is not None and len(centroids) > 0:
             have_cached_embedding = False
-            zf = zarr.open_group(ZARR_PATH, mode='a')
-            if NODE_NAME in zf and 'embeddings' in zf[NODE_NAME]:
-                try:
-                    if zf[NODE_NAME]['embeddings'].shape[0] == len(centroids):
-                        have_cached_embedding = True
-                        print("found existing embeddings => skip embedding calculation")
-                except Exception:
-                    have_cached_embedding = False
+            if ALREADY_HAVE_SEG:
+                zf = zarr.open_group(ZARR_PATH, mode="a")
+                if NODE_NAME in zf and "embeddings" in zf[NODE_NAME]:
+                    try:
+                        if zf[NODE_NAME]["embeddings"].shape[0] == len(centroids):
+                            have_cached_embedding = True
+                            print("found existing embeddings => skip embedding calculation")
+                    except Exception:
+                        have_cached_embedding = False
 
             if not have_cached_embedding:
-                print("no cached embeddings => generate new embeddings directly into Zarr")
-                ne = NucleiEmbedding(args, centroids, progress_callback=update_progress, cancel_checker=cancel_checker)
-                ne.generate_embeddings(zarr_path=ZARR_PATH, dataset_path=f"{NODE_NAME}/embeddings")
-
-        # Step D: write segmentation to workflow Zarr (embedding already written if generated)
-        if centroids is not None:
-            zf = zarr.open_group(ZARR_PATH, mode='a')
-            if NODE_NAME in zf:
-                del zf[NODE_NAME]
-            node_grp = zf.create_group(NODE_NAME)
-
-            node_grp.create_array('centroids', data=centroids)
-            if contours is not None:
-                node_grp.create_array('contours', data=contours)
-            if not ALREADY_HAVE_SEG and 'probabilities' in locals():
-                node_grp.create_array('probabilities', data=probability)
+                if not os.path.exists(_EMBED_CHECKPOINT):
+                    print(
+                        f"PLIP checkpoint not found at {_EMBED_CHECKPOINT}; "
+                        "skipping embedding. Segmentation was saved."
+                    )
+                    result["message"] = (
+                        (result.get("message") or "Segmentation completed")
+                        + "; embeddings skipped (missing checkpoints/checkpoint_step_10000.pt)"
+                    )
+                else:
+                    print("no cached embeddings => generate new embeddings directly into Zarr")
+                    try:
+                        ne = NucleiEmbedding(
+                            args, centroids,
+                            progress_callback=update_progress,
+                            cancel_checker=cancel_checker,
+                        )
+                        ne.generate_embeddings(
+                            zarr_path=ZARR_PATH,
+                            dataset_path=f"{NODE_NAME}/embeddings",
+                        )
+                    except CooperativeCancel:
+                        raise
+                    except Exception as embed_err:
+                        print(f"Embedding failed after segmentation was saved: {embed_err}")
+                        import traceback
+                        print(traceback.format_exc())
+                        result["status"] = "error"
+                        result["message"] = (
+                            f"Segmentation saved, but embedding failed: {embed_err}"
+                        )
+        elif centroids is not None and len(centroids) == 0:
+            print("No nuclei detected; skipping embedding.")
 
         # Ensure progress is set to 100 after Step C and D are completed
         update_progress(100)

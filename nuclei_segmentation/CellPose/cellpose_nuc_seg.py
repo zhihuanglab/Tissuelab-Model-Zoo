@@ -49,7 +49,10 @@ class SlideSegmentation():
         
         super(SlideSegmentation, self).__init__()
         
-        logger_setup()
+        try:
+            logger_setup()
+        except Exception as e:
+            print(f"cellpose logger_setup skipped: {e}")
         
         use_gpu = torch.cuda.is_available()
         if use_gpu:
@@ -127,7 +130,11 @@ class SlideSegmentation():
 
         try:
             self.slide = tiffslide.TiffSlide(self.args.slidepath)
-            mpp = float(self.slide.properties['tiffslide.mpp-x'])
+            props = self.slide.properties
+            mpp = props.get("tiffslide.mpp-x") or props.get("openslide.mpp-x")
+            if mpp is None:
+                raise KeyError("mpp-x")
+            mpp = float(mpp)
             print("Successfully read file using TiffSlide")
         except Exception as e:
             print(f"TiffSlide failed: {str(e)}")
@@ -306,8 +313,13 @@ class SlideSegmentation():
             print(f"Error generating clean tissue mask: {str(e)}")
             import traceback
             traceback.print_exc()
-            # Return a mask of all 1s when there is an error (consistent with simple_get_mask)
-            return np.ones(dim[::-1], dtype=np.uint8)
+            fallback_dim = locals().get("dim")
+            if fallback_dim is None:
+                try:
+                    fallback_dim = self.slide.level_dimensions[0]
+                except Exception:
+                    fallback_dim = getattr(self.slide, "dimensions", (1, 1))
+            return np.ones(fallback_dim[::-1], dtype=np.uint8)
 
     def cellpose_to_stardist_format(self, masks, flows, img_shape):
         """
@@ -323,6 +335,12 @@ class SlideSegmentation():
             coord: Contour coordinates (N, M, 2) - padded to consistent shape
             prob: Probability/confidence scores (N,)
         """
+        if isinstance(masks, list):
+            masks = masks[0]
+        masks = np.asarray(masks)
+        if masks.ndim > 2:
+            masks = np.squeeze(masks)
+
         # Get unique labels (excluding background 0)
         labels = np.unique(masks)
         labels = labels[labels > 0]
@@ -419,11 +437,16 @@ class SlideSegmentation():
         Returns:
             points, coord, prob in StarDist-like format
         """
-        # Cellpose expects RGB images
-        if len(img_np.shape) == 2:
-            img_np = np.stack([img_np]*3, axis=-1)
-        elif img_np.shape[2] == 1:
-            img_np = np.repeat(img_np, 3, axis=2)
+        # Cellpose 4 wants a 3-channel image.
+        if img_np.ndim == 2:
+            img_np = np.stack([img_np] * 3, axis=-1)
+        elif img_np.ndim == 3:
+            if img_np.shape[2] == 1:
+                img_np = np.repeat(img_np, 3, axis=2)
+            elif img_np.shape[2] > 3:
+                img_np = img_np[:, :, :3]
+        else:
+            raise ValueError(f"Unexpected image shape for Cellpose: {img_np.shape}")
         
         # Run Cellpose
         masks, flows, styles = self.model.eval(
@@ -719,7 +742,7 @@ class SlideSegmentation():
         if points_all is None or len(points_all) == 0:
             print("Warning: points_all is empty or has length 0!")
             self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
-            self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
+            self.final_coord = np.array([]).reshape(0, self.global_max_contour_points, 2).astype(np.int32)
             self.prob_all = np.array([])
             total_nuclei = 0
         else:
@@ -756,7 +779,7 @@ class SlideSegmentation():
                 import traceback
                 print(traceback.format_exc())
                 self.final_points = np.array([]).reshape(0, 2).astype(np.int32)
-                self.final_coord = np.array([]).reshape(0, 2, 0).astype(np.int32)
+                self.final_coord = np.array([]).reshape(0, self.global_max_contour_points, 2).astype(np.int32)
                 self.prob_all = np.array([])
                 total_nuclei = 0
         
@@ -778,13 +801,9 @@ class SlideSegmentation():
 
         print("---- Segmentation successfully completed ----")
         
-        # Add final validation
         print(f"Final self.final_points: shape={self.final_points.shape if self.final_points is not None else 'None'}")
         if self.final_points is not None and len(self.final_points) > 0:
             print(f"First 5 centroids: \n{self.final_points[:5]}")
-            
-            # Last validation
-            assert len(self.final_points) > 0, "Nuclei detection result is empty, please check"
 
     # Keep all the other methods unchanged
     def post_process_remove_duplicates_fixed(self, debug=True):
