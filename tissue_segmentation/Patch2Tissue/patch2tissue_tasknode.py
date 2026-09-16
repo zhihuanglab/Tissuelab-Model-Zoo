@@ -712,8 +712,6 @@ def run_patch_to_tissue(args) -> Dict[str, Any]:
     classes_grp = out_grp.create_group("classes")
     classes_grp.create_array("name", data=np.array([n.encode("utf-8") for n in merged_names], dtype="S256"))
     classes_grp.create_array("color", data=np.array([c.encode("utf-8") for c in merged_colors], dtype="S256"))
-    # Run stamp on the group itself; the sidebar shows it as the layer's "Updated" time.
-    out_grp.attrs["created_at"] = datetime.now().isoformat()
     print(f"[{NODE_NAME}] classes: replaced {replaced or '-'}, added {added or '-'}, "
           f"total {merged_names}")
 
