@@ -1447,6 +1447,10 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                 "level": level,
                 "model_type": getattr(args, "model_type", getattr(args, "default_text", "")),
             }, ensure_ascii=False))
+            # Run stamp on the group itself (the classification lineages keep
+            # theirs under metadata/); the sidebar shows it as the layer's
+            # "Updated" time.
+            out_grp.attrs["created_at"] = datetime.now().isoformat()
             mask_writer.mark_complete()
             print(f"[{NODE_NAME}] Saved {len(class_names)} class(es) to {TISSUE_SEG_GROUP}: {class_names}")
         
