@@ -147,48 +147,211 @@ DEP_ZARR_GROUPS = {}
 
 # --------------- utils functions ---------------
 
-def _has_rename_cycle(renames):
-    """Detect cycles in a rename chain. Mirrors NuClass._has_rename_cycle."""
-    if not renames:
-        return False
-    graph = {}
-    for op in renames:
-        src = op.get("from")
-        dst = op.get("to")
-        if src and dst:
-            graph[src] = dst
+# Rename ops carry a frontend id. A failed run leaves its ops queued and the
+# next Update sends them again, so each target (classifier file, stored palette)
+# records the ids it has applied and skips them: a resent swap must not swap back.
+_APPLIED_RENAME_IDS_KEEP = 2000
 
-    visited = set()
-    in_stack = set()
 
-    def visit(node):
-        if node in in_stack:
-            return True
-        if node in visited:
-            return False
-        visited.add(node)
-        in_stack.add(node)
-        nxt = graph.get(node)
-        if nxt is not None and visit(nxt):
-            return True
-        in_stack.remove(node)
-        return False
+def _not_yet_applied(renames, applied_ids):
+    applied = set(applied_ids or [])
+    return [op for op in renames or [] if not op.get("id") or op["id"] not in applied]
 
-    for node in list(graph.keys()):
-        if visit(node):
-            return True
-    return False
+
+def _with_applied(applied_ids, renames):
+    ids = list(applied_ids or []) + [op["id"] for op in renames or [] if op.get("id")]
+    return ids[-_APPLIED_RENAME_IDS_KEEP:]
+
+
+def _json_list(value):
+    try:
+        out = json.loads(value) if isinstance(value, str) else list(value or [])
+        return [str(x) for x in out] if isinstance(out, list) else []
+    except Exception:
+        return []
+
+
+def _rename_class_names(names, renames):
+    """Apply rename ops in the order the user made them.
+
+    Each name follows every later op that renames it, so chains (A->B, B->C)
+    and swaps through a temporary name (A->T, B->A, T->B) come out right. A
+    rename is a real rename: nothing keeps the old name.
+    """
+    out = []
+    for name in names or []:
+        cur = str(name)
+        for op in renames or []:
+            if cur == op["from"]:
+                cur = op["to"]
+        out.append(cur)
+    return out
+
+
+def _booster_attributes(booster):
+    """All booster attributes. `Booster.attributes()` / `attr()` assert on an
+    empty-string value, which saved classifiers can carry; read them from the
+    model JSON instead."""
+    try:
+        return dict(json.loads(booster.save_raw("json")).get("learner", {}).get("attributes", {}) or {})
+    except Exception:
+        return {}
+
+
+def _rename_loaded_classifier(clf, class_names, renames, path):
+    """Rename classes inside a loaded classifier and write it back to `path`.
+
+    Stored training labels are indices into `class_names`, so renaming the list
+    renames the class — samples and predictions — without adding a second one.
+    Written back so the next run does not load the old name again (the panel
+    sends each rename once). Returns the new names.
+    """
+    booster = clf.get_booster()
+    attrs = _booster_attributes(booster)
+    applied = _json_list(attrs.get("applied_rename_ids"))
+    renames = _not_yet_applied(renames, applied)
+    renamed = _rename_class_names(class_names, renames)
+    if renamed == list(class_names):
+        return class_names
+    if len(set(renamed)) != len(renamed):
+        print(f"[{NODE_NAME}] Rename would merge classes {renamed}; classifier names left unchanged")
+        return class_names
+    booster.set_attr(class_names=json.dumps(renamed))
+    booster.set_attr(applied_rename_ids=json.dumps(_with_applied(applied, renames)))
+    records = attrs.get("user_annotations")
+    if records:
+        try:
+            recs = json.loads(records)
+            for r in recs:
+                if r.get("class") is not None:
+                    r["class"] = _rename_class_names([r["class"]], renames)[0]
+            booster.set_attr(user_annotations=json.dumps(recs, ensure_ascii=False))
+        except Exception as e:
+            print(f"[{NODE_NAME}] Could not rename user_annotation provenance: {e}")
+    if path:
+        try:
+            clf.save_model(path)
+            print(f"[{NODE_NAME}] Renamed classifier classes {list(class_names)} -> {renamed} in {path}")
+        except Exception as e:
+            print(f"[{NODE_NAME}] Warning: could not write renamed classifier to {path}: {e}")
+    return renamed
+
+
+def _drop_classes_from_loaded_classifier(clf, class_names, class_colors, embeddings, labels, deletes, xgb_params, path):
+    """Remove deleted classes from a loaded classifier: refit on its stored
+    training data without them and write it back to `path`, so a class deleted
+    in the panel is not predicted (and listed) again. Returns the updated
+    (clf, class_names, class_colors, embeddings, labels)."""
+    global SAVE_CLASSIFIER_PATH
+    gone = {i for i, n in enumerate(class_names) if n in set(deletes or [])}
+    if not gone:
+        return clf, class_names, class_colors, embeddings, labels
+    if embeddings is None or labels is None or len(labels) == 0:
+        print(f"[{NODE_NAME}] Warning: classifier has no stored training data; cannot remove {sorted(class_names[i] for i in gone)}")
+        return clf, class_names, class_colors, embeddings, labels
+    labels = np.asarray(labels)
+    # Keep the classes that still have samples; labels must stay contiguous for xgboost.
+    keep = [i for i in range(len(class_names)) if i not in gone and np.any(labels == i)]
+    if len(keep) < 2:
+        print(f"[{NODE_NAME}] Warning: removing {sorted(class_names[i] for i in gone)} leaves fewer than 2 classes; classifier kept")
+        return clf, class_names, class_colors, embeddings, labels
+    remap = {old: new for new, old in enumerate(keep)}
+    mask = np.isin(labels, keep)
+    embeddings = np.asarray(embeddings)[mask]
+    labels = np.array([remap[int(v)] for v in labels[mask]], dtype=np.int32)
+    names = [class_names[i] for i in keep]
+    colors = [class_colors[i] if i < len(class_colors) else "#aaaaaa" for i in keep]
+    refit = xgb.XGBClassifier(**xgb_params)
+    refit.fit(embeddings, labels)
+    old_booster, new_booster = clf.get_booster(), refit.get_booster()
+    for key, value in _booster_attributes(old_booster).items():
+        if value and key not in ("class_names", "class_colors", "train_data"):
+            new_booster.set_attr(**{key: value})
+    if path:
+        previous = SAVE_CLASSIFIER_PATH
+        SAVE_CLASSIFIER_PATH = path   # save_classifier_params writes to SAVE_CLASSIFIER_PATH
+        try:
+            save_classifier_params(refit, names, colors, {"embeddings": embeddings, "labels": labels})
+            print(f"[{NODE_NAME}] Removed {sorted(class_names[i] for i in gone)} from classifier {path}")
+        except Exception as e:
+            print(f"[{NODE_NAME}] Warning: could not write classifier without deleted classes to {path}: {e}")
+        finally:
+            SAVE_CLASSIFIER_PATH = previous
+    return refit, names, colors, embeddings, labels
+
+
+def _decode_patch_annotations(zf, ui_classes, ui_colors, renames):
+    """User-Annotations/patch rows -> DataFrame (patch_ID, class, color, ...) or None.
+
+    Class indices point into the palette pinned when they were written
+    (`patch_class_names`), not into the list the panel sends now: a class the
+    panel deleted or renamed meanwhile would shift or mislabel every index
+    after it. Renames the store does not have yet are applied to that palette
+    and written back (ids already applied are skipped). Deletes never come here:
+    the AI service removes a class from the store when the user deletes it.
+    """
+    if 'User-Annotations' not in zf or 'patch' not in zf['User-Annotations']:
+        return None
+    ua = zf['User-Annotations']
+    palette = [n.decode('utf-8') if isinstance(n, bytes) else str(n) for n in (ua.attrs.get('patch_class_names') or [])]
+    palette_colors = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in (ua.attrs.get('patch_class_colors') or [])]
+    ui_classes = [str(c) for c in (ui_classes or [])]
+    applied = _json_list(ua.attrs.get('patch_applied_rename_ids'))
+    renames = _not_yet_applied(renames, applied)
+    if palette:
+        names = _rename_class_names(palette, renames)
+    else:
+        # Un-pinned store (older data): the panel list, then the last result.
+        names = list(ui_classes)
+        if not names and 'Patch-Classification' in zf and 'classes/name' in zf['Patch-Classification']:
+            names = [n.decode('utf-8') if isinstance(n, bytes) else str(n) for n in zf['Patch-Classification/classes/name'][:]]
+    ui_color = {c: col for c, col in zip(ui_classes, ui_colors or [])}
+    colors = [ui_color.get(n, palette_colors[i] if i < len(palette_colors) else "") for i, n in enumerate(names)]
+
+    patch_arr = ua['patch'][:]
+    if not (patch_arr.dtype.names and 'class' in patch_arr.dtype.names):
+        return None
+    if palette and names != palette:
+        ua.attrs['patch_class_names'] = names
+        ua.attrs['patch_class_colors'] = colors
+    if renames:
+        ua.attrs['patch_applied_rename_ids'] = _with_applied(applied, renames)
+
+    rows = {}
+    fields = patch_arr.dtype.names
+    for i in range(len(patch_arr)):
+        cls_idx = int(patch_arr['class'][i])
+        # Negative or out of range: not a label.
+        if cls_idx < 0 or cls_idx >= len(names):
+            continue
+        rows[str(i)] = {
+            'patch_ID': i,
+            'class': names[cls_idx],
+            'color': colors[cls_idx],
+            'datetime': int(patch_arr['datetime'][i]) if 'datetime' in fields else 0,
+            'method': str(patch_arr['method'][i]) if 'method' in fields else '',
+            'annotator': str(patch_arr['annotator'][i]) if 'annotator' in fields else '',
+        }
+    return pd.DataFrame(rows).T if rows else None
 
 
 def _normalize_class_operations(raw_ops):
     """Normalize class_operations dict from frontend `/read` payload.
 
-    Shape: {'renames': [{'from': str, 'to': str}, ...], 'adds': [{'name': str, 'color': str}, ...]}
+    Shape: {'renames': [{'from': str, 'to': str}, ...], 'adds': [{'name': str, 'color': str}, ...],
+           'deletes': [str, ...]}  (deletes name classes as stored, before the renames)
     Mirrors NuClass/classification_taskNode.py:_normalize_class_operations.
     """
-    ops = {"renames": [], "adds": []}
+    ops = {"renames": [], "adds": [], "deletes": []}
     if not isinstance(raw_ops, dict):
         return ops
+
+    deletes = raw_ops.get("deletes", [])
+    if isinstance(deletes, list):
+        for item in deletes:
+            name = str(item or "").strip()
+            if name and name not in ops["deletes"]:
+                ops["deletes"].append(name)
 
     renames = raw_ops.get("renames", [])
     if isinstance(renames, list):
@@ -198,7 +361,11 @@ def _normalize_class_operations(raw_ops):
             src = str(item.get("from", "")).strip()
             dst = str(item.get("to", "")).strip()
             if src and dst and src != dst:
-                ops["renames"].append({"from": src, "to": dst})
+                op = {"from": src, "to": dst}
+                op_id = str(item.get("id") or "").strip()
+                if op_id:
+                    op["id"] = op_id
+                ops["renames"].append(op)
 
     adds = raw_ops.get("adds", [])
     if isinstance(adds, list):
@@ -456,6 +623,17 @@ def remember_classifier_bundle_for_save(clf, class_names, class_colors, embeddin
     )
 
 
+def _load_classifier_at(path):
+    """load_classifier_params for an explicit file (it reads CLASSIFIER_PATH)."""
+    global CLASSIFIER_PATH
+    previous = CLASSIFIER_PATH
+    CLASSIFIER_PATH = path
+    try:
+        return load_classifier_params()
+    finally:
+        CLASSIFIER_PATH = previous
+
+
 def load_classifier_params():
     """Load classifier parameters and training data from XGBoost model file"""
     global CLASSIFIER_PATH
@@ -687,6 +865,14 @@ def train_linear_classifier(
             loaded_params = load_classifier_params()
             if loaded_params is not None:
                 clf, class_names, class_colors, prev_embeddings, prev_labels = loaded_params
+                # Panel deletes (as stored, so first) and renames apply to the
+                # classifier itself and are written back to its file.
+                _ops = _normalize_class_operations(CLASS_OPERATIONS)
+                if _ops["deletes"]:
+                    clf, class_names, class_colors, prev_embeddings, prev_labels = _drop_classes_from_loaded_classifier(
+                        clf, class_names, class_colors, prev_embeddings, prev_labels, _ops["deletes"], xgb_params, CLASSIFIER_PATH)
+                if _ops["renames"]:
+                    class_names = _rename_loaded_classifier(clf, class_names, _ops["renames"], CLASSIFIER_PATH)
                 loaded_classifier_colors = dict(zip(class_names, class_colors))  # Store for fallback
                 print(f"Loaded existing classifier parameters, classes: {class_names}")
                 
@@ -1497,67 +1683,16 @@ def run_classification(args) -> Dict[str, Any]:
         # A) check annotation
         annotations_data = None
         use_supervised = False
-        # Class names are stored as int indices in User-Annotations/patch['class'].
-        # The mapping comes from (in priority order):
-        #   1. The current workflow params (`args.tissue_classes` / `tissue_colors`)
-        #      — what the user is showing in the panel right now, source of truth
-        #   2. Patch-Classification/classes/{name,color} as backup, if args missing
-        # We deliberately do NOT fall back to f"class_{i}" — that just feeds a
-        # garbage label into XGBoost training, and the bad label ends up written
-        # back to classes/name on the next save.
-        ui_tissue_classes = list(getattr(args, "tissue_classes", []) or [])
-        ui_tissue_colors = list(getattr(args, "tissue_colors", []) or [])
-        class_name_lookup = list(ui_tissue_classes)
-        class_color_lookup = list(ui_tissue_colors)
-        if not class_name_lookup:
-            try:
-                if 'Patch-Classification' in zf and 'classes/name' in zf['Patch-Classification']:
-                    raw_names = zf['Patch-Classification/classes/name'][:]
-                    class_name_lookup = [
-                        n.decode('utf-8') if isinstance(n, bytes) else str(n)
-                        for n in raw_names
-                    ]
-                if 'Patch-Classification' in zf and 'classes/color' in zf['Patch-Classification']:
-                    raw_colors = zf['Patch-Classification/classes/color'][:]
-                    class_color_lookup = [
-                        c.decode('utf-8') if isinstance(c, bytes) else str(c)
-                        for c in raw_colors
-                    ]
-            except Exception:
-                pass
-
-        if 'User-Annotations' in zf and 'patch' in zf['User-Annotations']:
-            patch_arr = zf['User-Annotations/patch'][:]
-            ann_dict = {}
-            if patch_arr.dtype.names and 'class' in patch_arr.dtype.names:
-                for i in range(len(patch_arr)):
-                    cls_idx = int(patch_arr['class'][i])
-                    if cls_idx < 0:
-                        continue
-                    if not (0 <= cls_idx < len(class_name_lookup)):
-                        # Stale annotation: the user removed a class between
-                        # annotating and re-running. Skip rather than invent a
-                        # f"class_{i}" label that pollutes Patch-Classification.
-                        continue
-                    cls_name = class_name_lookup[cls_idx]
-                    cls_color = (
-                        class_color_lookup[cls_idx]
-                        if 0 <= cls_idx < len(class_color_lookup)
-                        else ""
-                    )
-                    ann_dict[str(i)] = {
-                        'patch_ID': i,
-                        'class': cls_name,
-                        'color': cls_color,
-                        'datetime': int(patch_arr['datetime'][i]) if 'datetime' in patch_arr.dtype.names else 0,
-                        'method': str(patch_arr['method'][i]) if 'method' in patch_arr.dtype.names else '',
-                        'annotator': str(patch_arr['annotator'][i]) if 'annotator' in patch_arr.dtype.names else '',
-                    }
-            annotations_data = pd.DataFrame(ann_dict).T if ann_dict else None
-            use_supervised = bool(ann_dict)
-        else:
-            annotations_data = None
-            use_supervised = False
+        # Class indices in User-Annotations/patch point into the palette pinned
+        # when they were written, not into the panel's list (see _decode_patch_annotations).
+        _ops = _normalize_class_operations(CLASS_OPERATIONS)
+        annotations_data = _decode_patch_annotations(
+            zf,
+            list(getattr(args, "tissue_classes", []) or []),
+            list(getattr(args, "tissue_colors", []) or []),
+            renames=_ops["renames"],
+        )
+        use_supervised = annotations_data is not None
         
         # B) read embedding - Try dependency first, then self
         embedding_source_group = None
@@ -2266,9 +2401,6 @@ def read_node(data: Dict[str, Any]):
                     print(f"[{NODE_NAME}] tissue_colors: {ARGS.tissue_colors}")
             elif k == "class_operations":
                 CLASS_OPERATIONS = _normalize_class_operations(val_json)
-                if _has_rename_cycle(CLASS_OPERATIONS.get("renames", [])):
-                    print(f"[{NODE_NAME}] Detected rename cycle, ignoring rename operations.")
-                    CLASS_OPERATIONS["renames"] = []
                 print(f"[{NODE_NAME}] class_operations => {CLASS_OPERATIONS}")
         
         # Debug: Print final classifier path values
@@ -2287,6 +2419,56 @@ def _user_data_write_json(zarr_path: str, node_name: str, key: str, payload: Any
         del grp[key]
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     grp.create_array(key, data=np.array(raw, dtype=f"S{len(raw)}"))
+
+
+@app.post("/class_operations/apply")
+def class_operations_apply_endpoint(data: Dict[str, Any]):
+    """
+    Apply class renames / deletes from the panel to a classifier file right away
+    (the store side is done by the AI service). Same rules as on an Update:
+    deletes (stored names) first, then renames in order; rename ids already
+    applied to this file are skipped, so the ops arriving again with the next
+    Update change nothing.
+
+    Body JSON: classifier_path (str), renames [{from, to, id}], deletes [str]
+    """
+    path = str(data.get("classifier_path") or "").strip()
+    if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return {"status": "ok", "applied": False, "message": "No classifier file to update"}
+    ops = _normalize_class_operations({"renames": data.get("renames"), "deletes": data.get("deletes")})
+    if not ops["renames"] and not ops["deletes"]:
+        return {"status": "ok", "applied": False, "message": "No class operations"}
+    try:
+        loaded = _load_classifier_at(path)
+        if loaded is None:
+            return {"status": "error", "message": f"Could not load classifier {path}"}
+        clf, class_names, class_colors, embeddings, labels = loaded
+        if ops["deletes"]:
+            clf, class_names, class_colors, embeddings, labels = _drop_classes_from_loaded_classifier(
+                clf, class_names, class_colors, embeddings, labels, ops["deletes"], _refit_xgb_params(), path)
+        if ops["renames"]:
+            class_names = _rename_loaded_classifier(clf, class_names, ops["renames"], path)
+        return {"status": "ok", "applied": True, "class_names": list(class_names)}
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Patch-Classification class operations failed: {e}"}
+
+
+def _refit_xgb_params():
+    """XGBoost settings for refitting a classifier outside a run (same as training;
+    single-threaded on macOS, where libomp is not fork-safe in a task node)."""
+    import platform as _platform
+    darwin = _platform.system() == "Darwin"
+    return {
+        "max_depth": 8,
+        "tree_method": "hist",
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "eval_metric": "mlogloss",
+        "random_state": 42,
+        "base_score": 0.5,
+        "n_jobs": 1 if darwin else -1,
+        "nthread": 1 if darwin else -1,
+    }
 
 
 @app.post("/classifier/save")

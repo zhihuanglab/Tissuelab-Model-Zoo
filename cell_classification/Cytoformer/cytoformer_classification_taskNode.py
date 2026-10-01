@@ -301,9 +301,17 @@ class _CancelTrainingCallback(xgb.callback.TrainingCallback):
 
 
 def _normalize_class_operations(raw_ops):
-    ops = {"renames": [], "adds": []}
+    ops = {"renames": [], "adds": [], "deletes": []}
     if not isinstance(raw_ops, dict):
         return ops
+
+    # Classes deleted in the panel, named as stored (before this batch's renames).
+    deletes = raw_ops.get("deletes", [])
+    if isinstance(deletes, list):
+        for item in deletes:
+            name = str(item or "").strip()
+            if name and name not in ops["deletes"]:
+                ops["deletes"].append(name)
 
     renames = raw_ops.get("renames", [])
     if isinstance(renames, list):
@@ -313,7 +321,11 @@ def _normalize_class_operations(raw_ops):
             src = str(item.get("from", "")).strip()
             dst = str(item.get("to", "")).strip()
             if src and dst and src != dst:
-                ops["renames"].append({"from": src, "to": dst})
+                op = {"from": src, "to": dst}
+                op_id = str(item.get("id") or "").strip()
+                if op_id:
+                    op["id"] = op_id
+                ops["renames"].append(op)
 
     adds = raw_ops.get("adds", [])
     if isinstance(adds, list):
@@ -327,36 +339,137 @@ def _normalize_class_operations(raw_ops):
     return ops
 
 
-def _has_rename_cycle(renames):
-    if not renames:
-        return False
-    graph = {}
-    for op in renames:
-        src = op.get("from")
-        dst = op.get("to")
-        if src and dst:
-            graph[src] = dst
+# Rename ops carry a frontend id. A failed run leaves its ops queued and the
+# next Update sends them again, so each target (classifier file, stored palette)
+# records the ids it has applied and skips them: a resent swap must not swap back.
+_APPLIED_RENAME_IDS_KEEP = 2000
 
-    visited = set()
-    in_stack = set()
 
-    def visit(node):
-        if node in in_stack:
-            return True
-        if node in visited:
-            return False
-        visited.add(node)
-        in_stack.add(node)
-        nxt = graph.get(node)
-        if nxt is not None and visit(nxt):
-            return True
-        in_stack.remove(node)
-        return False
+def _not_yet_applied(renames, applied_ids):
+    applied = set(applied_ids or [])
+    return [op for op in renames or [] if not op.get("id") or op["id"] not in applied]
 
-    for node in list(graph.keys()):
-        if visit(node):
-            return True
-    return False
+
+def _with_applied(applied_ids, renames):
+    ids = list(applied_ids or []) + [op["id"] for op in renames or [] if op.get("id")]
+    return ids[-_APPLIED_RENAME_IDS_KEEP:]
+
+
+def _json_list(value):
+    try:
+        out = json.loads(value) if isinstance(value, str) else list(value or [])
+        return [str(x) for x in out] if isinstance(out, list) else []
+    except Exception:
+        return []
+
+
+def _rename_class_names(names, renames):
+    """Apply rename ops in the order the user made them.
+
+    Each name follows every later op that renames it, so chains (A->B, B->C)
+    and swaps through a temporary name (A->T, B->A, T->B) come out right. A
+    rename is a real rename: nothing keeps the old name.
+    """
+    out = []
+    for name in names or []:
+        cur = str(name)
+        for op in renames or []:
+            if cur == op["from"]:
+                cur = op["to"]
+        out.append(cur)
+    return out
+
+
+def _rename_loaded_classifier(clf, class_names, renames, path):
+    """Rename classes inside a loaded classifier and write it back to `path`.
+
+    Labels in the stored training data are indices into `class_names`, so
+    renaming the list renames the class — its samples, its predictions — without
+    adding a second class. Written back so the next run does not load the old
+    name again (the frontend sends each rename once). Returns the new names.
+    """
+    booster = clf.get_booster()
+    attrs = _booster_attributes(booster)
+    applied = _json_list(attrs.get("applied_rename_ids"))
+    renames = _not_yet_applied(renames, applied)
+    renamed = _rename_class_names(class_names, renames)
+    if renamed == list(class_names):
+        return class_names
+    if len(set(renamed)) != len(renamed):
+        print(f"[Cell-Classification] Rename would merge classes {renamed}; classifier names left unchanged")
+        return class_names
+    booster.set_attr(class_names=json.dumps(renamed))
+    booster.set_attr(applied_rename_ids=json.dumps(_with_applied(applied, renames)))
+    records = attrs.get("user_annotations")
+    if records:
+        try:
+            recs = json.loads(records)
+            for r in recs:
+                if r.get("class") is not None:
+                    r["class"] = _rename_class_names([r["class"]], renames)[0]
+            booster.set_attr(user_annotations=json.dumps(recs, ensure_ascii=False))
+        except Exception as e:
+            print(f"[Cell-Classification] Could not rename user_annotation provenance: {e}")
+    if path:
+        try:
+            clf.save_model(path)
+            print(f"[Cell-Classification] Renamed classifier classes {list(class_names)} -> {renamed} in {path}")
+        except Exception as e:
+            print(f"[Cell-Classification] Warning: could not write renamed classifier to {path}: {e}")
+    return renamed
+
+
+def _booster_attributes(booster):
+    """All booster attributes. `Booster.attributes()` / `attr()` assert on an
+    empty-string value, which saved classifiers can carry; read them from the
+    model JSON instead."""
+    try:
+        return dict(json.loads(booster.save_raw("json")).get("learner", {}).get("attributes", {}) or {})
+    except Exception:
+        return {}
+
+
+def _drop_classes_from_loaded_classifier(clf, class_names, class_colors, embeddings, labels, deletes, xgb_params, path):
+    """Remove deleted classes from a loaded classifier: refit on its stored
+    training data without them and write it back to `path`, so a class deleted
+    in the panel is not predicted (and listed) again on the next run. Returns
+    the updated (clf, class_names, class_colors, embeddings, labels)."""
+    global SAVE_CLASSIFIER_PATH
+    gone = {i for i, n in enumerate(class_names) if n in set(deletes or [])}
+    if not gone:
+        return clf, class_names, class_colors, embeddings, labels
+    if embeddings is None or labels is None or len(labels) == 0:
+        print(f"[Cell-Classification] Warning: classifier has no stored training data; cannot remove {sorted(class_names[i] for i in gone)}")
+        return clf, class_names, class_colors, embeddings, labels
+    labels = np.asarray(labels)
+    # Keep the classes that still have samples; labels must stay contiguous for xgboost.
+    keep = [i for i in range(len(class_names)) if i not in gone and np.any(labels == i)]
+    if len(keep) < 2:
+        print(f"[Cell-Classification] Warning: removing {sorted(class_names[i] for i in gone)} leaves fewer than 2 classes; classifier kept")
+        return clf, class_names, class_colors, embeddings, labels
+    remap = {old: new for new, old in enumerate(keep)}
+    mask = np.isin(labels, keep)
+    embeddings = np.asarray(embeddings)[mask]
+    labels = np.array([remap[int(v)] for v in labels[mask]], dtype=np.int32)
+    names = [class_names[i] for i in keep]
+    colors = [class_colors[i] if i < len(class_colors) else "#aaaaaa" for i in keep]
+    refit = xgb.XGBClassifier(**xgb_params)
+    refit.fit(embeddings, labels)
+    old_booster, new_booster = clf.get_booster(), refit.get_booster()
+    for key, value in _booster_attributes(old_booster).items():
+        if value and key not in ("class_names", "class_colors", "train_data"):
+            new_booster.set_attr(**{key: value})
+    if path:
+        previous = SAVE_CLASSIFIER_PATH
+        SAVE_CLASSIFIER_PATH = path
+        try:
+            save_classifier_params(refit, names, colors, {"embeddings": embeddings, "labels": labels})
+            print(f"[Cell-Classification] Removed {sorted(class_names[i] for i in gone)} from classifier {path}")
+        except Exception as e:
+            print(f"[Cell-Classification] Warning: could not write classifier without deleted classes to {path}: {e}")
+        finally:
+            SAVE_CLASSIFIER_PATH = previous
+    return refit, names, colors, embeddings, labels
 
 
 def _decode_attr_str_list(val):
@@ -393,16 +506,6 @@ def _write_user_cell_palette(ua, class_names, class_colors=None):
     ua.attrs["cell_class_names"] = names
     if class_colors is not None and len(class_colors) == len(names):
         ua.attrs["cell_class_colors"] = [str(c) for c in class_colors]
-
-
-def _resolve_rename_terminal(name: str, rename_graph: dict) -> str:
-    """Follow single-step renames until a fixed point (caller must ensure no cycles)."""
-    seen = set()
-    n = name
-    while n in rename_graph and n not in seen:
-        seen.add(n)
-        n = rename_graph[n]
-    return n
 
 
 def _build_frontend_color_map(nuclei_classes, nuclei_colors):
@@ -494,7 +597,10 @@ def _persist_nuclei_rename_to_user_annotation(zf, effective_renames, nuclei_clas
     if not effective_renames or "User-Annotations" not in zf:
         return
     ua = zf["User-Annotations"]
-    rename_graph = {op["from"]: op["to"] for op in effective_renames}
+    applied = _json_list(ua.attrs.get("cell_applied_rename_ids"))
+    effective_renames = _not_yet_applied(effective_renames, applied)
+    if not effective_renames:
+        return
 
     # 1) Remap persisted class_counts (name -> count)
     if "cell_class_counts" in ua:
@@ -510,7 +616,7 @@ def _persist_nuclei_rename_to_user_annotation(zf, effective_renames, nuclei_clas
         if isinstance(counts_dict, dict) and counts_dict:
             new_counts = {}
             for k, v in counts_dict.items():
-                nk = _resolve_rename_terminal(str(k), rename_graph)
+                nk = _rename_class_names([k], effective_renames)[0]
                 try:
                     iv = int(v)
                 except Exception:
@@ -528,7 +634,7 @@ def _persist_nuclei_rename_to_user_annotation(zf, effective_renames, nuclei_clas
     if hasattr(ua, "attrs"):
         nc = [str(x) for x in (nuclei_classes or [])]
         old_names, _old_colors = _read_user_cell_palette(ua)
-        mapped = [_resolve_rename_terminal(nm, rename_graph) for nm in old_names] if old_names else []
+        mapped = _rename_class_names(old_names, effective_renames) if old_names else []
         # The workflow list is written positionally, so take it only when it IS the
         # renamed palette. The panel legitimately sends a subset (Cytoformer sends
         # the annotated classes), and a subset that happens to be the same length
@@ -542,6 +648,8 @@ def _persist_nuclei_rename_to_user_annotation(zf, effective_renames, nuclei_clas
         elif old_names:
             _write_user_cell_palette(ua, mapped)
             print(f"[Cell-Classification] user_annotation.attrs cell_class_names remapped by rename ops: {mapped}")
+    if hasattr(ua, "attrs"):
+        ua.attrs["cell_applied_rename_ids"] = _with_applied(applied, effective_renames)
 
 
 def _int_color_to_hex(color_int: int) -> str:
@@ -1109,6 +1217,17 @@ def remember_classifier_bundle_for_save(clf, class_names, class_colors, embeddin
     )
 
 
+def _load_classifier_at(path):
+    """load_classifier_params for an explicit file (it reads CLASSIFIER_PATH)."""
+    global CLASSIFIER_PATH
+    previous = CLASSIFIER_PATH
+    CLASSIFIER_PATH = path
+    try:
+        return load_classifier_params(path)
+    finally:
+        CLASSIFIER_PATH = previous
+
+
 def load_classifier_params(zarr_path):
     """Load classifier parameters and training data from XGBoost model file"""
     global CLASSIFIER_PATH
@@ -1185,7 +1304,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     """
     global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS, cancel_event
     class_ops = _normalize_class_operations(CLASS_OPERATIONS)
-    effective_renames = [] if _has_rename_cycle(class_ops.get("renames", [])) else class_ops.get("renames", [])
+    effective_renames = class_ops.get("renames", [])
     
     # update XGBoost parameter settings
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1243,6 +1362,13 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
             loaded_params = load_classifier_params(CLASSIFIER_PATH)
             if loaded_params is not None:
                 clf, class_names, class_colors, prev_embeddings, prev_labels = loaded_params
+                # Panel deletes (named as stored, so first) and renames apply to
+                # the classifier itself and are written back to its file.
+                if class_ops.get("deletes"):
+                    clf, class_names, class_colors, prev_embeddings, prev_labels = _drop_classes_from_loaded_classifier(
+                        clf, class_names, class_colors, prev_embeddings, prev_labels, class_ops["deletes"], xgb_params, CLASSIFIER_PATH)
+                if effective_renames:
+                    class_names = _rename_loaded_classifier(clf, class_names, effective_renames, CLASSIFIER_PATH)
                 old_class_names = class_names.copy()
                 print(f"Loaded existing classifier parameters, classes: {class_names}")
                 # Which class_names index each predict_proba column means. The
@@ -1324,24 +1450,6 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_train = X_update
                             y_train = y_update
 
-                        # Append-only rename behavior for classifier models:
-                        # when A -> B, keep A data and clone A's historical samples to B.
-                        if prev_embeddings is not None and prev_labels is not None and effective_renames:
-                            alias_x = []
-                            alias_y = []
-                            for op in effective_renames:
-                                src = op["from"]
-                                dst = op["to"]
-                                if src in old_class_names and dst in class_names:
-                                    src_idx = old_class_names.index(src)
-                                    dst_idx = class_names.index(dst)
-                                    src_mask = np.asarray(prev_labels) == src_idx
-                                    if np.any(src_mask):
-                                        alias_x.append(prev_embeddings[src_mask])
-                                        alias_y.append(np.full(int(np.sum(src_mask)), dst_idx, dtype=np.int32))
-                            if alias_x:
-                                X_train = np.vstack([X_train] + alias_x)
-                                y_train = np.concatenate([y_train] + alias_y)
                         
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
@@ -1405,23 +1513,6 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_train = X_update
                             y_train = y_update
 
-                        # Append-only rename behavior for classifier models.
-                        if prev_embeddings is not None and prev_labels is not None and effective_renames:
-                            alias_x = []
-                            alias_y = []
-                            for op in effective_renames:
-                                src = op["from"]
-                                dst = op["to"]
-                                if src in old_class_names and dst in class_names:
-                                    src_idx = old_class_names.index(src)
-                                    dst_idx = class_names.index(dst)
-                                    src_mask = np.asarray(prev_labels) == src_idx
-                                    if np.any(src_mask):
-                                        alias_x.append(prev_embeddings[src_mask])
-                                        alias_y.append(np.full(int(np.sum(src_mask)), dst_idx, dtype=np.int32))
-                            if alias_x:
-                                X_train = np.vstack([X_train] + alias_x)
-                                y_train = np.concatenate([y_train] + alias_y)
                         
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
@@ -2021,7 +2112,14 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
             clf = xgb.XGBClassifier()
             clf.load_model(path)
             booster = clf.get_booster()
-            _check_classifier_matches_slide(booster, path, _stored_train_data(booster)[0])
+            train_embeddings = _stored_train_data(booster)[0]
+            # Same rule as the multiclass load: another model's classifier (e.g.
+            # NuClass 768-d) is ignored, not reported as a Cytoformer build mismatch.
+            if train_embeddings is not None and train_embeddings.ndim == 2 and train_embeddings.shape[1] != EMBEDDING_DIM:
+                print(f"[OvR] classifier for '{cls}' has embedding dim {train_embeddings.shape[1]} != "
+                      f"{EMBEDDING_DIM} (Cytoformer); ignoring {path}")
+                continue
+            _check_classifier_matches_slide(booster, path, train_embeddings)
             _match_booster_device_to_data(clf)
             prediction_probs[:, ci] = clf.predict_proba(cell_embeddings)[:, 1]
             filled_cols.append(ci)
@@ -2191,9 +2289,7 @@ def run_classification(args) -> Dict[str, Any]:
 
         # Persist rename side-effects before loading annotations so cell_class / counts align with UI.
         class_ops_run = _normalize_class_operations(CLASS_OPERATIONS)
-        eff_renames_run = (
-            [] if _has_rename_cycle(class_ops_run.get("renames", [])) else class_ops_run.get("renames", [])
-        )
+        eff_renames_run = class_ops_run.get("renames", [])
         if eff_renames_run:
             _persist_nuclei_rename_to_user_annotation(zf, eff_renames_run, nuclei_classes, nuclei_colors)
 
@@ -2896,9 +2992,6 @@ def read_node(data: Dict[str, Any]):
                         ARGS.nuclei_colors = val_json
                 elif k == "class_operations":
                     CLASS_OPERATIONS = _normalize_class_operations(val_json)
-                    if _has_rename_cycle(CLASS_OPERATIONS.get("renames", [])):
-                        print(f"[{NODE_NAME}] Detected rename cycle, ignoring rename operations.")
-                        CLASS_OPERATIONS["renames"] = []
                     print(f"[{NODE_NAME}] class_operations => {CLASS_OPERATIONS}")
     finally:
         # Clean up zarr file handle
@@ -3005,6 +3098,56 @@ def classifier_load_endpoint(data: Dict[str, Any]):
     except Exception as e:
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
+
+
+@app.post("/class_operations/apply")
+def class_operations_apply_endpoint(data: Dict[str, Any]):
+    """
+    Apply class renames / deletes from the panel to a classifier file right away
+    (the store side is done by the AI service). Same rules as on an Update:
+    deletes (stored names) first, then renames in order; rename ids already
+    applied to this file are skipped, so the ops arriving again with the next
+    Update change nothing.
+
+    Body JSON: classifier_path (str), renames [{from, to, id}], deletes [str]
+    """
+    path = str(data.get("classifier_path") or "").strip()
+    if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return {"status": "ok", "applied": False, "message": "No classifier file to update"}
+    ops = _normalize_class_operations({"renames": data.get("renames"), "deletes": data.get("deletes")})
+    if not ops["renames"] and not ops["deletes"]:
+        return {"status": "ok", "applied": False, "message": "No class operations"}
+    try:
+        loaded = _load_classifier_at(path)
+        if loaded is None:
+            return {"status": "error", "message": f"Could not load classifier {path}"}
+        clf, class_names, class_colors, embeddings, labels = loaded
+        if ops["deletes"]:
+            clf, class_names, class_colors, embeddings, labels = _drop_classes_from_loaded_classifier(
+                clf, class_names, class_colors, embeddings, labels, ops["deletes"], _refit_xgb_params(), path)
+        if ops["renames"]:
+            class_names = _rename_loaded_classifier(clf, class_names, ops["renames"], path)
+        return {"status": "ok", "applied": True, "class_names": list(class_names)}
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Cell-Classification class operations failed: {e}"}
+
+
+def _refit_xgb_params():
+    """XGBoost settings for refitting a classifier outside a run (same as training;
+    single-threaded on macOS, where libomp is not fork-safe in a task node)."""
+    import platform as _platform
+    darwin = _platform.system() == "Darwin"
+    return {
+        "max_depth": 8,
+        "tree_method": "hist",
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "eval_metric": "mlogloss",
+        "random_state": 42,
+        "base_score": 0.5,
+        "n_jobs": 1 if darwin else -1,
+        "nthread": 1 if darwin else -1,
+    }
 
 
 @app.post("/classifier/save")
