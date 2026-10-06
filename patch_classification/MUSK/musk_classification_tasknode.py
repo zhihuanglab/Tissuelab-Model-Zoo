@@ -1373,7 +1373,8 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
     if CLASSIFIER_PATHS:
         predict_map.update(CLASSIFIER_PATHS)
     predict_map.update(trained_paths)
-    items = [(c, p) for c, p in predict_map.items() if c in name_to_idx]
+    items = [(c, p) for c, p in predict_map.items()
+             if c in name_to_idx and c.strip().lower() != "negative control" and p]
     for r_i, (cls, path) in enumerate(items):
         if cancel_event.is_set():
             raise CooperativeCancel("cancelled")
@@ -1387,7 +1388,10 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
             pass
         try:
             clf = xgb.XGBClassifier(); clf.load_model(path)
-            prediction_probs[:, ci] = clf.predict_proba(cell_embeddings)[:, 1]
+            binary_probs = clf.predict_proba(cell_embeddings)
+            if binary_probs.shape != (n_cells, 2):
+                raise ValueError("One-vs-rest requires a binary classifier with two probability columns")
+            prediction_probs[:, ci] = binary_probs[:, 1]
             filled_cols.append(ci)
             print(f"[OvR] ran '{cls}' <- {path}")
         except Exception as e:
@@ -2245,10 +2249,14 @@ def read_node(data: Dict[str, Any]):
                     CLASSIFIER_MODE = val_json
             elif k == "classifier_paths":
                 if isinstance(val_json, dict):
-                    CLASSIFIER_PATHS = {str(k2): str(v2) for k2, v2 in val_json.items()}
+                    CLASSIFIER_PATHS = {k2: v2.strip() for k2, v2 in val_json.items()
+                                        if isinstance(k2, str) and k2.strip().lower() != "negative control"
+                                        and isinstance(v2, str) and v2.strip()}
             elif k == "save_classifier_paths":
                 if isinstance(val_json, dict):
-                    SAVE_CLASSIFIER_PATHS = {str(k2): str(v2) for k2, v2 in val_json.items()}
+                    SAVE_CLASSIFIER_PATHS = {k2: v2.strip() for k2, v2 in val_json.items()
+                                             if isinstance(k2, str) and k2.strip().lower() != "negative control"
+                                             and isinstance(v2, str) and v2.strip()}
             elif k == "tissue_classes":
                 if isinstance(val_json, list) and len(val_json) > 0:
                     ARGS.tissue_classes = val_json

@@ -1827,9 +1827,9 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     Predict: for every class that ends up with a classifier — freshly trained
     (SAVE_CLASSIFIER_PATHS) or pre-attached (CLASSIFIER_PATHS) — score all cells
     with predict_proba[:, 1] and drop it into that class's probability column.
-    Classes with no classifier stay at 0 ("没添加就不管"). "Negative control" is
-    the reject bucket: score = 1 - max(class scores), so a cell that no binary
-    claims falls back to it. Final label per cell = argmax across all columns.
+    The strongest binary claims a cell at >= 0.5. Unclaimed cells fall back to
+    the organ head over classifier-less classes plus Negative control; without
+    an organ head they go to Negative control.
 
     Returns (predictions, prediction_probs, final_class_names, final_class_colors,
     method) or None. None means "no per-class classifier exists at all"; the
@@ -2002,7 +2002,8 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
         predict_map.update(CLASSIFIER_PATHS)
     predict_map.update(trained_paths)
 
-    items = [(c, p) for c, p in predict_map.items() if c in name_to_idx]
+    items = [(c, p) for c, p in predict_map.items()
+             if c in name_to_idx and c.strip().lower() != "negative control" and p]
     for r_i, (cls, path) in enumerate(items):
         if cancel_event.is_set():
             progress_state.value = 0
@@ -2023,7 +2024,10 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
             booster = clf.get_booster()
             _check_classifier_matches_slide(booster, path, _stored_train_data(booster)[0])
             _match_booster_device_to_data(clf)
-            prediction_probs[:, ci] = clf.predict_proba(cell_embeddings)[:, 1]
+            binary_probs = clf.predict_proba(cell_embeddings)
+            if binary_probs.shape != (n_cells, 2):
+                raise ValueError("One-vs-rest requires a binary classifier with two probability columns")
+            prediction_probs[:, ci] = binary_probs[:, 1]
             filled_cols.append(ci)
             print(f"[OvR] ran '{cls}' <- {path}")
         except EmbeddingProvenanceError:
@@ -2878,16 +2882,20 @@ def read_node(data: Dict[str, Any]):
                     SAVE_CLASSIFIER_PATH = val_json or None
                 elif k == "classifier_mode":
                     # "multiclass" | "one-vs-rest"
-                    if isinstance(val_json, str) and val_json:
+                    if isinstance(val_json, str) and val_json in ("multiclass", "one-vs-rest"):
                         CLASSIFIER_MODE = val_json
                 elif k == "classifier_paths":
                     # OvR predict: {class_name: path} of pre-trained per-class .tlcls
                     if isinstance(val_json, dict) and val_json:
-                        CLASSIFIER_PATHS = {str(k2): str(v2) for k2, v2 in val_json.items()}
+                        CLASSIFIER_PATHS = {k2: v2.strip() for k2, v2 in val_json.items()
+                                            if isinstance(k2, str) and k2.strip().lower() != "negative control"
+                                            and isinstance(v2, str) and v2.strip()}
                 elif k == "save_classifier_paths":
                     # OvR train: {class_name: path} to write each per-class .tlcls to
                     if isinstance(val_json, dict) and val_json:
-                        SAVE_CLASSIFIER_PATHS = {str(k2): str(v2) for k2, v2 in val_json.items()}
+                        SAVE_CLASSIFIER_PATHS = {k2: v2.strip() for k2, v2 in val_json.items()
+                                                 if isinstance(k2, str) and k2.strip().lower() != "negative control"
+                                                 and isinstance(v2, str) and v2.strip()}
                 elif k == "nuclei_classes":
                     if isinstance(val_json, list) and len(val_json) > 0:
                         ARGS.nuclei_classes = val_json
