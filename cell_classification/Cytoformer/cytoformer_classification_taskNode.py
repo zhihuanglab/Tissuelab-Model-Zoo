@@ -2149,8 +2149,29 @@ def _cyto_zeroshot_predict(cell_embeddings, organ, candidate_names, conf_thresho
     (pred_local_idx int32 [N] into candidate_names, prob float32 [N])."""
     pred_global, prob = CYTO_HEAD.predict(cell_embeddings, organ)
     name_to_local = {c: j for j, c in enumerate(candidate_names)}
+    # Match the frontend's cellTypeOptions in workflow.constants.ts. Only map
+    # presets with a direct head equivalent; preserve native model names too.
+    aliases = {
+        "endothelial cells": "endothelium",
+        "epithelial cells": "epithelium",
+        "lymphocytes": "lymphocyte",
+        "macrophages": "macrophage",
+        "neutrophils": "neutrophil",
+        "plasma cells": "plasma cell",
+    }
+
+    def normalize_name(name):
+        key = " ".join(name.replace("_", " ").strip().casefold().split())
+        return aliases.get(key, key)
+
+    normalized_to_local = {}
+    for j, name in enumerate(candidate_names):
+        normalized_to_local.setdefault(normalize_name(name), j)
     nc_local = name_to_local.get(NEG_CONTROL_NAME, 0)
-    local = np.array([name_to_local.get(nm, nc_local) for nm in pred_global], dtype=np.int32)
+    local = np.array([
+        name_to_local.get(nm, normalized_to_local.get(normalize_name(nm), nc_local))
+        for nm in pred_global
+    ], dtype=np.int32)
     local[prob < conf_threshold] = nc_local
     return local, prob.astype(np.float32)
 
