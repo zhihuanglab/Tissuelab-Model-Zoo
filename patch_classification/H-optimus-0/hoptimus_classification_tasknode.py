@@ -42,6 +42,7 @@ import colorsys
 import asyncio
 import threading
 import gc
+import hashlib
 import logging
 import collections
 import glob
@@ -319,6 +320,16 @@ def generate_distinct_colors(tissue_classes: list[str]) -> list[str]:
         colors.append(color)
     return colors
 
+def _stored_training_rows(X, y, weights):
+    """Training rows a classifier keeps as its train_data. The weak "not X" rows
+    (weight < 1) are rebuilt from the marks on every run; stored, a later refine
+    would read them back as full-weight labels."""
+    if weights is None or len(weights) != len(y):
+        return {'embeddings': X, 'labels': y}
+    keep = np.asarray(weights) >= 1
+    return {'embeddings': X[keep], 'labels': y[keep]}
+
+
 def save_classifier_params(clf, class_names, class_colors, train_data, max_samples_per_class=100000000000000):
     """Embed training metadata into the booster; optionally write XGBoost model to SAVE_CLASSIFIER_PATH."""
     global SAVE_CLASSIFIER_PATH, LAST_TRAINED_CLF_BUNDLE
@@ -545,6 +556,30 @@ def save_patch_image(slide_path, coords, output_dir, index, label):
         print(f"Error saving patch image: {e}")
         return None
 
+def _resolve_rename_terminal(name: str, rename_graph: dict) -> str:
+    """Follow single-step renames until a fixed point (caller must ensure no cycles)."""
+    seen = set()
+    n = name
+    while n in rename_graph and n not in seen:
+        seen.add(n)
+        n = rename_graph[n]
+    return n
+
+
+def _apply_renames_to_patch_palette(zf, renames):
+    """A panel rename keeps the marks: their pinned palette entry takes the new
+    name, as the cell nodes do (_persist_nuclei_rename_to_user_annotation)."""
+    if not renames or 'User-Annotations' not in zf:
+        return
+    ua = zf['User-Annotations']
+    old = _palette_attr_list(ua.attrs.get('patch_class_names'))
+    graph = {op['from']: op['to'] for op in renames}
+    mapped = [_resolve_rename_terminal(n, graph) for n in old]
+    if mapped != old:
+        ua.attrs['patch_class_names'] = mapped
+        print(f"Renamed classes in the pinned patch palette: {mapped}")
+
+
 def _palette_attr_list(val):
     if val is None:
         return []
@@ -553,7 +588,7 @@ def _palette_attr_list(val):
     return [x.decode("utf-8") if isinstance(x, (bytes, bytearray)) else str(x) for x in val]
 
 
-def _align_user_annotation_palette(ua, kind, names, colors):
+def _align_user_annotation_palette(ua, kind, names, colors, decoded_with=None):
     """Re-index the user's ``kind`` marks to ``names`` by class name, refresh each
     mark's stored colour, and pin the result as the ``kind`` palette on
     User-Annotations. One read of the annotation array, at most one write.
@@ -562,12 +597,17 @@ def _align_user_annotation_palette(ua, kind, names, colors):
     ``-(2 + k)`` is "NOT class k". A class only the old palette has is kept,
     appended, so its marks survive a run that does not list it. The seg service
     pins palettes the same way when it saves marks (tasks._align_annotation_palette).
+    ``decoded_with`` is the list this run read the marks through when no palette
+    was pinned yet; it stands in for the missing palette so the marks keep the
+    meaning the run gave them.
     Returns ``(names, colors)`` now pinned.
     """
     names = [str(n) for n in names]
     colors = [str(c) for c in (colors or [])][:len(names)]
     colors += ["#aaaaaa"] * (len(names) - len(colors))
     old_names = _palette_attr_list(ua.attrs.get(f"{kind}_class_names"))
+    if not old_names and decoded_with:
+        old_names = [str(n) for n in decoded_with]
     old_colors = _palette_attr_list(ua.attrs.get(f"{kind}_class_colors"))
     for i, n in enumerate(old_names):
         if n not in names:
@@ -599,7 +639,7 @@ def _align_user_annotation_palette(ua, kind, names, colors):
                 # seg service; an unusable colour must not retire a class's marks.
                 return v if v >= 0 else 0x808080
             palette_ints = np.array([to_int(c) for c in colors], dtype=np.int64)
-            pos = (cls >= 0) & (cls < len(palette_ints))
+            pos = (cls >= 0) & (cls < len(palette_ints)) & (rows["color"] != -1)
             want = palette_ints[cls[pos]]
             stale = rows["color"][pos] != want
             if np.any(stale):
@@ -844,6 +884,7 @@ def train_linear_classifier(
                         
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
+                        sample_weights_inc = None
                         neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names)
                         if neg_X is not None:
                             print(f"Adding {len(neg_X)} negative training samples (weighted 0.3) for retrain")
@@ -895,6 +936,7 @@ def train_linear_classifier(
                         
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
+                        sample_weights_inc = None
                         neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names)
                         if neg_X is not None:
                             print(f"Adding {len(neg_X)} negative training samples (weighted 0.3) for incremental training")
@@ -911,10 +953,7 @@ def train_linear_classifier(
                         print("Classifier updated with warm start (incremental training)")
                     
                     # Save updated classifier with new training data
-                    train_data = {
-                        'embeddings': X_train,
-                        'labels': y_train
-                    }
+                    train_data = _stored_training_rows(X_train, y_train, sample_weights_inc)
                     save_classifier_params(clf, class_names, class_colors, train_data)
                     print("Classifier updated and saved")
                 
@@ -1325,17 +1364,19 @@ def train_linear_classifier(
     print("Prediction completed")
 
     # save classifier parameters
-    train_data = {
-        'embeddings': X_train,
-        'labels': y_train
-    }
+    train_data = _stored_training_rows(X_train, y_train, sample_weights)
     save_classifier_params(clf, class_names, class_colors, train_data)
 
     return (clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0)
 
 def _row_keys(X):
-    """Exact identity of each embedding row, for de-duplicating training rows."""
-    return [r.tobytes() for r in np.ascontiguousarray(np.asarray(X, dtype=np.float32))]
+    """Exact identity of each embedding row (a 16-byte digest of its float32
+    bytes), for de-duplicating training rows."""
+    return [hashlib.blake2b(r.tobytes(), digest_size=16).digest()
+            for r in np.ascontiguousarray(np.asarray(X, dtype=np.float32))]
+
+
+_OVR_REWRITTEN_ATTRS = ("train_data", "best_iteration", "best_score", "best_ntree_limit")
 
 
 def _ovr_prior_training_data(cls, dim):
@@ -1345,8 +1386,8 @@ def _ovr_prior_training_data(cls, dim):
     multiclass path reads only CLASSIFIER_PATH. A save destination is where the
     result goes, not a classifier in use: reading it would bring back a classifier
     the user removed. Returns (X, y, booster attrs, path); None when nothing is
-    attached (or it carries no training data); False when one is attached but
-    cannot be used, so it must not be overwritten.
+    attached; False when one is attached but cannot be read. A file without
+    training data still returns its attrs (no rows), so its history carries over.
     """
     for path in ((CLASSIFIER_PATHS or {}).get(cls),):
         if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
@@ -1363,14 +1404,17 @@ def _ovr_prior_training_data(cls, dim):
         except Exception as e:
             print(f"[OvR] could not read {path}: {e}")
             return False
+        # The training-derived attrs are rewritten by this save; the rest
+        # (annotation history, lineage) carries over.
+        attrs = {k: v for k, v in booster.attributes().items() if k not in _OVR_REWRITTEN_ATTRS}
         if X is None:
             print(f"[OvR] {os.path.basename(path)} carries no training data; training '{cls}' from this slide only")
-            return None
+            return np.empty((0, dim), np.float32), np.empty(0, int), attrs, path
         y = np.asarray(y).astype(int)
         if X.ndim != 2 or X.shape[1] != dim or not np.isin(y, (0, 1)).all():
             print(f"[OvR] {os.path.basename(path)} is not a {dim}-d binary classifier (shape {X.shape})")
             return False
-        return X, y, booster.attributes(), path
+        return X, y, attrs, path
     return None
 
 
@@ -1442,6 +1486,8 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
         print(f"[OvR] skipping negative_control_vectors_1536d.npy: dim {nc_vectors.shape[1]} "
               f"!= embedding dim {cell_embeddings.shape[1]}")
         nc_vectors = None
+    if nc_vectors is not None:
+        nc_vectors = nc_vectors.astype(cell_embeddings.dtype, copy=False)
 
     prediction_probs = np.zeros((n_cells, len(final_class_names)), dtype=np.float32)
     filled_cols = []
@@ -1480,8 +1526,12 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
         # slide keeps only its current label.
         prior = _ovr_prior_training_data(cls, cell_embeddings.shape[1])
         if prior is False:
-            print(f"[OvR] '{cls}' not updated: its existing classifier could not be read")
-            continue
+            attached = os.path.abspath(CLASSIFIER_PATHS[cls])
+            if attached == os.path.abspath(SAVE_CLASSIFIER_PATHS[cls]):
+                print(f"[OvR] '{cls}' not updated: its existing classifier could not be read")
+                continue
+            print(f"[OvR] '{cls}': attached classifier unreadable; training a new file from this slide only")
+            prior = None
         prior_attrs = {}
         if prior is not None:
             X_prev, y_prev, prior_attrs, prior_path = prior
@@ -1495,7 +1545,8 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
                 trained_paths[cls] = prior_path  # already current: still predict with it
                 continue
             keep = np.fromiter((k not in new_keys for k in prev_keys), bool, len(prev_keys))
-            Xb = np.concatenate([Xb, X_prev[keep].astype(Xb.dtype, copy=False)], axis=0)
+            dt = np.result_type(Xb.dtype, X_prev.dtype)
+            Xb = np.concatenate([Xb.astype(dt, copy=False), X_prev[keep].astype(dt, copy=False)], axis=0)
             yb = np.concatenate([yb, y_prev[keep]])
             wb = np.concatenate([wb, np.ones(int(keep.sum()))])
             print(f"[OvR] '{cls}': merged {int(keep.sum())} earlier rows from {os.path.basename(prior_path)}")
@@ -1507,6 +1558,8 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
             continue
         clf = xgb.XGBClassifier(**xgb_params_bin)
         clf.fit(Xb, yb, sample_weight=wb)
+        if cancel_event.is_set():  # a cut-short fit must not be saved
+            raise CooperativeCancel("cancelled")
         if prior_attrs:
             # Provenance (annotation history, community lineage) carries over;
             # save_classifier_params rewrites the training-derived attrs.
@@ -1688,6 +1741,8 @@ def run_classification(args) -> Dict[str, Any]:
                     ]
             except Exception:
                 pass
+
+        _apply_renames_to_patch_palette(zf, (CLASS_OPERATIONS or {}).get('renames') or [])
 
         # Each mark stores an index into the palette the service pinned on
         # User-Annotations when it saved (patch_class_names); the panel's list
@@ -2060,7 +2115,8 @@ def run_classification(args) -> Dict[str, Any]:
         try:
             if 'User-Annotations' in zf:
                 _align_user_annotation_palette(
-                    zf['User-Annotations'], 'patch', final_class_names, final_class_colors)
+                    zf['User-Annotations'], 'patch', final_class_names, final_class_colors,
+                    decoded_with=class_name_lookup)
         except Exception as e:
             print(f"Warning: Could not align user annotations to the new palette: {e}")
         
