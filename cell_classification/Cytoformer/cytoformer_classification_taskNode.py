@@ -1563,9 +1563,18 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         # had no samples last round — force a full refit instead.
                         booster_lut = {int(v): c for c, v in enumerate(_clf_class_indices)}
                         unseen = [int(v) for v in np.unique(y_train) if int(v) not in booster_lut]
-                        if unseen:
-                            print(f"Classes {[class_names[i] for i in unseen if i < len(class_names)]} are new to the "
-                                  f"booster; retraining from scratch instead of warm start")
+                        # The attached classifier's own rows are part of X_train, so it is
+                        # refit on them: a warm start only adds trees, and the trees an
+                        # earlier, since-corrected or removed mark taught would stay. Only
+                        # a classifier that carries no rows is warm-started (all that
+                        # keeps what it knows).
+                        has_rows = prev_embeddings is not None and len(prev_embeddings) > 0
+                        if unseen or has_rows:
+                            if unseen:
+                                print(f"Classes {[class_names[i] for i in unseen if i < len(class_names)]} are new to the "
+                                      f"booster; retraining from scratch instead of warm start")
+                            else:
+                                print("Retraining on the merged training rows")
                             y_fit, _clf_class_indices = _compact_labels(y_train)
                             clf = xgb.XGBClassifier(**xgb_params)
                             clf.fit(X_train, y_fit, sample_weight=sample_weights_inc)
@@ -1583,7 +1592,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             progress_state.value = 0
                             return None
                         
-                        print("Classifier updated with warm start (incremental training)")
+                        print("Classifier updated" + (" (retrained on the merged training rows)" if unseen or has_rows
+                                                      else " with warm start"))
                     
                     # Save updated classifier with new training data
                     train_data = _stored_training_rows(X_train, y_train, sample_weights_inc)

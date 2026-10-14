@@ -973,6 +973,17 @@ def train_linear_classifier(
                             X_train = X_update
                             y_train = y_update
                         
+                        # The attached classifier's own rows are part of X_train, so it is
+                        # refit on them: a warm start only adds trees, and the trees an
+                        # earlier, since-corrected or removed mark taught would stay. Only
+                        # a classifier that carries no rows is warm-started (all that
+                        # keeps what it knows).
+                        if prev_embeddings is not None and len(prev_embeddings) > 0:
+                            existing_booster = None
+                            clf = xgb.XGBClassifier(**xgb_params)
+                        else:
+                            existing_booster = clf.get_booster()
+
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
                         sample_weights_inc = None
@@ -983,13 +994,12 @@ def train_linear_classifier(
                             y_train = np.concatenate([y_train, neg_y], axis=0)
                             sample_weights_inc = np.concatenate([np.ones(n_pos), neg_w])
                             _log_training_data_counts(class_names, y_train, n_pos)
-                            existing_booster = clf.get_booster()
                             clf.fit(X_train, y_train, xgb_model=existing_booster, sample_weight=sample_weights_inc)
                         else:
                             _log_training_data_counts(class_names, y_train, n_pos)
-                            existing_booster = clf.get_booster()
                             clf.fit(X_train, y_train, xgb_model=existing_booster)
-                        print("Classifier updated with warm start (incremental training)")
+                        print("Classifier updated" + (" with warm start" if existing_booster is not None
+                                                      else " (retrained on the merged training rows)"))
                     
                     # Save updated classifier with new training data
                     train_data = _stored_training_rows(X_train, y_train, sample_weights_inc)
