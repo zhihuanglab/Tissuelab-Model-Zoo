@@ -1036,6 +1036,20 @@ def _apply_exclusions(batch_full, exclude_map, offset):
     return batch_full
 
 
+def _drop_rows_marked_again(X_prev, y_prev, X_now):
+    """Refine, not repeat: the attached classifier's training rows minus those
+    this slide marks again (same embedding), so a re-run adds nothing twice and a
+    relabelled cell or patch keeps only its current label — as one-vs-rest merges
+    (run_ovr_classification)."""
+    if X_prev is None or len(X_prev) == 0 or X_now is None or len(X_now) == 0:
+        return X_prev, y_prev
+    now = set(_row_keys(X_now))
+    keep = np.fromiter((k not in now for k in _row_keys(X_prev)), bool, len(X_prev))
+    if not keep.all():
+        print(f"Refine: {int((~keep).sum())} earlier training rows replaced by this slide's marks")
+    return X_prev[keep], np.asarray(y_prev)[keep]
+
+
 def _stored_training_rows(X, y, weights):
     """Training rows a classifier keeps as its train_data. The weak "not X" rows
     (weight < 1) are rebuilt from the marks on every run; stored, a later refine
@@ -1402,8 +1416,9 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             prev_labels_reencoded = pd.Categorical(prev_labels_as_names, categories=class_names).codes
                             
                             # Combine all data
-                            X_train = np.vstack([prev_embeddings, X_update])
-                            y_train = np.concatenate([prev_labels_reencoded, y_update])
+                            prev_X, prev_y = _drop_rows_marked_again(prev_embeddings, prev_labels_reencoded, X_update)
+                            X_train = np.vstack([prev_X, X_update])
+                            y_train = np.concatenate([prev_y, y_update])
                         else:
                             X_train = X_update
                             y_train = y_update
@@ -1483,8 +1498,9 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         
                         # Combine new and previous training data
                         if prev_embeddings is not None and prev_labels is not None:
-                            X_train = np.vstack([prev_embeddings, X_update])
-                            y_train = np.concatenate([prev_labels, y_update])
+                            prev_X, prev_y = _drop_rows_marked_again(prev_embeddings, prev_labels, X_update)
+                            X_train = np.vstack([prev_X, X_update])
+                            y_train = np.concatenate([prev_y, y_update])
                         else:
                             X_train = X_update
                             y_train = y_update
