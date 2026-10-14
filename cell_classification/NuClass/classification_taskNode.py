@@ -1020,14 +1020,37 @@ def _drop_this_slides_rows(X_prev, y_prev, slide_embeddings):
     return X_prev[~mine], np.asarray(y_prev)[~mine]
 
 
+def _continue_training(clf, xgb_params, X, y, sample_weight=None):
+    """Add boosting rounds to a loaded classifier that carries no training rows.
+
+    XGBClassifier.fit wants every label 0..k-1 present, and a slide seldom marks
+    every class the booster knows; the rounds are added on the booster itself,
+    with ``y`` already in its column space."""
+    booster = clf.get_booster()
+    learner = json.loads(booster.save_config())["learner"]
+    params = {k: v for k, v in xgb_params.items()
+              if k not in ("callbacks", "n_jobs", "random_state", "n_estimators")}
+    params["seed"] = xgb_params.get("random_state", 0)
+    params["objective"] = learner["objective"]["name"]
+    num_class = int(learner["learner_model_param"].get("num_class", "0") or 0)
+    if num_class > 1:
+        params["num_class"] = num_class
+    clf._Booster = xgb.train(params, xgb.DMatrix(X, label=y, weight=sample_weight),
+                             num_boost_round=int(xgb_params.get("n_estimators") or 100),
+                             xgb_model=booster, callbacks=list(xgb_params.get("callbacks") or []))
+    return clf
+
+
 def _stored_training_rows(X, y, weights):
     """Training rows a classifier keeps as its train_data. The weak "not X" rows
     (weight < 1) are rebuilt from the marks on every run; stored, a later refine
     would read them back as full-weight labels."""
+    # The booster's columns are every class it was fit on, weak rows included.
+    trained = np.unique(np.asarray(y)).astype(int)
     if weights is None or len(weights) != len(y):
-        return {'embeddings': X, 'labels': y}
+        return {'embeddings': X, 'labels': y, 'trained_classes': trained}
     keep = np.asarray(weights) >= 1
-    return {'embeddings': X[keep], 'labels': y[keep]}
+    return {'embeddings': X[keep], 'labels': y[keep], 'trained_classes': trained}
 
 
 def save_classifier_params(clf, class_names, class_colors, train_data, max_samples_per_class=100000000000000):
@@ -1067,7 +1090,8 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
     # index each one means so a reload can widen predict_proba correctly.
     if len(labels) > 0:
         booster.set_attr(**{
-            BOOSTER_CLASS_INDEX_ATTR: json.dumps([int(v) for v in np.unique(np.asarray(labels))])
+            BOOSTER_CLASS_INDEX_ATTR: json.dumps([int(v) for v in np.unique(np.asarray(
+                train_data.get('trained_classes', labels)))])
         })
 
     # Plain savez, not savez_compressed: these are dense L2-normalised features,
@@ -1546,8 +1570,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             y_fit = np.array([booster_lut[int(v)] for v in y_train], dtype=int)
                             # loaded from disk, so it carries no callbacks of its own
                             clf.set_params(callbacks=[_CancelTrainingCallback()])
-                            existing_booster = clf.get_booster()
-                            clf.fit(X_train, y_fit, xgb_model=existing_booster, sample_weight=sample_weights_inc)
+                            clf = _continue_training(clf, xgb_params, X_train, y_fit, sample_weights_inc)
                         
                         # Check for cancellation after incremental training
                         if cancel_event.is_set():

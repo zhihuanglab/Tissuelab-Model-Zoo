@@ -352,14 +352,75 @@ def _drop_this_slides_rows(X_prev, y_prev, slide_embeddings):
     return X_prev[~mine], np.asarray(y_prev)[~mine]
 
 
+# Which class_names index each predict_proba column means, persisted with the
+# booster: XGBoost is fit on the compact set of classes that had samples.
+BOOSTER_CLASS_INDEX_ATTR = "trained_class_indices"
+
+
+def _compact_labels(y_full):
+    """Return (contiguous labels for xgboost, compact column -> class_names index)."""
+    compact_to_full = np.unique(np.asarray(y_full)).astype(int)
+    lut = {int(v): i for i, v in enumerate(compact_to_full)}
+    return np.array([lut[int(v)] for v in y_full], dtype=int), compact_to_full
+
+
+def _booster_class_indices(clf, n_classes, train_labels=None):
+    """class_names index for each predict_proba column of ``clf``: the mapping
+    saved with it, else the saved training labels (older files), else identity."""
+    try:
+        raw = clf.get_booster().attr(BOOSTER_CLASS_INDEX_ATTR)
+        if raw:
+            mapped = [int(v) for v in json.loads(raw)]
+            if mapped:
+                return np.array(mapped, dtype=int)
+    except Exception:
+        pass
+    if train_labels is not None and len(train_labels) > 0:
+        return np.unique(np.asarray(train_labels)).astype(int)
+    n_cols = int(getattr(clf, "n_classes_", 0) or 0)
+    return np.arange(min(n_cols, n_classes) if n_cols else n_classes, dtype=int)
+
+
+def _scatter_to_class_space(batch_probs, class_indices, n_classes):
+    """Widen compact predict_proba columns into the full class_names space."""
+    out = np.zeros((batch_probs.shape[0], n_classes), dtype=np.float32)
+    for col, full_idx in enumerate(class_indices):
+        if col < batch_probs.shape[1] and 0 <= int(full_idx) < n_classes:
+            out[:, int(full_idx)] = batch_probs[:, col]
+    return out
+
+
+def _continue_training(clf, xgb_params, X, y, sample_weight=None):
+    """Add boosting rounds to a loaded classifier that carries no training rows.
+
+    XGBClassifier.fit wants every label 0..k-1 present, and a slide seldom marks
+    every class the booster knows; the rounds are added on the booster itself,
+    with ``y`` already in its column space."""
+    booster = clf.get_booster()
+    learner = json.loads(booster.save_config())["learner"]
+    params = {k: v for k, v in xgb_params.items()
+              if k not in ("callbacks", "n_jobs", "random_state", "n_estimators")}
+    params["seed"] = xgb_params.get("random_state", 0)
+    params["objective"] = learner["objective"]["name"]
+    num_class = int(learner["learner_model_param"].get("num_class", "0") or 0)
+    if num_class > 1:
+        params["num_class"] = num_class
+    clf._Booster = xgb.train(params, xgb.DMatrix(X, label=y, weight=sample_weight),
+                             num_boost_round=int(xgb_params.get("n_estimators") or 100),
+                             xgb_model=booster, callbacks=list(xgb_params.get("callbacks") or []))
+    return clf
+
+
 def _stored_training_rows(X, y, weights):
     """Training rows a classifier keeps as its train_data. The weak "not X" rows
     (weight < 1) are rebuilt from the marks on every run; stored, a later refine
     would read them back as full-weight labels."""
+    # The booster's columns are every class it was fit on, weak rows included.
+    trained = np.unique(np.asarray(y)).astype(int)
     if weights is None or len(weights) != len(y):
-        return {'embeddings': X, 'labels': y}
+        return {'embeddings': X, 'labels': y, 'trained_classes': trained}
     keep = np.asarray(weights) >= 1
-    return {'embeddings': X[keep], 'labels': y[keep]}
+    return {'embeddings': X[keep], 'labels': y[keep], 'trained_classes': trained}
 
 
 def save_classifier_params(clf, class_names, class_colors, train_data, max_samples_per_class=100000000000000):
@@ -395,6 +456,10 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
     booster = clf.get_booster()
     booster.set_attr(class_names=json.dumps(class_names))
     booster.set_attr(class_colors=json.dumps(class_colors))
+    trained = train_data.get('trained_classes', labels)
+    if len(trained) > 0:
+        booster.set_attr(**{BOOSTER_CLASS_INDEX_ATTR: json.dumps(
+            [int(v) for v in np.unique(np.asarray(trained))])})
     # Tag the classifier with the model it was trained for, so the .tlcls
     # records which patch model (MUSK / H-optimus-0 / Virchow) it belongs to.
     try:
@@ -833,6 +898,9 @@ def train_linear_classifier(
             if loaded_params is not None:
                 clf, class_names, class_colors, prev_embeddings, prev_labels = loaded_params
                 loaded_classifier_colors = dict(zip(class_names, class_colors))  # Store for fallback
+                # Which class_names index each predict_proba column means; the
+                # refit / warm-start branches below replace it when they fit.
+                _clf_class_indices = _booster_class_indices(clf, len(class_names), prev_labels)
                 print(f"Loaded existing classifier parameters, classes: {class_names}")
                 
                 if not positive_annotations.empty:
@@ -930,12 +998,11 @@ def train_linear_classifier(
                             y_train = np.concatenate([y_train, neg_y], axis=0)
                             sample_weights_inc = np.concatenate([np.ones(n_pos), neg_w])
                             _log_training_data_counts(class_names, y_train, n_pos)
-                            clf = xgb.XGBClassifier(**xgb_params)
-                            clf.fit(X_train, y_train, sample_weight=sample_weights_inc)
                         else:
                             _log_training_data_counts(class_names, y_train, n_pos)
-                            clf = xgb.XGBClassifier(**xgb_params)
-                            clf.fit(X_train, y_train)
+                        y_fit, _clf_class_indices = _compact_labels(y_train)
+                        clf = xgb.XGBClassifier(**xgb_params)
+                        clf.fit(X_train, y_fit, sample_weight=sample_weights_inc)
                         print("Classifier retrained with new classes")
                         
                     else:
@@ -978,11 +1045,7 @@ def train_linear_classifier(
                         # earlier, since-corrected or removed mark taught would stay. Only
                         # a classifier that carries no rows is warm-started (all that
                         # keeps what it knows).
-                        if prev_embeddings is not None and len(prev_embeddings) > 0:
-                            existing_booster = None
-                            clf = xgb.XGBClassifier(**xgb_params)
-                        else:
-                            existing_booster = clf.get_booster()
+                        has_rows = prev_embeddings is not None and len(prev_embeddings) > 0
 
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
@@ -994,12 +1057,19 @@ def train_linear_classifier(
                             y_train = np.concatenate([y_train, neg_y], axis=0)
                             sample_weights_inc = np.concatenate([np.ones(n_pos), neg_w])
                             _log_training_data_counts(class_names, y_train, n_pos)
-                            clf.fit(X_train, y_train, xgb_model=existing_booster, sample_weight=sample_weights_inc)
                         else:
                             _log_training_data_counts(class_names, y_train, n_pos)
-                            clf.fit(X_train, y_train, xgb_model=existing_booster)
-                        print("Classifier updated" + (" with warm start" if existing_booster is not None
-                                                      else " (retrained on the merged training rows)"))
+                        booster_lut = {int(v): c for c, v in enumerate(_clf_class_indices)}
+                        unseen = [int(v) for v in np.unique(y_train) if int(v) not in booster_lut]
+                        if has_rows or unseen:
+                            y_fit, _clf_class_indices = _compact_labels(y_train)
+                            clf = xgb.XGBClassifier(**xgb_params)
+                            clf.fit(X_train, y_fit, sample_weight=sample_weights_inc)
+                        else:
+                            y_fit = np.array([booster_lut[int(v)] for v in y_train], dtype=int)
+                            clf = _continue_training(clf, xgb_params, X_train, y_fit, sample_weights_inc)
+                        print("Classifier updated" + (" (retrained on the merged training rows)" if has_rows or unseen
+                                                      else " with warm start"))
                     
                     # Save updated classifier with new training data
                     train_data = _stored_training_rows(X_train, y_train, sample_weights_inc)
@@ -1012,9 +1082,8 @@ def train_linear_classifier(
                 n_samples = len(cell_embeddings)
                 predictions = np.zeros(n_samples, dtype=int)
                 
-                # Get the actual number of classes from the classifier
-                n_classes = clf.n_classes_
-                prediction_probs = np.zeros((n_samples, n_classes), dtype=np.float32)
+                # Columns in the class list's space, whatever subset the booster knows
+                prediction_probs = np.zeros((n_samples, len(class_names)), dtype=np.float32)
                 
                 n_batches = (n_samples + batch_size - 1) // batch_size
                 print(f"Predicting {n_samples} samples in {n_batches} batches (batch_size={batch_size})")
@@ -1040,7 +1109,8 @@ def train_linear_classifier(
                     
                     # OPTIMIZATION: Only call predict_proba once, then extract predictions from probabilities
                     # This avoids duplicate forward passes through the model
-                    batch_probs = clf.predict_proba(batch_embeddings)
+                    batch_probs = _scatter_to_class_space(
+                        clf.predict_proba(batch_embeddings), _clf_class_indices, len(class_names))
                     
                     # Apply exclude_classes constraints: set probability to 0 for excluded classes
                     if exclude_map:
