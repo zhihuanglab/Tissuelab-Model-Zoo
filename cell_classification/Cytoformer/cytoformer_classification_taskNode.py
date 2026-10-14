@@ -1036,18 +1036,43 @@ def _apply_exclusions(batch_full, exclude_map, offset):
     return batch_full
 
 
-def _drop_rows_marked_again(X_prev, y_prev, X_now):
-    """Refine, not repeat: the attached classifier's training rows minus those
-    this slide marks again (same embedding), so a re-run adds nothing twice and a
-    relabelled cell or patch keeps only its current label — as one-vs-rest merges
-    (run_ovr_classification)."""
-    if X_prev is None or len(X_prev) == 0 or X_now is None or len(X_now) == 0:
+def _rows_from_slide(X, slide_embeddings):
+    """Mask of the rows of ``X`` that are embeddings of this slide (exact match).
+
+    A 64-bit key from each row's first dimensions narrows the slide's rows to a
+    few candidates on arrays; those are confirmed on the whole row.
+    """
+    X = np.asarray(X)
+    out = np.zeros(len(X), dtype=bool)
+    if (not len(X) or slide_embeddings is None or not len(slide_embeddings) or X.ndim != 2
+            or X.shape[1] != slide_embeddings.shape[1] or X.shape[1] < 4):
+        return out
+
+    def prefix_key(a):
+        u = np.ascontiguousarray(a[:, :4]).astype(np.float32).view(np.uint64)
+        return u[:, 0] ^ (u[:, 1] * np.uint64(0x9E3779B97F4A7C15))
+
+    xk, sk = prefix_key(X), prefix_key(slide_embeddings)
+    cand = np.flatnonzero(np.isin(xk, sk, kind="sort"))
+    if cand.size:
+        rows = np.flatnonzero(np.isin(sk, xk[cand], kind="sort"))
+        on_slide = set(_row_keys(np.asarray(slide_embeddings[rows])))
+        out[cand] = [k in on_slide for k in _row_keys(X[cand])]
+    return out
+
+
+def _drop_this_slides_rows(X_prev, y_prev, slide_embeddings):
+    """Refine, not repeat: the attached classifier's training rows minus every row
+    that came from this slide; the caller adds the slide's current marks back. So
+    a re-run adds nothing twice, a relabelled cell or patch keeps only its current
+    label, and a mark the user removed leaves the classifier — as one-vs-rest
+    merges (run_ovr_classification)."""
+    if X_prev is None or len(X_prev) == 0:
         return X_prev, y_prev
-    now = set(_row_keys(X_now))
-    keep = np.fromiter((k not in now for k in _row_keys(X_prev)), bool, len(X_prev))
-    if not keep.all():
-        print(f"Refine: {int((~keep).sum())} earlier training rows replaced by this slide's marks")
-    return X_prev[keep], np.asarray(y_prev)[keep]
+    mine = _rows_from_slide(X_prev, slide_embeddings)
+    if mine.any():
+        print(f"Refine: {int(mine.sum())} earlier training rows from this slide replaced by its current marks")
+    return X_prev[~mine], np.asarray(y_prev)[~mine]
 
 
 def _stored_training_rows(X, y, weights):
@@ -1416,7 +1441,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             prev_labels_reencoded = pd.Categorical(prev_labels_as_names, categories=class_names).codes
                             
                             # Combine all data
-                            prev_X, prev_y = _drop_rows_marked_again(prev_embeddings, prev_labels_reencoded, X_update)
+                            prev_X, prev_y = _drop_this_slides_rows(prev_embeddings, prev_labels_reencoded, cell_embeddings)
                             X_train = np.vstack([prev_X, X_update])
                             y_train = np.concatenate([prev_y, y_update])
                         else:
@@ -1498,7 +1523,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         
                         # Combine new and previous training data
                         if prev_embeddings is not None and prev_labels is not None:
-                            prev_X, prev_y = _drop_rows_marked_again(prev_embeddings, prev_labels, X_update)
+                            prev_X, prev_y = _drop_this_slides_rows(prev_embeddings, prev_labels, cell_embeddings)
                             X_train = np.vstack([prev_X, X_update])
                             y_train = np.concatenate([prev_y, y_update])
                         else:
@@ -2133,12 +2158,18 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
             prev_keys = _row_keys(X_prev)
             new_keys = set(cur_keys)
             same_file = os.path.abspath(prior_path) == os.path.abspath(SAVE_CLASSIFIER_PATHS[cls])
-            # New = a cell the file does not have yet, or has under another label.
-            if same_file and set(zip(cur_keys, yb.tolist())) <= set(zip(prev_keys, y_prev.tolist())):
+            # Every earlier row from this slide is replaced by the slide's current
+            # rows, so a mark the user removed leaves the classifier too.
+            from_slide = _rows_from_slide(X_prev, cell_embeddings)
+            dropped = from_slide & np.fromiter((k not in new_keys for k in prev_keys), bool, len(prev_keys))
+            # New = a cell the file does not have yet, or has under another label;
+            # or one it has that this slide no longer marks.
+            if same_file and not dropped.any() and \
+                    set(zip(cur_keys, yb.tolist())) <= set(zip(prev_keys, y_prev.tolist())):
                 print(f"[OvR] skip '{cls}': nothing new on this slide for {os.path.basename(prior_path)}")
                 trained_paths[cls] = prior_path  # already current: still predict with it
                 continue
-            keep = np.fromiter((k not in new_keys for k in prev_keys), bool, len(prev_keys))
+            keep = ~from_slide & np.fromiter((k not in new_keys for k in prev_keys), bool, len(prev_keys))
             dt = np.result_type(Xb.dtype, X_prev.dtype)
             Xb = np.concatenate([Xb.astype(dt, copy=False), X_prev[keep].astype(dt, copy=False)], axis=0)
             yb = np.concatenate([yb, y_prev[keep]])
