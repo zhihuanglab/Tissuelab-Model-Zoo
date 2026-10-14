@@ -370,10 +370,15 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
     except Exception as _e:
         print(f"[save_classifier_params] could not tag model_name: {_e}")
 
+    # Plain savez, not savez_compressed: these are dense L2-normalised features,
+    # so zlib takes a few percent off the size for many times the time (13 s of a
+    # 55 s run on 30k MUSK patches; one-vs-rest pays it once per class), as the
+    # cell nodes found. np.load reads either format, so classifiers written
+    # before this keep loading.
     train_data_bytes = io.BytesIO()
-    np.savez_compressed(train_data_bytes, 
-                       embeddings=final_embeddings, 
-                       labels=final_labels)
+    np.savez(train_data_bytes,
+             embeddings=final_embeddings,
+             labels=final_labels)
     train_data_str = base64.b64encode(train_data_bytes.getvalue()).decode('utf-8')
     booster.set_attr(train_data=train_data_str)
 
