@@ -1265,6 +1265,45 @@ def train_linear_classifier(
 
     return (clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0)
 
+def _row_keys(X):
+    """Exact identity of each embedding row, for de-duplicating training rows."""
+    return [r.tobytes() for r in np.ascontiguousarray(np.asarray(X, dtype=np.float32))]
+
+
+def _ovr_prior_training_data(cls, dim):
+    """Rows the class's existing binary .tlcls was trained on, for a refine.
+
+    Source: the classifier attached to the class, else the save destination when
+    it already exists. Returns (X, y, booster attrs, path); None when there is no
+    earlier classifier (or it carries no training data); False when one exists
+    but cannot be used, so it must not be overwritten.
+    """
+    for path in ((CLASSIFIER_PATHS or {}).get(cls), (SAVE_CLASSIFIER_PATHS or {}).get(cls)):
+        if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+            continue
+        try:
+            clf = xgb.XGBClassifier()
+            clf.load_model(path)
+            booster = clf.get_booster()
+            blob = booster.attr("train_data")
+            X = y = None
+            if blob:
+                data = np.load(io.BytesIO(base64.b64decode(blob)))
+                X, y = data["embeddings"], data["labels"]
+        except Exception as e:
+            print(f"[OvR] could not read {path}: {e}")
+            return False
+        if X is None:
+            print(f"[OvR] {os.path.basename(path)} carries no training data; training '{cls}' from this slide only")
+            return None
+        y = np.asarray(y).astype(int)
+        if X.ndim != 2 or X.shape[1] != dim or not np.isin(y, (0, 1)).all():
+            print(f"[OvR] {os.path.basename(path)} is not a {dim}-d binary classifier (shape {X.shape})")
+            return False
+        return X, y, booster.attributes(), path
+    return None
+
+
 def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_colors, use_supervised):
     """One-vs-rest for patch classification. Each class = an independent binary
     (binary:logistic) .tlcls. Two-stage merge: a patch is 'claimed' by its strongest
@@ -1334,9 +1373,6 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
             raise CooperativeCancel("cancelled")
         ci = name_to_idx[cls]
         pos_sel = (y_pos == ci)
-        if not np.any(pos_sel):
-            print(f"[OvR] skip '{cls}': no positive annotations")
-            continue
         Xp = X_pos[pos_sel]
         parts_X = [Xp]; parts_y = [np.ones(len(Xp))]; parts_w = [np.ones(len(Xp))]
         other = X_pos[y_pos != ci]  # patches annotated as some other class
@@ -1348,14 +1384,45 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
             # Explicit "not <cls>" is a full-strength negative (weight 1.0). OvR never
             # spreads it as a weak positive (that's multiclass-only), so no 0.3 here.
             parts_X.append(hn); parts_y.append(np.zeros(len(hn))); parts_w.append(np.ones(len(hn)))
-        if len(parts_X) < 2:
-            print(f"[OvR] skip '{cls}': no negatives available")
-            continue
         Xb = np.concatenate(parts_X, axis=0)
         yb = np.concatenate(parts_y, axis=0).astype(int)
         wb = np.concatenate(parts_w, axis=0)
+        # Refine, not replace: the class's existing .tlcls carries the rows it was
+        # trained on (other slides). Merge them in; a patch annotated again on this
+        # slide keeps only its current label.
+        prior = _ovr_prior_training_data(cls, cell_embeddings.shape[1])
+        if prior is False:
+            print(f"[OvR] '{cls}' not updated: its existing classifier could not be read")
+            continue
+        prior_attrs = {}
+        if prior is not None:
+            X_prev, y_prev, prior_attrs, prior_path = prior
+            cur_keys = _row_keys(Xb)
+            prev_keys = _row_keys(X_prev)
+            new_keys = set(cur_keys)
+            same_file = os.path.abspath(prior_path) == os.path.abspath(SAVE_CLASSIFIER_PATHS[cls])
+            # New = a patch the file does not have yet, or has under another label.
+            if same_file and set(zip(cur_keys, yb.tolist())) <= set(zip(prev_keys, y_prev.tolist())):
+                print(f"[OvR] skip '{cls}': nothing new on this slide for {os.path.basename(prior_path)}")
+                trained_paths[cls] = prior_path  # already current: still predict with it
+                continue
+            keep = np.fromiter((k not in new_keys for k in prev_keys), bool, len(prev_keys))
+            Xb = np.concatenate([Xb, X_prev[keep].astype(Xb.dtype, copy=False)], axis=0)
+            yb = np.concatenate([yb, y_prev[keep]])
+            wb = np.concatenate([wb, np.ones(int(keep.sum()))])
+            print(f"[OvR] '{cls}': merged {int(keep.sum())} earlier rows from {os.path.basename(prior_path)}")
+        if not np.any(yb == 1):
+            print(f"[OvR] skip '{cls}': no positive annotations")
+            continue
+        if not np.any(yb == 0):
+            print(f"[OvR] skip '{cls}': no negatives available")
+            continue
         clf = xgb.XGBClassifier(**xgb_params_bin)
         clf.fit(Xb, yb, sample_weight=wb)
+        if prior_attrs:
+            # Provenance (annotation history, community lineage) carries over;
+            # save_classifier_params rewrites the training-derived attrs.
+            clf.get_booster().set_attr(**prior_attrs)
         path = SAVE_CLASSIFIER_PATHS[cls]
         _dir = os.path.dirname(path)
         if _dir:
@@ -1369,8 +1436,16 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
         finally:
             SAVE_CLASSIFIER_PATH = _prev
         trained_paths[cls] = path
-        print(f"[OvR] trained '{cls}': {int(pos_sel.sum())} pos / {len(Xb) - int(pos_sel.sum())} neg -> {path}")
+        n_pos = int((yb == 1).sum())
+        print(f"[OvR] trained '{cls}': {n_pos} pos / {len(yb) - n_pos} neg -> {path}")
         progress_value = 40 + int(20 * (t_i + 1) / max(1, n_train))
+
+    # A class the user asked to save that ended up with no file at all.
+    if SAVE_CLASSIFIER_PATHS:
+        for cls in trainable:
+            path = SAVE_CLASSIFIER_PATHS.get(cls)
+            if cls not in trained_paths and path and not os.path.exists(path):
+                print(f"[OvR] '{cls}' was not saved: it has no positive annotations yet")
 
     # === Phase 2: RUN every .tlcls once, from disk, fill its column. ===
     predict_map = {}
@@ -1651,6 +1726,11 @@ def run_classification(args) -> Dict[str, Any]:
             if ovr_result is not None:
                 predictions, prediction_probs, final_class_names, final_class_colors, classification_method = ovr_result
                 print(f"One-vs-rest classification completed ({classification_method})")
+            else:
+                fallback = ("a multiclass classifier trained on the annotations"
+                            if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None)
+                            else "zero-shot prediction")
+                print(f"[OvR] no one-vs-rest classifier is available yet; this run used {fallback}")
 
         # Try supervised classification if we have classifier path or annotations
         classifier_result = None
