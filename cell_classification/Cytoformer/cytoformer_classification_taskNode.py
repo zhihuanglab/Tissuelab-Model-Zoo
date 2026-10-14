@@ -1889,13 +1889,15 @@ def _row_keys(X):
 def _ovr_prior_training_data(cls, dim):
     """Rows the class's existing binary .tlcls was trained on, for a refine.
 
-    Source: the classifier attached to the class, else the save destination when
-    it already exists. Returns (X, y, booster attrs, path); None when there is no
-    earlier classifier (or it carries no training data); False when one exists
-    but cannot be used, so it must not be overwritten. Raises
+    Source: only the classifier attached to the class (CLASSIFIER_PATHS), as the
+    multiclass path reads only CLASSIFIER_PATH. A save destination is where the
+    result goes, not a classifier in use: reading it would bring back a classifier
+    the user removed. Returns (X, y, booster attrs, path); None when nothing is
+    attached (or it carries no training data); False when one is attached but
+    cannot be used, so it must not be overwritten. Raises
     EmbeddingProvenanceError for a classifier from another embedding space.
     """
-    for path in ((CLASSIFIER_PATHS or {}).get(cls), (SAVE_CLASSIFIER_PATHS or {}).get(cls)):
+    for path in ((CLASSIFIER_PATHS or {}).get(cls),):
         if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
             continue
         try:
