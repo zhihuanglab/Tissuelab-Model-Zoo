@@ -391,9 +391,15 @@ def _booster_class_indices(clf, n_classes, train_labels=None):
 def _scatter_to_class_space(batch_probs, class_indices, n_classes):
     """Widen compact predict_proba columns into the full class_names space."""
     out = np.zeros((batch_probs.shape[0], n_classes), dtype=np.float32)
+    dropped = False
     for col, full_idx in enumerate(class_indices):
         if col < batch_probs.shape[1] and 0 <= int(full_idx) < n_classes:
             out[:, int(full_idx)] += batch_probs[:, col]
+        else:
+            dropped = True
+    if dropped:  # a deleted class's column: the rest sum to one again
+        total = out.sum(axis=1, keepdims=True)
+        np.divide(out, total, out=out, where=total > 0)
     return out
 
 
@@ -430,7 +436,7 @@ def _apply_class_operations_to_classifier(class_names, class_colors, X_prev, y_p
     """
     ops = _normalize_class_operations(CLASS_OPERATIONS)
     renames = [] if _has_rename_cycle(ops.get("renames", [])) else ops.get("renames", [])
-    deletes = {d for d in ops.get("deletes", []) if d != "Negative control"}
+    deletes = {d for d in ops.get("deletes", []) if d.strip().lower() != "negative control"}
     if not renames and not deletes:
         return class_names, class_colors, X_prev, y_prev, class_indices
     graph = {op["from"]: op["to"] for op in renames}
@@ -506,10 +512,15 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
     booster = clf.get_booster()
     booster.set_attr(class_names=json.dumps(class_names))
     booster.set_attr(class_colors=json.dumps(class_colors))
-    trained = train_data.get('trained_classes', labels)
-    if len(trained) > 0:
-        booster.set_attr(**{BOOSTER_CLASS_INDEX_ATTR: json.dumps(
-            [int(v) for v in np.unique(np.asarray(trained))])})
+    # Which class_names index each booster column means: the booster's own map
+    # when the caller has it (kept as is: a deleted class stays -1), else every
+    # class it was just fit on.
+    column_map = train_data.get('class_indices')
+    if column_map is None:
+        trained = train_data.get('trained_classes', labels)
+        column_map = np.unique(np.asarray(trained)) if len(trained) > 0 else None
+    if column_map is not None and len(column_map) > 0:
+        booster.set_attr(**{BOOSTER_CLASS_INDEX_ATTR: json.dumps([int(v) for v in column_map])})
     # Tag the classifier with the model it was trained for, so the .tlcls
     # records which patch model (MUSK / H-optimus-0 / Virchow) it belongs to.
     try:
@@ -601,7 +612,7 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
         print("No SAVE_CLASSIFIER_PATH; classifier metadata embedded in memory only (use POST /classifier/save mode=save_trained to write a file).")
 
 
-def remember_classifier_bundle_for_save(clf, class_names, class_colors, embeddings, labels):
+def remember_classifier_bundle_for_save(clf, class_names, class_colors, embeddings, labels, class_indices=None):
     """Remember (clf, class_names, class_colors, train_data) for POST /classifier/save mode=save_trained."""
     global LAST_TRAINED_CLF_BUNDLE
     if embeddings is None or labels is None:
@@ -615,7 +626,8 @@ def remember_classifier_bundle_for_save(clf, class_names, class_colors, embeddin
         clf,
         class_names,
         class_colors,
-        {"embeddings": embeddings, "labels": labels},
+        {"embeddings": embeddings, "labels": labels,
+         **({"class_indices": class_indices} if class_indices is not None else {})},
     )
 
 
@@ -951,9 +963,12 @@ def train_linear_classifier(
                 # Which class_names index each predict_proba column means; the
                 # refit / warm-start branches below replace it when they fit.
                 _clf_class_indices = _booster_class_indices(clf, len(class_names), prev_labels)
+                _names_before_ops = list(class_names)
                 class_names, class_colors, prev_embeddings, prev_labels, _clf_class_indices = \
                     _apply_class_operations_to_classifier(class_names, class_colors, prev_embeddings,
                                                           prev_labels, _clf_class_indices)
+                # A rename / delete is sent once; save it even when nothing is trained.
+                ops_changed = list(class_names) != _names_before_ops
                 loaded_classifier_colors = dict(zip(class_names, class_colors))
                 print(f"Loaded existing classifier parameters, classes: {class_names}")
                 
@@ -1061,7 +1076,7 @@ def train_linear_classifier(
                         
                     else:
                         # Class count unchanged, can use warm start for faster training
-                        print(f"Class count unchanged, using warm start for incremental training...")
+                        print(f"Class count unchanged, refining the classifier...")
                         
                         # Update class_colors: prioritize frontend (by class name), then keep existing
                         mapped_warm = _resolve_colors_for_class_names(
@@ -1127,6 +1142,7 @@ def train_linear_classifier(
                     
                     # Save updated classifier with new training data
                     train_data = _stored_training_rows(X_train, y_train, sample_weights_inc)
+                    train_data['class_indices'] = _clf_class_indices
                     save_classifier_params(clf, class_names, class_colors, train_data)
                     print("Classifier updated and saved")
                 
@@ -1225,7 +1241,7 @@ def train_linear_classifier(
                     td_emb, td_lbl = X_train, y_train
 
                 if (
-                    class_colors != old_class_colors
+                    (class_colors != old_class_colors or ops_changed)
                     and td_emb is not None
                     and td_lbl is not None
                     and getattr(td_emb, "size", 0) > 0
@@ -1234,12 +1250,13 @@ def train_linear_classifier(
                         clf,
                         class_names,
                         class_colors,
-                        {"embeddings": td_emb, "labels": td_lbl},
+                        {"embeddings": td_emb, "labels": td_lbl, "class_indices": _clf_class_indices},
                     )
                     node_tag = NODE_NAME or "Patch-Classification"
                     print(f"[{node_tag}] Updated classifier / bundle after color change (prediction path): {class_colors}")
 
-                remember_classifier_bundle_for_save(clf, class_names, class_colors, td_emb, td_lbl)
+                remember_classifier_bundle_for_save(clf, class_names, class_colors, td_emb, td_lbl,
+                                                    class_indices=_clf_class_indices)
 
 
                 return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
@@ -2071,6 +2088,26 @@ def run_classification(args) -> Dict[str, Any]:
                 print(f"[{NODE_NAME}] Frontend colors length mismatch ({len(tissue_colors)} vs {len(tissue_classes)}); use classifier colors where needed")
             else:
                 print(f"[{NODE_NAME}] Will use colors from classifier file (CLASSIFIER_PATH set, no valid UI color list)")
+
+        # A mark of a class the panel no longer lists (deleted there) stays on the
+        # slide but is not used: it would bring the class back.
+        if tissue_classes and annotations_data is not None and not annotations_data.empty:
+            listed = set(tissue_classes)
+
+            def _still_listed(row):
+                cls_name = row.get('class')
+                if cls_name is not None and not (isinstance(cls_name, float) and np.isnan(cls_name)):
+                    return cls_name in listed
+                excluded = row.get('exclude_classes')
+                return not isinstance(excluded, list) or any(e in listed for e in excluded)
+
+            keep_rows = [_still_listed(r) for _, r in annotations_data.iterrows()]
+            if not all(keep_rows):
+                print(f"[{NODE_NAME}] Ignoring {len(keep_rows) - sum(keep_rows)} marks of classes not in the panel")
+                annotations_data = annotations_data[keep_rows]
+                use_supervised = bool(annotations_data['class'].notna().any()) if not annotations_data.empty else False
+                if annotations_data.empty:
+                    annotations_data = None
 
         # One-vs-rest short-circuit: each class is its own binary .tlcls. When it
         # produces results we skip the multiclass/zero-shot dispatch entirely.

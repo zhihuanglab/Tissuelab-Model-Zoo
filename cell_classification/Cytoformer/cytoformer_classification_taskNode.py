@@ -1018,9 +1018,15 @@ def _booster_class_indices(clf, n_classes, train_labels=None):
 def _scatter_to_class_space(batch_probs, class_indices, n_classes):
     """Widen compact predict_proba columns into the full class_names space."""
     out = np.zeros((batch_probs.shape[0], n_classes), dtype=np.float32)
+    dropped = False
     for col, full_idx in enumerate(class_indices):
         if col < batch_probs.shape[1] and 0 <= int(full_idx) < n_classes:
             out[:, int(full_idx)] += batch_probs[:, col]
+        else:
+            dropped = True
+    if dropped:  # a deleted class's column: the rest sum to one again
+        total = out.sum(axis=1, keepdims=True)
+        np.divide(out, total, out=out, where=total > 0)
     return out
 
 
@@ -1115,7 +1121,7 @@ def _apply_class_operations_to_classifier(class_names, class_colors, X_prev, y_p
     """
     ops = _normalize_class_operations(CLASS_OPERATIONS)
     renames = [] if _has_rename_cycle(ops.get("renames", [])) else ops.get("renames", [])
-    deletes = {d for d in ops.get("deletes", []) if d != "Negative control"}
+    deletes = {d for d in ops.get("deletes", []) if d.strip().lower() != "negative control"}
     if not renames and not deletes:
         return class_names, class_colors, X_prev, y_prev, class_indices
     graph = {op["from"]: op["to"] for op in renames}
@@ -1193,13 +1199,15 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
     booster.set_attr(class_colors=json.dumps(class_colors))
     # Which embedding space this classifier belongs to; checked on every load.
     _stamp_classifier_provenance(booster)
-    # The booster's columns are the compacted label set; record which class_names
-    # index each one means so a reload can widen predict_proba correctly.
-    if len(labels) > 0:
-        booster.set_attr(**{
-            BOOSTER_CLASS_INDEX_ATTR: json.dumps([int(v) for v in np.unique(np.asarray(
-                train_data.get('trained_classes', labels)))])
-        })
+    # Which class_names index each booster column means: the booster's own map
+    # when the caller has it (kept as is: a deleted class stays -1), else every
+    # class it was just fit on.
+    column_map = train_data.get('class_indices')
+    if column_map is None:
+        trained = train_data.get('trained_classes', labels)
+        column_map = np.unique(np.asarray(trained)) if len(trained) > 0 else None
+    if column_map is not None and len(column_map) > 0:
+        booster.set_attr(**{BOOSTER_CLASS_INDEX_ATTR: json.dumps([int(v) for v in column_map])})
 
     # Plain savez, not savez_compressed: these are dense L2-normalised features,
     # so zlib gets ~7% off the size for ~18x the time (4.0 s vs 0.2 s on 20k
@@ -1288,7 +1296,7 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
         print("No SAVE_CLASSIFIER_PATH; classifier metadata embedded in memory only (use POST /classifier/save mode=save_trained to write a file).")
 
 
-def remember_classifier_bundle_for_save(clf, class_names, class_colors, embeddings, labels):
+def remember_classifier_bundle_for_save(clf, class_names, class_colors, embeddings, labels, class_indices=None):
     """Remember (clf, class_names, class_colors, train_data) for POST /classifier/save mode=save_trained."""
     global LAST_TRAINED_CLF_BUNDLE
     if embeddings is None or labels is None:
@@ -1302,7 +1310,8 @@ def remember_classifier_bundle_for_save(clf, class_names, class_colors, embeddin
         clf,
         class_names,
         class_colors,
-        {"embeddings": embeddings, "labels": labels},
+        {"embeddings": embeddings, "labels": labels,
+         **({"class_indices": class_indices} if class_indices is not None else {})},
     )
 
 
@@ -1381,8 +1390,6 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
             extracting from annotations.
     """
     global CLASSIFIER_PATH, SAVE_CLASSIFIER_PATH, CLASS_OPERATIONS, cancel_event
-    class_ops = _normalize_class_operations(CLASS_OPERATIONS)
-    effective_renames = [] if _has_rename_cycle(class_ops.get("renames", [])) else class_ops.get("renames", [])
     
     # update XGBoost parameter settings
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1445,9 +1452,12 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 # Which class_names index each predict_proba column means. The
                 # retrain / warm-start branches below replace it when they refit.
                 _clf_class_indices = _booster_class_indices(clf, len(class_names), prev_labels)
+                _names_before_ops = list(class_names)
                 class_names, class_colors, prev_embeddings, prev_labels, _clf_class_indices = \
                     _apply_class_operations_to_classifier(class_names, class_colors, prev_embeddings,
                                                           prev_labels, _clf_class_indices)
+                # A rename / delete is sent once; save it even when nothing is trained.
+                ops_changed = list(class_names) != _names_before_ops
                 old_class_names = class_names.copy()
                 # Update progress after loading classifier
                 progress_state.value = 40
@@ -1526,25 +1536,6 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_train = X_update
                             y_train = y_update
 
-                        # Append-only rename behavior for classifier models:
-                        # when A -> B, keep A data and clone A's historical samples to B.
-                        if prev_embeddings is not None and prev_labels is not None and effective_renames:
-                            alias_x = []
-                            alias_y = []
-                            for op in effective_renames:
-                                src = op["from"]
-                                dst = op["to"]
-                                if src in old_class_names and dst in class_names:
-                                    src_idx = old_class_names.index(src)
-                                    dst_idx = class_names.index(dst)
-                                    src_mask = np.asarray(prev_labels) == src_idx
-                                    if np.any(src_mask):
-                                        alias_x.append(prev_embeddings[src_mask])
-                                        alias_y.append(np.full(int(np.sum(src_mask)), dst_idx, dtype=np.int32))
-                            if alias_x:
-                                X_train = np.vstack([X_train] + alias_x)
-                                y_train = np.concatenate([y_train] + alias_y)
-                        
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
                         neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names, nuclei_classes)
@@ -1573,7 +1564,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         
                     else:
                         # Class count unchanged, can use warm start for faster training
-                        print(f"Class count unchanged, using warm start for incremental training...")
+                        print(f"Class count unchanged, refining the classifier...")
                         
                         # Update class_colors: prioritize frontend-provided colors, then keep existing colors
                         # This ensures user's color changes are saved to classifier even when class count doesn't change
@@ -1608,24 +1599,6 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_train = X_update
                             y_train = y_update
 
-                        # Append-only rename behavior for classifier models.
-                        if prev_embeddings is not None and prev_labels is not None and effective_renames:
-                            alias_x = []
-                            alias_y = []
-                            for op in effective_renames:
-                                src = op["from"]
-                                dst = op["to"]
-                                if src in old_class_names and dst in class_names:
-                                    src_idx = old_class_names.index(src)
-                                    dst_idx = class_names.index(dst)
-                                    src_mask = np.asarray(prev_labels) == src_idx
-                                    if np.any(src_mask):
-                                        alias_x.append(prev_embeddings[src_mask])
-                                        alias_y.append(np.full(int(np.sum(src_mask)), dst_idx, dtype=np.int32))
-                            if alias_x:
-                                X_train = np.vstack([X_train] + alias_x)
-                                y_train = np.concatenate([y_train] + alias_y)
-                        
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
                         neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names, nuclei_classes)
@@ -1674,6 +1647,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     
                     # Save updated classifier with new training data
                     train_data = _stored_training_rows(X_train, y_train, sample_weights_inc)
+                    train_data['class_indices'] = _clf_class_indices
                     save_classifier_params(clf, class_names, class_colors, train_data)
                     print("Classifier updated and saved")
                 
@@ -1761,7 +1735,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                     print(f"Keeping existing colors from classifier for prediction: {class_colors}")
                 
                 # If UI colors changed, refresh booster + LAST (even without SAVE_CLASSIFIER_PATH) so Save can export.
-                if class_colors != old_class_colors:
+                if class_colors != old_class_colors or ops_changed:
                     if 'X_train' in locals():
                         train_data = _stored_training_rows(X_train, y_train, locals().get('sample_weights_inc'))
                     else:
@@ -1769,6 +1743,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             'embeddings': prev_embeddings if prev_embeddings is not None else np.array([]),
                             'labels': prev_labels if prev_labels is not None else np.array([]),
                         }
+                    train_data['class_indices'] = _clf_class_indices
                     if train_data['embeddings'].size > 0:
                         save_classifier_params(clf, class_names, class_colors, train_data)
                         print(f"Updated classifier colors in memory (prediction path): {class_colors}")
@@ -1777,7 +1752,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 td_lbl = prev_labels
                 if 'X_train' in locals() and getattr(X_train, "size", 0) > 0:
                     td_emb, td_lbl = X_train, y_train
-                remember_classifier_bundle_for_save(clf, class_names, class_colors, td_emb, td_lbl)
+                remember_classifier_bundle_for_save(clf, class_names, class_colors, td_emb, td_lbl,
+                                                    class_indices=_clf_class_indices)
 
                 return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
         except EmbeddingProvenanceError:
