@@ -1305,8 +1305,7 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
     zero-shot over the classifier-less classes + Negative control (MUSK text
     similarity). Returns (predictions, prediction_probs, final_class_names,
     final_class_colors, method) or None to fall through to multiclass/zero-shot.
-    Mirrors the NuClass OvR; patch-specific: `patch_ID` indexing, MUSK zero-shot,
-    no pre-baked NC example vectors."""
+    Mirrors the NuClass OvR; patch-specific: `patch_ID` indexing, MUSK zero-shot."""
     global SAVE_CLASSIFIER_PATH, progress_value
 
     final_class_names = list(tissue_classes) if tissue_classes else []
@@ -1353,6 +1352,22 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
             for c in _parse_exclude_list(row, final_class_names):
                 excl_cells.setdefault(str(c), []).append(pid)
 
+    # shared background negatives: the same vectors the multiclass path injects
+    if not hasattr(train_linear_classifier, '_negative_control_vectors'):
+        base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
+        try:
+            train_linear_classifier._negative_control_vectors = np.load(
+                os.path.join(base_path, "negative_control_vectors_1024d.npy"))
+        except Exception as e:
+            print(f"[OvR] Could not load negative control vectors: {e}")
+            train_linear_classifier._negative_control_vectors = None
+    nc_vectors = getattr(train_linear_classifier, '_negative_control_vectors', None)
+    if nc_vectors is not None and getattr(nc_vectors, "ndim", 0) == 2 and \
+            nc_vectors.shape[1] != cell_embeddings.shape[1]:
+        print(f"[OvR] skipping negative_control_vectors_1024d.npy: dim {nc_vectors.shape[1]} "
+              f"!= embedding dim {cell_embeddings.shape[1]}")
+        nc_vectors = None
+
     prediction_probs = np.zeros((n_cells, len(final_class_names)), dtype=np.float32)
     filled_cols = []
 
@@ -1374,6 +1389,8 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
         other = X_pos[y_pos != ci]  # patches annotated as some other class
         if len(other):
             parts_X.append(other); parts_y.append(np.zeros(len(other))); parts_w.append(np.ones(len(other)))
+        if nc_vectors is not None and len(nc_vectors):
+            parts_X.append(nc_vectors); parts_y.append(np.zeros(len(nc_vectors))); parts_w.append(np.ones(len(nc_vectors)))
         hard_ids = excl_cells.get(cls, [])
         if hard_ids:
             hn = cell_embeddings[np.array(hard_ids, dtype=int)]
@@ -1607,6 +1624,21 @@ def run_classification(args) -> Dict[str, Any]:
             if patch_arr.dtype.names and 'class' in patch_arr.dtype.names:
                 for i in range(len(patch_arr)):
                     cls_idx = int(patch_arr['class'][i])
+                    if cls_idx <= -2:
+                        # "Not <class k>" mark, stored as -(2 + k): a negative row
+                        # (class None) naming the excluded class, as the cell
+                        # loader produces.
+                        k = -cls_idx - 2
+                        if 0 <= k < len(class_name_lookup):
+                            ann_dict[str(i)] = {
+                                'patch_ID': i,
+                                'class': None,
+                                'exclude_classes': [class_name_lookup[k]],
+                                'datetime': int(patch_arr['datetime'][i]) if 'datetime' in patch_arr.dtype.names else 0,
+                                'method': str(patch_arr['method'][i]) if 'method' in patch_arr.dtype.names else '',
+                                'annotator': str(patch_arr['annotator'][i]) if 'annotator' in patch_arr.dtype.names else '',
+                            }
+                        continue
                     if cls_idx < 0:
                         continue
                     if not (0 <= cls_idx < len(class_name_lookup)):
@@ -1629,7 +1661,8 @@ def run_classification(args) -> Dict[str, Any]:
                         'annotator': str(patch_arr['annotator'][i]) if 'annotator' in patch_arr.dtype.names else '',
                     }
             annotations_data = pd.DataFrame(ann_dict).T if ann_dict else None
-            use_supervised = bool(ann_dict)
+            # "Not <class>" marks alone are no training set: supervised needs a positive.
+            use_supervised = any(a['class'] is not None for a in ann_dict.values())
         else:
             annotations_data = None
             use_supervised = False
