@@ -180,7 +180,7 @@ def _normalize_class_operations(raw_ops):
     Shape: {'renames': [{'from': str, 'to': str}, ...], 'adds': [{'name': str, 'color': str}, ...]}
     Mirrors NuClass/classification_taskNode.py:_normalize_class_operations.
     """
-    ops = {"renames": [], "adds": []}
+    ops = {"renames": [], "adds": [], "deletes": []}
     if not isinstance(raw_ops, dict):
         return ops
 
@@ -203,6 +203,13 @@ def _normalize_class_operations(raw_ops):
             color = item.get("color")
             if name:
                 ops["adds"].append({"name": name, "color": color})
+
+    deletes = raw_ops.get("deletes", [])
+    if isinstance(deletes, list):
+        for item in deletes:
+            name = str(item.get("name", "") if isinstance(item, dict) else item).strip()
+            if name and name not in ops["deletes"]:
+                ops["deletes"].append(name)
     return ops
 
 
@@ -386,7 +393,7 @@ def _scatter_to_class_space(batch_probs, class_indices, n_classes):
     out = np.zeros((batch_probs.shape[0], n_classes), dtype=np.float32)
     for col, full_idx in enumerate(class_indices):
         if col < batch_probs.shape[1] and 0 <= int(full_idx) < n_classes:
-            out[:, int(full_idx)] = batch_probs[:, col]
+            out[:, int(full_idx)] += batch_probs[:, col]
     return out
 
 
@@ -409,6 +416,49 @@ def _continue_training(clf, xgb_params, X, y, sample_weight=None):
                              num_boost_round=int(xgb_params.get("n_estimators") or 100),
                              xgb_model=booster, callbacks=list(xgb_params.get("callbacks") or []))
     return clf
+
+
+def _apply_class_operations_to_classifier(class_names, class_colors, X_prev, y_prev, class_indices):
+    """Bring a loaded classifier's classes in line with the panel's class operations.
+
+    A renamed class carries its new name (renamed onto an existing class, the two
+    merge), and a class the user deleted from the panel leaves the classifier with
+    its training rows from every slide, as deleting a class's one-vs-rest file
+    does. Returns the updated (class_names, class_colors, X_prev, y_prev,
+    class_indices); class_indices maps the booster's columns, -1 for a deleted
+    class.
+    """
+    ops = _normalize_class_operations(CLASS_OPERATIONS)
+    renames = [] if _has_rename_cycle(ops.get("renames", [])) else ops.get("renames", [])
+    deletes = {d for d in ops.get("deletes", []) if d != "Negative control"}
+    if not renames and not deletes:
+        return class_names, class_colors, X_prev, y_prev, class_indices
+    graph = {op["from"]: op["to"] for op in renames}
+    names, colors, lut = [], [], []
+    for i, name in enumerate(class_names):
+        new = _resolve_rename_terminal(str(name), graph)
+        if new in deletes:
+            lut.append(-1)
+            continue
+        if new not in names:
+            names.append(new)
+            colors.append(class_colors[i] if i < len(class_colors) else "#aaaaaa")
+        lut.append(names.index(new))
+    lut = np.array(lut + [-1], dtype=int)  # the extra slot maps anything out of range
+    if y_prev is not None and len(y_prev):
+        y = np.asarray(y_prev, dtype=int)
+        y = lut[np.where((y >= 0) & (y < len(lut) - 1), y, len(lut) - 1)]
+        keep = y >= 0
+        if not keep.all():
+            print(f"Dropped {int((~keep).sum())} training rows of deleted classes {sorted(deletes)}")
+        X_prev = X_prev[keep] if X_prev is not None else X_prev
+        y_prev = y[keep]
+    if class_indices is not None:
+        ci = np.asarray(class_indices, dtype=int)
+        class_indices = lut[np.where((ci >= 0) & (ci < len(lut) - 1), ci, len(lut) - 1)]
+    if names != list(class_names):
+        print(f"Classifier classes after the panel's renames / deletes: {names}")
+    return names, colors, X_prev, y_prev, class_indices
 
 
 def _stored_training_rows(X, y, weights):
@@ -901,6 +951,10 @@ def train_linear_classifier(
                 # Which class_names index each predict_proba column means; the
                 # refit / warm-start branches below replace it when they fit.
                 _clf_class_indices = _booster_class_indices(clf, len(class_names), prev_labels)
+                class_names, class_colors, prev_embeddings, prev_labels, _clf_class_indices = \
+                    _apply_class_operations_to_classifier(class_names, class_colors, prev_embeddings,
+                                                          prev_labels, _clf_class_indices)
+                loaded_classifier_colors = dict(zip(class_names, class_colors))
                 print(f"Loaded existing classifier parameters, classes: {class_names}")
                 
                 if not positive_annotations.empty:
