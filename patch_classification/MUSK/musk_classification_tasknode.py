@@ -538,6 +538,74 @@ def save_patch_image(slide_path, coords, output_dir, index, label):
         print(f"Error saving patch image: {e}")
         return None
 
+def _palette_attr_list(val):
+    if val is None:
+        return []
+    if isinstance(val, np.ndarray):
+        val = val.tolist()
+    return [x.decode("utf-8") if isinstance(x, (bytes, bytearray)) else str(x) for x in val]
+
+
+def _align_user_annotation_palette(ua, kind, names, colors):
+    """Re-index the user's ``kind`` marks to ``names`` by class name, refresh each
+    mark's stored colour, and pin the result as the ``kind`` palette on
+    User-Annotations. One read of the annotation array, at most one write.
+
+    A row stores an index into that palette: ``k`` is "this IS class k",
+    ``-(2 + k)`` is "NOT class k". A class only the old palette has is kept,
+    appended, so its marks survive a run that does not list it. The seg service
+    pins palettes the same way when it saves marks (tasks._align_annotation_palette).
+    Returns ``(names, colors)`` now pinned.
+    """
+    names = [str(n) for n in names]
+    colors = [str(c) for c in (colors or [])][:len(names)]
+    colors += ["#aaaaaa"] * (len(names) - len(colors))
+    old_names = _palette_attr_list(ua.attrs.get(f"{kind}_class_names"))
+    old_colors = _palette_attr_list(ua.attrs.get(f"{kind}_class_colors"))
+    for i, n in enumerate(old_names):
+        if n not in names:
+            names.append(n)
+            colors.append(old_colors[i] if i < len(old_colors) else "#aaaaaa")
+    ds = ua[kind] if kind in ua else None
+    if ds is not None and ds.dtype.names and "class" in ds.dtype.names:
+        rows = ds[:]
+        old = rows["class"].astype(np.int64)
+        cls = old.copy()
+        lut = np.array([names.index(n) for n in old_names], dtype=np.int64)
+        if len(lut):
+            pos = (old >= 0) & (old < len(lut))
+            cls[pos] = lut[old[pos]]
+            neg = (old <= -2) & (-old - 2 < len(lut))
+            cls[neg] = -(2 + lut[-old[neg] - 2])
+        changed = not np.array_equal(old, cls)
+        if changed:
+            rows["class"] = cls
+            print(f"Re-indexed {int(np.sum(old != cls))} {kind} annotations to the run's class order")
+        if "color" in ds.dtype.names:
+            def to_int(c):
+                h = str(c or "").lstrip("#")
+                try:
+                    v = int(h, 16) if len(h) == 6 else -1
+                except ValueError:
+                    v = -1
+                # -1 in the colour column marks "not a real annotation" for the
+                # seg service; an unusable colour must not retire a class's marks.
+                return v if v >= 0 else 0x808080
+            palette_ints = np.array([to_int(c) for c in colors], dtype=np.int64)
+            pos = (cls >= 0) & (cls < len(palette_ints))
+            want = palette_ints[cls[pos]]
+            stale = rows["color"][pos] != want
+            if np.any(stale):
+                idx = np.flatnonzero(pos)[stale]
+                rows["color"][idx] = want[stale]
+                changed = True
+        if changed:
+            ds[:] = rows  # in place: a delete + re-create could lose every mark
+    ua.attrs[f"{kind}_class_names"] = names
+    ua.attrs[f"{kind}_class_colors"] = colors
+    return names, colors
+
+
 def _parse_exclude_list(row, class_names):
     """Parse exclude_classes from a row (string, list, or exclude_class_indices). Return list of class names to exclude."""
     exclude_list = []
@@ -1618,6 +1686,25 @@ def run_classification(args) -> Dict[str, Any]:
             except Exception:
                 pass
 
+        # Each mark stores an index into the palette the service pinned on
+        # User-Annotations when it saved (patch_class_names); the panel's list
+        # sent with this run may be ordered differently. Read the marks through
+        # that palette, as the cell nodes do (_read_user_cell_palette).
+        try:
+            ua_attrs = zf['User-Annotations'].attrs if 'User-Annotations' in zf else {}
+            pinned_names = list(ua_attrs.get('patch_class_names') or [])
+            if pinned_names:
+                class_name_lookup = [
+                    n.decode('utf-8') if isinstance(n, bytes) else str(n) for n in pinned_names
+                ]
+                pinned_colors = list(ua_attrs.get('patch_class_colors') or [])
+                if pinned_colors:
+                    class_color_lookup = [
+                        c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in pinned_colors
+                    ]
+        except Exception as e:
+            print(f"[{NODE_NAME}] could not read the patch annotation palette: {e}")
+
         if 'User-Annotations' in zf and 'patch' in zf['User-Annotations']:
             patch_arr = zf['User-Annotations/patch'][:]
             ann_dict = {}
@@ -1964,39 +2051,15 @@ def run_classification(args) -> Dict[str, Any]:
         colors_ascii = [c.encode('utf-8') for c in final_class_colors]
         classes_grp.create_array('color', data=np.array(colors_ascii, dtype='S256'))
 
-        # Update all annotation colors to match new class colors
-        # This ensures that when user changes a class color and clicks Update,
-        # all annotations using that class get the new color
-        # Refresh denormalised per-row color (color field on each annotation row)
-        # so it matches the new class colors. With the dense structured-array
-        # format this is a vectorised np.where update.
+        # Re-index the user's marks to this run's class order by name (classes the
+        # run does not list are kept, appended), pin that as the palette, and
+        # refresh each mark's stored colour. The cell nodes do the same.
         try:
-            if 'User-Annotations' in zf and 'patch' in zf['User-Annotations']:
-                patch_ds = zf['User-Annotations/patch']
-                patch_arr = patch_ds[:]
-                if patch_arr.dtype.names and 'class' in patch_arr.dtype.names and 'color' in patch_arr.dtype.names:
-                    new_color_ints = []
-                    for c in final_class_colors:
-                        try:
-                            ci = int(str(c).lstrip('#'), 16) if c else -1
-                        except (TypeError, ValueError):
-                            ci = -1
-                        new_color_ints.append(ci)
-                    updated_count = 0
-                    for idx in range(len(patch_arr)):
-                        cls_idx = int(patch_arr['class'][idx])
-                        if 0 <= cls_idx < len(new_color_ints):
-                            new_c = new_color_ints[cls_idx]
-                            if new_c >= 0 and int(patch_arr['color'][idx]) != new_c:
-                                patch_arr['color'][idx] = new_c
-                                updated_count += 1
-                    if updated_count > 0:
-                        del zf['User-Annotations/patch']
-                        zf['User-Annotations'].create_array('patch', data=patch_arr)
-                        print(f"Updated {updated_count} patch annotation colors to match new class colors")
+            if 'User-Annotations' in zf:
+                _align_user_annotation_palette(
+                    zf['User-Annotations'], 'patch', final_class_names, final_class_colors)
         except Exception as e:
-            # If update fails, log but don't fail the workflow.
-            print(f"Warning: Could not update patch annotation colors: {e}")
+            print(f"Warning: Could not align user annotations to the new palette: {e}")
         
         # Patch-Classification/classes/{name,color} (written above) is now the
         # canonical source for the class palette. The old
