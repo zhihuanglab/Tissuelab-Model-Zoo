@@ -1101,12 +1101,13 @@ def _stored_training_rows(X, y, weights):
     """Training rows a classifier keeps as its train_data. The weak "not X" rows
     (weight < 1) are rebuilt from the marks on every run; stored, a later refine
     would read them back as full-weight labels."""
-    # The booster's columns are every class it was fit on, weak rows included.
-    trained = np.unique(np.asarray(y)).astype(int)
+    # A booster just fit on y has a column per class in it, weak rows included;
+    # a caller holding the booster's own map (warm start, merged classes) sets it.
+    class_indices = np.unique(np.asarray(y)).astype(int)
     if weights is None or len(weights) != len(y):
-        return {'embeddings': X, 'labels': y, 'trained_classes': trained}
+        return {'embeddings': X, 'labels': y, 'class_indices': class_indices}
     keep = np.asarray(weights) >= 1
-    return {'embeddings': X[keep], 'labels': y[keep], 'trained_classes': trained}
+    return {'embeddings': X[keep], 'labels': y[keep], 'class_indices': class_indices}
 
 
 def save_classifier_params(clf, class_names, class_colors, train_data, max_samples_per_class=100000000000000):
@@ -1142,13 +1143,11 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
     booster = clf.get_booster()
     booster.set_attr(class_names=json.dumps(class_names))
     booster.set_attr(class_colors=json.dumps(class_colors))
-    # Which class_names index each booster column means: the booster's own map
-    # when the caller has it (kept as is: a deleted class stays -1), else every
-    # class it was just fit on.
+    # Which class_names index each booster column means, kept as given (a deleted
+    # class stays -1); without one, every class in the labels.
     column_map = train_data.get('class_indices')
-    if column_map is None:
-        trained = train_data.get('trained_classes', labels)
-        column_map = np.unique(np.asarray(trained)) if len(trained) > 0 else None
+    if column_map is None and len(labels) > 0:
+        column_map = np.unique(np.asarray(labels))
     if column_map is not None and len(column_map) > 0:
         booster.set_attr(**{BOOSTER_CLASS_INDEX_ATTR: json.dumps([int(v) for v in column_map])})
 
