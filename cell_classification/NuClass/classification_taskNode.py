@@ -166,7 +166,7 @@ class _CancelTrainingCallback(xgb.callback.TrainingCallback):
 
 
 def _normalize_class_operations(raw_ops):
-    ops = {"renames": [], "adds": [], "deletes": []}
+    ops = {"renames": [], "adds": []}
     if not isinstance(raw_ops, dict):
         return ops
 
@@ -189,13 +189,6 @@ def _normalize_class_operations(raw_ops):
             color = item.get("color")
             if name:
                 ops["adds"].append({"name": name, "color": color})
-
-    deletes = raw_ops.get("deletes", [])
-    if isinstance(deletes, list):
-        for item in deletes:
-            name = str(item.get("name", "") if isinstance(item, dict) else item).strip()
-            if name and name not in ops["deletes"]:
-                ops["deletes"].append(name)
     return ops
 
 def _has_rename_cycle(renames):
@@ -963,15 +956,9 @@ def _booster_class_indices(clf, n_classes, train_labels=None):
 def _scatter_to_class_space(batch_probs, class_indices, n_classes):
     """Widen compact predict_proba columns into the full class_names space."""
     out = np.zeros((batch_probs.shape[0], n_classes), dtype=np.float32)
-    dropped = False
     for col, full_idx in enumerate(class_indices):
         if col < batch_probs.shape[1] and 0 <= int(full_idx) < n_classes:
-            out[:, int(full_idx)] += batch_probs[:, col]
-        else:
-            dropped = True
-    if dropped:  # a deleted class's column: the rest sum to one again
-        total = out.sum(axis=1, keepdims=True)
-        np.divide(out, total, out=out, where=total > 0)
+            out[:, int(full_idx)] += batch_probs[:, col]  # merged classes add up
     return out
 
 
@@ -1055,45 +1042,30 @@ def _continue_training(clf, xgb_params, X, y, sample_weight=None):
 
 
 def _apply_class_operations_to_classifier(class_names, class_colors, X_prev, y_prev, class_indices):
-    """Bring a loaded classifier's classes in line with the panel's class operations.
-
-    A renamed class carries its new name (renamed onto an existing class, the two
-    merge), and a class the user deleted from the panel leaves the classifier with
-    its training rows from every slide, as deleting a class's one-vs-rest file
-    does. Returns the updated (class_names, class_colors, X_prev, y_prev,
-    class_indices); class_indices maps the booster's columns, -1 for a deleted
-    class.
-    """
+    """Carry the panel's renames into a loaded classifier: a renamed class takes
+    its new name, and one renamed onto an existing class merges with it (its
+    training rows and booster column go with it). Returns the updated
+    (class_names, class_colors, X_prev, y_prev, class_indices)."""
     ops = _normalize_class_operations(CLASS_OPERATIONS)
     renames = [] if _has_rename_cycle(ops.get("renames", [])) else ops.get("renames", [])
-    deletes = {d for d in ops.get("deletes", []) if d.strip().lower() != "negative control"}
-    if not renames and not deletes:
+    if not renames:
         return class_names, class_colors, X_prev, y_prev, class_indices
     graph = {op["from"]: op["to"] for op in renames}
     names, colors, lut = [], [], []
     for i, name in enumerate(class_names):
         new = _resolve_rename_terminal(str(name), graph)
-        if new in deletes:
-            lut.append(-1)
-            continue
         if new not in names:
             names.append(new)
             colors.append(class_colors[i] if i < len(class_colors) else "#aaaaaa")
         lut.append(names.index(new))
-    lut = np.array(lut + [-1], dtype=int)  # the extra slot maps anything out of range
+    lut = np.array(lut, dtype=int)
+    remap = lambda v: np.where((v >= 0) & (v < len(lut)), lut[np.clip(v, 0, len(lut) - 1)], v)
     if y_prev is not None and len(y_prev):
-        y = np.asarray(y_prev, dtype=int)
-        y = lut[np.where((y >= 0) & (y < len(lut) - 1), y, len(lut) - 1)]
-        keep = y >= 0
-        if not keep.all():
-            print(f"Dropped {int((~keep).sum())} training rows of deleted classes {sorted(deletes)}")
-        X_prev = X_prev[keep] if X_prev is not None else X_prev
-        y_prev = y[keep]
+        y_prev = remap(np.asarray(y_prev, dtype=int))
     if class_indices is not None:
-        ci = np.asarray(class_indices, dtype=int)
-        class_indices = lut[np.where((ci >= 0) & (ci < len(lut) - 1), ci, len(lut) - 1)]
+        class_indices = remap(np.asarray(class_indices, dtype=int))
     if names != list(class_names):
-        print(f"Classifier classes after the panel's renames / deletes: {names}")
+        print(f"Classifier classes after the panel's renames: {names}")
     return names, colors, X_prev, y_prev, class_indices
 
 
@@ -1419,7 +1391,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 class_names, class_colors, prev_embeddings, prev_labels, _clf_class_indices = \
                     _apply_class_operations_to_classifier(class_names, class_colors, prev_embeddings,
                                                           prev_labels, _clf_class_indices)
-                # A rename / delete is sent once; save it even when nothing is trained.
+                # A rename is sent once; save it even when nothing is trained.
                 ops_changed = list(class_names) != _names_before_ops
                 old_class_names = class_names.copy()
                 # Update progress after loading classifier
