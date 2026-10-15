@@ -373,6 +373,74 @@ def _decode_attr_str_list(val):
     return out
 
 
+def _palette_attr_list(val):
+    if val is None:
+        return []
+    if isinstance(val, np.ndarray):
+        val = val.tolist()
+    return [x.decode("utf-8") if isinstance(x, (bytes, bytearray)) else str(x) for x in val]
+
+
+def _align_user_annotation_palette(ua, kind, names, colors):
+    """Re-index the user's ``kind`` marks to ``names`` by class name, refresh each
+    mark's stored colour, and pin the result as the ``kind`` palette on
+    User-Annotations. One read of the annotation array, at most one write.
+
+    A row stores an index into that palette: ``k`` is "this IS class k",
+    ``-(2 + k)`` is "NOT class k". A class only the old palette has is kept,
+    appended, so its marks survive a run that does not list it. The seg service
+    pins palettes the same way when it saves marks (tasks._align_annotation_palette).
+    Returns ``(names, colors)`` now pinned.
+    """
+    names = [str(n) for n in names]
+    colors = [str(c) for c in (colors or [])][:len(names)]
+    colors += ["#aaaaaa"] * (len(names) - len(colors))
+    old_names = _palette_attr_list(ua.attrs.get(f"{kind}_class_names"))
+    old_colors = _palette_attr_list(ua.attrs.get(f"{kind}_class_colors"))
+    for i, n in enumerate(old_names):
+        if n not in names:
+            names.append(n)
+            colors.append(old_colors[i] if i < len(old_colors) else "#aaaaaa")
+    ds = ua[kind] if kind in ua else None
+    if ds is not None and ds.dtype.names and "class" in ds.dtype.names:
+        rows = ds[:]
+        old = rows["class"].astype(np.int64)
+        cls = old.copy()
+        lut = np.array([names.index(n) for n in old_names], dtype=np.int64)
+        if len(lut):
+            pos = (old >= 0) & (old < len(lut))
+            cls[pos] = lut[old[pos]]
+            neg = (old <= -2) & (-old - 2 < len(lut))
+            cls[neg] = -(2 + lut[-old[neg] - 2])
+        changed = not np.array_equal(old, cls)
+        if changed:
+            rows["class"] = cls
+            print(f"Re-indexed {int(np.sum(old != cls))} {kind} annotations to the run's class order")
+        if "color" in ds.dtype.names:
+            def to_int(c):
+                h = str(c or "").lstrip("#")
+                try:
+                    v = int(h, 16) if len(h) == 6 else -1
+                except ValueError:
+                    v = -1
+                # -1 in the colour column marks "not a real annotation" for the
+                # seg service; an unusable colour must not retire a class's marks.
+                return v if v >= 0 else 0x808080
+            palette_ints = np.array([to_int(c) for c in colors], dtype=np.int64)
+            pos = (cls >= 0) & (cls < len(palette_ints))
+            want = palette_ints[cls[pos]]
+            stale = rows["color"][pos] != want
+            if np.any(stale):
+                idx = np.flatnonzero(pos)[stale]
+                rows["color"][idx] = want[stale]
+                changed = True
+        if changed:
+            ds[:] = rows  # in place: a delete + re-create could lose every mark
+    ua.attrs[f"{kind}_class_names"] = names
+    ua.attrs[f"{kind}_class_colors"] = colors
+    return names, colors
+
+
 def _read_user_cell_palette(ua):
     """Read User-Annotations cell palette (TissueLab prefixed keys only)."""
     if ua is None or not hasattr(ua, "attrs"):
@@ -2660,103 +2728,15 @@ def run_classification(args) -> Dict[str, Any]:
         colors_ascii = np.array([c.encode('utf-8') for c in final_class_colors], dtype='S256')
         classes_grp.create_array('color', data=colors_ascii)
 
-        # Update all annotation colors / remapped class indices to match new palette.
-        # Remap by class name so reordered nuclei_classes do not paint the wrong overlay.
-        try:
-            if 'User-Annotations' in zf and 'cell' in zf['User-Annotations']:
-                annotations_dataset = zf['User-Annotations/cell']
-                if 'class' in annotations_dataset.dtype.names and 'color' in annotations_dataset.dtype.names:
-                    user_anno_group = zf['User-Annotations']
-                    old_names, _ = _read_user_cell_palette(user_anno_group)
-
-                    class_name_to_color = dict(zip(final_class_names, final_class_colors))
-                    name_to_new_idx = {n: i for i, n in enumerate(final_class_names)}
-
-                    def hex_to_int(hex_color):
-                        # -1 for anything unusable, like the seg service's
-                        # equivalent. int() raises on a 6-char non-hex string, and
-                        # letting that escape would skip the whole colour/index
-                        # update below.
-                        hex_color = str(hex_color or '').lstrip('#')
-                        if len(hex_color) != 6:
-                            return -1
-                        try:
-                            return int(hex_color, 16)
-                        except ValueError:
-                            return -1
-
-                    all_annotations = annotations_dataset[:]
-                    updated_count = 0
-
-                    if old_names and old_names != list(final_class_names):
-                        old_classes = np.asarray(all_annotations['class']).copy()
-                        remapped = old_classes.copy()
-                        for old_idx, old_name in enumerate(old_names):
-                            new_idx = name_to_new_idx.get(old_name)
-                            # "not this type" rows encode the excluded class as
-                            # -(2 + index); they index the same palette and have to
-                            # move with it, or the constraint silently points at a
-                            # different class after a reorder.
-                            old_weak = -(2 + old_idx)
-                            if new_idx is None:
-                                remapped[old_classes == old_idx] = -1
-                                remapped[old_classes == old_weak] = -1
-                            elif new_idx != old_idx:
-                                remapped[old_classes == old_idx] = new_idx
-                                remapped[old_classes == old_weak] = -(2 + new_idx)
-                        all_annotations['class'] = remapped
-                        updated_count += int(np.sum(remapped != old_classes))
-                        print(
-                            f"Remapped user annotation class indices for palette reorder "
-                            f"({len(old_names)} -> {len(final_class_names)} classes)"
-                        )
-
-                    for class_idx, class_name in enumerate(final_class_names):
-                        if class_name in class_name_to_color:
-                            new_color_hex = class_name_to_color[class_name]
-                            new_color_int = hex_to_int(new_color_hex)
-                            if new_color_int < 0:
-                                # -1 in the colour column is the seg service's
-                                # sentinel for "this row is not a real annotation".
-                                # Writing it here would silently retire every cell
-                                # the user labelled as this class, so an unusable
-                                # colour falls back to a visible one instead.
-                                print(f"Class '{class_name}' has no usable colour "
-                                      f"({new_color_hex!r}); keeping annotations visible with #808080")
-                                new_color_int = 0x808080
-                            class_mask = (all_annotations['class'] == class_idx)
-                            if np.any(class_mask):
-                                all_annotations['color'][class_mask] = new_color_int
-                                updated_count += int(np.sum(class_mask))
-                                print(
-                                    f"Updated {np.sum(class_mask)} annotations for class "
-                                    f"'{class_name}' (index {class_idx}) to color {new_color_hex}"
-                                )
-
-                    if updated_count > 0:
-                        # Write back in place. Deleting and re-creating the array
-                        # left a window in which any failure (or a concurrent
-                        # save_annotation re-creating it empty) lost every user
-                        # annotation on the slide; same rows, same dtype, so an
-                        # in-place write needs no such window.
-                        annotations_dataset[:] = all_annotations
-                        print(f"Updated {updated_count} annotation rows after classification write")
-        except Exception as e:
-            print(f"Warning: Could not update annotation colors/indices: {e}")
-
+        # Re-index the user's marks to this run's class order by name (classes the
+        # run does not list are kept, appended), pin that as the palette, and
+        # refresh each mark's stored colour. The patch nodes do the same.
         try:
             if 'User-Annotations' in zf:
-                _write_user_cell_palette(
-                    zf['User-Annotations'],
-                    final_class_names,
-                    final_class_colors,
-                )
-                print(
-                    f"Updated user_annotation.attrs cell colormap: "
-                    f"{len(final_class_names)} classes with new colors"
-                )
+                _align_user_annotation_palette(
+                    zf['User-Annotations'], 'cell', final_class_names, final_class_colors)
         except Exception as e:
-            print(f"Warning: Could not update user_annotation.attrs colormap: {e}")
+            print(f"Warning: Could not align user annotations to the new palette: {e}")
 
         # Also write Cell-Classification group attrs so TissueLab load_file
         # takes the primary metadata path (not classes/name datasets only).
