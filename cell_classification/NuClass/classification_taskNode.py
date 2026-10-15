@@ -917,9 +917,8 @@ def _match_booster_device_to_data(clf):
 
 def _compact_labels(y_full):
     """Return (contiguous labels for xgboost, compact column -> class_names index)."""
-    compact_to_full = np.unique(np.asarray(y_full)).astype(int)
-    lut = {int(v): i for i, v in enumerate(compact_to_full)}
-    return np.array([lut[int(v)] for v in y_full], dtype=int), compact_to_full
+    compact_to_full, compact = np.unique(np.asarray(y_full).astype(int), return_inverse=True)
+    return compact.reshape(-1).astype(int), compact_to_full
 
 
 def _booster_class_indices(clf, n_classes, train_labels=None):
@@ -1067,6 +1066,104 @@ def _apply_class_operations_to_classifier(class_names, class_colors, X_prev, y_p
     if names != list(class_names):
         print(f"Classifier classes after the panel's renames: {names}")
     return names, colors, X_prev, y_prev, class_indices
+
+
+# The "not X" marks a multiclass classifier was refined with, kept in their own
+# booster attr: train_data holds labelled samples only (what its readers count),
+# and a "not X" mark is no sample of any one class.
+NOT_MARKS_ATTR = "not_marks"
+# One row per mark; a mark excluding several classes joins their names.
+NOT_MARK_SEP = "\x1f"
+
+
+def _read_not_marks(clf):
+    """(embeddings, the classes each mark excludes) the classifier keeps, or (None, None)."""
+    try:
+        blob = clf.get_booster().attr(NOT_MARKS_ATTR)
+        if blob:
+            data = np.load(io.BytesIO(base64.b64decode(blob)))
+            return data["embeddings"], [str(n) for n in data["classes"]]
+    except Exception as e:
+        print(f"Could not read the classifier's \"not\" marks: {e}")
+    return None, None
+
+
+def _write_not_marks(clf, X, names):
+    """Keep these "not X" marks with the classifier (none: drop the attr)."""
+    booster = clf.get_booster()
+    if X is None or not len(X):
+        booster.set_attr(**{NOT_MARKS_ATTR: None})
+        return
+    buf = io.BytesIO()
+    np.savez(buf, embeddings=np.asarray(X), classes=np.asarray([str(n) for n in names]))
+    booster.set_attr(**{NOT_MARKS_ATTR: base64.b64encode(buf.getvalue()).decode("utf-8")})
+
+
+def _rename_not_marks(X, names):
+    """Carry the panel's renames into kept "not X" marks, as into the classes."""
+    if X is None:
+        return X, names
+    ops = _normalize_class_operations(CLASS_OPERATIONS)
+    renames = [] if _has_rename_cycle(ops.get("renames", [])) else ops.get("renames", [])
+    if renames:
+        graph = {op["from"]: op["to"] for op in renames}
+        names = [NOT_MARK_SEP.join(_resolve_rename_terminal(c, graph) for c in str(n).split(NOT_MARK_SEP))
+                 for n in names]
+    return X, names
+
+
+def _merge_not_marks(kept, current, slide_embeddings):
+    """The kept "not X" marks with this slide's replaced by its current ones, as
+    the slide's training rows are (_drop_this_slides_rows)."""
+    (X_kept, n_kept), (X_cur, n_cur) = kept, current
+    parts_X, parts_n = [], []
+    if X_kept is not None and len(X_kept):
+        other = ~_rows_from_slide(X_kept, slide_embeddings)
+        parts_X.append(np.asarray(X_kept)[other])
+        parts_n += [n for n, o in zip(n_kept, other) if o]
+    if X_cur is not None and len(X_cur):
+        parts_X.append(np.asarray(X_cur))
+        parts_n += list(n_cur)
+    X = np.concatenate(parts_X, axis=0) if parts_X else None
+    return (X, parts_n) if X is not None and len(X) else (None, None)
+
+
+def _weak_rows_from_not_marks(X, names, class_names):
+    """Spread "not X" marks into weak rows (weight 0.3): one per class a mark leaves
+    possible, Negative control aside, as _build_negative_training_samples does."""
+    if X is None or not len(X):
+        return None, None, None
+    col_of = {cname: c for c, cname in enumerate(class_names)}
+    allowed = np.ones((len(X), len(class_names)), dtype=bool)
+    for i, excluded in enumerate(names):
+        for cname in str(excluded).split(NOT_MARK_SEP):
+            if cname in col_of:
+                allowed[i, col_of[cname]] = False
+    if "Negative control" in col_of:
+        allowed[:, col_of["Negative control"]] = False
+    rows, labels = np.nonzero(allowed)
+    if not len(rows):
+        return None, None, None
+    return np.asarray(X)[rows], labels.astype(int), np.full(len(labels), 0.3)
+
+
+def _not_marks_on_slide(cell_embeddings, negative_annotations, class_names, nuclei_classes=None):
+    """This slide's "not X" marks: (embeddings, the classes each mark excludes)."""
+    if negative_annotations is None or negative_annotations.empty or not (
+            'exclude_classes' in negative_annotations.columns
+            or 'exclude_class_indices' in negative_annotations.columns):
+        return None, None
+    fallback = nuclei_classes if nuclei_classes else class_names
+    ids, names = [], []
+    cell_ids = negative_annotations['cell_ID'].astype(int).tolist()
+    for cell_id, (excl_names, inds) in zip(cell_ids, _exclude_columns(negative_annotations)):
+        excluded = [str(c) for c in _resolve_excluded_names(excl_names, inds, fallback)]
+        if excluded:
+            ids.append(cell_id)
+            names.append(NOT_MARK_SEP.join(excluded))
+    if not ids:
+        return None, None
+    return cell_embeddings[np.asarray(ids, dtype=int)], names
 
 
 def _stored_training_rows(X, y, weights):
@@ -1391,8 +1488,13 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 class_names, class_colors, prev_embeddings, prev_labels, _clf_class_indices = \
                     _apply_class_operations_to_classifier(class_names, class_colors, prev_embeddings,
                                                           prev_labels, _clf_class_indices)
+                loaded_nots = _read_not_marks(clf)
+                prev_nots = _rename_not_marks(*loaded_nots)
+                nots_renamed = prev_nots[1] != loaded_nots[1]
+                if nots_renamed:
+                    _write_not_marks(clf, *prev_nots)
                 # A rename is sent once; save it even when nothing is trained.
-                ops_changed = list(class_names) != _names_before_ops
+                ops_changed = list(class_names) != _names_before_ops or nots_renamed
                 old_class_names = class_names.copy()
                 # Update progress after loading classifier
                 progress_state.value = 40
@@ -1490,7 +1592,10 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
 
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
-                        neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names, nuclei_classes)
+                        kept_nots = _merge_not_marks(
+                            prev_nots, _not_marks_on_slide(cell_embeddings, negative_annotations, class_names, nuclei_classes),
+                            cell_embeddings)
+                        neg_X, neg_y, neg_w = _weak_rows_from_not_marks(*kept_nots, class_names)
                         sample_weights_inc = None
                         if neg_X is not None:
                             print(f"Adding {len(neg_X)} negative training samples (weighted 0.3) for retrain")
@@ -1553,7 +1658,10 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
 
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
-                        neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names, nuclei_classes)
+                        kept_nots = _merge_not_marks(
+                            prev_nots, _not_marks_on_slide(cell_embeddings, negative_annotations, class_names, nuclei_classes),
+                            cell_embeddings)
+                        neg_X, neg_y, neg_w = _weak_rows_from_not_marks(*kept_nots, class_names)
                         sample_weights_inc = None
                         if neg_X is not None:
                             print(f"Adding {len(neg_X)} negative training samples (weighted 0.3) for incremental training")
@@ -1598,6 +1706,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                                                       else " with warm start"))
                     
                     # Save updated classifier with new training data
+                    _write_not_marks(clf, *kept_nots)
                     train_data = _stored_training_rows(X_train, y_train, sample_weights_inc)
                     train_data['class_indices'] = _clf_class_indices
                     save_classifier_params(clf, class_names, class_colors, train_data)
@@ -1703,7 +1812,9 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 td_emb = prev_embeddings
                 td_lbl = prev_labels
                 if 'X_train' in locals() and getattr(X_train, "size", 0) > 0:
-                    td_emb, td_lbl = X_train, y_train
+                    # its labelled rows only: the weak "not X" rows are no samples
+                    stored = _stored_training_rows(X_train, y_train, locals().get('sample_weights_inc'))
+                    td_emb, td_lbl = stored['embeddings'], stored['labels']
                 remember_classifier_bundle_for_save(clf, class_names, class_colors, td_emb, td_lbl,
                                                     class_indices=_clf_class_indices)
 
@@ -1939,6 +2050,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     print(f"Progress: 90% (Completed prediction for {n_cells} cells)")
 
     # save classifier parameters
+    _write_not_marks(clf, *_not_marks_on_slide(cell_embeddings, negative_annotations, class_names, nuclei_classes))
     train_data = _stored_training_rows(X_train, y_train, sample_weights)
     save_classifier_params(clf, class_names, class_colors, train_data)
 
