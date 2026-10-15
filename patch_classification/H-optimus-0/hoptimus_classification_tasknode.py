@@ -42,6 +42,7 @@ import colorsys
 import asyncio
 import threading
 import gc
+import hashlib
 import logging
 import collections
 import glob
@@ -319,6 +320,241 @@ def generate_distinct_colors(tissue_classes: list[str]) -> list[str]:
         colors.append(color)
     return colors
 
+def _rows_from_slide(X, slide_embeddings):
+    """Mask of the rows of ``X`` that are embeddings of this slide (exact match).
+
+    A 64-bit key from each row's first dimensions narrows the slide's rows to a
+    few candidates on arrays; those are confirmed on the whole row.
+    """
+    X = np.asarray(X)
+    out = np.zeros(len(X), dtype=bool)
+    if (not len(X) or slide_embeddings is None or not len(slide_embeddings) or X.ndim != 2
+            or X.shape[1] != slide_embeddings.shape[1] or X.shape[1] < 4):
+        return out
+
+    def prefix_key(a):
+        u = np.ascontiguousarray(a[:, :4]).astype(np.float32).view(np.uint64)
+        return u[:, 0] ^ (u[:, 1] * np.uint64(0x9E3779B97F4A7C15))
+
+    xk, sk = prefix_key(X), prefix_key(slide_embeddings)
+    cand = np.flatnonzero(np.isin(xk, sk, kind="sort"))
+    if cand.size:
+        rows = np.flatnonzero(np.isin(sk, xk[cand], kind="sort"))
+        on_slide = set(_row_keys(np.asarray(slide_embeddings[rows])))
+        out[cand] = [k in on_slide for k in _row_keys(X[cand])]
+    return out
+
+
+def _drop_this_slides_rows(X_prev, y_prev, slide_embeddings):
+    """Refine, not repeat: the attached classifier's training rows minus every row
+    that came from this slide; the caller adds the slide's current marks back. So
+    a re-run adds nothing twice, a relabelled cell or patch keeps only its current
+    label, and a mark the user removed leaves the classifier — as one-vs-rest
+    merges (run_ovr_classification)."""
+    if X_prev is None or len(X_prev) == 0:
+        return X_prev, y_prev
+    mine = _rows_from_slide(X_prev, slide_embeddings)
+    if mine.any():
+        print(f"Refine: {int(mine.sum())} earlier training rows from this slide replaced by its current marks")
+    return X_prev[~mine], np.asarray(y_prev)[~mine]
+
+
+# Which class_names index each predict_proba column means, persisted with the
+# booster: XGBoost is fit on the compact set of classes that had samples.
+BOOSTER_CLASS_INDEX_ATTR = "trained_class_indices"
+
+
+def _compact_labels(y_full):
+    """Return (contiguous labels for xgboost, compact column -> class_names index)."""
+    compact_to_full, compact = np.unique(np.asarray(y_full).astype(int), return_inverse=True)
+    return compact.reshape(-1).astype(int), compact_to_full
+
+
+def _booster_class_indices(clf, n_classes, train_labels=None):
+    """class_names index for each predict_proba column of ``clf``: the mapping
+    saved with it, else the saved training labels (older files), else identity."""
+    try:
+        raw = clf.get_booster().attr(BOOSTER_CLASS_INDEX_ATTR)
+        if raw:
+            mapped = [int(v) for v in json.loads(raw)]
+            if mapped:
+                return np.array(mapped, dtype=int)
+    except Exception:
+        pass
+    if train_labels is not None and len(train_labels) > 0:
+        return np.unique(np.asarray(train_labels)).astype(int)
+    n_cols = int(getattr(clf, "n_classes_", 0) or 0)
+    return np.arange(min(n_cols, n_classes) if n_cols else n_classes, dtype=int)
+
+
+def _scatter_to_class_space(batch_probs, class_indices, n_classes):
+    """Widen compact predict_proba columns into the full class_names space."""
+    out = np.zeros((batch_probs.shape[0], n_classes), dtype=np.float32)
+    for col, full_idx in enumerate(class_indices):
+        if col < batch_probs.shape[1] and 0 <= int(full_idx) < n_classes:
+            out[:, int(full_idx)] += batch_probs[:, col]  # merged classes add up
+    return out
+
+
+def _continue_training(clf, xgb_params, X, y, sample_weight=None):
+    """Add boosting rounds to a loaded classifier that carries no training rows.
+
+    XGBClassifier.fit wants every label 0..k-1 present, and a slide seldom marks
+    every class the booster knows; the rounds are added on the booster itself,
+    with ``y`` already in its column space."""
+    booster = clf.get_booster()
+    learner = json.loads(booster.save_config())["learner"]
+    params = {k: v for k, v in xgb_params.items()
+              if k not in ("callbacks", "n_jobs", "random_state", "n_estimators")}
+    params["seed"] = xgb_params.get("random_state", 0)
+    params["objective"] = learner["objective"]["name"]
+    num_class = int(learner["learner_model_param"].get("num_class", "0") or 0)
+    if num_class > 1:
+        params["num_class"] = num_class
+    clf._Booster = xgb.train(params, xgb.DMatrix(X, label=y, weight=sample_weight),
+                             num_boost_round=int(xgb_params.get("n_estimators") or 100),
+                             xgb_model=booster, callbacks=list(xgb_params.get("callbacks") or []))
+    return clf
+
+
+def _apply_class_operations_to_classifier(class_names, class_colors, X_prev, y_prev, class_indices):
+    """Carry the panel's renames into a loaded classifier: a renamed class takes
+    its new name, and one renamed onto an existing class merges with it (its
+    training rows and booster column go with it). Returns the updated
+    (class_names, class_colors, X_prev, y_prev, class_indices)."""
+    ops = _normalize_class_operations(CLASS_OPERATIONS)
+    renames = [] if _has_rename_cycle(ops.get("renames", [])) else ops.get("renames", [])
+    if not renames:
+        return class_names, class_colors, X_prev, y_prev, class_indices
+    graph = {op["from"]: op["to"] for op in renames}
+    names, colors, lut = [], [], []
+    for i, name in enumerate(class_names):
+        new = _resolve_rename_terminal(str(name), graph)
+        if new not in names:
+            names.append(new)
+            colors.append(class_colors[i] if i < len(class_colors) else "#aaaaaa")
+        lut.append(names.index(new))
+    lut = np.array(lut, dtype=int)
+    remap = lambda v: np.where((v >= 0) & (v < len(lut)), lut[np.clip(v, 0, len(lut) - 1)], v)
+    if y_prev is not None and len(y_prev):
+        y_prev = remap(np.asarray(y_prev, dtype=int))
+    if class_indices is not None:
+        class_indices = remap(np.asarray(class_indices, dtype=int))
+    if names != list(class_names):
+        print(f"Classifier classes after the panel's renames: {names}")
+    return names, colors, X_prev, y_prev, class_indices
+
+
+# The "not X" marks a multiclass classifier was refined with, kept in their own
+# booster attr: train_data holds labelled samples only (what its readers count),
+# and a "not X" mark is no sample of any one class.
+NOT_MARKS_ATTR = "not_marks"
+# One row per mark; a mark excluding several classes joins their names.
+NOT_MARK_SEP = "\x1f"
+
+
+def _read_not_marks(clf):
+    """(embeddings, the classes each mark excludes) the classifier keeps, or (None, None)."""
+    try:
+        blob = clf.get_booster().attr(NOT_MARKS_ATTR)
+        if blob:
+            data = np.load(io.BytesIO(base64.b64decode(blob)))
+            return data["embeddings"], [str(n) for n in data["classes"]]
+    except Exception as e:
+        print(f"Could not read the classifier's \"not\" marks: {e}")
+    return None, None
+
+
+def _write_not_marks(clf, X, names):
+    """Keep these "not X" marks with the classifier (none: drop the attr)."""
+    booster = clf.get_booster()
+    if X is None or not len(X):
+        booster.set_attr(**{NOT_MARKS_ATTR: None})
+        return
+    buf = io.BytesIO()
+    np.savez(buf, embeddings=np.asarray(X), classes=np.asarray([str(n) for n in names]))
+    booster.set_attr(**{NOT_MARKS_ATTR: base64.b64encode(buf.getvalue()).decode("utf-8")})
+
+
+def _rename_not_marks(X, names):
+    """Carry the panel's renames into kept "not X" marks, as into the classes."""
+    if X is None:
+        return X, names
+    ops = _normalize_class_operations(CLASS_OPERATIONS)
+    renames = [] if _has_rename_cycle(ops.get("renames", [])) else ops.get("renames", [])
+    if renames:
+        graph = {op["from"]: op["to"] for op in renames}
+        names = [NOT_MARK_SEP.join(_resolve_rename_terminal(c, graph) for c in str(n).split(NOT_MARK_SEP))
+                 for n in names]
+    return X, names
+
+
+def _merge_not_marks(kept, current, slide_embeddings):
+    """The kept "not X" marks with this slide's replaced by its current ones, as
+    the slide's training rows are (_drop_this_slides_rows)."""
+    (X_kept, n_kept), (X_cur, n_cur) = kept, current
+    parts_X, parts_n = [], []
+    if X_kept is not None and len(X_kept):
+        other = ~_rows_from_slide(X_kept, slide_embeddings)
+        parts_X.append(np.asarray(X_kept)[other])
+        parts_n += [n for n, o in zip(n_kept, other) if o]
+    if X_cur is not None and len(X_cur):
+        parts_X.append(np.asarray(X_cur))
+        parts_n += list(n_cur)
+    X = np.concatenate(parts_X, axis=0) if parts_X else None
+    return (X, parts_n) if X is not None and len(X) else (None, None)
+
+
+def _weak_rows_from_not_marks(X, names, class_names):
+    """Spread "not X" marks into weak rows (weight 0.3): one per class a mark leaves
+    possible, Negative control aside, as _build_negative_training_samples does."""
+    if X is None or not len(X):
+        return None, None, None
+    col_of = {cname: c for c, cname in enumerate(class_names)}
+    allowed = np.ones((len(X), len(class_names)), dtype=bool)
+    for i, excluded in enumerate(names):
+        for cname in str(excluded).split(NOT_MARK_SEP):
+            if cname in col_of:
+                allowed[i, col_of[cname]] = False
+    if "Negative control" in col_of:
+        allowed[:, col_of["Negative control"]] = False
+    rows, labels = np.nonzero(allowed)
+    if not len(rows):
+        return None, None, None
+    return np.asarray(X)[rows], labels.astype(int), np.full(len(labels), 0.3)
+
+
+def _not_marks_on_slide(patch_embeddings, negative_annotations, class_names):
+    """This slide's "not X" marks: (embeddings, the classes each mark excludes)."""
+    if negative_annotations is None or negative_annotations.empty or not (
+            'exclude_classes' in negative_annotations.columns
+            or 'exclude_class_indices' in negative_annotations.columns):
+        return None, None
+    ids, names = [], []
+    cols = [c for c in ('patch_ID', 'exclude_classes', 'exclude_class_indices') if c in negative_annotations.columns]
+    for row in negative_annotations[cols].to_dict('records'):
+        excluded = [str(c) for c in _parse_exclude_list(row, class_names)]
+        if excluded:
+            ids.append(int(row['patch_ID']))
+            names.append(NOT_MARK_SEP.join(excluded))
+    if not ids:
+        return None, None
+    return patch_embeddings[np.asarray(ids, dtype=int)], names
+
+
+def _stored_training_rows(X, y, weights):
+    """Training rows a classifier keeps as its train_data. The weak "not X" rows
+    (weight < 1) are rebuilt from the marks on every run; stored, a later refine
+    would read them back as full-weight labels."""
+    # A booster just fit on y has a column per class in it, weak rows included;
+    # a caller holding the booster's own map (warm start, merged classes) sets it.
+    class_indices = np.unique(np.asarray(y)).astype(int)
+    if weights is None or len(weights) != len(y):
+        return {'embeddings': X, 'labels': y, 'class_indices': class_indices}
+    keep = np.asarray(weights) >= 1
+    return {'embeddings': X[keep], 'labels': y[keep], 'class_indices': class_indices}
+
+
 def save_classifier_params(clf, class_names, class_colors, train_data, max_samples_per_class=100000000000000):
     """Embed training metadata into the booster; optionally write XGBoost model to SAVE_CLASSIFIER_PATH."""
     global SAVE_CLASSIFIER_PATH, LAST_TRAINED_CLF_BUNDLE
@@ -352,6 +588,13 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
     booster = clf.get_booster()
     booster.set_attr(class_names=json.dumps(class_names))
     booster.set_attr(class_colors=json.dumps(class_colors))
+    # Which class_names index each booster column means, kept as given (a deleted
+    # class stays -1); without one, every class in the labels.
+    column_map = train_data.get('class_indices')
+    if column_map is None and len(labels) > 0:
+        column_map = np.unique(np.asarray(labels))
+    if column_map is not None and len(column_map) > 0:
+        booster.set_attr(**{BOOSTER_CLASS_INDEX_ATTR: json.dumps([int(v) for v in column_map])})
     # Tag the classifier with the model it was trained for, so the .tlcls
     # records which patch model (MUSK / H-optimus-0 / Virchow) it belongs to.
     try:
@@ -359,10 +602,15 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
     except Exception as _e:
         print(f"[save_classifier_params] could not tag model_name: {_e}")
 
+    # Plain savez, not savez_compressed: these are dense L2-normalised features,
+    # so zlib takes a few percent off the size for many times the time (13 s of a
+    # 55 s run on 30k MUSK patches; one-vs-rest pays it once per class), as the
+    # cell nodes found. np.load reads either format, so classifiers written
+    # before this keep loading.
     train_data_bytes = io.BytesIO()
-    np.savez_compressed(train_data_bytes, 
-                       embeddings=final_embeddings, 
-                       labels=final_labels)
+    np.savez(train_data_bytes,
+             embeddings=final_embeddings,
+             labels=final_labels)
     train_data_str = base64.b64encode(train_data_bytes.getvalue()).decode('utf-8')
     booster.set_attr(train_data=train_data_str)
 
@@ -438,7 +686,7 @@ def save_classifier_params(clf, class_names, class_colors, train_data, max_sampl
         print("No SAVE_CLASSIFIER_PATH; classifier metadata embedded in memory only (use POST /classifier/save mode=save_trained to write a file).")
 
 
-def remember_classifier_bundle_for_save(clf, class_names, class_colors, embeddings, labels):
+def remember_classifier_bundle_for_save(clf, class_names, class_colors, embeddings, labels, class_indices=None):
     """Remember (clf, class_names, class_colors, train_data) for POST /classifier/save mode=save_trained."""
     global LAST_TRAINED_CLF_BUNDLE
     if embeddings is None or labels is None:
@@ -452,7 +700,8 @@ def remember_classifier_bundle_for_save(clf, class_names, class_colors, embeddin
         clf,
         class_names,
         class_colors,
-        {"embeddings": embeddings, "labels": labels},
+        {"embeddings": embeddings, "labels": labels,
+         **({"class_indices": class_indices} if class_indices is not None else {})},
     )
 
 
@@ -544,6 +793,103 @@ def save_patch_image(slide_path, coords, output_dir, index, label):
     except Exception as e:
         print(f"Error saving patch image: {e}")
         return None
+
+def _resolve_rename_terminal(name: str, rename_graph: dict) -> str:
+    """Follow single-step renames until a fixed point (caller must ensure no cycles)."""
+    seen = set()
+    n = name
+    while n in rename_graph and n not in seen:
+        seen.add(n)
+        n = rename_graph[n]
+    return n
+
+
+def _apply_renames_to_patch_palette(zf, renames):
+    """A panel rename keeps the marks: their pinned palette entry takes the new
+    name, as the cell nodes do (_persist_nuclei_rename_to_user_annotation)."""
+    if not renames or 'User-Annotations' not in zf:
+        return
+    ua = zf['User-Annotations']
+    old = _palette_attr_list(ua.attrs.get('patch_class_names'))
+    graph = {op['from']: op['to'] for op in renames}
+    mapped = [_resolve_rename_terminal(n, graph) for n in old]
+    if mapped != old:
+        ua.attrs['patch_class_names'] = mapped
+        print(f"Renamed classes in the pinned patch palette: {mapped}")
+
+
+def _palette_attr_list(val):
+    if val is None:
+        return []
+    if isinstance(val, np.ndarray):
+        val = val.tolist()
+    return [x.decode("utf-8") if isinstance(x, (bytes, bytearray)) else str(x) for x in val]
+
+
+def _align_user_annotation_palette(ua, kind, names, colors, decoded_with=None):
+    """Re-index the user's ``kind`` marks to ``names`` by class name, refresh each
+    mark's stored colour, and pin the result as the ``kind`` palette on
+    User-Annotations. One read of the annotation array, at most one write.
+
+    A row stores an index into that palette: ``k`` is "this IS class k",
+    ``-(2 + k)`` is "NOT class k". A class only the old palette has is kept,
+    appended, so its marks survive a run that does not list it. The seg service
+    pins palettes the same way when it saves marks (tasks._align_annotation_palette).
+    ``decoded_with`` is the list this run read the marks through when no palette
+    was pinned yet; it stands in for the missing palette so the marks keep the
+    meaning the run gave them.
+    Returns ``(names, colors)`` now pinned.
+    """
+    names = [str(n) for n in names]
+    colors = [str(c) for c in (colors or [])][:len(names)]
+    colors += ["#aaaaaa"] * (len(names) - len(colors))
+    old_names = _palette_attr_list(ua.attrs.get(f"{kind}_class_names"))
+    if not old_names and decoded_with:
+        old_names = [str(n) for n in decoded_with]
+    old_colors = _palette_attr_list(ua.attrs.get(f"{kind}_class_colors"))
+    for i, n in enumerate(old_names):
+        if n not in names:
+            names.append(n)
+            colors.append(old_colors[i] if i < len(old_colors) else "#aaaaaa")
+    ds = ua[kind] if kind in ua else None
+    if ds is not None and ds.dtype.names and "class" in ds.dtype.names:
+        rows = ds[:]
+        old = rows["class"].astype(np.int64)
+        cls = old.copy()
+        lut = np.array([names.index(n) for n in old_names], dtype=np.int64)
+        if len(lut):
+            pos = (old >= 0) & (old < len(lut))
+            cls[pos] = lut[old[pos]]
+            neg = (old <= -2) & (-old - 2 < len(lut))
+            cls[neg] = -(2 + lut[-old[neg] - 2])
+        changed = not np.array_equal(old, cls)
+        if changed:
+            rows["class"] = cls
+            print(f"Re-indexed {int(np.sum(old != cls))} {kind} annotations to the run's class order")
+        if "color" in ds.dtype.names:
+            def to_int(c):
+                h = str(c or "").lstrip("#")
+                try:
+                    v = int(h, 16) if len(h) == 6 else -1
+                except ValueError:
+                    v = -1
+                # -1 in the colour column marks "not a real annotation" for the
+                # seg service; an unusable colour must not retire a class's marks.
+                return v if v >= 0 else 0x808080
+            palette_ints = np.array([to_int(c) for c in colors], dtype=np.int64)
+            pos = (cls >= 0) & (cls < len(palette_ints)) & (rows["color"] != -1)
+            want = palette_ints[cls[pos]]
+            stale = rows["color"][pos] != want
+            if np.any(stale):
+                idx = np.flatnonzero(pos)[stale]
+                rows["color"][idx] = want[stale]
+                changed = True
+        if changed:
+            ds[:] = rows  # in place: a delete + re-create could lose every mark
+    ua.attrs[f"{kind}_class_names"] = names
+    ua.attrs[f"{kind}_class_colors"] = colors
+    return names, colors
+
 
 def _parse_exclude_list(row, class_names):
     """Parse exclude_classes from a row (string, list, or exclude_class_indices). Return list of class names to exclude."""
@@ -688,9 +1034,41 @@ def train_linear_classifier(
             if loaded_params is not None:
                 clf, class_names, class_colors, prev_embeddings, prev_labels = loaded_params
                 loaded_classifier_colors = dict(zip(class_names, class_colors))  # Store for fallback
+                # Which class_names index each predict_proba column means; the
+                # refit / warm-start branches below replace it when they fit.
+                _clf_class_indices = _booster_class_indices(clf, len(class_names), prev_labels)
+                _names_before_ops = list(class_names)
+                class_names, class_colors, prev_embeddings, prev_labels, _clf_class_indices = \
+                    _apply_class_operations_to_classifier(class_names, class_colors, prev_embeddings,
+                                                          prev_labels, _clf_class_indices)
+                loaded_nots = _read_not_marks(clf)
+                prev_nots = _rename_not_marks(*loaded_nots)
+                nots_renamed = prev_nots[1] != loaded_nots[1]
+                if nots_renamed:
+                    _write_not_marks(clf, *prev_nots)
+                # A rename is sent once; save it even when nothing is trained.
+                ops_changed = list(class_names) != _names_before_ops or nots_renamed
+                loaded_classifier_colors = dict(zip(class_names, class_colors))
                 print(f"Loaded existing classifier parameters, classes: {class_names}")
                 
-                if not positive_annotations.empty:
+                # Update refines with whatever the slide marks, "not X" marks alone
+                # included; a slide with no marks at all leaves the classifier as is.
+                # (Negative control samples alone, the bundled background vectors
+                # among them, are no classifier to refine.)
+                slide_marked = not annotations.empty
+                nc_index = class_names.index("Negative control") if "Negative control" in class_names else -1
+                has_class_marks = not positive_annotations.empty and bool(
+                    (positive_annotations['class'].astype(str) != "Negative control").any())
+                rows_left = slide_marked and (has_class_marks or (
+                    prev_embeddings is not None and len(prev_embeddings) > 0 and bool(np.any(
+                        (np.asarray(prev_labels) != nc_index) & ~_rows_from_slide(prev_embeddings, cell_embeddings)))))
+                if slide_marked and not rows_left and (prev_embeddings is None or not len(prev_embeddings)):
+                    print("Classifier not updated: it keeps no training samples, and this slide marks no class "
+                          "but Negative control; mark a class on this slide and Update")
+                elif slide_marked and not rows_left:
+                    print("Classifier not updated: without this slide's earlier samples it keeps none of any class "
+                          "but Negative control, and this slide marks none; the file is kept as it was")
+                if rows_left:
                     existing_classes = set(class_names)
                     annotated_classes = set(positive_annotations['class'].unique())
                     new_classes = annotated_classes - existing_classes
@@ -747,11 +1125,11 @@ def train_linear_classifier(
                         class_colors = new_class_colors
                         
                         # Extract cell indices from the patch_ID column
-                        cell_indices = annotations['patch_ID'].astype(int).values
+                        cell_indices = positive_annotations['patch_ID'].astype(int).values
                         X_update = cell_embeddings[cell_indices]
                         
                         # Re-encode all labels with new complete class list
-                        y_update = pd.Categorical(annotations['class'], categories=class_names).codes
+                        y_update = pd.Categorical(positive_annotations['class'], categories=class_names).codes
                         
                         # Check for invalid labels (shouldn't happen, but safety check)
                         if np.any(y_update < 0):
@@ -768,32 +1146,36 @@ def train_linear_classifier(
                             prev_labels_reencoded = pd.Categorical(prev_labels_as_names, categories=class_names).codes
                             
                             # Combine all data
-                            X_train = np.vstack([prev_embeddings, X_update])
-                            y_train = np.concatenate([prev_labels_reencoded, y_update])
+                            prev_X, prev_y = _drop_this_slides_rows(prev_embeddings, prev_labels_reencoded, cell_embeddings)
+                            X_train = np.vstack([prev_X, X_update])
+                            y_train = np.concatenate([prev_y, y_update])
                         else:
                             X_train = X_update
                             y_train = y_update
                         
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
-                        neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names)
+                        sample_weights_inc = None
+                        kept_nots = _merge_not_marks(
+                            prev_nots, _not_marks_on_slide(cell_embeddings, negative_annotations, class_names),
+                            cell_embeddings)
+                        neg_X, neg_y, neg_w = _weak_rows_from_not_marks(*kept_nots, class_names)
                         if neg_X is not None:
                             print(f"Adding {len(neg_X)} negative training samples (weighted 0.3) for retrain")
                             X_train = np.concatenate([X_train, neg_X], axis=0)
                             y_train = np.concatenate([y_train, neg_y], axis=0)
                             sample_weights_inc = np.concatenate([np.ones(n_pos), neg_w])
                             _log_training_data_counts(class_names, y_train, n_pos)
-                            clf = xgb.XGBClassifier(**xgb_params)
-                            clf.fit(X_train, y_train, sample_weight=sample_weights_inc)
                         else:
                             _log_training_data_counts(class_names, y_train, n_pos)
-                            clf = xgb.XGBClassifier(**xgb_params)
-                            clf.fit(X_train, y_train)
+                        y_fit, _clf_class_indices = _compact_labels(y_train)
+                        clf = xgb.XGBClassifier(**xgb_params)
+                        clf.fit(X_train, y_fit, sample_weight=sample_weights_inc)
                         print("Classifier retrained with new classes")
                         
                     else:
                         # Class count unchanged, can use warm start for faster training
-                        print(f"Class count unchanged, using warm start for incremental training...")
+                        print(f"Class count unchanged, refining the classifier...")
                         
                         # Update class_colors: prioritize frontend (by class name), then keep existing
                         mapped_warm = _resolve_colors_for_class_names(
@@ -806,9 +1188,9 @@ def train_linear_classifier(
                             print(f"Keeping existing colors from classifier: {class_colors}")
                         
                         # Extract cell indices from the patch_ID column
-                        cell_indices = annotations['patch_ID'].astype(int).values
+                        cell_indices = positive_annotations['patch_ID'].astype(int).values
                         X_update = cell_embeddings[cell_indices]
-                        y_update = pd.Categorical(annotations['class'], categories=class_names).codes
+                        y_update = pd.Categorical(positive_annotations['class'], categories=class_names).codes
                         
                         # Check for invalid labels
                         if np.any(y_update < 0):
@@ -819,34 +1201,51 @@ def train_linear_classifier(
                         
                         # Combine new and previous training data
                         if prev_embeddings is not None and prev_labels is not None:
-                            X_train = np.vstack([prev_embeddings, X_update])
-                            y_train = np.concatenate([prev_labels, y_update])
+                            prev_X, prev_y = _drop_this_slides_rows(prev_embeddings, prev_labels, cell_embeddings)
+                            X_train = np.vstack([prev_X, X_update])
+                            y_train = np.concatenate([prev_y, y_update])
                         else:
                             X_train = X_update
                             y_train = y_update
                         
+                        # The attached classifier's own rows are part of X_train, so it is
+                        # refit on them: a warm start only adds trees, and the trees an
+                        # earlier, since-corrected or removed mark taught would stay. Only
+                        # a classifier that carries no rows is warm-started (all that
+                        # keeps what it knows).
+                        has_rows = prev_embeddings is not None and len(prev_embeddings) > 0
+
                         # Add negative (weak) training samples with weight 0.3, same as from-scratch
                         n_pos = X_train.shape[0]
-                        neg_X, neg_y, neg_w = _build_negative_training_samples(cell_embeddings, negative_annotations, class_names)
+                        sample_weights_inc = None
+                        kept_nots = _merge_not_marks(
+                            prev_nots, _not_marks_on_slide(cell_embeddings, negative_annotations, class_names),
+                            cell_embeddings)
+                        neg_X, neg_y, neg_w = _weak_rows_from_not_marks(*kept_nots, class_names)
                         if neg_X is not None:
                             print(f"Adding {len(neg_X)} negative training samples (weighted 0.3) for incremental training")
                             X_train = np.concatenate([X_train, neg_X], axis=0)
                             y_train = np.concatenate([y_train, neg_y], axis=0)
                             sample_weights_inc = np.concatenate([np.ones(n_pos), neg_w])
                             _log_training_data_counts(class_names, y_train, n_pos)
-                            existing_booster = clf.get_booster()
-                            clf.fit(X_train, y_train, xgb_model=existing_booster, sample_weight=sample_weights_inc)
                         else:
                             _log_training_data_counts(class_names, y_train, n_pos)
-                            existing_booster = clf.get_booster()
-                            clf.fit(X_train, y_train, xgb_model=existing_booster)
-                        print("Classifier updated with warm start (incremental training)")
+                        booster_lut = {int(v): c for c, v in enumerate(_clf_class_indices)}
+                        unseen = [int(v) for v in np.unique(y_train) if int(v) not in booster_lut]
+                        if has_rows or unseen:
+                            y_fit, _clf_class_indices = _compact_labels(y_train)
+                            clf = xgb.XGBClassifier(**xgb_params)
+                            clf.fit(X_train, y_fit, sample_weight=sample_weights_inc)
+                        else:
+                            y_fit = np.array([booster_lut[int(v)] for v in y_train], dtype=int)
+                            clf = _continue_training(clf, xgb_params, X_train, y_fit, sample_weights_inc)
+                        print("Classifier updated" + (" (retrained on the merged training rows)" if has_rows or unseen
+                                                      else " with warm start"))
                     
                     # Save updated classifier with new training data
-                    train_data = {
-                        'embeddings': X_train,
-                        'labels': y_train
-                    }
+                    _write_not_marks(clf, *kept_nots)
+                    train_data = _stored_training_rows(X_train, y_train, sample_weights_inc)
+                    train_data['class_indices'] = _clf_class_indices
                     save_classifier_params(clf, class_names, class_colors, train_data)
                     print("Classifier updated and saved")
                 
@@ -856,9 +1255,8 @@ def train_linear_classifier(
                 n_samples = len(cell_embeddings)
                 predictions = np.zeros(n_samples, dtype=int)
                 
-                # Get the actual number of classes from the classifier
-                n_classes = clf.n_classes_
-                prediction_probs = np.zeros((n_samples, n_classes), dtype=np.float32)
+                # Columns in the class list's space, whatever subset the booster knows
+                prediction_probs = np.zeros((n_samples, len(class_names)), dtype=np.float32)
                 
                 n_batches = (n_samples + batch_size - 1) // batch_size
                 print(f"Predicting {n_samples} samples in {n_batches} batches (batch_size={batch_size})")
@@ -884,7 +1282,8 @@ def train_linear_classifier(
                     
                     # OPTIMIZATION: Only call predict_proba once, then extract predictions from probabilities
                     # This avoids duplicate forward passes through the model
-                    batch_probs = clf.predict_proba(batch_embeddings)
+                    batch_probs = _scatter_to_class_space(
+                        clf.predict_proba(batch_embeddings), _clf_class_indices, len(class_names))
                     
                     # Apply exclude_classes constraints: set probability to 0 for excluded classes
                     if exclude_map:
@@ -942,10 +1341,12 @@ def train_linear_classifier(
                 td_emb = prev_embeddings
                 td_lbl = prev_labels
                 if "X_train" in locals() and getattr(X_train, "size", 0) > 0:
-                    td_emb, td_lbl = X_train, y_train
+                    # its labelled rows only: the weak "not X" rows are no samples
+                    stored = _stored_training_rows(X_train, y_train, locals().get("sample_weights_inc"))
+                    td_emb, td_lbl = stored["embeddings"], stored["labels"]
 
                 if (
-                    class_colors != old_class_colors
+                    (class_colors != old_class_colors or ops_changed)
                     and td_emb is not None
                     and td_lbl is not None
                     and getattr(td_emb, "size", 0) > 0
@@ -954,12 +1355,13 @@ def train_linear_classifier(
                         clf,
                         class_names,
                         class_colors,
-                        {"embeddings": td_emb, "labels": td_lbl},
+                        {"embeddings": td_emb, "labels": td_lbl, "class_indices": _clf_class_indices},
                     )
                     node_tag = NODE_NAME or "Patch-Classification"
                     print(f"[{node_tag}] Updated classifier / bundle after color change (prediction path): {class_colors}")
 
-                remember_classifier_bundle_for_save(clf, class_names, class_colors, td_emb, td_lbl)
+                remember_classifier_bundle_for_save(clf, class_names, class_colors, td_emb, td_lbl,
+                                                    class_indices=_clf_class_indices)
 
 
                 return clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0
@@ -1257,15 +1659,62 @@ def train_linear_classifier(
     print("Prediction completed")
 
     # save classifier parameters
-    train_data = {
-        'embeddings': X_train,
-        'labels': y_train
-    }
+    _write_not_marks(clf, *_not_marks_on_slide(cell_embeddings, negative_annotations, class_names))
+    train_data = _stored_training_rows(X_train, y_train, sample_weights)
     save_classifier_params(clf, class_names, class_colors, train_data)
 
     return (clf, class_names, class_colors, predictions, prediction_probs, None, None, 0, 0)
 
-def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_colors, use_supervised):
+def _row_keys(X):
+    """Exact identity of each embedding row (a 16-byte digest of its float32
+    bytes), for de-duplicating training rows."""
+    return [hashlib.blake2b(r.tobytes(), digest_size=16).digest()
+            for r in np.ascontiguousarray(np.asarray(X, dtype=np.float32))]
+
+
+_OVR_REWRITTEN_ATTRS = ("train_data", "best_iteration", "best_score", "best_ntree_limit")
+
+
+def _ovr_prior_training_data(cls, dim):
+    """Rows the class's existing binary .tlcls was trained on, for a refine.
+
+    Source: only the classifier attached to the class (CLASSIFIER_PATHS), as the
+    multiclass path reads only CLASSIFIER_PATH. A save destination is where the
+    result goes, not a classifier in use: reading it would bring back a classifier
+    the user removed. Returns (X, y, booster attrs, path); None when nothing is
+    attached; False when one is attached but cannot be read. A file without
+    training data still returns its attrs (no rows), so its history carries over.
+    """
+    for path in ((CLASSIFIER_PATHS or {}).get(cls),):
+        if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+            continue
+        try:
+            clf = xgb.XGBClassifier()
+            clf.load_model(path)
+            booster = clf.get_booster()
+            blob = booster.attr("train_data")
+            X = y = None
+            if blob:
+                data = np.load(io.BytesIO(base64.b64decode(blob)))
+                X, y = data["embeddings"], data["labels"]
+        except Exception as e:
+            print(f"[OvR] could not read {path}: {e}")
+            return False
+        # The training-derived attrs are rewritten by this save; the rest
+        # (annotation history, lineage) carries over.
+        attrs = {k: v for k, v in booster.attributes().items() if k not in _OVR_REWRITTEN_ATTRS}
+        if X is None:
+            print(f"[OvR] {os.path.basename(path)} carries no training data; training '{cls}' from this slide only")
+            return np.empty((0, dim), np.float32), np.empty(0, int), attrs, path
+        y = np.asarray(y).astype(int)
+        if X.ndim != 2 or X.shape[1] != dim or not np.isin(y, (0, 1)).all():
+            print(f"[OvR] {os.path.basename(path)} is not a {dim}-d binary classifier (shape {X.shape})")
+            return False
+        return X, y, attrs, path
+    return None
+
+
+def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_colors):
     """One-vs-rest for patch classification. Each class = an independent binary
     (binary:logistic) .tlcls. Two-stage merge: a patch is 'claimed' by its strongest
     binary if >= 0.5 (supervised argmax); patches no binary claims fall back to
@@ -1304,9 +1753,9 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
     if not positive_annotations.empty:
         pidx = positive_annotations['patch_ID'].astype(int).values
         X_pos = cell_embeddings[pidx]
+        # A mark of a class the run does not list is still some other class: it
+        # stays, as a negative of every binary (its -1 matches none of them).
         y_pos = np.array([name_to_idx.get(str(c), -1) for c in positive_annotations['class'].values])
-        valid = y_pos >= 0
-        X_pos, y_pos = X_pos[valid], y_pos[valid]
 
     # patches explicitly annotated "not <class>" -> hard negatives for that class
     excl_cells = {}
@@ -1318,6 +1767,24 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
             for c in _parse_exclude_list(row, final_class_names):
                 excl_cells.setdefault(str(c), []).append(pid)
 
+    # shared background negatives: the same vectors the multiclass path injects
+    if not hasattr(train_linear_classifier, '_negative_control_vectors'):
+        base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
+        try:
+            train_linear_classifier._negative_control_vectors = np.load(
+                os.path.join(base_path, "negative_control_vectors_1536d.npy"))
+        except Exception as e:
+            print(f"[OvR] Could not load negative control vectors: {e}")
+            train_linear_classifier._negative_control_vectors = None
+    nc_vectors = getattr(train_linear_classifier, '_negative_control_vectors', None)
+    if nc_vectors is not None and getattr(nc_vectors, "ndim", 0) == 2 and \
+            nc_vectors.shape[1] != cell_embeddings.shape[1]:
+        print(f"[OvR] skipping negative_control_vectors_1536d.npy: dim {nc_vectors.shape[1]} "
+              f"!= embedding dim {cell_embeddings.shape[1]}")
+        nc_vectors = None
+    if nc_vectors is not None:
+        nc_vectors = nc_vectors.astype(cell_embeddings.dtype, copy=False)
+
     prediction_probs = np.zeros((n_cells, len(final_class_names)), dtype=np.float32)
     filled_cols = []
 
@@ -1327,35 +1794,97 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
 
     # === Phase 1: TRAIN one binary per class, SAVE each to disk. ===
     trained_paths = {}
-    can_train = use_supervised and X_pos is not None and len(X_pos) > 0 and bool(SAVE_CLASSIFIER_PATHS)
+    # Update replaces this slide's rows in each class's file with the slide's
+    # current marks, so it runs whether or not the slide has an "is X" mark: "not X"
+    # marks alone still teach X's binary, and removed marks still leave the file.
+    if X_pos is None:
+        X_pos, y_pos = cell_embeddings[:0], np.empty(0, dtype=int)
+    # A slide with no marks at all (e.g. just reset) has nothing to replace its
+    # earlier rows with: applying the classifiers to it leaves them as they are.
+    slide_marked = len(positive_annotations) > 0 or any(excl_cells.values())
+    can_train = bool(SAVE_CLASSIFIER_PATHS) and slide_marked
+    if SAVE_CLASSIFIER_PATHS and not slide_marked:
+        print("[OvR] nothing is marked on this slide; the attached classifiers are left as they are "
+              "(mark the slide and Update to refine them)")
     n_train = len(trainable) if can_train else 0
     for t_i, cls in enumerate(trainable if can_train else []):
         if cancel_event.is_set():
             raise CooperativeCancel("cancelled")
         ci = name_to_idx[cls]
         pos_sel = (y_pos == ci)
-        if not np.any(pos_sel):
-            print(f"[OvR] skip '{cls}': no positive annotations")
-            continue
         Xp = X_pos[pos_sel]
         parts_X = [Xp]; parts_y = [np.ones(len(Xp))]; parts_w = [np.ones(len(Xp))]
         other = X_pos[y_pos != ci]  # patches annotated as some other class
         if len(other):
             parts_X.append(other); parts_y.append(np.zeros(len(other))); parts_w.append(np.ones(len(other)))
+        if nc_vectors is not None and len(nc_vectors):
+            parts_X.append(nc_vectors); parts_y.append(np.zeros(len(nc_vectors))); parts_w.append(np.ones(len(nc_vectors)))
         hard_ids = excl_cells.get(cls, [])
         if hard_ids:
             hn = cell_embeddings[np.array(hard_ids, dtype=int)]
             # Explicit "not <cls>" is a full-strength negative (weight 1.0). OvR never
             # spreads it as a weak positive (that's multiclass-only), so no 0.3 here.
             parts_X.append(hn); parts_y.append(np.zeros(len(hn))); parts_w.append(np.ones(len(hn)))
-        if len(parts_X) < 2:
-            print(f"[OvR] skip '{cls}': no negatives available")
-            continue
         Xb = np.concatenate(parts_X, axis=0)
         yb = np.concatenate(parts_y, axis=0).astype(int)
         wb = np.concatenate(parts_w, axis=0)
+        # Refine, not replace: the class's existing .tlcls carries the rows it was
+        # trained on (other slides). Merge them in; a patch annotated again on this
+        # slide keeps only its current label.
+        prior = _ovr_prior_training_data(cls, cell_embeddings.shape[1])
+        if prior is False:
+            attached = os.path.abspath(CLASSIFIER_PATHS[cls])
+            if attached == os.path.abspath(SAVE_CLASSIFIER_PATHS[cls]):
+                print(f"[OvR] '{cls}' not updated: its existing classifier could not be read")
+                continue
+            print(f"[OvR] '{cls}': attached classifier unreadable; training a new file from this slide only")
+            prior = None
+        prior_attrs = {}
+        merge_note = None
+        if prior is not None:
+            X_prev, y_prev, prior_attrs, prior_path = prior
+            cur_keys = _row_keys(Xb)
+            prev_keys = _row_keys(X_prev)
+            new_keys = set(cur_keys)
+            same_file = os.path.abspath(prior_path) == os.path.abspath(SAVE_CLASSIFIER_PATHS[cls])
+            # Every earlier row from this slide is replaced by the slide's current
+            # rows, so a mark the user removed leaves the classifier too.
+            from_slide = _rows_from_slide(X_prev, cell_embeddings)
+            dropped = from_slide & np.fromiter((k not in new_keys for k in prev_keys), bool, len(prev_keys))
+            # New = a patch the file does not have yet, or has under another label;
+            # or one it has that this slide no longer marks.
+            if same_file and not dropped.any() and \
+                    set(zip(cur_keys, yb.tolist())) <= set(zip(prev_keys, y_prev.tolist())):
+                print(f"[OvR] skip '{cls}': nothing new on this slide for {os.path.basename(prior_path)}")
+                trained_paths[cls] = prior_path  # already current: still predict with it
+                continue
+            keep = ~from_slide & np.fromiter((k not in new_keys for k in prev_keys), bool, len(prev_keys))
+            dt = np.result_type(Xb.dtype, X_prev.dtype)
+            Xb = np.concatenate([Xb.astype(dt, copy=False), X_prev[keep].astype(dt, copy=False)], axis=0)
+            yb = np.concatenate([yb, y_prev[keep]])
+            wb = np.concatenate([wb, np.ones(int(keep.sum()))])
+            merge_note = (f"[OvR] '{cls}': {os.path.basename(prior_path)} keeps {int(keep.sum())} rows from other "
+                          f"slides; its {int(from_slide.sum())} rows from this slide are replaced by the slide's current marks")
+        if not np.any(yb == 1):
+            if prior is not None and np.any(prior[1] == 1):
+                print(f"[OvR] '{cls}' not updated: every '{cls}' example in {os.path.basename(prior[3])} "
+                      f"came from patches marked on this slide, and none is marked now; the file is kept as it was")
+            else:
+                print(f"[OvR] skip '{cls}': no positive annotations")
+            continue
+        if not np.any(yb == 0):
+            print(f"[OvR] skip '{cls}': no negatives available")
+            continue
+        if merge_note:
+            print(merge_note)
         clf = xgb.XGBClassifier(**xgb_params_bin)
         clf.fit(Xb, yb, sample_weight=wb)
+        if cancel_event.is_set():  # a cut-short fit must not be saved
+            raise CooperativeCancel("cancelled")
+        if prior_attrs:
+            # Provenance (annotation history, community lineage) carries over;
+            # save_classifier_params rewrites the training-derived attrs.
+            clf.get_booster().set_attr(**prior_attrs)
         path = SAVE_CLASSIFIER_PATHS[cls]
         _dir = os.path.dirname(path)
         if _dir:
@@ -1369,8 +1898,16 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
         finally:
             SAVE_CLASSIFIER_PATH = _prev
         trained_paths[cls] = path
-        print(f"[OvR] trained '{cls}': {int(pos_sel.sum())} pos / {len(Xb) - int(pos_sel.sum())} neg -> {path}")
+        n_pos = int((yb == 1).sum())
+        print(f"[OvR] trained '{cls}': {n_pos} pos / {len(yb) - n_pos} neg -> {path}")
         progress_value = 40 + int(20 * (t_i + 1) / max(1, n_train))
+
+    # A class the user asked to save that ended up with no file at all.
+    if SAVE_CLASSIFIER_PATHS:
+        for cls in trainable:
+            path = SAVE_CLASSIFIER_PATHS.get(cls)
+            if cls not in trained_paths and path and not os.path.exists(path):
+                print(f"[OvR] '{cls}' was not saved: it has no positive annotations yet")
 
     # === Phase 2: RUN every .tlcls once, from disk, fill its column. ===
     predict_map = {}
@@ -1402,6 +1939,12 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
         print("[OvR] no per-class classifiers available => fall through")
         return None
 
+    # A "not X" mark holds at prediction too, as multiclass enforces it: X's
+    # binary never claims the marked patch.
+    for cname, ids in excl_cells.items():
+        if cname in name_to_idx and ids:
+            prediction_probs[np.asarray(ids, dtype=int), name_to_idx[cname]] = 0.0
+
     # === Phase 3: merge — supervised claim (>=0.5), zero-shot for the rest. ===
     OVR_CLAIM_THRESHOLD = 0.5
     nc_idx = name_to_idx.get("Negative control")
@@ -1432,6 +1975,11 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
                 sims = np.dot(cell_embeddings[rows], cand_emb.T)       # (n_unclaimed, C)
                 exp = np.exp(sims - sims.max(axis=1, keepdims=True))
                 soft = (exp / exp.sum(axis=1, keepdims=True)).astype(np.float32)
+                # nor does zero-shot pick X for a "not X" mark
+                for j, cname in enumerate(zs_candidates):
+                    soft[np.isin(rows, excl_cells.get(cname, [])), j] = 0.0
+                total = soft.sum(axis=1, keepdims=True)
+                np.divide(soft, total, out=soft, where=total > 0)
                 cand_cols = [name_to_idx[c] for c in zs_candidates]
                 for j, col in enumerate(cand_cols):
                     prediction_probs[rows, col] = soft[:, j]
@@ -1526,12 +2074,48 @@ def run_classification(args) -> Dict[str, Any]:
             except Exception:
                 pass
 
+        _apply_renames_to_patch_palette(zf, (CLASS_OPERATIONS or {}).get('renames') or [])
+
+        # Each mark stores an index into the palette the service pinned on
+        # User-Annotations when it saved (patch_class_names); the panel's list
+        # sent with this run may be ordered differently. Read the marks through
+        # that palette, as the cell nodes do (_read_user_cell_palette).
+        try:
+            ua_attrs = zf['User-Annotations'].attrs if 'User-Annotations' in zf else {}
+            pinned_names = list(ua_attrs.get('patch_class_names') or [])
+            if pinned_names:
+                class_name_lookup = [
+                    n.decode('utf-8') if isinstance(n, bytes) else str(n) for n in pinned_names
+                ]
+                pinned_colors = list(ua_attrs.get('patch_class_colors') or [])
+                if pinned_colors:
+                    class_color_lookup = [
+                        c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in pinned_colors
+                    ]
+        except Exception as e:
+            print(f"[{NODE_NAME}] could not read the patch annotation palette: {e}")
+
         if 'User-Annotations' in zf and 'patch' in zf['User-Annotations']:
             patch_arr = zf['User-Annotations/patch'][:]
             ann_dict = {}
             if patch_arr.dtype.names and 'class' in patch_arr.dtype.names:
                 for i in range(len(patch_arr)):
                     cls_idx = int(patch_arr['class'][i])
+                    if cls_idx <= -2:
+                        # "Not <class k>" mark, stored as -(2 + k): a negative row
+                        # (class None) naming the excluded class, as the cell
+                        # loader produces.
+                        k = -cls_idx - 2
+                        if 0 <= k < len(class_name_lookup):
+                            ann_dict[str(i)] = {
+                                'patch_ID': i,
+                                'class': None,
+                                'exclude_classes': [class_name_lookup[k]],
+                                'datetime': int(patch_arr['datetime'][i]) if 'datetime' in patch_arr.dtype.names else 0,
+                                'method': str(patch_arr['method'][i]) if 'method' in patch_arr.dtype.names else '',
+                                'annotator': str(patch_arr['annotator'][i]) if 'annotator' in patch_arr.dtype.names else '',
+                            }
+                        continue
                     if cls_idx < 0:
                         continue
                     if not (0 <= cls_idx < len(class_name_lookup)):
@@ -1554,7 +2138,8 @@ def run_classification(args) -> Dict[str, Any]:
                         'annotator': str(patch_arr['annotator'][i]) if 'annotator' in patch_arr.dtype.names else '',
                     }
             annotations_data = pd.DataFrame(ann_dict).T if ann_dict else None
-            use_supervised = bool(ann_dict)
+            # "Not <class>" marks alone are no training set: supervised needs a positive.
+            use_supervised = any(a['class'] is not None for a in ann_dict.values())
         else:
             annotations_data = None
             use_supervised = False
@@ -1643,7 +2228,6 @@ def run_classification(args) -> Dict[str, Any]:
             ovr_result = run_ovr_classification(
                 cell_embeddings, annotations_data, tissue_classes,
                 effective_tissue_colors if effective_tissue_colors else tissue_colors,
-                use_supervised,
             )
             if ovr_result is None and cancel_event.is_set():
                 cancel_event.clear(); progress_value = 0
@@ -1651,6 +2235,11 @@ def run_classification(args) -> Dict[str, Any]:
             if ovr_result is not None:
                 predictions, prediction_probs, final_class_names, final_class_colors, classification_method = ovr_result
                 print(f"One-vs-rest classification completed ({classification_method})")
+            else:
+                fallback = ("a multiclass classifier trained on the annotations"
+                            if CLASSIFIER_PATH is not None or (use_supervised and annotations_data is not None)
+                            else "zero-shot prediction")
+                print(f"[OvR] no one-vs-rest classifier is available yet; this run used {fallback}")
 
         # Try supervised classification if we have classifier path or annotations
         classifier_result = None
@@ -1851,39 +2440,16 @@ def run_classification(args) -> Dict[str, Any]:
         colors_ascii = [c.encode('utf-8') for c in final_class_colors]
         classes_grp.create_array('color', data=np.array(colors_ascii, dtype='S256'))
 
-        # Update all annotation colors to match new class colors
-        # This ensures that when user changes a class color and clicks Update,
-        # all annotations using that class get the new color
-        # Refresh denormalised per-row color (color field on each annotation row)
-        # so it matches the new class colors. With the dense structured-array
-        # format this is a vectorised np.where update.
+        # Re-index the user's marks to this run's class order by name (classes the
+        # run does not list are kept, appended), pin that as the palette, and
+        # refresh each mark's stored colour. The cell nodes do the same.
         try:
-            if 'User-Annotations' in zf and 'patch' in zf['User-Annotations']:
-                patch_ds = zf['User-Annotations/patch']
-                patch_arr = patch_ds[:]
-                if patch_arr.dtype.names and 'class' in patch_arr.dtype.names and 'color' in patch_arr.dtype.names:
-                    new_color_ints = []
-                    for c in final_class_colors:
-                        try:
-                            ci = int(str(c).lstrip('#'), 16) if c else -1
-                        except (TypeError, ValueError):
-                            ci = -1
-                        new_color_ints.append(ci)
-                    updated_count = 0
-                    for idx in range(len(patch_arr)):
-                        cls_idx = int(patch_arr['class'][idx])
-                        if 0 <= cls_idx < len(new_color_ints):
-                            new_c = new_color_ints[cls_idx]
-                            if new_c >= 0 and int(patch_arr['color'][idx]) != new_c:
-                                patch_arr['color'][idx] = new_c
-                                updated_count += 1
-                    if updated_count > 0:
-                        del zf['User-Annotations/patch']
-                        zf['User-Annotations'].create_array('patch', data=patch_arr)
-                        print(f"Updated {updated_count} patch annotation colors to match new class colors")
+            if 'User-Annotations' in zf:
+                _align_user_annotation_palette(
+                    zf['User-Annotations'], 'patch', final_class_names, final_class_colors,
+                    decoded_with=class_name_lookup)
         except Exception as e:
-            # If update fails, log but don't fail the workflow.
-            print(f"Warning: Could not update patch annotation colors: {e}")
+            print(f"Warning: Could not align user annotations to the new palette: {e}")
         
         # Patch-Classification/classes/{name,color} (written above) is now the
         # canonical source for the class palette. The old
