@@ -1434,7 +1434,24 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 progress_state.value = 40
                 print(f"Progress: 40% (Classifier loaded)")
                 
-                if not positive_annotations.empty:
+                # Update refines with whatever the slide marks, "not X" marks alone
+                # included; a slide with no marks at all leaves the classifier as is.
+                # (Negative control samples alone, the bundled background vectors
+                # among them, are no classifier to refine.)
+                slide_marked = not annotations.empty
+                nc_index = class_names.index("Negative control") if "Negative control" in class_names else -1
+                has_class_marks = any(c != "Negative control"
+                                      for c in _ordered_annotation_classes(positive_annotations, nuclei_classes))
+                rows_left = slide_marked and (has_class_marks or (
+                    prev_embeddings is not None and len(prev_embeddings) > 0 and bool(np.any(
+                        (np.asarray(prev_labels) != nc_index) & ~_rows_from_slide(prev_embeddings, cell_embeddings)))))
+                if slide_marked and not rows_left and (prev_embeddings is None or not len(prev_embeddings)):
+                    print("Classifier not updated: it keeps no training samples, and this slide marks no class "
+                          "but Negative control; mark a class on this slide and Update")
+                elif slide_marked and not rows_left:
+                    print("Classifier not updated: without this slide's earlier samples it keeps none of any class "
+                          "but Negative control, and this slide marks none; the file is kept as it was")
+                if rows_left:
                     existing_classes = list(class_names)
                     annotated_classes_ordered = _ordered_annotation_classes(positive_annotations, nuclei_classes)
                     new_classes = [cn for cn in annotated_classes_ordered if cn not in existing_classes]
@@ -1478,16 +1495,16 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                         class_colors = new_class_colors
                         
                         # Extract cell indices from the cell_ID column
-                        cell_indices = annotations['cell_ID'].astype(int).values
+                        cell_indices = positive_annotations['cell_ID'].astype(int).values
                         X_update = cell_embeddings[cell_indices]
                         
                         # Map to classifier indices by ID (cell_class_index + nuclei_classes) or by class name
-                        y_update = _annotation_labels_to_classifier_indices(annotations, class_names, nuclei_classes)
+                        y_update = _annotation_labels_to_classifier_indices(positive_annotations, class_names, nuclei_classes)
                         if np.any(y_update < 0):
                             invalid_mask = y_update < 0
                             print(f"Warning: Found {np.sum(invalid_mask)} invalid labels (annotation ID/name not in classifier), removing them")
                             if np.sum(invalid_mask) <= 20:
-                                invalid_classes = annotations.loc[invalid_mask, 'class' if 'class' in annotations.columns else 'cell_class_index'].value_counts()
+                                invalid_classes = positive_annotations.loc[invalid_mask, 'class' if 'class' in positive_annotations.columns else 'cell_class_index'].value_counts()
                                 print(f"  Counts: {invalid_classes.to_dict()}")
                             X_update = X_update[~invalid_mask]
                             y_update = y_update[~invalid_mask]
@@ -1548,15 +1565,15 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             print(f"Keeping existing colors from classifier: {class_colors}")
                         
                         # Extract cell indices from the cell_ID column
-                        cell_indices = annotations['cell_ID'].astype(int).values
+                        cell_indices = positive_annotations['cell_ID'].astype(int).values
                         X_update = cell_embeddings[cell_indices]
                         # Map to classifier indices by ID (cell_class_index + nuclei_classes) or by class name
-                        y_update = _annotation_labels_to_classifier_indices(annotations, class_names, nuclei_classes)
+                        y_update = _annotation_labels_to_classifier_indices(positive_annotations, class_names, nuclei_classes)
                         if np.any(y_update < 0):
                             invalid_mask = y_update < 0
                             print(f"Warning: Found {np.sum(invalid_mask)} invalid labels (annotation ID/name not in classifier), removing them")
                             if np.sum(invalid_mask) <= 20:
-                                invalid_classes = annotations.loc[invalid_mask, 'class' if 'class' in annotations.columns else 'cell_class_index'].value_counts()
+                                invalid_classes = positive_annotations.loc[invalid_mask, 'class' if 'class' in positive_annotations.columns else 'cell_class_index'].value_counts()
                                 print(f"  Counts: {invalid_classes.to_dict()}")
                             X_update = X_update[~invalid_mask]
                             y_update = y_update[~invalid_mask]
@@ -2016,7 +2033,7 @@ def _ovr_prior_training_data(cls, dim):
     return None
 
 
-def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_colors, use_supervised, organ=None):
+def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_colors, organ=None):
     """
     One-vs-rest classification: every class is its own independent binary
     classifier stored in a separate .tlcls file.
@@ -2144,15 +2161,18 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     # uniformly from disk in Phase 2, so the merge is a single "run each model
     # once, then combine" pipeline rather than an in-memory/on-disk split.
     trained_paths = {}  # class_name -> path we just wrote (source of truth for Phase 2)
-    can_train = (
-        use_supervised and X_pos is not None and len(X_pos) > 0 and bool(SAVE_CLASSIFIER_PATHS)
-    )
-    if SAVE_CLASSIFIER_PATHS and not can_train:
-        # Saving was asked for: say why nothing is trained, or it looks like an Update.
-        n_marked = len(positive_annotations)
-        n_listed = 0 if X_pos is None else len(X_pos)
-        print(f"[OvR] not training: {n_marked} positive cell marks on this slide, {n_listed} of them "
-              f"of the listed classes {trainable}; predicting with the attached classifiers")
+    # Update replaces this slide's rows in each class's file with the slide's
+    # current marks, so it runs whether or not the slide has an "is X" mark: "not X"
+    # marks alone still teach X's binary, and removed marks still leave the file.
+    if X_pos is None:
+        X_pos, y_pos = cell_embeddings[:0], np.empty(0, dtype=int)
+    # A slide with no marks at all (e.g. just reset) has nothing to replace its
+    # earlier rows with: applying the classifiers to it leaves them as they are.
+    slide_marked = len(positive_annotations) > 0 or any(excl_cells.values())
+    can_train = bool(SAVE_CLASSIFIER_PATHS) and slide_marked
+    if SAVE_CLASSIFIER_PATHS and not slide_marked:
+        print("[OvR] nothing is marked on this slide; the attached classifiers are left as they are "
+              "(mark the slide and Update to refine them)")
     n_train = len(trainable) if can_train else 0
     for t_i, cls in enumerate(trainable if can_train else []):
         if cancel_event.is_set():
@@ -2192,6 +2212,7 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
             print(f"[OvR] '{cls}': attached classifier unreadable; training a new file from this slide only")
             prior = None
         prior_attrs = {}
+        merge_note = None
         if prior is not None:
             X_prev, y_prev, prior_attrs, prior_path = prior
             cur_keys = _row_keys(Xb)
@@ -2214,13 +2235,20 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
             Xb = np.concatenate([Xb.astype(dt, copy=False), X_prev[keep].astype(dt, copy=False)], axis=0)
             yb = np.concatenate([yb, y_prev[keep]])
             wb = np.concatenate([wb, np.ones(int(keep.sum()))])
-            print(f"[OvR] '{cls}': merged {int(keep.sum())} earlier rows from {os.path.basename(prior_path)}")
+            merge_note = (f"[OvR] '{cls}': {os.path.basename(prior_path)} keeps {int(keep.sum())} rows from other "
+                          f"slides; its {int(from_slide.sum())} rows from this slide are replaced by the slide's current marks")
         if not np.any(yb == 1):
-            print(f"[OvR] skip '{cls}': no positive annotations")
+            if prior is not None and np.any(prior[1] == 1):
+                print(f"[OvR] '{cls}' not updated: every '{cls}' example in {os.path.basename(prior[3])} "
+                      f"came from cells marked on this slide, and none is marked now; the file is kept as it was")
+            else:
+                print(f"[OvR] skip '{cls}': no positive annotations")
             continue
         if not np.any(yb == 0):
             print(f"[OvR] skip '{cls}': no negatives available")
             continue
+        if merge_note:
+            print(merge_note)
         clf = xgb.XGBClassifier(**xgb_params_bin)
         clf.fit(Xb, yb, sample_weight=wb)
         if cancel_event.is_set():  # a cut-short fit must not be saved
@@ -2580,7 +2608,7 @@ def run_classification(args) -> Dict[str, Any]:
         ovr_result = None
         if CLASSIFIER_MODE == "one-vs-rest":
             ovr_result = run_ovr_classification(
-                cell_embeddings, annotations_data, nuclei_classes, nuclei_colors, use_supervised, organ
+                cell_embeddings, annotations_data, nuclei_classes, nuclei_colors, organ
             )
             if ovr_result is None and cancel_event.is_set():
                 cancel_event.clear()
