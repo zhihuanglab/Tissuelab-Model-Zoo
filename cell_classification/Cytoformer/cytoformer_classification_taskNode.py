@@ -2442,6 +2442,12 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
         print("[OvR] no per-class classifiers available => zero-shot fallback")
         return None
 
+    # A "not X" mark holds at prediction too, as multiclass enforces it: X's
+    # binary never claims the marked cell.
+    for cname, ids in excl_cells.items():
+        if cname in name_to_idx and ids:
+            prediction_probs[np.asarray(ids, dtype=int), name_to_idx[cname]] = 0.0
+
     # === Phase 3: merge — supervised first, zero-shot fallback for the rest ===
     # Stage A (supervised): a cell is "claimed" if its strongest binary is >= 0.5
     #   (the binary:logistic decision boundary — the classifier itself saying
@@ -2484,6 +2490,15 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
                     cell_embeddings[rows], organ, zs_candidates, OVR_CLAIM_THRESHOLD)
                 cand_cols = np.array([name_to_idx[c] for c in zs_candidates])
                 chosen_cols = cand_cols[local]
+                # nor does the head pick X for a "not X" mark: such a cell goes to
+                # Negative control, as a low-confidence one does
+                conf = np.array(conf, dtype=np.float32)
+                if nc_idx is not None:
+                    for cname, ids in excl_cells.items():
+                        if cname in name_to_idx and ids:
+                            hit = (chosen_cols == name_to_idx[cname]) & np.isin(rows, ids)
+                            chosen_cols[hit] = nc_idx
+                            conf[hit] = 1.0
                 prediction_probs[rows, chosen_cols] = conf
                 predictions[rows] = chosen_cols
                 did_zeroshot = True

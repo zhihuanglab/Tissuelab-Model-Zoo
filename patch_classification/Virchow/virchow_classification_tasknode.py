@@ -1939,6 +1939,12 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
         print("[OvR] no per-class classifiers available => fall through")
         return None
 
+    # A "not X" mark holds at prediction too, as multiclass enforces it: X's
+    # binary never claims the marked patch.
+    for cname, ids in excl_cells.items():
+        if cname in name_to_idx and ids:
+            prediction_probs[np.asarray(ids, dtype=int), name_to_idx[cname]] = 0.0
+
     # === Phase 3: merge — supervised claim (>=0.5), zero-shot for the rest. ===
     OVR_CLAIM_THRESHOLD = 0.5
     nc_idx = name_to_idx.get("Negative control")
@@ -1969,6 +1975,11 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
                 sims = np.dot(cell_embeddings[rows], cand_emb.T)       # (n_unclaimed, C)
                 exp = np.exp(sims - sims.max(axis=1, keepdims=True))
                 soft = (exp / exp.sum(axis=1, keepdims=True)).astype(np.float32)
+                # nor does zero-shot pick X for a "not X" mark
+                for j, cname in enumerate(zs_candidates):
+                    soft[np.isin(rows, excl_cells.get(cname, [])), j] = 0.0
+                total = soft.sum(axis=1, keepdims=True)
+                np.divide(soft, total, out=soft, where=total > 0)
                 cand_cols = [name_to_idx[c] for c in zs_candidates]
                 for j, col in enumerate(cand_cols):
                     prediction_probs[rows, col] = soft[:, j]
