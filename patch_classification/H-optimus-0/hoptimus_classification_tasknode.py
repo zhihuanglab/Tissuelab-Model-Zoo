@@ -1667,6 +1667,12 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
     # === Phase 1: TRAIN one binary per class, SAVE each to disk. ===
     trained_paths = {}
     can_train = use_supervised and X_pos is not None and len(X_pos) > 0 and bool(SAVE_CLASSIFIER_PATHS)
+    if SAVE_CLASSIFIER_PATHS and not can_train:
+        # Saving was asked for: say why nothing is trained, or it looks like an Update.
+        n_marked = len(positive_annotations)
+        n_listed = 0 if X_pos is None else len(X_pos)
+        print(f"[OvR] not training: {n_marked} positive patch marks on this slide, {n_listed} of them "
+              f"of the listed classes {trainable}; predicting with the attached classifiers")
     n_train = len(trainable) if can_train else 0
     for t_i, cls in enumerate(trainable if can_train else []):
         if cancel_event.is_set():
