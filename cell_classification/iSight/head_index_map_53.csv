@@ -1,0 +1,54 @@
+head,data_type,tissue,cell_type
+0,pathology,lymphoma,Tumor cells
+1,pathology,renal cancer,Tumor cells
+2,pathology,endometrial cancer,Tumor cells
+3,pathology,ovarian cancer,Tumor cells
+4,pathology,liver cancer,Tumor cells
+5,pathology,cervical cancer,Tumor cells
+6,pathology,melanoma,Tumor cells
+7,pathology,urothelial cancer,Tumor cells
+8,pathology,lung cancer,Tumor cells
+9,pathology,colorectal cancer,Tumor cells
+10,pathology,glioma,Tumor cells
+11,pathology,breast cancer,Tumor cells
+12,pathology,testis cancer,Tumor cells
+13,pathology,skin cancer,Tumor cells
+14,pathology,stomach cancer,Tumor cells
+15,pathology,prostate cancer,Tumor cells
+16,pathology,pancreatic cancer,Tumor cells
+17,pathology,head and neck cancer,Tumor cells
+18,pathology,carcinoid,Tumor cells
+19,pathology,thyroid cancer,Tumor cells
+20,tissue,stomach,Glandular cells
+21,tissue,endometrium,Cells in endometrial stroma
+22,tissue,salivary gland,Glandular cells
+23,tissue,oral mucosa,Squamous epithelial cells
+24,tissue,epididymis,Glandular cells
+25,tissue,prostate,Glandular cells
+26,tissue,esophagus,Squamous epithelial cells
+27,tissue,vagina,Squamous epithelial cells
+28,tissue,pancreas,Exocrine glandular cells
+29,tissue,adrenal gland,Glandular cells
+30,tissue,testis,Cells in seminiferous ducts
+31,tissue,kidney,Cells in glomeruli
+32,tissue,duodenum,Glandular cells
+33,tissue,urinary bladder,Urothelial cells
+34,tissue,cerebellum,Cells in granular layer
+35,tissue,appendix,Glandular cells
+36,tissue,fallopian tube,Glandular cells
+37,tissue,gallbladder,Glandular cells
+38,tissue,small intestine,Glandular cells
+39,tissue,seminal vesicle,Glandular cells
+40,tissue,thyroid gland,Glandular cells
+41,tissue,rectum,Glandular cells
+42,tissue,nasopharynx,Respiratory epithelial cells
+43,tissue,cervix,Glandular cells
+44,tissue,bronchus,Respiratory epithelial cells
+45,tissue,parathyroid gland,Glandular cells
+46,tissue,skin,Epidermal cells
+47,tissue,ovary,Ovarian stroma cells
+48,tissue,skin,Fibroblasts
+49,tissue,cervix,Squamous epithelial cells
+50,tissue,breast,Glandular cells
+51,tissue,colon,Glandular cells
+52,tissue,liver,Hepatocytes
