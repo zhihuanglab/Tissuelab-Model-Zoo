@@ -2680,7 +2680,7 @@ def run_classification(args) -> Dict[str, Any]:
                 f"NuClass requires [N, {EMBEDDING_DIM}] PLIP embeddings; "
                 f"Cell-Segmentation/embeddings has shape {cell_embeddings.shape}. "
                 "Those features came from another model (Cytoformer writes 1536) — "
-                "re-run a PLIP cell segmentation (StarDist/CellPose/InstanSeg), or "
+                "re-run a PLIP cell segmentation (StarDist/InstanSeg), or "
                 "use that model's own classification node."
             )
         progress_state.value = 35
