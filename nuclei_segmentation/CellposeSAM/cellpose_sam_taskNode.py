@@ -103,11 +103,43 @@ progress_state = ProgressSSEState()
 cancel_event = threading.Event()
 
 
+# Stamped on Cell-Segmentation with the run's inputs. Another node's segmentation
+# (no stamp) or one of another region / resolution is redone, not reused.
+SEGMENTATION_MODEL = "Cellpose-SAM"
+
+
+def _segmentation_params(args):
+    """The inputs a stored segmentation must match to be reused, as stored in attrs."""
+    target_mpp = getattr(args, "target_mpp", None)
+    polygon = getattr(args, "polygon_points", None)
+    return {
+        "segmentation_model": SEGMENTATION_MODEL,
+        "bbox": str(getattr(args, "bbox", None) or ""),
+        "target_mpp": float(target_mpp) if target_mpp else "",
+        "polygon_points": json.dumps(polygon) if polygon else "",
+    }
+
+
+def _stored_segmentation_matches(node_grp, args):
+    attrs = node_grp.attrs
+    for key, want in _segmentation_params(args).items():
+        have = attrs.get(key, "")
+        if isinstance(want, float):
+            try:
+                if abs(float(have) - want) > 1e-6:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        elif str(have) != want:
+            return False
+    return True
+
+
 def _mark_sse_cancelled() -> None:
     progress_state.mark_cancelled()
 
 
-def _persist_segmentation_to_zarr(centroids, contours, probability=None):
+def _persist_segmentation_to_zarr(centroids, contours, probability=None, params=None):
     """Write segmentation without deleting the node group. Embeddings in the
     shared slot belonged to the previous cells, so they go."""
     if centroids is None or not ZARR_PATH or not NODE_NAME:
@@ -127,6 +159,8 @@ def _persist_segmentation_to_zarr(centroids, contours, probability=None):
         if "probabilities" in node_grp:
             del node_grp["probabilities"]
         node_grp.create_array("probabilities", data=probability)
+    if params:
+        node_grp.attrs.update(params)
 
 
 def parse_args():
@@ -168,7 +202,7 @@ def update_progress(value):
 
 def run_segmentation(args):
     """
-    1) a stored segmentation => reuse it
+    1) a stored Cellpose-SAM segmentation of the same region / resolution => reuse it
     2) otherwise run Cellpose-SAM
     3) write the cells to Cell-Segmentation
     """
@@ -192,7 +226,9 @@ def run_segmentation(args):
 
         if os.path.exists(ZARR_PATH):
             zf = zarr.open_group(ZARR_PATH, mode='r')
-            if NODE_NAME in zf:
+            if NODE_NAME in zf and not _stored_segmentation_matches(zf[NODE_NAME], args):
+                print("Stored segmentation is not Cellpose-SAM's for this region / resolution => re-run.")
+            elif NODE_NAME in zf:
                 # if already have segmentation => skip cellpose
                 try:
                     centroids = zf[f"{NODE_NAME}/centroids"][()]
@@ -220,7 +256,8 @@ def run_segmentation(args):
             probability = np.asarray(getattr(ss, "prob_all", np.array([])), dtype=np.float32)
             result["nuclei_count"] = len(centroids)
             result["message"] = "Segmentation completed successfully"
-            _persist_segmentation_to_zarr(centroids, contours, probability)
+            _persist_segmentation_to_zarr(centroids, contours, probability,
+                                          params=_segmentation_params(args))
 
         # Ensure progress is set to 100
         update_progress(100)
@@ -291,6 +328,12 @@ def read_node(data: Dict[str, Any]):
             read_image_method="tiffslide",
             isIHC=False,
         )
+    # Region / resolution are per run: reset so a previous run's do not stick
+    # (magnification is derived from the slide on every run).
+    ARGS.magnification = None
+    ARGS.bbox = None
+    ARGS.polygon_points = None
+    ARGS.target_mpp = None
 
     zf = zarr.open_group(ZARR_PATH, mode='r')
     user_data_path = f"{NODE_NAME}/userData"
@@ -310,6 +353,15 @@ def read_node(data: Dict[str, Any]):
                 ARGS.read_image_method = val_json
             elif k == "isIHC":
                 ARGS.isIHC = (val_json in [True, "true", "True"])
+            elif k == "bbox":
+                ARGS.bbox = val_json or None
+            elif k == "polygon_points":
+                ARGS.polygon_points = val_json if isinstance(val_json, list) and val_json else None
+            elif k == "target_mpp":
+                try:
+                    ARGS.target_mpp = float(val_json) if val_json not in (None, "") else None
+                except (TypeError, ValueError):
+                    print(f"[Cell-Segmentation] bad target_mpp={val_json!r}; using 0.5 um/px")
 
     return {"status": "ok", "message": "Cell-Segmentation read done"}
 

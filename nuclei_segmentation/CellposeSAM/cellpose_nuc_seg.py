@@ -28,6 +28,31 @@ CELLPROB_THRESHOLD = 0.0
 MIN_CELL_AREA_PX = 50
 # Plain JPEG/PNG carry no resolution; HPA-style IHC images are 0.5 um/px.
 PLAIN_IMAGE_MPP = 0.5
+# Resolution the settings above are in; userData target_mpp overrides it.
+PROCESSING_MPP = 0.5
+
+
+def parse_roi(args):
+    """(bbox, polygon) in level-0 pixels from userData: bbox "x,y,w,h", polygon
+    [[x, y], ...]. bbox wins when both are set, as in the Cytoformer node."""
+    bbox = polygon = None
+    raw = getattr(args, "bbox", None)
+    if raw:
+        try:
+            parts = [float(p) for p in str(raw).split(",")]
+            if len(parts) == 4 and parts[2] > 0 and parts[3] > 0:
+                bbox = tuple(parts)
+            else:
+                print(f"Ignoring bbox {raw!r}: expected x,y,w,h with w, h > 0")
+        except ValueError:
+            print(f"Ignoring unparsable bbox {raw!r}")
+    pts = getattr(args, "polygon_points", None)
+    if bbox is None and isinstance(pts, list) and len(pts) >= 3:
+        try:
+            polygon = np.array([(float(p[0]), float(p[1])) for p in pts], dtype=np.float32)
+        except (TypeError, ValueError, IndexError):
+            print("Ignoring unparsable polygon_points")
+    return bbox, polygon
 
 
 class SlideSegmentation():
@@ -56,7 +81,11 @@ class SlideSegmentation():
             print("No GPU found. Running Cellpose on CPU.")
             
         self.args = args
-        self.reference_magnification = 20 # Keep 20x for consistency
+        # Magnification the settings are in (20x at 0.5 um/px), or the target_mpp asked for.
+        target_mpp = getattr(args, "target_mpp", None)
+        self.processing_mpp = float(target_mpp) if target_mpp else PROCESSING_MPP
+        self.reference_magnification = 10 / self.processing_mpp
+        self.roi_bbox, self.roi_polygon = parse_roi(args)
         self.tile_size = tile_size
         self.read_data()
         
@@ -456,10 +485,43 @@ class SlideSegmentation():
         
         return points, coord, prob
 
+    def _tile_meets_roi(self, x0, y0, x1, y1):
+        """Whether a level-0 tile overlaps the ROI's bounding box (no ROI: always)."""
+        if self.roi_bbox is not None:
+            bx, by, bw, bh = self.roi_bbox
+            rx0, ry0, rx1, ry1 = bx, by, bx + bw, by + bh
+        elif self.roi_polygon is not None:
+            rx0, ry0 = self.roi_polygon.min(axis=0)
+            rx1, ry1 = self.roi_polygon.max(axis=0)
+        else:
+            return True
+        return x0 < rx1 and x1 > rx0 and y0 < ry1 and y1 > ry0
+
+    def _keep_roi_cells(self):
+        """Drop cells whose centroid lies outside the ROI."""
+        if self.roi_bbox is None and self.roi_polygon is None:
+            return
+        pts = np.asarray(self.final_points)
+        if len(pts) == 0:
+            return
+        if self.roi_bbox is not None:
+            bx, by, bw, bh = self.roi_bbox
+            keep = (pts[:, 0] >= bx) & (pts[:, 0] < bx + bw) & (pts[:, 1] >= by) & (pts[:, 1] < by + bh)
+        else:
+            poly = self.roi_polygon.reshape(-1, 1, 2)
+            keep = np.array([cv2.pointPolygonTest(poly, (float(x), float(y)), False) >= 0 for x, y in pts], dtype=bool)
+        self.final_points = self.final_points[keep]
+        self.final_coord = self.final_coord[keep]
+        if getattr(self, "prob_all", None) is not None and len(self.prob_all) == len(keep):
+            self.prob_all = self.prob_all[keep]
+        print(f"ROI: kept {int(keep.sum())} of {len(keep)} cells")
+
     def run_WSI_segmentation(self):
-        '''
-        Modified to use Cellpose instead of StarDist
-        '''
+        """Segment the slide (or its ROI) with Cellpose-SAM."""
+        self._segment()
+        self._keep_roi_cells()
+
+    def _segment(self):
         
         # Record overall start time
         overall_start_time = time.time()
@@ -479,6 +541,15 @@ class SlideSegmentation():
                 # Directly load the entire image
                 img = self.slide.read_region((0, 0), 0, self.dim)
                 img_np = np.array(img)[:,:,:3]  # Ensure RGB format
+                # Plain images are taken as PLAIN_IMAGE_MPP; resample only when
+                # a target_mpp asks for another resolution.
+                resize_factor = self.reference_magnification / self.args.magnification
+                if abs(resize_factor - 1) > 1e-6:
+                    img_np = cv2.resize(
+                        img_np,
+                        (int(round(self.dim[0] * resize_factor)), int(round(self.dim[1] * resize_factor))),
+                        interpolation=cv2.INTER_AREA if resize_factor < 1 else cv2.INTER_LINEAR,
+                    )
                 
                 if self.progress_callback:
                     self.progress_callback(30)
@@ -486,6 +557,9 @@ class SlideSegmentation():
                 
                 # Run Cellpose prediction
                 points, coord, prob = self.predict_cellpose(img_np)
+                if abs(resize_factor - 1) > 1e-6 and len(points) > 0:
+                    points = points / resize_factor
+                    coord = coord / resize_factor
                 
                 # Filter results based on tissue mask
                 if self.wsi_mask is not None and len(points) > 0:
@@ -596,6 +670,9 @@ class SlideSegmentation():
                 
                 w_col = x_1 - x_0
                 h_row = y_1 - y_0
+
+                if not self._tile_meets_roi(x_0, y_0, x_1, y_1):
+                    continue
 
                 if self.wsi_mask is not None:
                     # Check mask for efficiency
