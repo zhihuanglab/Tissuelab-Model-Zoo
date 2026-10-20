@@ -1026,19 +1026,22 @@ def _background_negatives(embeddings, annotations, positive_groups):
 
 
 def _with_background_negatives(embeddings, annotations, X, y, w, class_names):
-    """(X, y, w) plus the stand-in background as Negative control rows when no row
-    is (fully) labelled Negative control; unchanged otherwise."""
+    """(X, y, w) plus the stand-in background as Negative control rows when the
+    (fully weighted) Negative control rows — marks and bundled vectors — are fewer
+    than the other classes' rows; unchanged otherwise. Ten bundled vectors cannot
+    tell a few hundred marks what is not them."""
     if "Negative control" not in class_names:
         return X, y, w
     nc = class_names.index("Negative control")
     strong = np.ones(len(y), dtype=bool) if w is None else np.asarray(w) >= 1
-    if np.any(strong & (y == nc)):
+    if np.sum(strong & (y == nc)) >= np.sum(strong & (y != nc)):
         return X, y, w
-    found = _background_negatives(embeddings, annotations, [X[strong & (y == c)] for c in np.unique(y[strong])])
+    found = _background_negatives(
+        embeddings, annotations, [X[strong & (y == c)] for c in np.unique(y[strong]) if c != nc])
     if found is None:
         return X, y, w
     background, weight = found
-    print(f"No Negative control examples: {len(background)} unannotated patches outside the marked "
+    print(f"Too few Negative control examples: {len(background)} unannotated patches outside the marked "
           f"classes stand in (weight {weight:.3f})")
     w = np.ones(len(y)) if w is None else np.asarray(w)
     return (np.concatenate([X, background.astype(X.dtype, copy=False)], axis=0),
@@ -1577,8 +1580,9 @@ def train_linear_classifier(
                 # Negative control vectors get weight 1.0
                 sample_weights = np.concatenate([np.ones(negative_control_vectors.shape[0]), sample_weights])
         else:
-            X_train, y_train, sample_weights = _with_background_negatives(
-                cell_embeddings, annotations, X_train, y_train, sample_weights, list(class_names))
+            print("Proceeding without negative control vectors.")
+        X_train, y_train, sample_weights = _with_background_negatives(
+            cell_embeddings, annotations, X_train, y_train, sample_weights, list(class_names))
 
     n_positive = int((sample_weights == 1.0).sum()) if sample_weights is not None else len(y_train)
     _log_training_data_counts(class_names, y_train, n_positive)
@@ -1865,17 +1869,19 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
     trainable = [c for c in final_class_names if c != "Negative control"
                  and (c in (SAVE_CLASSIFIER_PATHS or {}) or not (CLASSIFIER_PATHS or {}).get(c))]
 
-    # Nothing marked Negative control and no background vectors in this embedding
-    # space: unannotated patches outside every marked class are each binary's "rest",
+    # Fewer Negative control examples (marks + bundled vectors) than marks of the
+    # other classes: unannotated patches outside every marked class are each binary's "rest",
     # as in multiclass. Otherwise the marked classes split every patch between them.
     background = bg_weight = None
     nc_i = name_to_idx.get("Negative control")
-    if nc_vectors is None and X_pos is not None and len(X_pos) and not np.any(y_pos == nc_i):
+    n_nc = (0 if X_pos is None else int(np.sum(y_pos == nc_i))) + (0 if nc_vectors is None else len(nc_vectors))
+    n_marked = 0 if X_pos is None else int(np.sum((y_pos >= 0) & (y_pos != nc_i)))
+    if n_nc < n_marked:
         found = _background_negatives(
             cell_embeddings, annotations, [X_pos[y_pos == c] for c in np.unique(y_pos) if c >= 0 and c != nc_i])
         if found is not None:
             background, bg_weight = found
-            print(f"[OvR] no Negative control examples: {len(background)} unannotated patches outside the "
+            print(f"[OvR] too few Negative control examples: {len(background)} unannotated patches outside the "
                   f"marked classes stand in (weight {bg_weight:.3f})")
 
     # === Phase 1: TRAIN one binary per class; SAVE those that have a path. ===
