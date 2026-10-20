@@ -41,7 +41,6 @@ import io
 import json
 import logging
 import os
-import tempfile
 import shutil
 import sys
 import threading
@@ -2135,15 +2134,6 @@ def _ovr_prior_training_data(cls, dim):
     return None
 
 
-def _ovr_scratch_path(cls):
-    """Where a binary trained without a save destination is written for this
-    run's Phase 2: one file per class, overwritten by the next run."""
-    d = os.path.join(tempfile.gettempdir(), "tissuelab_ovr_unsaved",
-                     f"{os.path.splitext(os.path.basename(__file__))[0]}-{os.getpid()}")
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, hashlib.sha1(cls.encode("utf-8")).hexdigest() + ".tlcls")
-
-
 def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_colors, organ=None):
     """
     One-vs-rest classification: every class is its own independent binary
@@ -2258,7 +2248,7 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     # Every class marked on the slide trains its binary, as multiclass trains on
     # the annotations without a save destination: annotate + Update is how a
     # class gets its classifier. SAVE_CLASSIFIER_PATHS only picks the classes
-    # whose binary is written out; the rest run from a scratch file this once.
+    # whose binary is written out; the rest are used from memory for this run.
     trainable = [c for c in final_class_names if c != "Negative control"]
 
     # === Phase 1: TRAIN — fit one binary per class and SAVE it to disk. ===
@@ -2266,6 +2256,7 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     # uniformly from disk in Phase 2, so the merge is a single "run each model
     # once, then combine" pipeline rather than an in-memory/on-disk split.
     trained_paths = {}  # class_name -> path we just wrote (source of truth for Phase 2)
+    trained_models = {}  # class_name -> binary trained without a save destination
     # Update replaces this slide's rows in each class's file with the slide's
     # current marks, so it runs whether or not the slide has an "is X" mark: "not X"
     # marks alone still teach X's binary, and removed marks still leave the file.
@@ -2373,7 +2364,11 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
             clf.get_booster().set_attr(**prior_attrs)
         # persist (SAVE_CLASSIFIER_PATH temporarily points at this class file so
         # save_classifier_params writes the right target + embeds provenance)
-        path = save_to or _ovr_scratch_path(cls)
+        if not save_to:
+            trained_models[cls] = clf
+            print(f"[OvR] trained '{cls}' (not saved): {int((yb == 1).sum())} pos / {int((yb == 0).sum())} neg")
+            continue
+        path = save_to
         _dir = os.path.dirname(path)
         if _dir:
             os.makedirs(_dir, exist_ok=True)
@@ -2404,6 +2399,12 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     if CLASSIFIER_PATHS:
         predict_map.update(CLASSIFIER_PATHS)
     predict_map.update(trained_paths)
+    # Trained this run but not saved: predict from memory; it replaces the
+    # class's attached file, which it was refined from.
+    for cls, clf in trained_models.items():
+        predict_map.pop(cls, None)
+        prediction_probs[:, name_to_idx[cls]] = clf.predict_proba(cell_embeddings)[:, 1]
+        filled_cols.append(name_to_idx[cls])
 
     items = [(c, p) for c, p in predict_map.items() if c in name_to_idx]
     for r_i, (cls, path) in enumerate(items):

@@ -22,7 +22,6 @@ if _platform_early.system() == 'Darwin':
 
 import argparse
 import os
-import tempfile
 import sys
 import time
 import json
@@ -1744,15 +1743,6 @@ def _ovr_prior_training_data(cls, dim):
     return None
 
 
-def _ovr_scratch_path(cls):
-    """Where a binary trained without a save destination is written for this
-    run's Phase 2: one file per class, overwritten by the next run."""
-    d = os.path.join(tempfile.gettempdir(), "tissuelab_ovr_unsaved",
-                     f"{os.path.splitext(os.path.basename(__file__))[0]}-{os.getpid()}")
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, hashlib.sha1(cls.encode("utf-8")).hexdigest() + ".tlcls")
-
-
 def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_colors):
     """One-vs-rest for patch classification. Each class = an independent binary
     (binary:logistic) .tlcls. Two-stage merge: a patch is 'claimed' by its strongest
@@ -1830,11 +1820,12 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
     # Every class marked on the slide trains its binary, as multiclass trains on
     # the annotations without a save destination: annotate + Update is how a
     # class gets its classifier. SAVE_CLASSIFIER_PATHS only picks the classes
-    # whose binary is written out; the rest run from a scratch file this once.
+    # whose binary is written out; the rest are used from memory for this run.
     trainable = [c for c in final_class_names if c != "Negative control"]
 
     # === Phase 1: TRAIN one binary per class, SAVE each to disk. ===
     trained_paths = {}
+    trained_models = {}  # class_name -> binary trained without a save destination
     # Update replaces this slide's rows in each class's file with the slide's
     # current marks, so it runs whether or not the slide has an "is X" mark: "not X"
     # marks alone still teach X's binary, and removed marks still leave the file.
@@ -1934,7 +1925,11 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
             # Provenance (annotation history, community lineage) carries over;
             # save_classifier_params rewrites the training-derived attrs.
             clf.get_booster().set_attr(**prior_attrs)
-        path = save_to or _ovr_scratch_path(cls)
+        if not save_to:
+            trained_models[cls] = clf
+            print(f"[OvR] trained '{cls}' (not saved): {int((yb == 1).sum())} pos / {int((yb == 0).sum())} neg")
+            continue
+        path = save_to
         _dir = os.path.dirname(path)
         if _dir:
             os.makedirs(_dir, exist_ok=True)
@@ -1963,6 +1958,12 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
     if CLASSIFIER_PATHS:
         predict_map.update(CLASSIFIER_PATHS)
     predict_map.update(trained_paths)
+    # Trained this run but not saved: predict from memory; it replaces the
+    # class's attached file, which it was refined from.
+    for cls, clf in trained_models.items():
+        predict_map.pop(cls, None)
+        prediction_probs[:, name_to_idx[cls]] = clf.predict_proba(cell_embeddings)[:, 1]
+        filled_cols.append(name_to_idx[cls])
     items = [(c, p) for c, p in predict_map.items() if c in name_to_idx]
     for r_i, (cls, path) in enumerate(items):
         if cancel_event.is_set():
