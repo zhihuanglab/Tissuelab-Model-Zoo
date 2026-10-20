@@ -22,6 +22,7 @@ if _platform_early.system() == 'Darwin':
 
 import argparse
 import os
+import tempfile
 import sys
 import time
 import json
@@ -1714,6 +1715,15 @@ def _ovr_prior_training_data(cls, dim):
     return None
 
 
+def _ovr_scratch_path(cls):
+    """Where a binary trained without a save destination is written for this
+    run's Phase 2: one file per class, overwritten by the next run."""
+    d = os.path.join(tempfile.gettempdir(), "tissuelab_ovr_unsaved",
+                     f"{os.path.splitext(os.path.basename(__file__))[0]}-{os.getpid()}")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, hashlib.sha1(cls.encode("utf-8")).hexdigest() + ".tlcls")
+
+
 def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_colors):
     """One-vs-rest for patch classification. Each class = an independent binary
     (binary:logistic) .tlcls. Two-stage merge: a patch is 'claimed' by its strongest
@@ -1788,9 +1798,11 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
     prediction_probs = np.zeros((n_cells, len(final_class_names)), dtype=np.float32)
     filled_cols = []
 
+    # Every class marked on the slide trains its binary, as multiclass trains on
+    # the annotations without a save destination: annotate + Update is how a
+    # class gets its classifier. SAVE_CLASSIFIER_PATHS only picks the classes
+    # whose binary is written out; the rest run from a scratch file this once.
     trainable = [c for c in final_class_names if c != "Negative control"]
-    if SAVE_CLASSIFIER_PATHS:
-        trainable = [c for c in trainable if c in SAVE_CLASSIFIER_PATHS]
 
     # === Phase 1: TRAIN one binary per class, SAVE each to disk. ===
     trained_paths = {}
@@ -1802,7 +1814,7 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
     # A slide with no marks at all (e.g. just reset) has nothing to replace its
     # earlier rows with: applying the classifiers to it leaves them as they are.
     slide_marked = len(positive_annotations) > 0 or any(excl_cells.values())
-    can_train = bool(SAVE_CLASSIFIER_PATHS) and slide_marked
+    can_train = slide_marked
     if SAVE_CLASSIFIER_PATHS and not slide_marked:
         print("[OvR] nothing is marked on this slide; the attached classifiers are left as they are "
               "(mark the slide and Update to refine them)")
@@ -1811,6 +1823,7 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
         if cancel_event.is_set():
             raise CooperativeCancel("cancelled")
         ci = name_to_idx[cls]
+        save_to = (SAVE_CLASSIFIER_PATHS or {}).get(cls)
         pos_sel = (y_pos == ci)
         Xp = X_pos[pos_sel]
         parts_X = [Xp]; parts_y = [np.ones(len(Xp))]; parts_w = [np.ones(len(Xp))]
@@ -1834,7 +1847,7 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
         prior = _ovr_prior_training_data(cls, cell_embeddings.shape[1])
         if prior is False:
             attached = os.path.abspath(CLASSIFIER_PATHS[cls])
-            if attached == os.path.abspath(SAVE_CLASSIFIER_PATHS[cls]):
+            if save_to and attached == os.path.abspath(save_to):
                 print(f"[OvR] '{cls}' not updated: its existing classifier could not be read")
                 continue
             print(f"[OvR] '{cls}': attached classifier unreadable; training a new file from this slide only")
@@ -1846,7 +1859,7 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
             cur_keys = _row_keys(Xb)
             prev_keys = _row_keys(X_prev)
             new_keys = set(cur_keys)
-            same_file = os.path.abspath(prior_path) == os.path.abspath(SAVE_CLASSIFIER_PATHS[cls])
+            same_file = bool(save_to) and os.path.abspath(prior_path) == os.path.abspath(save_to)
             # Every earlier row from this slide is replaced by the slide's current
             # rows, so a mark the user removed leaves the classifier too.
             from_slide = _rows_from_slide(X_prev, cell_embeddings)
@@ -1885,7 +1898,7 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
             # Provenance (annotation history, community lineage) carries over;
             # save_classifier_params rewrites the training-derived attrs.
             clf.get_booster().set_attr(**prior_attrs)
-        path = SAVE_CLASSIFIER_PATHS[cls]
+        path = save_to or _ovr_scratch_path(cls)
         _dir = os.path.dirname(path)
         if _dir:
             os.makedirs(_dir, exist_ok=True)
