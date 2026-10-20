@@ -1443,6 +1443,71 @@ def load_classifier_params(zarr_path):
         return None
 
         
+# Stand-in for Negative control when nothing on the slide is marked as
+# not-the-class and the bundled background vectors are not in this model's
+# embedding space: unannotated cells that lie outside every marked class. Weak
+# (at most 0.3, as a "not X" mark, and in all at most max(#marked, 20) so a few
+# marks are not outweighed), since a few may still be the class; seeded, so the
+# same marks train the same model. Rebuilt on every run, never stored.
+BACKGROUND_NEG_WEIGHT = 0.3
+
+
+def _background_negatives(embeddings, annotations, positive_groups):
+    """(rows, weight): up to max(500, 2 * #marked) (at most 20000) unannotated cells
+    farther (cosine) from each marked class's centre than 95% of that class's own
+    marks; None if none. Sampling at random instead would take the class's own
+    unmarked cells as its negatives, the more so the more of the slide it covers."""
+    groups = [np.asarray(g, dtype=np.float32) for g in positive_groups if len(g)]
+    if not groups:
+        return None
+    n = len(embeddings)
+    marked = np.empty(0, dtype=int)
+    if annotations is not None and not annotations.empty and "cell_ID" in annotations.columns:
+        marked = pd.to_numeric(annotations["cell_ID"], errors="coerce").dropna().astype(int).values
+        marked = marked[(marked >= 0) & (marked < n)]
+    centres = np.stack([g.mean(axis=0) for g in groups])
+    centres /= np.linalg.norm(centres, axis=1, keepdims=True) + 1e-12
+    radii = np.array([np.percentile((g @ c) / (np.linalg.norm(g, axis=1) + 1e-12), 5)
+                      for g, c in zip(groups, centres)], dtype=np.float32)
+    outside = np.ones(n, dtype=bool)
+    outside[marked] = False
+    for i in range(0, n, 8192):  # in float32 chunks: no full-size copy of float16 embeddings
+        x = np.asarray(embeddings[i:i + 8192], dtype=np.float32)
+        cos = (x @ centres.T) / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-12)
+        outside[i:i + len(x)] &= (cos < radii).all(axis=1)
+    far = np.flatnonzero(outside)
+    if len(far) == 0:
+        return None
+    n_pos = sum(len(g) for g in groups)
+    k = int(min(len(far), max(500, 2 * n_pos), 20000))
+    weight = min(BACKGROUND_NEG_WEIGHT, max(n_pos, 20) / k)
+    return embeddings[np.random.default_rng(0).choice(far, size=k, replace=False)], weight
+
+
+def _with_background_negatives(embeddings, annotations, X, y, w, class_names):
+    """(X, y, w) plus the stand-in background as Negative control rows when the
+    (fully weighted) Negative control rows — marks and bundled vectors — are fewer
+    than the other classes' rows; unchanged otherwise. Ten bundled vectors cannot
+    tell a few hundred marks what is not them."""
+    if "Negative control" not in class_names:
+        return X, y, w
+    nc = class_names.index("Negative control")
+    strong = np.ones(len(y), dtype=bool) if w is None else np.asarray(w) >= 1
+    if np.sum(strong & (y == nc)) >= np.sum(strong & (y != nc)):
+        return X, y, w
+    found = _background_negatives(
+        embeddings, annotations, [X[strong & (y == c)] for c in np.unique(y[strong]) if c != nc])
+    if found is None:
+        return X, y, w
+    background, weight = found
+    print(f"Too few Negative control examples: {len(background)} unannotated cells outside the marked "
+          f"classes stand in (weight {weight:.3f})")
+    w = np.ones(len(y)) if w is None else np.asarray(w)
+    return (np.concatenate([X, background.astype(X.dtype, copy=False)], axis=0),
+            np.concatenate([y, np.full(len(background), nc)]).astype(int),
+            np.concatenate([w, np.full(len(background), weight)]))
+
+
 def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame, nuclei_classes: list = None, nuclei_colors: list[str] = None):
     """
     Train a linear classifier for cell classification.
@@ -1638,6 +1703,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_train = np.concatenate([X_train, neg_X], axis=0)
                             y_train = np.concatenate([y_train, neg_y], axis=0)
                             sample_weights_inc = np.concatenate([np.ones(n_pos), neg_w])
+                        X_train, y_train, sample_weights_inc = _with_background_negatives(
+                            cell_embeddings, annotations, X_train, y_train, sample_weights_inc, list(class_names))
                         _log_training_data_counts(class_names, y_train, n_pos)
                         # A merged class list can leave gaps (a class with no samples
                         # yet); xgboost rejects non-contiguous labels, so compact them
@@ -1704,6 +1771,11 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                             X_train = np.concatenate([X_train, neg_X], axis=0)
                             y_train = np.concatenate([y_train, neg_y], axis=0)
                             sample_weights_inc = np.concatenate([np.ones(n_pos), neg_w])
+                        # A classifier that carries no rows is warm-started to keep what it knows;
+                        # a Negative control label new to it would force a refit on this slide alone.
+                        if prev_embeddings is not None and len(prev_embeddings) > 0:
+                            X_train, y_train, sample_weights_inc = _with_background_negatives(
+                                cell_embeddings, annotations, X_train, y_train, sample_weights_inc, list(class_names))
                         _log_training_data_counts(class_names, y_train, n_pos)
                         # A warm start has to speak the booster's own (compacted) label
                         # space and cannot grow it. Labels it never saw — a class that
@@ -1979,7 +2051,9 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
                 # Negative control vectors get weight 1.0
                 sample_weights = np.concatenate([np.ones(negative_control_vectors.shape[0]), sample_weights])
         else:
-            print("Proceeding without negative control vectors as they could not be loaded.")
+            print("Proceeding without negative control vectors.")
+        X_train, y_train, sample_weights = _with_background_negatives(
+            cell_embeddings, annotations, X_train, y_train, sample_weights, list(class_names))
 
     # Check for cancellation before training (XGBoost fit cannot be interrupted)
     if cancel_event.is_set():
@@ -2150,15 +2224,18 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     One-vs-rest classification: every class is its own independent binary
     classifier stored in a separate .tlcls file.
 
-    Train (only when annotations exist): for each class the frontend asked to
-    save (SAVE_CLASSIFIER_PATHS) that also has >=1 positive annotation, fit a
+    Train (only when annotations exist): for each class being saved
+    (SAVE_CLASSIFIER_PATHS) or with no classifier attached that has >=1 positive
+    annotation, fit a
     binary XGB — positives = cells annotated as that class; negatives = cells
     annotated as any other class + the shared negative-control vectors + any
     cells explicitly marked "not this class" (weak, 0.3). Rows already in the
-    class's .tlcls (earlier slides) are merged in. Save each to its path.
+    class's .tlcls (earlier slides) are merged in. With no negative at all,
+    unannotated cells outside the class stand in (weak). Save each binary
+    that has a path; the others are used from memory for this run.
 
     Predict: for every class that ends up with a classifier — freshly trained
-    (SAVE_CLASSIFIER_PATHS) or pre-attached (CLASSIFIER_PATHS) — score all cells
+    or pre-attached (CLASSIFIER_PATHS) — score all cells
     with predict_proba[:, 1] and drop it into that class's probability column.
     The strongest binary claims a cell at >= 0.5. Unclaimed cells fall back to
     the organ head over classifier-less classes plus Negative control; without
@@ -2263,16 +2340,33 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     prediction_probs = np.zeros((n_cells, len(final_class_names)), dtype=np.float32)
     filled_cols = []  # final indices that received a real classifier score
 
-    # classes the frontend asked to train (default: every non-NC class)
-    trainable = [c for c in final_class_names if c != "Negative control"]
-    if SAVE_CLASSIFIER_PATHS:
-        trainable = [c for c in trainable if c in SAVE_CLASSIFIER_PATHS]
+    # Trained: every class being saved (SAVE_CLASSIFIER_PATHS), and every class
+    # with no classifier attached, as multiclass trains on the annotations without
+    # a save destination (annotate + Update). The latter run from memory this once.
+    # An attached classifier that is not being updated is used as it is.
+    trainable = [c for c in final_class_names if c != "Negative control"
+                 and (c in (SAVE_CLASSIFIER_PATHS or {}) or not (CLASSIFIER_PATHS or {}).get(c))]
 
-    # === Phase 1: TRAIN — fit one binary per class and SAVE it to disk. ===
-    # No prediction here; every .tlcls (freshly trained or pre-attached) is run
-    # uniformly from disk in Phase 2, so the merge is a single "run each model
-    # once, then combine" pipeline rather than an in-memory/on-disk split.
+    # Fewer Negative control examples (marks + bundled vectors) than marks of the
+    # other classes: unannotated cells outside every marked class are each binary's "rest",
+    # as in multiclass. Otherwise the marked classes split every cell between them.
+    background = bg_weight = None
+    nc_i = name_to_idx.get("Negative control")
+    n_nc = (0 if X_pos is None else int(np.sum(y_pos == nc_i))) + (0 if nc_vectors is None else len(nc_vectors))
+    n_marked = 0 if X_pos is None else int(np.sum((y_pos >= 0) & (y_pos != nc_i)))
+    if n_nc < n_marked:
+        found = _background_negatives(
+            cell_embeddings, annotations, [X_pos[y_pos == c] for c in np.unique(y_pos) if c >= 0 and c != nc_i])
+        if found is not None:
+            background, bg_weight = found
+            print(f"[OvR] too few Negative control examples: {len(background)} unannotated cells outside the "
+                  f"marked classes stand in (weight {bg_weight:.3f})")
+
+    # === Phase 1: TRAIN one binary per class; SAVE those that have a path. ===
+    # No prediction here: Phase 2 runs each saved or attached .tlcls from disk,
+    # and each binary trained without a path from memory, then combines them.
     trained_paths = {}  # class_name -> path we just wrote (source of truth for Phase 2)
+    trained_models = {}  # class_name -> binary trained without a save destination
     # Update replaces this slide's rows in each class's file with the slide's
     # current marks, so it runs whether or not the slide has an "is X" mark: "not X"
     # marks alone still teach X's binary, and removed marks still leave the file.
@@ -2281,7 +2375,7 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     # A slide with no marks at all (e.g. just reset) has nothing to replace its
     # earlier rows with: applying the classifiers to it leaves them as they are.
     slide_marked = len(positive_annotations) > 0 or any(excl_cells.values())
-    can_train = bool(SAVE_CLASSIFIER_PATHS) and slide_marked
+    can_train = slide_marked
     if SAVE_CLASSIFIER_PATHS and not slide_marked:
         print("[OvR] nothing is marked on this slide; the attached classifiers are left as they are "
               "(mark the slide and Update to refine them)")
@@ -2291,6 +2385,7 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
             progress_state.value = 0
             return None
         ci = name_to_idx[cls]
+        save_to = (SAVE_CLASSIFIER_PATHS or {}).get(cls)
         pos_sel = (y_pos == ci)
         Xp = X_pos[pos_sel]
         parts_X = [Xp]
@@ -2318,7 +2413,7 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
         prior = _ovr_prior_training_data(cls, cell_embeddings.shape[1])
         if prior is False:
             attached = os.path.abspath(CLASSIFIER_PATHS[cls])
-            if attached == os.path.abspath(SAVE_CLASSIFIER_PATHS[cls]):
+            if save_to and attached == os.path.abspath(save_to):
                 print(f"[OvR] '{cls}' not updated: its existing classifier could not be read")
                 continue
             print(f"[OvR] '{cls}': attached classifier unreadable; training a new file from this slide only")
@@ -2330,7 +2425,7 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
             cur_keys = _row_keys(Xb)
             prev_keys = _row_keys(X_prev)
             new_keys = set(cur_keys)
-            same_file = os.path.abspath(prior_path) == os.path.abspath(SAVE_CLASSIFIER_PATHS[cls])
+            same_file = bool(save_to) and os.path.abspath(prior_path) == os.path.abspath(save_to)
             # Every earlier row from this slide is replaced by the slide's current
             # rows, so a mark the user removed leaves the classifier too.
             from_slide = _rows_from_slide(X_prev, cell_embeddings)
@@ -2356,6 +2451,10 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
             else:
                 print(f"[OvR] skip '{cls}': no positive annotations")
             continue
+        if background is not None:
+            Xb = np.concatenate([Xb, background.astype(Xb.dtype, copy=False)], axis=0)
+            yb = np.concatenate([yb, np.zeros(len(background), dtype=yb.dtype)])
+            wb = np.concatenate([wb, np.full(len(background), bg_weight)])
         if not np.any(yb == 0):
             print(f"[OvR] skip '{cls}': no negatives available")
             continue
@@ -2372,16 +2471,21 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
             clf.get_booster().set_attr(**prior_attrs)
         # persist (SAVE_CLASSIFIER_PATH temporarily points at this class file so
         # save_classifier_params writes the right target + embeds provenance)
-        path = SAVE_CLASSIFIER_PATHS[cls]
+        if not save_to:
+            trained_models[cls] = clf
+            print(f"[OvR] trained '{cls}' (not saved): {int((yb == 1).sum())} pos / {int((yb == 0).sum())} neg")
+            continue
+        path = save_to
         _dir = os.path.dirname(path)
         if _dir:
             os.makedirs(_dir, exist_ok=True)
         _prev = SAVE_CLASSIFIER_PATH
         SAVE_CLASSIFIER_PATH = path
         try:
+            # Stand-in background rows (weak) are rebuilt each run, not stored.
             save_classifier_params(clf, ["Negative control", cls],
                                    ["#aaaaaa", final_class_colors[ci]],
-                                   {'embeddings': Xb, 'labels': yb})
+                                   {'embeddings': Xb[wb >= 1], 'labels': yb[wb >= 1]})
         finally:
             SAVE_CLASSIFIER_PATH = _prev
         trained_paths[cls] = path
@@ -2403,6 +2507,11 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     if CLASSIFIER_PATHS:
         predict_map.update(CLASSIFIER_PATHS)
     predict_map.update(trained_paths)
+    # Trained this run but not saved (no classifier attached): predict from memory.
+    for cls, clf in trained_models.items():
+        _match_booster_device_to_data(clf)
+        prediction_probs[:, name_to_idx[cls]] = clf.predict_proba(cell_embeddings)[:, 1]
+        filled_cols.append(name_to_idx[cls])
 
     items = [(c, p) for c, p in predict_map.items()
              if c in name_to_idx and c.strip().lower() != "negative control" and p]
