@@ -1860,6 +1860,19 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
     trainable = [c for c in final_class_names if c != "Negative control"
                  and (c in (SAVE_CLASSIFIER_PATHS or {}) or not (CLASSIFIER_PATHS or {}).get(c))]
 
+    # Nothing marked Negative control and no background vectors in this embedding
+    # space: unannotated patches outside every marked class are each binary's "rest",
+    # as in multiclass. Otherwise the marked classes split every patch between them.
+    background = bg_weight = None
+    nc_i = name_to_idx.get("Negative control")
+    if nc_vectors is None and X_pos is not None and len(X_pos) and not np.any(y_pos == nc_i):
+        found = _background_negatives(
+            cell_embeddings, annotations, [X_pos[y_pos == c] for c in np.unique(y_pos) if c >= 0 and c != nc_i])
+        if found is not None:
+            background, bg_weight = found
+            print(f"[OvR] no Negative control examples: {len(background)} unannotated patches outside the "
+                  f"marked classes stand in (weight {bg_weight:.3f})")
+
     # === Phase 1: TRAIN one binary per class; SAVE those that have a path. ===
     trained_paths = {}
     trained_models = {}  # class_name -> binary trained without a save destination
@@ -1942,17 +1955,13 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
             else:
                 print(f"[OvR] skip '{cls}': no positive annotations")
             continue
-        if not np.any(yb == 0):
-            found = _background_negatives(cell_embeddings, annotations, [Xb[yb == 1]])
-            if found is None:
-                print(f"[OvR] skip '{cls}': no negatives available")
-                continue
-            background, bg_weight = found
-            print(f"[OvR] '{cls}': nothing marked as not '{cls}'; {len(background)} unannotated patches "
-                  f"stand in (weight {bg_weight:.3f})")
+        if background is not None:
             Xb = np.concatenate([Xb, background.astype(Xb.dtype, copy=False)], axis=0)
             yb = np.concatenate([yb, np.zeros(len(background), dtype=yb.dtype)])
             wb = np.concatenate([wb, np.full(len(background), bg_weight)])
+        if not np.any(yb == 0):
+            print(f"[OvR] skip '{cls}': no negatives available")
+            continue
         if merge_note:
             print(merge_note)
         clf = xgb.XGBClassifier(**xgb_params_bin)
