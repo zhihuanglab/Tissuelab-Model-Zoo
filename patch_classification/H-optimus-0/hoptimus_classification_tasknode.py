@@ -1817,11 +1817,12 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
     prediction_probs = np.zeros((n_cells, len(final_class_names)), dtype=np.float32)
     filled_cols = []
 
-    # Every class marked on the slide trains its binary, as multiclass trains on
-    # the annotations without a save destination: annotate + Update is how a
-    # class gets its classifier. SAVE_CLASSIFIER_PATHS only picks the classes
-    # whose binary is written out; the rest are used from memory for this run.
-    trainable = [c for c in final_class_names if c != "Negative control"]
+    # Trained: every class being saved (SAVE_CLASSIFIER_PATHS), and every class
+    # with no classifier attached, as multiclass trains on the annotations without
+    # a save destination (annotate + Update). The latter run from memory this once.
+    # An attached classifier that is not being updated is used as it is.
+    trainable = [c for c in final_class_names if c != "Negative control"
+                 and (c in (SAVE_CLASSIFIER_PATHS or {}) or not (CLASSIFIER_PATHS or {}).get(c))]
 
     # === Phase 1: TRAIN one binary per class, SAVE each to disk. ===
     trained_paths = {}
@@ -1936,9 +1937,10 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
         _prev = SAVE_CLASSIFIER_PATH
         SAVE_CLASSIFIER_PATH = path
         try:
+            # Stand-in background rows (weak) are rebuilt each run, not stored.
             save_classifier_params(clf, ["Negative control", cls],
                                    ["#aaaaaa", final_class_colors[ci]],
-                                   {'embeddings': Xb, 'labels': yb})
+                                   {'embeddings': Xb[wb >= 1], 'labels': yb[wb >= 1]})
         finally:
             SAVE_CLASSIFIER_PATH = _prev
         trained_paths[cls] = path
@@ -1958,10 +1960,8 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
     if CLASSIFIER_PATHS:
         predict_map.update(CLASSIFIER_PATHS)
     predict_map.update(trained_paths)
-    # Trained this run but not saved: predict from memory; it replaces the
-    # class's attached file, which it was refined from.
+    # Trained this run but not saved (no classifier attached): predict from memory.
     for cls, clf in trained_models.items():
-        predict_map.pop(cls, None)
         prediction_probs[:, name_to_idx[cls]] = clf.predict_proba(cell_embeddings)[:, 1]
         filled_cols.append(name_to_idx[cls])
     items = [(c, p) for c, p in predict_map.items() if c in name_to_idx]
