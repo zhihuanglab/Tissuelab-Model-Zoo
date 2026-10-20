@@ -16,21 +16,19 @@ import torch
 
 opj = os.path.join
 
-# Cellpose 4 builtin names. v3 nuclei/cyto/cyto2/cyto3 are ignored by v4.
-_CELLPOSE4_MODELS = {"cpsam_v2", "cpsam", "cpdino", "cpdino-vitb"}
-_CELLPOSE3_MODELS = {"nuclei", "cyto", "cyto2", "cyto3"}
+# Cellpose-SAM, Cellpose 4's default model. The only model this node runs.
+CELLPOSE_MODEL = "cpsam_v2"
 
+# Segmentation settings of iSight v2 (iSight_v2/isight_infer.py `segment`), so
+# its target-cell model sees the cells it was trained on. Pixels are 0.5 um/px
+# (20x): whole slides are resampled to it, plain images are taken as it.
+CELL_DIAMETER_PX = 20
+FLOW_THRESHOLD = 0.4
+CELLPROB_THRESHOLD = 0.0
+MIN_CELL_AREA_PX = 50
+# Plain JPEG/PNG carry no resolution; HPA-style IHC images are 0.5 um/px.
+PLAIN_IMAGE_MPP = 0.5
 
-def _cellpose_pretrained(name):
-    if os.path.exists(name):
-        return name
-    if name in _CELLPOSE4_MODELS:
-        return name
-    if name in _CELLPOSE3_MODELS:
-        print(f"Cellpose 4 ignores model_type={name!r}; using cpsam_v2")
-    else:
-        print(f"Unknown Cellpose model {name!r}; using cpsam_v2")
-    return "cpsam_v2"
 
 class SlideSegmentation():
 
@@ -38,10 +36,7 @@ class SlideSegmentation():
                  args,
                  tile_size=2048,
                  overlap=224,
-                 prob_thresh=0.3,
-                 nms_thresh=0.3,
                  n_tiles=(2,2,1),
-                 cellpose_model='cpsam_v2',
                  isIHC=False,
                  progress_callback=None,
                  cancel_checker=None,
@@ -67,14 +62,13 @@ class SlideSegmentation():
         
         self.wsi_mask = self.simple_get_mask()
         
-        pretrained = _cellpose_pretrained(cellpose_model)
-        print(f"Loading Cellpose model: {pretrained}")
-        self.model = CellposeModel(gpu=use_gpu, pretrained_model=pretrained)
+        print(f"Loading Cellpose-SAM model: {CELLPOSE_MODEL}")
+        self.model = CellposeModel(gpu=use_gpu, pretrained_model=CELLPOSE_MODEL)
         
-        # Cellpose parameters
-        self.diameter = 30  # Typical nucleus diameter in pixels at 20x magnification
-        self.flow_threshold = 0.4
-        self.cellprob_threshold = prob_thresh  # Use the same threshold as StarDist
+        self.diameter = CELL_DIAMETER_PX
+        self.flow_threshold = FLOW_THRESHOLD
+        self.cellprob_threshold = CELLPROB_THRESHOLD
+        self.min_cell_area = MIN_CELL_AREA_PX
         
         self.level = 0
         try:
@@ -89,8 +83,6 @@ class SlideSegmentation():
             self.mask_ratio_y = self.dim[1]/self.wsi_mask.shape[0]
         
         self.overlap = overlap
-        self.prob_thresh = prob_thresh
-        self.nms_thresh = nms_thresh
         self.n_tiles = n_tiles
         self.isIHC = isIHC
         
@@ -143,7 +135,7 @@ class SlideSegmentation():
             file_extension = os.path.splitext(self.args.slidepath)[1].lower()[1:]
             if file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
                 self.slide = SimpleImageWrapper(self.args.slidepath)
-                mpp = 0.25  # Default value
+                mpp = PLAIN_IMAGE_MPP
             elif file_extension in ['dcm']:
                 self.slide = DicomImageWrapper(self.args.slidepath)
                 mpp = 0.25  # Default value
@@ -359,7 +351,7 @@ class SlideSegmentation():
             
             # Get centroid
             y_coords, x_coords = np.where(cell_mask)
-            if len(x_coords) == 0:
+            if len(x_coords) < self.min_cell_area:
                 continue
                 
             centroid_x = np.mean(x_coords)
@@ -528,9 +520,9 @@ class SlideSegmentation():
                     self.progress_callback(80)
                 self._maybe_cancel()
                     
-                # Set final results
-                self.final_points = points.astype(np.int32)
-                self.final_coord = coord.astype(np.int32)
+                # Set final results (centroids are pixel means: round, not truncate)
+                self.final_points = np.rint(points).astype(np.int32)
+                self.final_coord = np.rint(coord).astype(np.int32)
                 self.prob_all = prob
                 
                 # Apply post-processing for simple images too
@@ -753,17 +745,20 @@ class SlideSegmentation():
             
             # Add debug info when generating final_points
             try:
-                self.final_points = points_all[['x','y']].values.astype(np.int32)
-                print(f"Successfully generated final_points, shape={self.final_points.shape}")
+                # Kept as float until the end: centroids are pixel means, so round once, not truncate.
+                final_points = points_all[['x','y']].values.astype(np.float64)
+                print(f"Successfully generated final_points, shape={final_points.shape}")
                 
-                self.final_coord = coord_all.astype(np.int32)
+                final_coord = np.asarray(coord_all, dtype=np.float64)
                 self.prob_all = prob_all
                 
                 if self.args.magnification is not None:
                     # Need to scale back to original size since calculations were at 20x
                     resize_factor = self.reference_magnification / self.args.magnification
-                    self.final_points = (self.final_points/resize_factor).astype(np.int32)
-                    self.final_coord = (self.final_coord/resize_factor).astype(np.int32)
+                    final_points = final_points / resize_factor
+                    final_coord = final_coord / resize_factor
+                self.final_points = np.rint(final_points).astype(np.int32)
+                self.final_coord = np.rint(final_coord).astype(np.int32)
                 
                 print(f"Before deduplication: {len(self.final_points)} detected nuclei")
                 
