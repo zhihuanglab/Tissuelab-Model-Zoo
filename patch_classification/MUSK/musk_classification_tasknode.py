@@ -978,6 +978,25 @@ def _resolve_colors_for_class_names(
     return None
 
 
+# Stand-in for Negative control when the bundled background vectors are not in
+# this model's embedding space and nothing on the slide is marked as not-the-class:
+# unannotated patches of the slide. Weak (0.3, as a "not X" mark), since a few of
+# them are the annotated class; seeded, so the same marks train the same model.
+BACKGROUND_NEG_WEIGHT = 0.3
+
+
+def _background_negatives(embeddings, annotations, n_pos):
+    """Embeddings of up to max(500, 2 * n_pos) (at most 20000) unannotated patches; None if none."""
+    marked = np.empty(0, dtype=int)
+    if annotations is not None and not annotations.empty and "patch_ID" in annotations.columns:
+        marked = pd.to_numeric(annotations["patch_ID"], errors="coerce").dropna().astype(int).values
+    pool = np.setdiff1d(np.arange(len(embeddings)), marked)
+    if len(pool) == 0:
+        return None
+    n = int(min(len(pool), max(500, 2 * int(n_pos)), 20000))
+    return embeddings[np.random.default_rng(0).choice(pool, size=n, replace=False)]
+
+
 def train_linear_classifier(
     cell_embeddings: np.ndarray,
     annotations: pd.DataFrame,
@@ -1503,7 +1522,17 @@ def train_linear_classifier(
                 # Negative control vectors get weight 1.0
                 sample_weights = np.concatenate([np.ones(negative_control_vectors.shape[0]), sample_weights])
         else:
-            print("Proceeding without negative control vectors.")
+            background = _background_negatives(cell_embeddings, annotations, len(y_train))
+            if background is None:
+                print("Proceeding without negative control vectors.")
+            else:
+                print(f"No background vectors for this embedding space: {len(background)} unannotated patches "
+                      f"stand in for Negative control (weight {BACKGROUND_NEG_WEIGHT})")
+                if sample_weights is None:
+                    sample_weights = np.ones(len(y_train))
+                X_train = np.concatenate([background.astype(X_train.dtype, copy=False), X_train], axis=0)
+                y_train = np.concatenate([np.zeros(len(background)), y_train], axis=0).astype(int)
+                sample_weights = np.concatenate([np.full(len(background), BACKGROUND_NEG_WEIGHT), sample_weights])
 
     n_positive = int((sample_weights == 1.0).sum()) if sample_weights is not None else len(y_train)
     _log_training_data_counts(class_names, y_train, n_positive)
@@ -1881,8 +1910,15 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
                 print(f"[OvR] skip '{cls}': no positive annotations")
             continue
         if not np.any(yb == 0):
-            print(f"[OvR] skip '{cls}': no negatives available")
-            continue
+            background = _background_negatives(cell_embeddings, annotations, int(yb.sum()))
+            if background is None:
+                print(f"[OvR] skip '{cls}': no negatives available")
+                continue
+            print(f"[OvR] '{cls}': nothing marked as not '{cls}'; {len(background)} unannotated patches "
+                  f"stand in (weight {BACKGROUND_NEG_WEIGHT})")
+            Xb = np.concatenate([Xb, background.astype(Xb.dtype, copy=False)], axis=0)
+            yb = np.concatenate([yb, np.zeros(len(background), dtype=yb.dtype)])
+            wb = np.concatenate([wb, np.full(len(background), BACKGROUND_NEG_WEIGHT)])
         if merge_note:
             print(merge_note)
         clf = xgb.XGBClassifier(**xgb_params_bin)
