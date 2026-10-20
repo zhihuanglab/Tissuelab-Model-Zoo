@@ -2,6 +2,7 @@
 
 from cellpose.models import CellposeModel
 from cellpose.io import logger_setup
+from cellpose import plot as cellpose_plot
 import numpy as np
 import pandas as pd
 import time
@@ -13,8 +14,14 @@ from multiprocessing import Queue
 from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
 import tiffslide
 import torch
+from scipy.ndimage import find_objects
 
 opj = os.path.join
+
+# CellposeModel.eval() always renders the flows as an RGB picture (dx_to_circ)
+# for display; this node never reads it, and it is a full-size numpy pass per
+# eval. iSight's reference segmentation disables it the same way.
+cellpose_plot.dx_to_circ = lambda *args, **kwargs: None
 
 # Cellpose-SAM, Cellpose 4's default model. The only model this node runs.
 CELLPOSE_MODEL = "cpsam_v2"
@@ -362,29 +369,28 @@ class SlideSegmentation():
         if masks.ndim > 2:
             masks = np.squeeze(masks)
 
-        # Get unique labels (excluding background 0)
-        labels = np.unique(masks)
-        labels = labels[labels > 0]
-        
-        if len(labels) == 0:
-            # No cells detected
-            return np.array([]).reshape(0, 2), np.array([]).reshape(0, self.global_max_contour_points, 2), np.array([])
-        
+        labels_img = masks.astype(np.int32)
         points = []
         coord = []
         prob = []
         
-        for label in labels:
-            # Get mask for this cell
-            cell_mask = (masks == label)
+        # One bounding box per label (find_objects), so each cell is measured on
+        # its own few pixels rather than by comparing the whole tile per label.
+        for label, sl in enumerate(find_objects(labels_img), start=1):
+            if sl is None:
+                continue
+            # 1 px margin so a contour touching the box edge is still closed.
+            y0, y1 = max(0, sl[0].start - 1), min(labels_img.shape[0], sl[0].stop + 1)
+            x0, x1 = max(0, sl[1].start - 1), min(labels_img.shape[1], sl[1].stop + 1)
+            cell_mask = labels_img[y0:y1, x0:x1] == label
             
             # Get centroid
-            y_coords, x_coords = np.where(cell_mask)
+            y_coords, x_coords = np.nonzero(cell_mask)
             if len(x_coords) < self.min_cell_area:
                 continue
                 
-            centroid_x = np.mean(x_coords)
-            centroid_y = np.mean(y_coords)
+            centroid_x = np.mean(x_coords) + x0
+            centroid_y = np.mean(y_coords) + y0
             points.append([centroid_x, centroid_y])
             
             # Get contour
@@ -397,8 +403,8 @@ class SlideSegmentation():
                 if len(contour.shape) == 1:  # Handle single point
                     contour = contour.reshape(1, 2)
                 
-                # Ensure contour is float for interpolation
-                contour = contour.astype(np.float32)
+                # Ensure contour is float for interpolation; back to tile coordinates
+                contour = contour.astype(np.float32) + np.array([x0, y0], dtype=np.float32)
                 
                 # Pad or downsample contour to global_max_contour_points
                 if len(contour) < self.global_max_contour_points:

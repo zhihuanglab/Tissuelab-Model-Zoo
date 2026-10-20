@@ -9,6 +9,13 @@ only: no embeddings (the classifier that needs them computes its own).
 """
 import argparse
 import os
+
+# NumPy asks Linux for transparent huge pages on every large array. On a server
+# whose THP defrag is "madvise" and whose memory is fragmented, each such
+# allocation compacts memory synchronously: measured on napa, Cellpose-SAM's
+# first eval of a 3000x3000 image took 169 s with it and 8 s without. Must be
+# set before numpy is imported; an explicit setting still wins.
+os.environ.setdefault("NUMPY_MADVISE_HUGEPAGE", "0")
 import time
 import json
 import threading
