@@ -35,9 +35,12 @@ SAM encoder runs as a bf16 TensorRT engine (ONNX Runtime TensorRT EP), ~40%
 faster than PyTorch with the same cells (3000x3000 IHC image on an H200: 6.6 s
 -> 4.1 s, ~4.4 GB GPU memory). fp16 is not used: it loses ~4% of the cells.
 
-- First use exports `cache/cpsam_v2_b16.onnx` and builds the engine in
-  `cache/trt_engines/` (~90 s); later processes load them (~25 s, once per
-  node process; the model stays loaded between runs).
+- First use exports `cache/cpsam_v2_b16.onnx`, builds the engine in
+  `cache/trt_ep_ctx_engines/` (~90 s) and writes the EPContext model
+  `cache/cpsam_v2_b16_ctx.onnx` that points at it. Later processes load the
+  EPContext model in a second or two (once per node process; the model stays
+  loaded between runs). One that no longer loads (other GPU or TensorRT
+  version) is deleted and the engine rebuilt.
 - `CELLPOSE_SAM_CACHE` moves the cache; `CELLPOSE_SAM_TRT=0` forces PyTorch.
 - Missing CUDA / packages, or any build failure, falls back to PyTorch.
 - On Linux the node re-execs itself once to put the TensorRT / CUDA wheel

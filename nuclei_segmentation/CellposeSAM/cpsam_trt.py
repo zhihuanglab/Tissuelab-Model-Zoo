@@ -6,9 +6,10 @@ than PyTorch bf16 with the same cells (measured on an H200: 3000x3000 IHC image,
 fp16 is not an option: it drops ~4% of the cells, in TensorRT as in PyTorch.
 
 On first use the net is exported to ONNX (batch fixed at TRT_BATCH) and a bf16
-engine is built (~90 s); both are cached under the cache directory, so later
-processes only load them (~25 s, once per node process). Anything missing
-(CUDA, onnxruntime-gpu, tensorrt) or failing leaves the caller on PyTorch.
+engine is built (~90 s) along with an EPContext model pointing at it; all are
+cached under the cache directory, so later processes load the EPContext model
+in a second or two (once per node process). Anything missing (CUDA,
+onnxruntime-gpu, tensorrt) or failing leaves the caller on PyTorch.
 CELLPOSE_SAM_TRT=0 turns the path off.
 """
 import os
@@ -160,11 +161,60 @@ def _export_onnx(make_fp32_net, path):
     torch.cuda.empty_cache()
 
 
+# Engines live in this dir next to the *_ctx.onnx that points at them. TRT EP
+# requires the EPContext engine path to be relative, so sessions are created
+# from inside the cache dir.
+ENGINE_DIR = "trt_ep_ctx_engines"
+
+
+class _cwd:
+    """Run a block from another working directory (relative TRT paths)."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        self.prev = os.getcwd()
+        os.chdir(self.path)
+
+    def __exit__(self, *exc):
+        os.chdir(self.prev)
+
+
+def _trt_options(device_id, build, dump_ctx=None):
+    opts = {
+        "device_id": device_id,
+        "trt_bf16_enable": True,
+        "trt_engine_cache_enable": True,
+        "trt_engine_cache_path": ENGINE_DIR,
+    }
+    if build:
+        # Builder settings only when building: on an EPContext model they make
+        # ORT re-check the engine's tactics.
+        opts["trt_max_workspace_size"] = str(TRT_WORKSPACE_GB << 30)
+        opts["trt_builder_optimization_level"] = 3
+    if dump_ctx:
+        opts["trt_dump_ep_context_model"] = True
+        opts["trt_ep_context_file_path"] = dump_ctx
+        opts["trt_ep_context_embed_mode"] = 0  # engine stays a file in ENGINE_DIR
+    return opts
+
+
+def _session(ort, model_name, opts):
+    so = ort.SessionOptions()
+    so.log_severity_level = 3
+    return ort.InferenceSession(model_name, so, providers=[("TensorrtExecutionProvider", opts), "CUDAExecutionProvider"])
+
+
 def try_build(orig_net, make_fp32_net, log=print):
     """A TrtNet for Cellpose-SAM, or None when the TensorRT path is unavailable.
 
     orig_net: the model's PyTorch net (moved to the CPU when TensorRT takes over).
     make_fp32_net: builds the net in float32, used once to export the ONNX.
+
+    Later processes load the EPContext model (*_ctx.onnx + its engine, ~1-2 s)
+    instead of parsing the 1.2 GB ONNX and deserializing the engine (~18 s). A
+    stale one (other GPU, other TensorRT) is dropped and rebuilt.
     """
     if not enabled():
         log("[Cellpose-SAM] TensorRT disabled (CELLPOSE_SAM_TRT=0); using PyTorch")
@@ -179,35 +229,53 @@ def try_build(orig_net, make_fp32_net, log=print):
             return None
         root = cache_dir()
         root.mkdir(parents=True, exist_ok=True)
-        onnx_path = root / f"cpsam_v2_b{TRT_BATCH}.onnx"
-        if not onnx_path.is_file():
-            t = time.time()
-            _export_onnx(make_fp32_net, onnx_path)
-            log(f"[Cellpose-SAM] exported {onnx_path} in {time.time() - t:.0f}s")
-        engines = root / "trt_engines"
-        engines.mkdir(exist_ok=True)
-        opts = {
-            "device_id": torch.cuda.current_device(),
-            "trt_bf16_enable": True,
-            "trt_engine_cache_enable": True,
-            "trt_engine_cache_path": str(engines),
-            "trt_max_workspace_size": str(TRT_WORKSPACE_GB << 30),
-            "trt_builder_optimization_level": 3,
-        }
-        so = ort.SessionOptions()
-        so.log_severity_level = 3
+        onnx_name = f"cpsam_v2_b{TRT_BATCH}.onnx"
+        ctx_name = f"cpsam_v2_b{TRT_BATCH}_ctx.onnx"
+        device = torch.cuda.current_device()
+        warm = torch.zeros((1, 3, TILE, TILE), device="cuda")
+
         t = time.time()
-        session = ort.InferenceSession(str(onnx_path), so,
-                                       providers=[("TensorrtExecutionProvider", opts), "CUDAExecutionProvider"])
-        if session.get_providers()[0] != "TensorrtExecutionProvider":
-            log("[Cellpose-SAM] TensorRT EP did not load (libraries missing?); using PyTorch")
-            return None
-        trt_net = TrtNet(session, orig_net)
-        trt_net(torch.zeros((1, 3, TILE, TILE), device="cuda"))  # build or load the engine now, not mid-slide
-        log(f"[Cellpose-SAM] TensorRT bf16 engine ready in {time.time() - t:.0f}s (batch {TRT_BATCH})")
-        trt_net._orig = orig_net.cpu()
-        torch.cuda.empty_cache()
-        return trt_net
+        if (root / ctx_name).is_file():
+            try:
+                with _cwd(root):
+                    session = _session(ort, ctx_name, _trt_options(device, build=False))
+                    if session.get_providers()[0] != "TensorrtExecutionProvider":
+                        raise RuntimeError("TensorRT EP did not load")
+                    trt_net = TrtNet(session, orig_net)
+                    trt_net(warm)
+                log(f"[Cellpose-SAM] TensorRT bf16 engine loaded in {time.time() - t:.1f}s (EPContext, batch {TRT_BATCH})")
+                return _hand_over(trt_net, orig_net, torch)
+            except Exception as e:
+                log(f"[Cellpose-SAM] EPContext model unusable ({type(e).__name__}: {e}); rebuilding the engine")
+                (root / ctx_name).unlink(missing_ok=True)
+
+        if not (root / onnx_name).is_file():
+            t = time.time()
+            _export_onnx(make_fp32_net, root / onnx_name)
+            log(f"[Cellpose-SAM] exported {root / onnx_name} in {time.time() - t:.0f}s")
+        # TRT EP writes the EPContext model only when it builds an engine, so start
+        # from an empty engine dir.
+        import shutil
+        shutil.rmtree(root / ENGINE_DIR, ignore_errors=True)
+        (root / ENGINE_DIR).mkdir()
+        t = time.time()
+        with _cwd(root):
+            session = _session(ort, onnx_name, _trt_options(device, build=True, dump_ctx=ctx_name))
+            if session.get_providers()[0] != "TensorrtExecutionProvider":
+                log("[Cellpose-SAM] TensorRT EP did not load (libraries missing?); using PyTorch")
+                return None
+            trt_net = TrtNet(session, orig_net)
+            trt_net(warm)  # build the engine now, not mid-slide
+        log(f"[Cellpose-SAM] TensorRT bf16 engine built in {time.time() - t:.0f}s (batch {TRT_BATCH}); "
+            f"EPContext {'written' if (root / ctx_name).is_file() else 'NOT written'}")
+        return _hand_over(trt_net, orig_net, torch)
     except Exception as e:  # any failure: stay on PyTorch rather than fail the run
         log(f"[Cellpose-SAM] TensorRT unavailable ({type(e).__name__}: {e}); using PyTorch")
         return None
+
+
+def _hand_over(trt_net, orig_net, torch):
+    """TensorRT runs the net from now on: free the PyTorch weights' GPU memory."""
+    trt_net._orig = orig_net.cpu()
+    torch.cuda.empty_cache()
+    return trt_net
