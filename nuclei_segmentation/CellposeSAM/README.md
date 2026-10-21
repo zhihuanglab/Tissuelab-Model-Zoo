@@ -28,6 +28,22 @@ userData (from the Cell Segmentation panel):
   segment only that region; tiles outside it are skipped and cells whose
   centre falls outside it are dropped. `bbox` wins when both are set.
 
+## TensorRT
+
+On Linux / Windows with CUDA and `onnxruntime-gpu` + `tensorrt` installed, the
+SAM encoder runs as a bf16 TensorRT engine (ONNX Runtime TensorRT EP), ~40%
+faster than PyTorch with the same cells (3000x3000 IHC image on an H200: 6.6 s
+-> 4.1 s, ~4.4 GB GPU memory). fp16 is not used: it loses ~4% of the cells.
+
+- First use exports `cache/cpsam_v2_b16.onnx` and builds the engine in
+  `cache/trt_engines/` (~90 s); later processes load them (~25 s, once per
+  node process; the model stays loaded between runs).
+- `CELLPOSE_SAM_CACHE` moves the cache; `CELLPOSE_SAM_TRT=0` forces PyTorch.
+- Missing CUDA / packages, or any build failure, falls back to PyTorch.
+- On Linux the node re-execs itself once to put the TensorRT / CUDA wheel
+  libraries on `LD_LIBRARY_PATH` (TissueLab may start it without them).
+- The PyInstaller specs do not bundle TensorRT; frozen builds run PyTorch.
+
 ## Output (`Cell-Segmentation`)
 
 - `centroids` (N, 2) and `contours` (N, 32, 2), level-0 pixels

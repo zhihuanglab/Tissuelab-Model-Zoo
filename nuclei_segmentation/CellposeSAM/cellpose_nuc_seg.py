@@ -15,6 +15,7 @@ from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFil
 import tiffslide
 import torch
 from scipy.ndimage import find_objects
+import cpsam_trt
 
 opj = os.path.join
 
@@ -37,6 +38,34 @@ MIN_CELL_AREA_PX = 50
 PLAIN_IMAGE_MPP = 0.5
 # Resolution the settings above are in; userData target_mpp overrides it.
 PROCESSING_MPP = 0.5
+
+
+# Cellpose's default batch of 256x256 tiles on the PyTorch path.
+TORCH_BATCH = 8
+
+# One model per process: the node serves many runs, and loading the 1.2 GB
+# weights (or the TensorRT engine) every run would dominate small images.
+_MODEL = None
+_MODEL_BATCH = TORCH_BATCH
+
+
+def get_model(use_gpu):
+    """(CellposeModel, batch size) for this process, with the TensorRT net
+    swapped in when it is available."""
+    global _MODEL, _MODEL_BATCH
+    if _MODEL is None:
+        print(f"Loading Cellpose-SAM model: {CELLPOSE_MODEL}")
+        model = CellposeModel(gpu=use_gpu, pretrained_model=CELLPOSE_MODEL)
+        if use_gpu:
+            trt_net = cpsam_trt.try_build(
+                model.net,
+                lambda: CellposeModel(gpu=True, pretrained_model=CELLPOSE_MODEL, use_bfloat16=False).net,
+            )
+            if trt_net is not None:
+                model.net = trt_net
+                _MODEL_BATCH = trt_net.batch_size
+        _MODEL = model
+    return _MODEL, _MODEL_BATCH
 
 
 def parse_roi(args):
@@ -98,8 +127,7 @@ class SlideSegmentation():
         
         self.wsi_mask = self.simple_get_mask()
         
-        print(f"Loading Cellpose-SAM model: {CELLPOSE_MODEL}")
-        self.model = CellposeModel(gpu=use_gpu, pretrained_model=CELLPOSE_MODEL)
+        self.model, self.batch_size = get_model(use_gpu)
         
         self.diameter = CELL_DIAMETER_PX
         self.flow_threshold = FLOW_THRESHOLD
@@ -484,6 +512,7 @@ class SlideSegmentation():
             normalize=True,
             tile_overlap=0.1,
             resample=True,
+            batch_size=self.batch_size,
         )
         
         # Convert to StarDist format
