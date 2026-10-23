@@ -44,6 +44,11 @@ the export folds it into q and k (`_fusable_attention`, exact in fp32): 83 ->
 
 Cells agree with Cellpose's own eval to 99.7-99.9% of centroids within 1 px.
 
+Without TensorRT (PyTorch on CUDA / MPS) the same folded attention runs through
+`scaled_dot_product_attention` (`use_fused_attention`): 59.6 -> 33.3 ms per 8
+tiles, 3.9 s -> 2.3 s per 3000x3000 image on an H200, 99.7-99.8% of centroids
+within 1 px. `CELLPOSE_SAM_FUSED_ATTENTION=0` keeps SAM's attention.
+
 - First use exports `cache/cpsam_v2_fa2_dyn16.onnx` (batch 1-16: a tile's
   last, partial batch runs only its real tiles), builds the engine in
   `cache/trt_ep_ctx_engines/` (~60-90 s) and writes the EPContext model

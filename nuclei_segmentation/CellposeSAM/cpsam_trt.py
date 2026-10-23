@@ -177,9 +177,26 @@ def _fusable_attention(self, x):
     if q.shape[-1] != C:
         # Zero-pad v to q/k's width: fused attention kernels want one head size.
         v = torch.cat((v, v.new_zeros(*v.shape[:-1], q.shape[-1] - C)), dim=-1)
-    attn = (q @ k.transpose(-2, -1)).softmax(dim=-1)
-    x = (attn @ v)[..., :C].reshape(B, nh, H, W, C).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+    if getattr(self, "_fa_sdpa", False):
+        # PyTorch path: one fused attention call (flash / cuDNN / mem-efficient)
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=1.0)
+    else:
+        # ONNX export: written out, so the exported graph is the plain pattern
+        out = (q @ k.transpose(-2, -1)).softmax(dim=-1) @ v
+    x = out[..., :C].reshape(B, nh, H, W, C).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
     return self.proj(x)
+
+
+def use_fused_attention(net):
+    """PyTorch path: bind _fusable_attention (through scaled_dot_product_attention)
+    to every attention layer of this net. Off with CELLPOSE_SAM_FUSED_ATTENTION=0."""
+    import types
+    if os.environ.get("CELLPOSE_SAM_FUSED_ATTENTION", "1") == "0":
+        return False
+    for blk in net.encoder.blocks:
+        blk.attn._fa_sdpa = True
+        blk.attn.forward = types.MethodType(_fusable_attention, blk.attn)
+    return True
 
 
 def _export_onnx(make_fp32_net, path):

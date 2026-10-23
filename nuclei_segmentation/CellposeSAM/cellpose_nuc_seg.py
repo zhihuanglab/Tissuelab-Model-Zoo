@@ -67,6 +67,8 @@ def get_model(use_gpu):
             if trt_net is not None:
                 model.net = trt_net
                 _MODEL_BATCH = trt_net.batch_size
+            elif cpsam_trt.use_fused_attention(model.net):
+                print("[Cellpose-SAM] PyTorch with fused attention")
         _MODEL = model
     return _MODEL, _MODEL_BATCH
 
