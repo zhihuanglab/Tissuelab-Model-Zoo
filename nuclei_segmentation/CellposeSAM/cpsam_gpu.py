@@ -28,7 +28,9 @@ TILE_OVERLAP = 0.1
 
 
 def enabled(model):
-    return os.environ.get("CELLPOSE_SAM_GPU_PIPELINE", "1") != "0" and model.device.type in ("cuda", "mps")
+    # CUDA only: the pipeline keeps Cellpose's float64 steps (quantiles, tile
+    # taper and weights) for identical output, and MPS has no float64.
+    return os.environ.get("CELLPOSE_SAM_GPU_PIPELINE", "1") != "0" and model.device.type == "cuda"
 
 
 def _quantile_u8(v, q):

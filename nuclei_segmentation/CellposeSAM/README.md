@@ -71,7 +71,8 @@ within 1 px. `CELLPOSE_SAM_FUSED_ATTENTION=0` keeps SAM's attention.
 `CellposeModel.eval` runs only the network on the GPU; the normalization, the
 1.5x resize, the tiling, the tile averaging and the resize back run in numpy /
 OpenCV and allocate a few GB per eval. `cpsam_gpu.py` reproduces those steps
-in torch on the GPU (CUDA or MPS); the masks are still computed by Cellpose's
+in torch on the GPU (CUDA only: they keep Cellpose's float64 steps, which
+MPS does not support, so on a Mac Cellpose's own eval runs); the masks are still computed by Cellpose's
 `_compute_masks`. Measured on an H200 with the TensorRT engine:
 
 | | Cellpose eval | GPU pipeline |
