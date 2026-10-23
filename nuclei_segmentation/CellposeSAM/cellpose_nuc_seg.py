@@ -404,88 +404,118 @@ class SlideSegmentation():
             masks = np.squeeze(masks)
 
         labels_img = masks.astype(np.int32)
-        points = []
-        coord = []
-        prob = []
-        
-        # One bounding box per label (find_objects), so each cell is measured on
-        # its own few pixels rather than by comparing the whole tile per label.
-        for label, sl in enumerate(find_objects(labels_img), start=1):
-            if sl is None:
-                continue
-            # 1 px margin so a contour touching the box edge is still closed.
-            y0, y1 = max(0, sl[0].start - 1), min(labels_img.shape[0], sl[0].stop + 1)
-            x0, x1 = max(0, sl[1].start - 1), min(labels_img.shape[1], sl[1].stop + 1)
-            cell_mask = labels_img[y0:y1, x0:x1] == label
-            
-            # Get centroid
-            y_coords, x_coords = np.nonzero(cell_mask)
-            if len(x_coords) < self.min_cell_area:
-                continue
-                
-            centroid_x = np.mean(x_coords) + x0
-            centroid_y = np.mean(y_coords) + y0
-            points.append([centroid_x, centroid_y])
-            
-            # Get contour
-            contours, _ = cv2.findContours(cell_mask.astype(np.uint8), 
-                                          cv2.RETR_EXTERNAL, 
-                                          cv2.CHAIN_APPROX_SIMPLE)
-            
-            if contours and len(contours[0]) > 0:
-                contour = contours[0].squeeze()
-                if len(contour.shape) == 1:  # Handle single point
-                    contour = contour.reshape(1, 2)
-                
-                # Ensure contour is float for interpolation; back to tile coordinates
-                contour = contour.astype(np.float32) + np.array([x0, y0], dtype=np.float32)
-                
-                # Pad or downsample contour to global_max_contour_points
-                if len(contour) < self.global_max_contour_points:
-                    # Interpolate points along the contour
-                    if len(contour) > 1:
-                        # Close the contour for smooth interpolation
-                        contour_closed = np.vstack([contour, contour[0]])
-                        
-                        # Calculate cumulative distances
-                        diffs = np.diff(contour_closed, axis=0)
-                        distances = np.cumsum(np.sqrt(np.sum(diffs**2, axis=1)))
-                        distances = np.insert(distances, 0, 0)
-                        
-                        # Create evenly spaced points
-                        alpha = np.linspace(0, distances[-1], self.global_max_contour_points + 1)[:-1]
-                        
-                        # Interpolate x and y separately
-                        cx = np.interp(alpha, distances, contour_closed[:, 0])
-                        cy = np.interp(alpha, distances, contour_closed[:, 1])
-                        contour_padded = np.column_stack([cx, cy])
-                    else:
-                        # Single point - just repeat it
-                        contour_padded = np.repeat(contour, self.global_max_contour_points, axis=0)
-                else:
-                    # Downsample if too many points
-                    indices = np.round(np.linspace(0, len(contour) - 1, self.global_max_contour_points)).astype(int)
-                    contour_padded = contour[indices]
-                
-                coord.append(contour_padded)
-                
-                # Estimate probability based on cell area
-                area = cv2.contourArea(contour.reshape(-1, 1, 2))
-                expected_area = np.pi * (self.diameter/2)**2 if self.diameter else 500
-                area_ratio = min(area / expected_area, expected_area / area) if area > 0 else 0.1
-                cell_prob = area_ratio * 0.9 + 0.1  # Scale to 0.1-1.0 range
-                prob.append(min(1.0, cell_prob))
-            else:
-                # Fallback if no contour found
-                fallback_contour = np.repeat([[centroid_x, centroid_y]], self.global_max_contour_points, axis=0)
-                coord.append(fallback_contour)
-                prob.append(0.5)
-        
-        # Convert to numpy arrays with consistent shape
-        points = np.array(points, dtype=np.float32) if points else np.empty((0, 2), dtype=np.float32)
-        coord = np.array(coord, dtype=np.float32) if coord else np.empty((0, self.global_max_contour_points, 2), dtype=np.float32)
-        prob = np.array(prob, dtype=np.float32) if prob else np.empty((0,), dtype=np.float32)
-        
+        n_pts = self.global_max_contour_points
+        empty = (np.empty((0, 2), dtype=np.float32),
+                 np.empty((0, n_pts, 2), dtype=np.float32),
+                 np.empty((0,), dtype=np.float32))
+        slices = find_objects(labels_img)
+        if not slices:
+            return empty
+
+        # Per-label boxes, indexed by label (row 0 = background).
+        box = np.zeros((len(slices) + 1, 4), dtype=np.int64)
+        box[1:] = [(s[0].start, s[0].stop, s[1].start, s[1].stop) if s is not None else (0, 0, 0, 0)
+                   for s in slices]
+        ys, xs = np.nonzero(labels_img > 0)
+        labs = labels_img[ys, xs]
+        area = np.bincount(labs, minlength=len(box))
+        keep = area >= self.min_cell_area
+        keep[0] = False
+        sel = np.flatnonzero(keep)
+        if not len(sel):
+            return empty
+        on = keep[labs]
+        ys, xs, labs = ys[on], xs[on], labs[on]
+
+        # Centroids: mean of the box-local coordinates plus the box origin (the
+        # same 1 px margin, clamped at the tile edge, the per-cell crop used).
+        y0 = np.maximum(box[:, 0] - 1, 0)
+        x0 = np.maximum(box[:, 2] - 1, 0)
+        n = area[sel]
+        cx = np.bincount(labs, weights=xs - x0[labs], minlength=len(box))[sel] / n + x0[sel]
+        cy = np.bincount(labs, weights=ys - y0[labs], minlength=len(box))[sel] / n + y0[sel]
+        points = np.stack([cx, cy], axis=1).astype(np.float32)
+
+        # Contours: copy every cell into its own slot of one "atlas" image, with a
+        # zero border around each slot so cells never touch, and trace them all in
+        # a single findContours call. Each cell's contour is then exactly the one
+        # its own crop gives (OpenCV pads the crop with zeros the same way).
+        h = box[sel, 1] - box[sel, 0] + 2
+        w = box[sel, 3] - box[sel, 2] + 2
+        atlas_w = max(2048, int(w.max()))
+        ox = np.empty_like(w)
+        oy = np.empty_like(h)
+        x = y = row_h = 0
+        for i, (hi, wi) in enumerate(zip(h.tolist(), w.tolist())):
+            if x + wi > atlas_w:
+                y, x, row_h = y + row_h, 0, 0
+            ox[i], oy[i] = x, y
+            x += wi
+            row_h = max(row_h, hi)
+        sx = np.zeros(len(box), dtype=np.int64)
+        sy = np.zeros(len(box), dtype=np.int64)
+        sx[sel] = ox + 1 - box[sel, 2]
+        sy[sel] = oy + 1 - box[sel, 0]
+        atlas = np.zeros((y + row_h, atlas_w), dtype=np.int32)
+        atlas[ys + sy[labs], xs + sx[labs]] = labs
+        contours, _ = cv2.findContours((atlas > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        first = np.array([c[0, 0] for c in contours])
+        owner = atlas[first[:, 1], first[:, 0]]
+        # A cell split into pieces has several contours; keep the first, as the
+        # per-cell call did (output order within a slot is the same).
+        _, pick = np.unique(owner, return_index=True)
+        chosen = [contours[i] for i in pick]
+        lens = np.array([len(c) for c in chosen])
+        starts = np.concatenate([[0], np.cumsum(lens)[:-1]])
+        rep = np.repeat(sel, lens)
+        pts = np.concatenate(chosen).reshape(-1, 2).astype(np.int64)
+        pts = np.stack([pts[:, 0] - sx[rep], pts[:, 1] - sy[rep]], axis=1).astype(np.float32)
+
+        coord = np.empty((len(sel), n_pts, 2), dtype=np.float32)
+        # Long contours: pick n_pts evenly spaced vertices.
+        a = np.flatnonzero(lens >= n_pts)
+        if len(a):
+            idx = np.round(np.linspace(0, lens[a] - 1, n_pts, axis=1)).astype(int)
+            coord[a] = pts[starts[a, None] + idx]
+        # Short contours: resample the closed polygon at n_pts equal arc-length
+        # steps (np.interp, written out per row so all cells go at once).
+        b = np.flatnonzero((lens > 1) & (lens < n_pts))
+        if len(b):
+            nb = lens[b]
+            k = np.arange(nb.max() + 1)
+            closed = pts[starts[b, None] + np.where(k < nb[:, None], k, 0)]
+            seg = np.sqrt(np.sum(np.diff(closed, axis=1) ** 2, axis=2))
+            dist = np.concatenate([np.zeros((len(b), 1), dtype=np.float32), np.cumsum(seg, axis=1)], axis=1)
+            rows = np.arange(len(b))[:, None]
+            alpha = np.linspace(0, dist[rows[:, 0], nb], n_pts + 1, axis=1)[:, :-1].astype(np.float64)
+            xp = dist.astype(np.float64)
+            xp[k > nb[:, None]] = np.inf
+            j = (xp[:, None, :] <= alpha[:, :, None]).sum(axis=2) - 1
+            jl = np.minimum(j, nb[:, None] - 1)
+            xl, xr = xp[rows, jl], xp[rows, jl + 1]
+            for c in (0, 1):
+                fl = closed[rows, jl, c].astype(np.float64)
+                fr = closed[rows, jl + 1, c].astype(np.float64)
+                val = (fr - fl) / (xr - xl) * (alpha - xl) + fl
+                val = np.where(alpha == xl, fl, val)
+                coord[b, :, c] = np.where(j >= nb[:, None], closed[rows, nb[:, None], c], val)
+        # Single-vertex contour: repeat it.
+        s = np.flatnonzero(lens == 1)
+        if len(s):
+            coord[s] = pts[starts[s], None]
+
+        # Probability from the polygon area (shoelace, as cv2.contourArea; the
+        # sums are exact in float64, so the order does not matter).
+        prev = np.arange(len(pts)) - 1
+        prev[starts] = starts + lens - 1
+        p = pts.astype(np.float64)
+        q = p[prev]
+        poly_area = np.abs(np.add.reduceat(q[:, 0] * p[:, 1] - q[:, 1] * p[:, 0], starts) * 0.5)
+        expected_area = np.pi * (self.diameter/2)**2 if self.diameter else 500
+        with np.errstate(divide='ignore'):
+            area_ratio = np.where(poly_area > 0, np.minimum(poly_area / expected_area, expected_area / poly_area), 0.1)
+        prob = np.minimum(1.0, area_ratio * 0.9 + 0.1).astype(np.float32)
+
         return points, coord, prob
 
     def predict_cellpose(self, img_np):

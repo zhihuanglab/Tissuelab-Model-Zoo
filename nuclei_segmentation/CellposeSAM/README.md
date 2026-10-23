@@ -41,6 +41,7 @@ the export folds it into q and k (`_fusable_attention`, exact in fp32): 83 ->
 | Cellpose eval, unfused engine | 5.6-6.0 s | 455 s |
 | GPU pipeline + overlap, unfused | 3.2-3.4 s | 214 s |
 | + batch 1-16, fused attention | 1.5 s | 114 s |
+| + all contours in one findContours call | 1.5 s | 110 s |
 
 Cells agree with Cellpose's own eval to 99.7-99.9% of centroids within 1 px.
 
