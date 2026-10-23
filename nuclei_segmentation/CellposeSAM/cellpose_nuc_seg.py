@@ -531,10 +531,11 @@ class SlideSegmentation():
         masks = self.predict_masks(img_np)
         return self.cellpose_to_stardist_format(masks, None, masks.shape[:2])
 
-    def predict_masks(self, img_np, fill_holes=True):
+    def predict_masks(self, img_np, fill_holes=True, tissue=None):
         """Cellpose-SAM label image of an (H, W, C) patch. fill_holes=False
         skips the final hole filling / small-mask removal where the GPU path
-        can (the caller then runs finish_masks)."""
+        can (the caller then runs finish_masks). tissue: the patch's tissue
+        mask; the GPU path skips network tiles that see none."""
         # Cellpose 4 wants a 3-channel image.
         if img_np.ndim == 2:
             img_np = np.stack([img_np] * 3, axis=-1)
@@ -555,6 +556,7 @@ class SlideSegmentation():
                 cellprob_threshold=self.cellprob_threshold,
                 batch_size=self.batch_size,
                 fill_holes=fill_holes,
+                tissue=tissue,
             )
         else:
             masks, _, _ = self.model.eval(
@@ -609,7 +611,12 @@ class SlideSegmentation():
         if n_dark_pixels < 50:
             print(f"Tile r{job['ir']} c{job['ic']} is mostly white, skipping")
             return None
-        return {**job, "img": img_np, "sx_0": x_0, "sy_0": y_0, "w_col": x_1 - x_0, "h_row": y_1 - y_0}
+        tissue = None
+        if self.wsi_mask is not None:
+            tissue = self.wsi_mask[int(job["y_0"] / self.mask_ratio_y):int(job["y_1"] / self.mask_ratio_y),
+                                   int(job["x_0"] / self.mask_ratio_x):int(job["x_1"] / self.mask_ratio_x)]
+        return {**job, "img": img_np, "tissue": tissue,
+                "sx_0": x_0, "sy_0": y_0, "w_col": x_1 - x_0, "h_row": y_1 - y_0}
 
     @staticmethod
     def finish_masks(masks):
@@ -820,7 +827,7 @@ class SlideSegmentation():
                 if tile is None:
                     continue
                 # hole filling (CPU) moves to the post thread with the cell extraction
-                masks = self.predict_masks(tile["img"], fill_holes=False)
+                masks = self.predict_masks(tile["img"], fill_holes=False, tissue=tile["tissue"])
                 tile_results.append(post.submit(self._post_tile, tile, masks))
             for future in tile_results:
                 self._maybe_cancel()

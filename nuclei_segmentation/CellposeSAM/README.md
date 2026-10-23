@@ -42,6 +42,7 @@ the export folds it into q and k (`_fusable_attention`, exact in fp32): 83 ->
 | GPU pipeline + overlap, unfused | 3.2-3.4 s | 214 s |
 | + batch 1-16, fused attention | 1.5 s | 114 s |
 | + all contours in one findContours call | 1.5 s | 110 s |
+| + skip 256-px tiles off the tissue mask | 1.5 s | 76 s |
 
 Cells agree with Cellpose's own eval to 99.7-99.9% of centroids within 1 px.
 
@@ -79,6 +80,12 @@ in torch on the GPU (CUDA or MPS); the masks are still computed by Cellpose's
 99.6-99.8% of the centroids agree within 1 px (bilinear resampling and the
 summation order differ slightly). With the PyTorch net: 6.9-7.4 s -> 4.4-4.6 s.
 `CELLPOSE_SAM_GPU_PIPELINE=0` falls back to `CellposeModel.eval`.
+
+On whole slides only the 256-px network tiles whose footprint (plus one mask
+pixel) touches the slide's tissue mask are run; the others would only yield
+cells the tissue filter drops. Output is unchanged on CMU-1 and TCGA-AD-6548
+(identical arrays); CMU-1 110 -> 76 s, TCGA-AD-6548 41 -> 36 s.
+`CELLPOSE_SAM_SKIP_BLANK_TILES=0` runs every tile.
 
 ## Output (`Cell-Segmentation`)
 

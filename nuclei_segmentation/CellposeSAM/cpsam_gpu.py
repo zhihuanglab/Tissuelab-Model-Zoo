@@ -85,10 +85,30 @@ def _tile_weights(Ly, Lx, by, bx, ystart, xstart, mask):
     return _WEIGHTS[key]
 
 
-def run_net(net, img, rescale, batch_size):
+def _tiles_on_tissue(tissue, origins, by, bx, ypad1, xpad1, Lyr, Lxr):
+    """Which tiles see tissue: each tile's footprint, as a fraction of the
+    image, on the (coarse) tissue mask of the image, grown by one mask pixel."""
+    th, tw = tissue.shape
+    ii = np.pad(np.cumsum(np.cumsum(tissue, 0, dtype=np.int64), 1), ((1, 0), (1, 0)))
+    keep = []
+    for y0, x0 in origins:
+        a = max(int(np.floor((y0 - ypad1) / Lyr * th)) - 1, 0)
+        b = min(int(np.ceil((y0 + by - ypad1) / Lyr * th)) + 1, th)
+        c = max(int(np.floor((x0 - xpad1) / Lxr * tw)) - 1, 0)
+        d = min(int(np.ceil((x0 + bx - xpad1) / Lxr * tw)) + 1, tw)
+        keep.append(b > a and d > c and ii[b, d] - ii[a, d] - ii[b, c] + ii[a, c] > 0)
+    return keep
+
+
+def run_net(net, img, rescale, batch_size, tissue=None):
     """core.run_net + the resample step of CellposeModel._run_net for one
     normalized (3, Ly0, Lx0) image. Returns dP (2, Ly0, Lx0) and cellprob
-    (Ly0, Lx0), on the GPU."""
+    (Ly0, Lx0), on the GPU.
+
+    tissue: optional bool mask of the image (any resolution). Tiles that see no
+    tissue are not run; pixels only they cover get zero flows and cellprob
+    (background), the rest are averaged over the tiles that ran.
+    CELLPOSE_SAM_SKIP_BLANK_TILES=0 runs every tile."""
     _, Ly0, Lx0 = img.shape
     Lyr, Lxr = int(Ly0 * rescale), int(Lx0 * rescale)
     ypad1, ypad2, xpad1, xpad2 = transforms.get_pad_yx(Lyr, Lxr, min_size=(BSIZE, BSIZE))
@@ -100,7 +120,19 @@ def run_net(net, img, rescale, batch_size):
 
     mask = torch.from_numpy(transforms._taper_mask(ly=by, lx=bx)).to(img.device)  # float64, as in average_tiles
     yf = torch.zeros((3, Ly, Lx), device=img.device, dtype=torch.float32)
-    navg = _tile_weights(Ly, Lx, by, bx, ystart, xstart, mask)
+    keep = None
+    if tissue is not None and os.environ.get("CELLPOSE_SAM_SKIP_BLANK_TILES", "1") != "0":
+        keep = _tiles_on_tissue(np.asarray(tissue, dtype=bool), origins, by, bx, ypad1, xpad1, Lyr, Lxr)
+        if all(keep):
+            keep = None
+    if keep is None:
+        navg = _tile_weights(Ly, Lx, by, bx, ystart, xstart, mask)
+    else:
+        origins = [o for o, k in zip(origins, keep) if k]
+        navg = torch.zeros((Ly, Lx), device=img.device, dtype=torch.float64)
+        for y0, x0 in origins:
+            navg[y0:y0 + by, x0:x0 + bx] += mask
+        navg[navg == 0] = 1  # covered by no tile that ran: yf stays 0
     dtype = getattr(net, "dtype", torch.float32)
     net.eval()  # as core._forward: CPSAM in training mode takes its stochastic-depth branch
     with torch.no_grad():
@@ -232,14 +264,15 @@ def compute_masks(dP, cellprob, niter, cellprob_threshold, flow_threshold, min_s
     return utils.fill_holes_and_remove_small_masks(mask, min_size=min_size) if fill_holes else mask
 
 
-def eval_masks(model, img_np, diameter, flow_threshold, cellprob_threshold, batch_size, fill_holes=True):
+def eval_masks(model, img_np, diameter, flow_threshold, cellprob_threshold, batch_size, fill_holes=True,
+               tissue=None):
     """masks of one (Ly, Lx, 3) uint8 image, as model.eval(img_np, diameter=...,
     flow_threshold=..., cellprob_threshold=..., normalize=True, tile_overlap=0.1,
-    resample=True, batch_size=...) returns them."""
+    resample=True, batch_size=...) returns them (tissue: see run_net)."""
     device = model.device
     img = torch.from_numpy(np.ascontiguousarray(img_np)).to(device)
     rescale = 30. / diameter if diameter else 1.0
-    dP, cellprob = run_net(model.net, _normalize(img), rescale, batch_size)
+    dP, cellprob = run_net(model.net, _normalize(img), rescale, batch_size, tissue)
     niter = int(200 / rescale)  # eval(): niter_scale = rescale when resample
     if os.environ.get("CELLPOSE_SAM_GPU_MASKS", "1") != "0":
         return compute_masks(dP, cellprob, niter, cellprob_threshold, flow_threshold, fill_holes=fill_holes)
