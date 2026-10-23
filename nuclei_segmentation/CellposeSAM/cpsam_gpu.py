@@ -67,6 +67,24 @@ def _tile_starts(L, bsize):
     return np.linspace(0, L - b, n).astype(int), b
 
 
+_WEIGHTS = {}
+
+
+def _tile_weights(Ly, Lx, by, bx, ystart, xstart, mask):
+    """average_tiles' Navg (summed taper per pixel), which depends only on the
+    tile layout: computed once per layout, in the same order."""
+    key = (Ly, Lx, by, bx, mask.device)
+    if key not in _WEIGHTS:
+        navg = torch.zeros((Ly, Lx), device=mask.device, dtype=torch.float64)
+        for y0 in ystart:
+            for x0 in xstart:
+                navg[y0:y0 + by, x0:x0 + bx] += mask
+        if len(_WEIGHTS) > 16:  # a slide has a few tile sizes (interior, edges)
+            _WEIGHTS.clear()
+        _WEIGHTS[key] = navg
+    return _WEIGHTS[key]
+
+
 def run_net(net, img, rescale, batch_size):
     """core.run_net + the resample step of CellposeModel._run_net for one
     normalized (3, Ly0, Lx0) image. Returns dP (2, Ly0, Lx0) and cellprob
@@ -82,18 +100,18 @@ def run_net(net, img, rescale, batch_size):
 
     mask = torch.from_numpy(transforms._taper_mask(ly=by, lx=bx)).to(img.device)  # float64, as in average_tiles
     yf = torch.zeros((3, Ly, Lx), device=img.device, dtype=torch.float32)
-    navg = torch.zeros((Ly, Lx), device=img.device, dtype=torch.float64)
+    navg = _tile_weights(Ly, Lx, by, bx, ystart, xstart, mask)
     dtype = getattr(net, "dtype", torch.float32)
     net.eval()  # as core._forward: CPSAM in training mode takes its stochastic-depth branch
     with torch.no_grad():
         for j in range(0, len(origins), batch_size):
             batch = origins[j:j + batch_size]
             X = torch.stack([imgb[:, y0:y0 + by, x0:x0 + bx] for y0, x0 in batch])
-            y = net(X.to(dtype))[0].float()
+            # average_tiles: float32 accumulator += float32 tile * float64 taper,
+            # the products for the whole batch at once, the sums in tile order
+            y = (net(X.to(dtype))[0].float() * mask).float()
             for (y0, x0), yt in zip(batch, y):
-                # average_tiles: float32 accumulator += float32 tile * float64 taper
-                yf[:, y0:y0 + by, x0:x0 + bx] += (yt * mask).float()
-                navg[y0:y0 + by, x0:x0 + bx] += mask
+                yf[:, y0:y0 + by, x0:x0 + bx] += yt
     yf = (yf / navg).float()[:, ypad1:Ly - ypad2, xpad1:Lx - xpad2]
     yf = _resize(yf, Ly0, Lx0)  # resample=True: flows back to the input size
     return yf[:2], yf[2]
@@ -192,10 +210,13 @@ def _remove_bad_flow_masks(masks, dP, threshold):
     return masks
 
 
-def compute_masks(dP, cellprob, niter, cellprob_threshold, flow_threshold, min_size=15, max_size_fraction=0.4):
+def compute_masks(dP, cellprob, niter, cellprob_threshold, flow_threshold, min_size=15, max_size_fraction=0.4,
+                  fill_holes=True):
     """dynamics.resize_and_compute_masks (2D, resize=None) with the flow
     following and the flow-error QC on the GPU; seeds (get_masks_torch) and the
-    hole filling stay Cellpose's own. dP (2, Ly, Lx), cellprob (Ly, Lx) on the GPU."""
+    hole filling stay Cellpose's own. dP (2, Ly, Lx), cellprob (Ly, Lx) on the GPU.
+    fill_holes=False leaves the (CPU-only) last step, fill_holes_and_remove_small_masks,
+    to the caller, e.g. a thread that is not feeding the GPU."""
     from cellpose import dynamics, utils
     fg = cellprob > cellprob_threshold
     if not bool(fg.any()):
@@ -208,10 +229,10 @@ def compute_masks(dP, cellprob, niter, cellprob_threshold, flow_threshold, min_s
         mask = _remove_bad_flow_masks(mask, dP, flow_threshold)
     if mask.max() < 2 ** 16 and mask.dtype != "uint16":
         mask = mask.astype("uint16")
-    return utils.fill_holes_and_remove_small_masks(mask, min_size=min_size)
+    return utils.fill_holes_and_remove_small_masks(mask, min_size=min_size) if fill_holes else mask
 
 
-def eval_masks(model, img_np, diameter, flow_threshold, cellprob_threshold, batch_size):
+def eval_masks(model, img_np, diameter, flow_threshold, cellprob_threshold, batch_size, fill_holes=True):
     """masks of one (Ly, Lx, 3) uint8 image, as model.eval(img_np, diameter=...,
     flow_threshold=..., cellprob_threshold=..., normalize=True, tile_overlap=0.1,
     resample=True, batch_size=...) returns them."""
@@ -221,7 +242,7 @@ def eval_masks(model, img_np, diameter, flow_threshold, cellprob_threshold, batc
     dP, cellprob = run_net(model.net, _normalize(img), rescale, batch_size)
     niter = int(200 / rescale)  # eval(): niter_scale = rescale when resample
     if os.environ.get("CELLPOSE_SAM_GPU_MASKS", "1") != "0":
-        return compute_masks(dP, cellprob, niter, cellprob_threshold, flow_threshold)
+        return compute_masks(dP, cellprob, niter, cellprob_threshold, flow_threshold, fill_holes=fill_holes)
     Ly0, Lx0 = img_np.shape[:2]
     masks = model._compute_masks(
         (1, Ly0, Lx0, 3),

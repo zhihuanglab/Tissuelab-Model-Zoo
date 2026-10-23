@@ -17,6 +17,7 @@ from scipy.ndimage import find_objects
 from concurrent.futures import ThreadPoolExecutor
 import cpsam_trt
 import cpsam_gpu
+from cellpose import utils
 
 opj = os.path.join
 
@@ -500,8 +501,10 @@ class SlideSegmentation():
         masks = self.predict_masks(img_np)
         return self.cellpose_to_stardist_format(masks, None, masks.shape[:2])
 
-    def predict_masks(self, img_np):
-        """Cellpose-SAM label image of an (H, W, C) patch."""
+    def predict_masks(self, img_np, fill_holes=True):
+        """Cellpose-SAM label image of an (H, W, C) patch. fill_holes=False
+        skips the final hole filling / small-mask removal where the GPU path
+        can (the caller then runs finish_masks)."""
         # Cellpose 4 wants a 3-channel image.
         if img_np.ndim == 2:
             img_np = np.stack([img_np] * 3, axis=-1)
@@ -521,6 +524,7 @@ class SlideSegmentation():
                 flow_threshold=self.flow_threshold,
                 cellprob_threshold=self.cellprob_threshold,
                 batch_size=self.batch_size,
+                fill_holes=fill_holes,
             )
         else:
             masks, _, _ = self.model.eval(
@@ -577,9 +581,16 @@ class SlideSegmentation():
             return None
         return {**job, "img": img_np, "sx_0": x_0, "sy_0": y_0, "w_col": x_1 - x_0, "h_row": y_1 - y_0}
 
+    @staticmethod
+    def finish_masks(masks):
+        """Cellpose's last mask step, fill_holes_and_remove_small_masks (CPU);
+        a no-op on masks that already had it."""
+        return utils.fill_holes_and_remove_small_masks(masks, min_size=15)
+
     def _post_tile(self, tile, masks):
         """Cells of one tile's label image, in processing-magnification
         coordinates of the whole slide (post thread). None when it has none."""
+        masks = self.finish_masks(masks)
         points, coord, prob = self.cellpose_to_stardist_format(masks, None, masks.shape[:2])
         w_col, h_row = tile["w_col"], tile["h_row"]
         if self.wsi_mask is not None and len(points) > 0:
@@ -778,7 +789,8 @@ class SlideSegmentation():
                 tile = pending_reads.pop(k).result()
                 if tile is None:
                     continue
-                masks = self.predict_masks(tile["img"])
+                # hole filling (CPU) moves to the post thread with the cell extraction
+                masks = self.predict_masks(tile["img"], fill_holes=False)
                 tile_results.append(post.submit(self._post_tile, tile, masks))
             for future in tile_results:
                 self._maybe_cancel()
