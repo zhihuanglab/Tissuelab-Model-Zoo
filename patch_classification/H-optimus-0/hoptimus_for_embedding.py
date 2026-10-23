@@ -355,7 +355,8 @@ def _saturation_texture_mask(rgb, um_px):
     # Pixel must be darker than glass, so the std window does not bleed into
     # glass at tissue edges or inside narrow lumens.
     white = np.median(rgb[bg].reshape(-1, 3), axis=0).astype(np.float32)
-    od = (-np.log((rgb.astype(np.float32) + 1) / (white + 1))).clip(0).max(-1)
+    lut = (-np.log((np.arange(256, dtype=np.float32)[:, None] + 1) / (white + 1))).clip(0)
+    od = np.maximum(np.maximum(lut[rgb[..., 0], 0], lut[rgb[..., 1], 1]), lut[rgb[..., 2], 2])
     od_s = cv2.GaussianBlur(od, (_odd(16 / um_px),) * 2, 0)
     o_med = np.median(od_s[bg])
     o_mad = np.median(np.abs(od_s[bg] - o_med)) + 1e-4
@@ -401,7 +402,16 @@ def _fill_non_glass_holes(mask, od_s, t_od, small_frac=0.001):
 def _add_pale_tissue(rgb, mask, um_px):
     """Union of the grayscale mask with the saturation/texture mask, then fill
     non-glass holes and drop specks below the original min_area scale."""
-    mask = mask.astype(bool)
+    full = mask.astype(bool)
+    h0, w0 = full.shape
+    # Every scale below is >= ~16 um, so work on <= 4 MP and upsample the result.
+    f = max(1.0, (h0 * w0 / 4e6) ** 0.5)
+    mask = full
+    if f > 1:
+        size = (max(1, int(round(w0 / f))), max(1, int(round(h0 / f))))
+        rgb = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
+        mask = cv2.resize(full.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
+        um_px = um_px * w0 / size[0]
     st_mask, od_s, t_od, sat_s, t_s = _saturation_texture_mask(rgb, um_px)
     # A region that does not touch the grayscale mask must be stained on
     # average; grey dust, out-of-focus smudges and scan edges are not.
@@ -430,9 +440,13 @@ def _add_pale_tissue(rgb, mask, um_px):
     keep[0] = False
     m = _fill_non_glass_holes(mask | keep[lab], od_s, t_od)
     n, lab, st, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
-    keep = st[:, cv2.CC_STAT_AREA] >= min(max(int(0.0005 * h * w), 2000), int(0.002 * h * w))
+    min_area = min(max(0.0005 * h0 * w0, 2000), 0.002 * h0 * w0) * (h * w) / (h0 * w0)
+    keep = st[:, cv2.CC_STAT_AREA] >= min_area
     keep[0] = False
-    return keep[lab].astype(np.uint8)
+    m = keep[lab].astype(np.uint8)
+    if f > 1:
+        m = cv2.resize(m, (w0, h0), interpolation=cv2.INTER_NEAREST)
+    return (full | m.astype(bool)).astype(np.uint8)
 
 
 def _tissue_patch_coords(mask, width, height, patch_size, tissue_threshold):
