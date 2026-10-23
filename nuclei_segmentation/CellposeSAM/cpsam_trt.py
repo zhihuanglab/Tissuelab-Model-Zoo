@@ -5,7 +5,7 @@ than PyTorch bf16 with the same cells (measured on an H200: 3000x3000 IHC image,
 6.6 s -> 4.1 s, 1,566 vs 1,567 cells, 99.8% of centroids within 1 px of fp32).
 fp16 is not an option: it drops ~4% of the cells, in TensorRT as in PyTorch.
 
-On first use the net is exported to ONNX (batch fixed at TRT_BATCH) and a bf16
+On first use the net is exported to ONNX (batch 1..TRT_BATCH) and a bf16
 engine is built (~90 s) along with an EPContext model pointing at it; all are
 cached under the cache directory, so later processes load the EPContext model
 in a second or two (once per node process). Anything missing (CUDA,
@@ -20,6 +20,9 @@ from pathlib import Path
 # A batch of 16 tiles already fills the GPU; larger ones are not faster but need
 # far more memory (bs 64: 10 GB, and no engine at all within a 2 GB workspace).
 TRT_BATCH = 16
+# Engine input batch range (min, opt, max): the last batch of a tile runs only
+# its real tiles (a 2048 tile has 225 = 14 x 16 + 1) instead of padding to 16.
+_PROFILE = "input:{}x3x256x256"
 TRT_WORKSPACE_GB = 2
 ONNX_OPSET = 17
 TILE = 256  # Cellpose's tile size (bsize)
@@ -104,8 +107,8 @@ def ensure_runtime_env():
 
 
 class TrtNet:
-    """Stands in for CellposeModel.net. cellpose.core calls it with a float batch
-    of n <= TRT_BATCH tiles on the GPU and reads the first output (flows)."""
+    """Stands in for CellposeModel.net. Called with a float batch of
+    n <= TRT_BATCH tiles on the GPU; returns the flows of those n tiles."""
 
     def __init__(self, session, orig_net):
         import torch
@@ -125,17 +128,14 @@ class TrtNet:
         import numpy as np
         import torch
         n = X.shape[0]
-        Xp = X.float()
-        if n < TRT_BATCH:
-            Xp = torch.cat([Xp, Xp.new_zeros((TRT_BATCH - n, *Xp.shape[1:]))])
-        Xp = Xp.contiguous()
-        out = torch.empty((TRT_BATCH, 3, TILE, TILE), device=X.device, dtype=torch.float32)
+        Xp = X.float().contiguous()
+        out = torch.empty((n, 3, TILE, TILE), device=X.device, dtype=torch.float32)
         io = self._session.io_binding()
         io.bind_input("input", "cuda", 0, np.float32, tuple(Xp.shape), Xp.data_ptr())
         io.bind_output("flows", "cuda", 0, np.float32, tuple(out.shape), out.data_ptr())
         torch.cuda.synchronize()  # ORT runs on its own stream
         self._session.run_with_iobinding(io)
-        return out[:n], torch.zeros((n, 256), device=X.device)
+        return out, torch.zeros((n, 256), device=X.device)
 
 
 def _export_onnx(make_fp32_net, path):
@@ -155,6 +155,7 @@ def _export_onnx(make_fp32_net, path):
     tmp = path.with_suffix(".onnx.tmp")
     with torch.no_grad():
         torch.onnx.export(Flows(net), (x,), str(tmp), input_names=["input"], output_names=["flows"],
+                          dynamic_axes={"input": {0: "batch"}, "flows": {0: "batch"}},
                           opset_version=ONNX_OPSET, dynamo=False, do_constant_folding=True)
     os.replace(tmp, path)
     del net
@@ -193,6 +194,9 @@ def _trt_options(device_id, build, dump_ctx=None):
         # ORT re-check the engine's tactics.
         opts["trt_max_workspace_size"] = str(TRT_WORKSPACE_GB << 30)
         opts["trt_builder_optimization_level"] = 3
+        opts["trt_profile_min_shapes"] = _PROFILE.format(1)
+        opts["trt_profile_opt_shapes"] = _PROFILE.format(TRT_BATCH)
+        opts["trt_profile_max_shapes"] = _PROFILE.format(TRT_BATCH)
     if dump_ctx:
         opts["trt_dump_ep_context_model"] = True
         opts["trt_ep_context_file_path"] = dump_ctx
@@ -229,8 +233,8 @@ def try_build(orig_net, make_fp32_net, log=print):
             return None
         root = cache_dir()
         root.mkdir(parents=True, exist_ok=True)
-        onnx_name = f"cpsam_v2_b{TRT_BATCH}.onnx"
-        ctx_name = f"cpsam_v2_b{TRT_BATCH}_ctx.onnx"
+        onnx_name = f"cpsam_v2_dyn{TRT_BATCH}.onnx"
+        ctx_name = f"cpsam_v2_dyn{TRT_BATCH}_ctx.onnx"
         device = torch.cuda.current_device()
         warm = torch.zeros((1, 3, TILE, TILE), device="cuda")
 
@@ -243,7 +247,7 @@ def try_build(orig_net, make_fp32_net, log=print):
                         raise RuntimeError("TensorRT EP did not load")
                     trt_net = TrtNet(session, orig_net)
                     trt_net(warm)
-                log(f"[Cellpose-SAM] TensorRT bf16 engine loaded in {time.time() - t:.1f}s (EPContext, batch {TRT_BATCH})")
+                log(f"[Cellpose-SAM] TensorRT bf16 engine loaded in {time.time() - t:.1f}s (EPContext, batch 1-{TRT_BATCH})")
                 return _hand_over(trt_net, orig_net, torch)
             except Exception as e:
                 log(f"[Cellpose-SAM] EPContext model unusable ({type(e).__name__}: {e}); rebuilding the engine")
@@ -266,7 +270,7 @@ def try_build(orig_net, make_fp32_net, log=print):
                 return None
             trt_net = TrtNet(session, orig_net)
             trt_net(warm)  # build the engine now, not mid-slide
-        log(f"[Cellpose-SAM] TensorRT bf16 engine built in {time.time() - t:.0f}s (batch {TRT_BATCH}); "
+        log(f"[Cellpose-SAM] TensorRT bf16 engine built in {time.time() - t:.0f}s (batch 1-{TRT_BATCH}); "
             f"EPContext {'written' if (root / ctx_name).is_file() else 'NOT written'}")
         return _hand_over(trt_net, orig_net, torch)
     except Exception as e:  # any failure: stay on PyTorch rather than fail the run
