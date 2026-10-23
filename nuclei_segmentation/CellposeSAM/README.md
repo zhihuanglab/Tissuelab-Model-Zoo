@@ -44,6 +44,7 @@ the export folds it into q and k (`_fusable_attention`, exact in fp32): 83 ->
 | + all contours in one findContours call | 1.5 s | 110 s |
 | + skip 256-px tiles off the tissue mask | 1.5 s | 76 s |
 | + compute_masks overlapping the next network | 1.5 s | 71 s |
+| + network on its own thread, histogram percentiles | 1.5 s | 67 s |
 
 Cells agree with Cellpose's own eval to 99.7-99.9% of centroids within 1 px.
 
@@ -90,8 +91,12 @@ cells the tissue filter drops. Output is unchanged on CMU-1 and TCGA-AD-6548
 
 In the tiled pipeline the main thread only runs the network; each tile's
 compute_masks runs on a masks thread with its own CUDA stream while the next
-tile's network runs (identical output; CMU-1 78 -> 71 s). The network itself,
-56 s of CMU-1, is what is left on the main thread.
+tile's network runs (identical output; CMU-1 78 -> 71 s). The network batches
+themselves run back to back on a net thread (`start_net` / `finish_net`): the
+main thread cuts the next tile into batches before averaging the current one,
+and the 1st / 99th percentiles of uint8 images come from a 256-bin histogram
+instead of a sort (exact). CMU-1 70 -> 67 s, with the network busy 61 of
+65 s; the network alone is 56 s, the rest of the GPU work now overlaps it.
 
 ## Output (`Cell-Segmentation`)
 

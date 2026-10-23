@@ -16,6 +16,7 @@ is still Cellpose's own _compute_masks (already GPU-based inside).
 CELLPOSE_SAM_GPU_PIPELINE=0 turns it off.
 """
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -30,22 +31,36 @@ def enabled(model):
     return os.environ.get("CELLPOSE_SAM_GPU_PIPELINE", "1") != "0" and model.device.type in ("cuda", "mps")
 
 
+def _quantile_u8(v, q):
+    """torch.quantile(v.double(), q) (linear interpolation) of a uint8 tensor,
+    from its 256-bin histogram instead of a sort: the order statistics at the
+    same ranks, interpolated with the same lerp."""
+    cum = torch.cumsum(torch.bincount(v.reshape(-1), minlength=256), 0)
+    ranks = q * (v.numel() - 1)
+    below = torch.searchsorted(cum, ranks.long(), right=True).double()
+    above = torch.searchsorted(cum, ranks.ceil().long(), right=True).double()
+    return below.lerp_(above, ranks - ranks.long())
+
+
 def _normalize(img):
     """transforms.normalize_img(normalize=True) for an (Ly, Lx, 3) image: each
     channel with any range maps its 1st / 99th percentile to 0 / 1, else 0.
     Returns (3, Ly, Lx) float32."""
     x = img.permute(2, 0, 1).float()
     out = torch.zeros_like(x)
+    qs = torch.tensor([0.01, 0.99], device=x.device, dtype=torch.float64)
     for c in range(x.shape[0]):
         xc = x[c]
         if xc.max() - xc.min() <= 0:
             continue
-        sample = xc
+        sy = sx = 1
         if xc.numel() > 224 ** 3:  # normalize99(downsample=True): strided subsample of large planes
             sy, sx = max(1, xc.shape[0] // 224), max(1, xc.shape[1] // 224)
-            sample = xc[::sy, ::sx]
         # float64 like np.percentile; linear interpolation is np.percentile's default
-        q = torch.quantile(sample.reshape(-1).double(), torch.tensor([0.01, 0.99], device=x.device, dtype=torch.float64))
+        if img.dtype == torch.uint8:
+            q = _quantile_u8(img[::sy, ::sx, c], qs)
+        else:
+            q = torch.quantile(xc[::sy, ::sx].reshape(-1).double(), qs)
         x01, x99 = float(q[0]), float(q[1])
         if x99 - x01 > 1e-3:
             out[c] = (xc - x01) / (x99 - x01)
@@ -100,15 +115,58 @@ def _tiles_on_tissue(tissue, origins, by, bx, ypad1, xpad1, Lyr, Lxr):
     return keep
 
 
-def run_net(net, img, rescale, batch_size, tissue=None):
-    """core.run_net + the resample step of CellposeModel._run_net for one
-    normalized (3, Ly0, Lx0) image. Returns dP (2, Ly0, Lx0) and cellprob
-    (Ly0, Lx0), on the GPU.
+class _NetQueue:
+    """Runs network batches in submission order on a thread and CUDA stream of
+    their own, so the GPU goes from one batch to the next while the caller
+    cuts and averages tiles (ONNX Runtime releases the GIL while it runs)."""
 
-    tissue: optional bool mask of the image (any resolution). Tiles that see no
-    tissue are not run; pixels only they cover get zero flows and cellprob
-    (background), the rest are averaged over the tiles that ran.
-    CELLPOSE_SAM_SKIP_BLANK_TILES=0 runs every tile."""
+    def __init__(self, device):
+        self.stream = torch.cuda.Stream(device)
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cpsam-net")
+
+    def submit(self, net, X):
+        ready = torch.cuda.Event()
+        ready.record()
+        return self.pool.submit(self._run, net, X, ready)
+
+    def _run(self, net, X, ready):
+        with torch.no_grad(), torch.cuda.stream(self.stream):
+            self.stream.wait_event(ready)
+            y = net(X)[0]
+            done = torch.cuda.Event()
+            done.record(self.stream)
+        return y, done
+
+    @staticmethod
+    def result(future):
+        y, done = future.result()
+        stream = torch.cuda.current_stream()
+        stream.wait_event(done)
+        y.record_stream(stream)  # allocated on the queue's stream, used on this one
+        return y
+
+
+_QUEUES = {}
+
+
+def _net_queue(device):
+    if device.type != "cuda":
+        return None
+    if device not in _QUEUES:
+        _QUEUES[device] = _NetQueue(device)
+    return _QUEUES[device]
+
+
+# Batches of one image submitted ahead of the one being averaged: covers a
+# whole 2048-px slide tile, bounds the GPU memory of larger images.
+NET_AHEAD = 16
+
+
+def start_net(net, img, rescale, batch_size, tissue=None):
+    """run_net's first half: resize, pad and cut the image into tiles and
+    submit their batches to the network (on CUDA a queue that runs them in the
+    background). finish_net(...) averages them; the caller can start the next
+    image in between, so the network never waits for the averaging."""
     _, Ly0, Lx0 = img.shape
     Lyr, Lxr = int(Ly0 * rescale), int(Lx0 * rescale)
     ypad1, ypad2, xpad1, xpad2 = transforms.get_pad_yx(Lyr, Lxr, min_size=(BSIZE, BSIZE))
@@ -119,7 +177,6 @@ def run_net(net, img, rescale, batch_size, tissue=None):
     origins = [(y0, x0) for y0 in ystart for x0 in xstart]
 
     mask = torch.from_numpy(transforms._taper_mask(ly=by, lx=bx)).to(img.device)  # float64, as in average_tiles
-    yf = torch.zeros((3, Ly, Lx), device=img.device, dtype=torch.float32)
     keep = None
     if tissue is not None and os.environ.get("CELLPOSE_SAM_SKIP_BLANK_TILES", "1") != "0":
         keep = _tiles_on_tissue(np.asarray(tissue, dtype=bool), origins, by, bx, ypad1, xpad1, Lyr, Lxr)
@@ -133,20 +190,60 @@ def run_net(net, img, rescale, batch_size, tissue=None):
         for y0, x0 in origins:
             navg[y0:y0 + by, x0:x0 + bx] += mask
         navg[navg == 0] = 1  # covered by no tile that ran: yf stays 0
-    dtype = getattr(net, "dtype", torch.float32)
     net.eval()  # as core._forward: CPSAM in training mode takes its stochastic-depth branch
-    with torch.no_grad():
-        for j in range(0, len(origins), batch_size):
-            batch = origins[j:j + batch_size]
-            X = torch.stack([imgb[:, y0:y0 + by, x0:x0 + bx] for y0, x0 in batch])
-            # average_tiles: float32 accumulator += float32 tile * float64 taper,
-            # the products for the whole batch at once, the sums in tile order
-            y = (net(X.to(dtype))[0].float() * mask).float()
-            for (y0, x0), yt in zip(batch, y):
-                yf[:, y0:y0 + by, x0:x0 + bx] += yt
+    run = {"net": net, "imgb": imgb, "by": by, "bx": bx, "mask": mask, "navg": navg,
+           "pad": (ypad1, ypad2, xpad1, xpad2), "size": (Ly0, Lx0), "queue": _net_queue(img.device),
+           "batches": [origins[j:j + batch_size] for j in range(0, len(origins), batch_size)], "submitted": []}
+    for _ in range(min(NET_AHEAD, len(run["batches"]))):
+        _submit_batch(run)
+    return run
+
+
+def _submit_batch(run):
+    batch = run["batches"][len(run["submitted"])]
+    by, bx, imgb = run["by"], run["bx"], run["imgb"]
+    X = torch.stack([imgb[:, y0:y0 + by, x0:x0 + bx] for y0, x0 in batch]).to(getattr(run["net"], "dtype", torch.float32))
+    if run["queue"] is not None:
+        run["submitted"].append((X, run["queue"].submit(run["net"], X)))
+    else:
+        with torch.no_grad():
+            run["submitted"].append((X, run["net"](X)[0]))
+
+
+def finish_net(run):
+    """run_net's second half: average the tiles' outputs as they arrive.
+    Returns dP (2, Ly0, Lx0) and cellprob (Ly0, Lx0), on the GPU."""
+    by, bx, mask, navg = run["by"], run["bx"], run["mask"], run["navg"]
+    _, Ly, Lx = run["imgb"].shape
+    yf = torch.zeros((3, Ly, Lx), device=navg.device, dtype=torch.float32)
+    for i, batch in enumerate(run["batches"]):
+        _, y = run["submitted"][i]
+        run["submitted"][i] = None
+        if run["queue"] is not None:
+            y = run["queue"].result(y)
+        if len(run["submitted"]) < len(run["batches"]):
+            _submit_batch(run)
+        # average_tiles: float32 accumulator += float32 tile * float64 taper,
+        # the products for the whole batch at once, the sums in tile order
+        y = (y.float() * mask).float()
+        for (y0, x0), yt in zip(batch, y):
+            yf[:, y0:y0 + by, x0:x0 + bx] += yt
+    ypad1, ypad2, xpad1, xpad2 = run["pad"]
     yf = (yf / navg).float()[:, ypad1:Ly - ypad2, xpad1:Lx - xpad2]
-    yf = _resize(yf, Ly0, Lx0)  # resample=True: flows back to the input size
+    yf = _resize(yf, *run["size"])  # resample=True: flows back to the input size
     return yf[:2], yf[2]
+
+
+def run_net(net, img, rescale, batch_size, tissue=None):
+    """core.run_net + the resample step of CellposeModel._run_net for one
+    normalized (3, Ly0, Lx0) image. Returns dP (2, Ly0, Lx0) and cellprob
+    (Ly0, Lx0), on the GPU.
+
+    tissue: optional bool mask of the image (any resolution). Tiles that see no
+    tissue are not run; pixels only they cover get zero flows and cellprob
+    (background), the rest are averaged over the tiles that ran.
+    CELLPOSE_SAM_SKIP_BLANK_TILES=0 runs every tile."""
+    return finish_net(start_net(net, img, rescale, batch_size, tissue))
 
 
 def _follow_flows(dPm, iy, ix, niter):
@@ -264,13 +361,24 @@ def compute_masks(dP, cellprob, niter, cellprob_threshold, flow_threshold, min_s
     return utils.fill_holes_and_remove_small_masks(mask, min_size=min_size) if fill_holes else mask
 
 
-def eval_flows(model, img_np, diameter, batch_size, tissue=None):
-    """eval_masks' network half: dP and cellprob on the GPU, and the niter
-    compute_masks follows them for (tissue: see run_net)."""
+def start_flows(model, img_np, diameter, batch_size, tissue=None):
+    """eval_masks' network half, started: see start_net."""
     img = torch.from_numpy(np.ascontiguousarray(img_np)).to(model.device)
     rescale = 30. / diameter if diameter else 1.0
-    dP, cellprob = run_net(model.net, _normalize(img), rescale, batch_size, tissue)
-    return dP, cellprob, int(200 / rescale)  # eval(): niter_scale = rescale when resample
+    run = start_net(model.net, _normalize(img), rescale, batch_size, tissue)
+    run["niter"] = int(200 / rescale)  # eval(): niter_scale = rescale when resample
+    return run
+
+
+def finish_flows(run):
+    """dP and cellprob on the GPU, and the niter compute_masks follows them for."""
+    dP, cellprob = finish_net(run)
+    return dP, cellprob, run["niter"]
+
+
+def eval_flows(model, img_np, diameter, batch_size, tissue=None):
+    """eval_masks' network half (tissue: see run_net)."""
+    return finish_flows(start_flows(model, img_np, diameter, batch_size, tissue))
 
 
 def hand_off(flows):

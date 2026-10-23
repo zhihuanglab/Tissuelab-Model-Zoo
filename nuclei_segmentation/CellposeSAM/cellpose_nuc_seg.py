@@ -587,10 +587,14 @@ class SlideSegmentation():
         return (cpsam_gpu.enabled(self.model) and self.model.device.type == "cuda"
                 and os.environ.get("CELLPOSE_SAM_GPU_MASKS", "1") != "0")
 
-    def predict_flows(self, img_np, tissue=None):
-        """The network half of predict_masks (GPU path), handed off for masks_from_flows."""
-        return cpsam_gpu.hand_off(cpsam_gpu.eval_flows(
-            self.model, self._rgb(img_np), self.diameter, self.batch_size, tissue))
+    def start_flows(self, img_np, tissue=None):
+        """The network half of predict_masks (GPU path), started in the
+        background; finish_flows hands it off for masks_from_flows."""
+        return cpsam_gpu.start_flows(self.model, self._rgb(img_np), self.diameter, self.batch_size, tissue)
+
+    @staticmethod
+    def finish_flows(run):
+        return cpsam_gpu.hand_off(cpsam_gpu.finish_flows(run))
 
     def masks_from_flows(self, flows):
         """The compute_masks half (masks thread), without the hole filling."""
@@ -827,11 +831,13 @@ class SlideSegmentation():
         
         # Below is the tiling processing code.
         # The stages overlap: a reader thread reads and resizes the next
-        # tiles, the main thread runs the network on the GPU, a masks thread
-        # turns the previous tile's flows into a label image (GPU, own stream),
-        # and a post thread turns each label image into cells. The network
-        # never waits for the other steps, and results are kept in tile order,
-        # so the output is the same as running the tiles one after another.
+        # tiles; the main thread cuts each tile into network batches, which a
+        # net thread runs back to back, and averages them (it starts the next
+        # tile's batches before averaging the current one's); a masks thread
+        # turns the flows into a label image (GPU, own stream); and a post
+        # thread turns each label image into cells. The network never waits
+        # for the other steps, and results are kept in tile order, so the
+        # output is the same as running the tiles one after another.
         n_col = int(np.ceil(self.dim[0]/(self.tile_size-self.overlap)))
         n_row = int(np.ceil(self.dim[1]/(self.tile_size-self.overlap)))
         total_tiles = n_row * n_col
@@ -845,6 +851,16 @@ class SlideSegmentation():
         masker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cpsam-masks")
         overlap_masks = self._overlap_masks()
         in_flight = []
+
+        def finish(tile, run):
+            flows = self.finish_flows(run)
+            while len(in_flight) >= MASKS_AHEAD:  # bounds the flows held on the GPU
+                in_flight.pop(0).result()
+            masks = masker.submit(self.masks_from_flows, flows)
+            in_flight.append(masks)
+            tile_results.append(post.submit(lambda: self._post_tile(tile, masks.result())))
+
+        started = None  # (tile, run) whose network batches are in flight
         try:
             pending_reads = {}
             for k in range(min(READ_AHEAD, len(jobs))):
@@ -863,12 +879,12 @@ class SlideSegmentation():
                     masks = self.predict_masks(tile["img"], fill_holes=False, tissue=tile["tissue"])
                     tile_results.append(post.submit(self._post_tile, tile, masks))
                     continue
-                flows = self.predict_flows(tile["img"], tissue=tile["tissue"])
-                while len(in_flight) >= MASKS_AHEAD:  # bounds the flows held on the GPU
-                    in_flight.pop(0).result()
-                masks = masker.submit(self.masks_from_flows, flows)
-                in_flight.append(masks)
-                tile_results.append(post.submit(lambda t=tile, m=masks: self._post_tile(t, m.result())))
+                run = self.start_flows(tile["img"], tissue=tile["tissue"])
+                if started is not None:
+                    finish(*started)
+                started = (tile, run)
+            if started is not None:
+                finish(*started)
             for future in tile_results:
                 self._maybe_cancel()
                 future.result()
