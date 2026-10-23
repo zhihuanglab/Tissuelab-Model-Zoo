@@ -1,8 +1,8 @@
 """TensorRT path for Cellpose-SAM's network (ONNX Runtime TensorRT EP, bf16).
 
-The SAM ViT-L encoder is ~85% of an eval. Run through TensorRT it is ~40% faster
-than PyTorch bf16 with the same cells (measured on an H200: 3000x3000 IHC image,
-6.6 s -> 4.1 s, 1,566 vs 1,567 cells, 99.8% of centroids within 1 px of fp32).
+The SAM ViT-L encoder dominates an eval. It runs as a bf16 TensorRT engine
+whose attention is exported in a form TensorRT fuses (_fusable_attention):
+83 -> 43 ms per 16 tiles on an H200, with outputs bit-identical in fp32 PyTorch.
 fp16 is not an option: it drops ~4% of the cells, in TensorRT as in PyTorch.
 
 On first use the net is exported to ONNX (batch 1..TRT_BATCH) and a bf16
@@ -138,8 +138,53 @@ class TrtNet:
         return out, torch.zeros((n, 256), device=X.device)
 
 
+def _fusable_attention(self, x):
+    """segment_anything's Attention.forward with the decomposed relative
+    position terms folded into q and k, so the graph is a plain
+    softmax(q' k'^T) v that TensorRT fuses into one attention kernel.
+
+    SAM adds rel_h[i, row(j)] + rel_w[i, col(j)] to q_i . k_j * scale. With
+    q'_i = [q_i * scale, rel_h[i, :], rel_w[i, :]] and k'_j = [k_j, onehot(row(j)),
+    onehot(col(j))], q'_i . k'_j is exactly that sum. As SAM's bias was, it blocked
+    the fusion: measured on an H200, 83 ms per 16 tiles vs 35 ms without it.
+    """
+    import torch
+    from segment_anything.modeling.image_encoder import get_rel_pos
+    B, H, W, _ = x.shape
+    nh = self.num_heads
+    q0, k, v = self.qkv(x).reshape(B, H * W, 3, nh, -1).permute(2, 0, 3, 1, 4).unbind(0)  # (B, nh, HW, C)
+    q = q0 * self.scale
+    if self.use_rel_pos:
+        H, W = int(H), int(W)
+        # Constant tables per (H, W), built eagerly (a warm-up call before the
+        # ONNX trace): get_rel_pos indexes the GPU table with a CPU index,
+        # which tracing rejects.
+        tables = getattr(self, "_fa_tables", None)
+        if tables is None or tables[0] != (H, W):
+            Rh = get_rel_pos(H, H, self.rel_pos_h).detach()
+            Rw = get_rel_pos(W, W, self.rel_pos_w).detach()
+            rows = torch.eye(H, dtype=k.dtype, device=k.device).repeat_interleave(W, dim=0)  # (HW, H): row of key j
+            cols = torch.eye(W, dtype=k.dtype, device=k.device).repeat(H, 1)  # (HW, W): column of key j
+            self._fa_tables = tables = ((H, W), Rh, Rw, rows, cols)
+        _, Rh, Rw, rows, cols = tables
+        C = k.shape[-1]
+        r_q = q0.reshape(B * nh, H, W, C)  # SAM's terms use the unscaled q
+        rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh).reshape(B, nh, H * W, H)
+        rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw).reshape(B, nh, H * W, W)
+        q = torch.cat((q, rel_h, rel_w), dim=-1)
+        k = torch.cat((k, rows.expand(B, nh, -1, -1), cols.expand(B, nh, -1, -1)), dim=-1)
+    C = v.shape[-1]
+    if q.shape[-1] != C:
+        # Zero-pad v to q/k's width: fused attention kernels want one head size.
+        v = torch.cat((v, v.new_zeros(*v.shape[:-1], q.shape[-1] - C)), dim=-1)
+    attn = (q @ k.transpose(-2, -1)).softmax(dim=-1)
+    x = (attn @ v)[..., :C].reshape(B, nh, H, W, C).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+    return self.proj(x)
+
+
 def _export_onnx(make_fp32_net, path):
     import torch
+    from segment_anything.modeling import image_encoder
 
     class Flows(torch.nn.Module):
         def __init__(self, net):
@@ -153,10 +198,16 @@ def _export_onnx(make_fp32_net, path):
     net.requires_grad_(False)
     x = torch.zeros(TRT_BATCH, 3, TILE, TILE, device="cuda")
     tmp = path.with_suffix(".onnx.tmp")
-    with torch.no_grad():
-        torch.onnx.export(Flows(net), (x,), str(tmp), input_names=["input"], output_names=["flows"],
-                          dynamic_axes={"input": {0: "batch"}, "flows": {0: "batch"}},
-                          opset_version=ONNX_OPSET, dynamo=False, do_constant_folding=True)
+    orig_forward = image_encoder.Attention.forward
+    image_encoder.Attention.forward = _fusable_attention  # only while tracing the export
+    try:
+        with torch.no_grad():
+            net(x)  # builds each block's constant tables outside the trace
+            torch.onnx.export(Flows(net), (x,), str(tmp), input_names=["input"], output_names=["flows"],
+                              dynamic_axes={"input": {0: "batch"}, "flows": {0: "batch"}},
+                              opset_version=ONNX_OPSET, dynamo=False, do_constant_folding=True)
+    finally:
+        image_encoder.Attention.forward = orig_forward
     os.replace(tmp, path)
     del net
     torch.cuda.empty_cache()
@@ -233,8 +284,8 @@ def try_build(orig_net, make_fp32_net, log=print):
             return None
         root = cache_dir()
         root.mkdir(parents=True, exist_ok=True)
-        onnx_name = f"cpsam_v2_dyn{TRT_BATCH}.onnx"
-        ctx_name = f"cpsam_v2_dyn{TRT_BATCH}_ctx.onnx"
+        onnx_name = f"cpsam_v2_fa2_dyn{TRT_BATCH}.onnx"
+        ctx_name = f"cpsam_v2_fa2_dyn{TRT_BATCH}_ctx.onnx"
         device = torch.cuda.current_device()
         warm = torch.zeros((1, 3, TILE, TILE), device="cuda")
 

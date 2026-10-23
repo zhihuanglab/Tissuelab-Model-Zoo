@@ -31,13 +31,23 @@ userData (from the Cell Segmentation panel):
 ## TensorRT
 
 On Linux / Windows with CUDA and `onnxruntime-gpu` + `tensorrt` installed, the
-SAM encoder runs as a bf16 TensorRT engine (ONNX Runtime TensorRT EP), ~40%
-faster than PyTorch with the same cells (3000x3000 IHC image on an H200: 6.6 s
--> 4.1 s, ~4.4 GB GPU memory). fp16 is not used: it loses ~4% of the cells.
+SAM encoder runs as a bf16 TensorRT engine (ONNX Runtime TensorRT EP). SAM's
+decomposed relative-position bias kept TensorRT from fusing the attention, so
+the export folds it into q and k (`_fusable_attention`, exact in fp32): 83 ->
+43 ms per 16 tiles on an H200. fp16 is not used: it loses ~4% of the cells.
 
-- First use exports `cache/cpsam_v2_b16.onnx`, builds the engine in
-  `cache/trt_ep_ctx_engines/` (~90 s) and writes the EPContext model
-  `cache/cpsam_v2_b16_ctx.onnx` that points at it. Later processes load the
+| H200, TensorRT | 3000x3000 IHC image | CMU-1 whole slide |
+|---|---|---|
+| Cellpose eval, unfused engine | 5.6-6.0 s | 455 s |
+| GPU pipeline + overlap, unfused | 3.2-3.4 s | 214 s |
+| + batch 1-16, fused attention | 1.5 s | 114 s |
+
+Cells agree with Cellpose's own eval to 99.7-99.9% of centroids within 1 px.
+
+- First use exports `cache/cpsam_v2_fa2_dyn16.onnx` (batch 1-16: a tile's
+  last, partial batch runs only its real tiles), builds the engine in
+  `cache/trt_ep_ctx_engines/` (~60-90 s) and writes the EPContext model
+  `cache/cpsam_v2_fa2_dyn16_ctx.onnx` that points at it. Later processes load the
   EPContext model in a second or two (once per node process; the model stays
   loaded between runs). One that no longer loads (other GPU or TensorRT
   version) is deleted and the engine rebuilt.
