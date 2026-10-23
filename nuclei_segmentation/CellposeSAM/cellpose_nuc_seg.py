@@ -860,6 +860,15 @@ class SlideSegmentation():
             in_flight.append(masks)
             tile_results.append(post.submit(lambda: self._post_tile(tile, masks.result())))
 
+        checked = 0  # tile_results[:checked] finished without error
+
+        def raise_failed():
+            """Re-raise a post thread error now rather than after the last tile."""
+            nonlocal checked
+            while checked < len(tile_results) and tile_results[checked].done():
+                tile_results[checked].result()
+                checked += 1
+
         started = None  # (tile, run) whose network batches are in flight
         try:
             pending_reads = {}
@@ -871,6 +880,7 @@ class SlideSegmentation():
                 if self.progress_callback:
                     self.progress_callback(int((job["index"] + 1) / total_tiles * 100))
                 self._maybe_cancel()
+                raise_failed()
                 tile = pending_reads.pop(k).result()
                 if tile is None:
                     continue
