@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 import time
 import cv2
-from tqdm import tqdm
 import os
 from datetime import datetime
 from multiprocessing import Queue
@@ -15,6 +14,7 @@ from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFil
 import tiffslide
 import torch
 from scipy.ndimage import find_objects
+from concurrent.futures import ThreadPoolExecutor
 import cpsam_trt
 import cpsam_gpu
 
@@ -37,6 +37,8 @@ CELLPROB_THRESHOLD = 0.0
 MIN_CELL_AREA_PX = 50
 # Plain JPEG/PNG carry no resolution; HPA-style IHC images are 0.5 um/px.
 PLAIN_IMAGE_MPP = 0.5
+# Tiles read ahead of the one on the GPU (reader thread).
+READ_AHEAD = 2
 # Resolution the settings above are in; userData target_mpp overrides it.
 PROCESSING_MPP = 0.5
 
@@ -493,6 +495,11 @@ class SlideSegmentation():
         Returns:
             points, coord, prob in StarDist-like format
         """
+        masks = self.predict_masks(img_np)
+        return self.cellpose_to_stardist_format(masks, None, masks.shape[:2])
+
+    def predict_masks(self, img_np):
+        """Cellpose-SAM label image of an (H, W, C) patch."""
         # Cellpose 4 wants a 3-channel image.
         if img_np.ndim == 2:
             img_np = np.stack([img_np] * 3, axis=-1)
@@ -524,10 +531,76 @@ class SlideSegmentation():
                 resample=True,
                 batch_size=self.batch_size,
             )
-        
-        # Convert to StarDist format
-        points, coord, prob = self.cellpose_to_stardist_format(masks, None, img_np.shape[:2])
-        
+        return masks
+
+    def _tile_jobs(self, n_row, n_col):
+        """Level-0 boxes of the tiles that overlap the ROI and the tissue mask."""
+        jobs = []
+        for ir in range(n_row):
+            for ic in range(n_col):
+                x_0 = ic*(self.tile_size-self.overlap)
+                y_0 = ir*(self.tile_size-self.overlap)
+                x_1 = int(np.min((x_0 + self.tile_size, self.dim[0])))
+                y_1 = int(np.min((y_0 + self.tile_size, self.dim[1])))
+                if not self._tile_meets_roi(x_0, y_0, x_1, y_1):
+                    continue
+                if self.wsi_mask is not None:
+                    mask = self.wsi_mask[int(y_0/self.mask_ratio_y):int(y_1/self.mask_ratio_y),
+                                        int(x_0/self.mask_ratio_x):int(x_1/self.mask_ratio_x)]
+                    if np.sum(mask) == 0:
+                        continue
+                jobs.append({"index": ir * n_col + ic, "ir": ir, "ic": ic,
+                             "x_0": x_0, "y_0": y_0, "x_1": x_1, "y_1": y_1})
+        return jobs
+
+    def _read_tile(self, job):
+        """Read a tile at the processing magnification (reader thread). None
+        when it is mostly white."""
+        x_0, y_0, x_1, y_1 = job["x_0"], job["y_0"], job["x_1"], job["y_1"]
+        w_col, h_row = x_1 - x_0, y_1 - y_0
+        img = self.slide.read_region((x_0, y_0), self.level, (w_col, h_row))
+        if self.args.magnification is not None:
+            resize_factor = self.reference_magnification / self.args.magnification
+            img = img.resize((int(np.round(w_col*resize_factor)), int(np.round(h_row*resize_factor))))
+            x_0 = int(np.round(x_0*resize_factor))
+            x_1 = int(np.round(x_1*resize_factor))
+            y_0 = int(np.round(y_0*resize_factor))
+            y_1 = int(np.round(y_1*resize_factor))
+        img_np = np.array(img)
+        img_np = img_np[:, :, :3] if img_np.ndim == 3 else img_np[:, :, np.newaxis]
+        # Skip if mostly white pixels (>240)
+        n_dark_pixels = np.sum(np.any(img_np < 240, axis=2))
+        if n_dark_pixels < 50:
+            print(f"Tile r{job['ir']} c{job['ic']} is mostly white, skipping")
+            return None
+        return {**job, "img": img_np, "sx_0": x_0, "sy_0": y_0, "w_col": x_1 - x_0, "h_row": y_1 - y_0}
+
+    def _post_tile(self, tile, masks):
+        """Cells of one tile's label image, in processing-magnification
+        coordinates of the whole slide (post thread). None when it has none."""
+        points, coord, prob = self.cellpose_to_stardist_format(masks, None, masks.shape[:2])
+        w_col, h_row = tile["w_col"], tile["h_row"]
+        if self.wsi_mask is not None and len(points) > 0:
+            mask_patch = self.wsi_mask[int(tile["y_0"] / self.mask_ratio_y):int(tile["y_1"] / self.mask_ratio_y),
+                                       int(tile["x_0"] / self.mask_ratio_x):int(tile["x_1"] / self.mask_ratio_x)]
+            if mask_patch.size > 0:
+                tissue_mask = cv2.resize(mask_patch.astype(np.uint8), (w_col, h_row),
+                                         interpolation=cv2.INTER_NEAREST).astype(bool)
+                # int() truncation of the (non-negative) local coordinates, as before
+                lx, ly = points[:, 0].astype(int), points[:, 1].astype(int)
+                inb = (lx >= 0) & (lx < w_col) & (ly >= 0) & (ly < h_row)
+                keep = np.zeros(len(points), bool)
+                keep[inb] = tissue_mask[ly[inb], lx[inb]]
+                points, coord, prob = points[keep], coord[keep], prob[keep]
+        if len(points) == 0:
+            return None
+        points[:, 0] += tile["sx_0"]
+        points[:, 1] += tile["sy_0"]
+        points = pd.DataFrame(points, index=[(tile["ir"], tile["ic"])]*len(points), columns=['x', 'y']).reset_index()
+        coord = np.round(coord).astype(np.int32)
+        coord[:, :, 0] += tile["sx_0"]
+        coord[:, :, 1] += tile["sy_0"]
+        print(f"Tile r{tile['ir']} c{tile['ic']} (x={tile['sx_0']}, y={tile['sy_0']}) detected {len(points)} nuclei")
         return points, coord, prob
 
     def _tile_meets_roi(self, x0, y0, x1, y1):
@@ -674,184 +747,50 @@ class SlideSegmentation():
                 print(traceback.format_exc())
                 print("Falling back to standard tiling process")
         
-        # Below is the tiling processing code
+        # Below is the tiling processing code.
+        # Three stages overlap: a reader thread reads and resizes the next
+        # tiles, the main thread runs Cellpose on the GPU, and a post thread
+        # turns each label image into cells. The GPU never waits for the CPU
+        # steps, and results are kept in tile order, so the output is the same
+        # as running the tiles one after another.
         n_col = int(np.ceil(self.dim[0]/(self.tile_size-self.overlap)))
         n_row = int(np.ceil(self.dim[1]/(self.tile_size-self.overlap)))
-        
-        points_all = None
-        coord_all = None
-        prob_all = None
-        
         total_tiles = n_row * n_col
-        processed_tiles = 0 
-        iter = 0
-
-        pbar = tqdm(total=total_tiles, mininterval=0.1)
-        
         print(f"Starting segmentation process - Total tiles: {n_row}x{n_col}={n_row*n_col}")
-        
-        for ir in range(n_row):
-            for ic in range(n_col):
-                # Update progress bar
-                iter += 1
-                pbar.update(1)
-                processed_tiles += 1
-                progress = int((processed_tiles / total_tiles) * 100)
+
+        jobs = self._tile_jobs(n_row, n_col)
+        print(f"{len(jobs)} tiles overlap the tissue / ROI")
+        tile_results = []
+        reader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cpsam-read")
+        post = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cpsam-post")
+        try:
+            pending_reads = {}
+            for k in range(min(READ_AHEAD, len(jobs))):
+                pending_reads[k] = reader.submit(self._read_tile, jobs[k])
+            for k, job in enumerate(jobs):
+                if k + READ_AHEAD < len(jobs):
+                    pending_reads[k + READ_AHEAD] = reader.submit(self._read_tile, jobs[k + READ_AHEAD])
                 if self.progress_callback:
-                    self.progress_callback(progress)
+                    self.progress_callback(int((job["index"] + 1) / total_tiles * 100))
                 self._maybe_cancel()
-                
-                # Calculate current tile position
-                x_0 = ic*(self.tile_size-self.overlap)
-                y_0 = ir*(self.tile_size-self.overlap)
-                
-                print(f"Processing tile r{ir} c{ic} (x={x_0}, y={y_0}) - {processed_tiles}/{total_tiles}")
-                
-                # Record tile processing start time
-                patch_start_time = time.time()
-                
-                x_1 = np.min((x_0 + self.tile_size, self.dim[0]))
-                y_1 = np.min((y_0 + self.tile_size, self.dim[1]))
-                
-                w_col = x_1 - x_0
-                h_row = y_1 - y_0
-
-                if not self._tile_meets_roi(x_0, y_0, x_1, y_1):
+                tile = pending_reads.pop(k).result()
+                if tile is None:
                     continue
+                masks = self.predict_masks(tile["img"])
+                tile_results.append(post.submit(self._post_tile, tile, masks))
+            for future in tile_results:
+                self._maybe_cancel()
+                future.result()
+        finally:
+            reader.shutdown(wait=True, cancel_futures=True)
+            post.shutdown(wait=True, cancel_futures=True)
 
-                if self.wsi_mask is not None:
-                    # Check mask for efficiency
-                    mask = self.wsi_mask[int(y_0/self.mask_ratio_y):int(y_1/self.mask_ratio_y),
-                                        int(x_0/self.mask_ratio_x):int(x_1/self.mask_ratio_x)]
-                    
-                    if np.sum(mask) == 0: 
-                        print(f"Tile r{ir} c{ic} is empty in mask, skipping")
-                        continue
-                
-                # Record image reading start time
-                read_start_time = time.time()
-                img = self.slide.read_region((x_0, y_0), self.level, (w_col, h_row))
-                # Record image reading end time
-                read_end_time = time.time()
-                read_duration = read_end_time - read_start_time
-                
-                if self.args.magnification is not None:
-                    st = time.time()
-                    resize_factor = self.reference_magnification / self.args.magnification
-                    img = img.resize((int(np.round(w_col*resize_factor)), int(np.round(h_row*resize_factor))))
-                    et = time.time()
-                    
-                    x_0 = int(np.round(x_0*resize_factor)) 
-                    x_1 = int(np.round(x_1*resize_factor))
-                    y_0 = int(np.round(y_0*resize_factor))
-                    y_1 = int(np.round(y_1*resize_factor))
-                    
-                    w_col = x_1 - x_0
-                    h_row = y_1 - y_0
+        kept = [f.result() for f in tile_results]
+        kept = [r for r in kept if r is not None]
+        points_all = pd.concat([r[0] for r in kept], axis=0, ignore_index=True) if kept else None
+        coord_all = np.concatenate([r[1] for r in kept], axis=0) if kept else None
+        prob_all = np.concatenate([r[2] for r in kept], axis=0) if kept else None
 
-                img_np = np.array(img)
-                if len(img_np.shape) == 3:
-                    #RGB
-                    img_np = img_np[:,:,:3]
-                else:
-                    #greyscale
-                    img_np = img_np[:, :, np.newaxis]
-                
-                # Skip if mostly white pixels (>240)
-                n_dark_pixels = np.sum(np.any(img_np < 240, axis=2) if len(img_np.shape) == 3 else img_np < 240)
-                if n_dark_pixels < 50:
-                    print(f"Tile r{ir} c{ic} is mostly white, skipping")
-                    continue
-                
-                # Run Cellpose prediction
-                points, coord, prob = self.predict_cellpose(img_np)
-                
-                # Filter results based on tissue mask
-                if self.wsi_mask is not None and len(points) > 0:
-                    # Calculate the mask region corresponding to this patch
-                    # Use original coordinates before magnification adjustment
-                    orig_x_0 = ic*(self.tile_size-self.overlap)
-                    orig_y_0 = ir*(self.tile_size-self.overlap)
-                    orig_x_1 = np.min((orig_x_0 + self.tile_size, self.dim[0]))
-                    orig_y_1 = np.min((orig_y_0 + self.tile_size, self.dim[1]))
-                    
-                    mask_x0 = int(orig_x_0 / self.mask_ratio_x)
-                    mask_y0 = int(orig_y_0 / self.mask_ratio_y)
-                    mask_x1 = int(orig_x_1 / self.mask_ratio_x)
-                    mask_y1 = int(orig_y_1 / self.mask_ratio_y)
-                    
-                    # Extract mask patch
-                    mask_patch = self.wsi_mask[mask_y0:mask_y1, mask_x0:mask_x1]
-                    
-                    # Resize mask to match the image patch size
-                    if mask_patch.size > 0:
-                        tissue_mask = cv2.resize(
-                            mask_patch.astype(np.uint8), 
-                            (w_col, h_row), 
-                            interpolation=cv2.INTER_NEAREST
-                        ).astype(bool)
-                        
-                        # Filter points based on tissue mask
-                        keep_indices = []
-                        for i, (x, y) in enumerate(points):
-                            # Points are in local coordinates
-                            local_x = int(x)
-                            local_y = int(y)
-                            
-                            # Check if the point is within bounds and in tissue area
-                            if (0 <= local_x < w_col and 0 <= local_y < h_row and 
-                                tissue_mask[local_y, local_x]):
-                                keep_indices.append(i)
-                        
-                        # Keep only the cells that are in tissue areas
-                        if keep_indices:
-                            initial_count = len(points)
-                            points = points[keep_indices]
-                            coord = coord[keep_indices]
-                            prob = prob[keep_indices]
-                            print(f"Filtered {len(keep_indices)} cells in tissue area out of {initial_count} total detected")
-                        else:
-                            # No cells in tissue area
-                            points = np.array([]).reshape(0, 2)
-                            coord = np.array([]).reshape(0, self.global_max_contour_points, 2)
-                            prob = np.array([])
-                            print("No cells found in tissue area after filtering")
-                
-                # Only process if we have points
-                if len(points) > 0:
-                    # Adjust coordinates to global position
-                    points[:,0] += x_0
-                    points[:,1] += y_0
-                    points = pd.DataFrame(points, index=[(ir, ic)]*len(points), columns=['x','y']).reset_index()
-                    
-                    coord = np.round(coord).astype(np.int32)
-                    coord[:,:,0] += x_0
-                    coord[:,:,1] += y_0
-                    
-                    # Calculate tile processing time
-                    patch_end_time = time.time()
-                    patch_duration = patch_end_time - patch_start_time
-                    compute_duration = patch_duration - read_duration
-                    
-                    # Print nuclei detection results for each tile
-                    print("\n========================================")
-                    print(f"Tile r{ir} c{ic} (x={x_0}, y={y_0}) detected {len(points)} nuclei")
-                    print("========================================\n")
-                    
-                    # Print processing time information
-                    print(f"Tile r{ir} c{ic} processing time: {patch_duration:.4f}s (read: {read_duration:.4f}s, compute: {compute_duration:.4f}s)")
-                    print(f"Start: {datetime.fromtimestamp(patch_start_time).strftime('%H:%M:%S')} - End: {datetime.fromtimestamp(patch_end_time).strftime('%H:%M:%S')}")
-                    
-                    # Accumulate results from all tiles
-                    if points_all is None:
-                        points_all = points
-                        coord_all = coord
-                        prob_all = prob
-                    else:
-                        points_all = pd.concat((points_all, points), axis=0, ignore_index=True)
-                        coord_all = np.concatenate((coord_all, coord), axis=0)
-                        prob_all = np.concatenate((prob_all, prob), axis=0)
-        
         # Print clear information before generating final_points
         if points_all is None or len(points_all) == 0:
             print("Warning: points_all is empty or has length 0!")
@@ -904,8 +843,6 @@ class SlideSegmentation():
         if self.progress_callback:
             self.progress_callback(100)
         self._maybe_cancel()
-
-        pbar.close()
 
         # Record overall end time and duration
         overall_end_time = time.time()
