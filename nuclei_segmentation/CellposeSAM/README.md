@@ -97,6 +97,9 @@ main thread cuts the next tile into batches before averaging the current one,
 and the 1st / 99th percentiles of uint8 images come from a 256-bin histogram
 instead of a sort (exact). CMU-1 70 -> 67 s, with the network busy 61 of
 65 s; the network alone is 56 s, the rest of the GPU work now overlaps it.
+The net thread is only used with TensorRT (ONNX Runtime runs without the
+GIL); the PyTorch net launches its kernels under the GIL and was 3-4 s
+slower on TCGA-AD-6548 with it, so it runs on the main thread.
 
 ## Output (`Cell-Segmentation`)
 

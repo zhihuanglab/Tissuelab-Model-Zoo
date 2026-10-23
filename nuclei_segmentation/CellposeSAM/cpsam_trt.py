@@ -110,6 +110,11 @@ class TrtNet:
     """Stands in for CellposeModel.net. Called with a float batch of
     n <= TRT_BATCH tiles on the GPU; returns the flows of those n tiles."""
 
+    # ONNX Runtime runs without the GIL, so a thread of its own (cpsam_gpu's
+    # net queue) keeps the GPU busy while the caller works; the PyTorch net
+    # launches its kernels under the GIL and only gets slower on one.
+    releases_gil = True
+
     def __init__(self, session, orig_net):
         import torch
         self._session = session

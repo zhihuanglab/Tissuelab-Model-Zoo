@@ -132,6 +132,9 @@ class _NetQueue:
     def _run(self, net, X, ready):
         with torch.no_grad(), torch.cuda.stream(self.stream):
             self.stream.wait_event(ready)
+            # allocated on the caller's stream, which may drop it once this returns:
+            # not reused there before this stream has read it
+            X.record_stream(self.stream)
             y = net(X)[0]
             done = torch.cuda.Event()
             done.record(self.stream)
@@ -149,8 +152,8 @@ class _NetQueue:
 _QUEUES = {}
 
 
-def _net_queue(device):
-    if device.type != "cuda":
+def _net_queue(net, device):
+    if device.type != "cuda" or not getattr(net, "releases_gil", False):
         return None
     if device not in _QUEUES:
         _QUEUES[device] = _NetQueue(device)
@@ -192,7 +195,7 @@ def start_net(net, img, rescale, batch_size, tissue=None):
         navg[navg == 0] = 1  # covered by no tile that ran: yf stays 0
     net.eval()  # as core._forward: CPSAM in training mode takes its stochastic-depth branch
     run = {"net": net, "imgb": imgb, "by": by, "bx": bx, "mask": mask, "navg": navg,
-           "pad": (ypad1, ypad2, xpad1, xpad2), "size": (Ly0, Lx0), "queue": _net_queue(img.device),
+           "pad": (ypad1, ypad2, xpad1, xpad2), "size": (Ly0, Lx0), "queue": _net_queue(net, img.device),
            "batches": [origins[j:j + batch_size] for j in range(0, len(origins), batch_size)], "submitted": []}
     for _ in range(min(NET_AHEAD, len(run["batches"]))):
         _submit_batch(run)
