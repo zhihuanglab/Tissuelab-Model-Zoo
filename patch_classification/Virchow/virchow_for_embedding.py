@@ -403,7 +403,8 @@ def _fill_non_glass_holes(mask, od_s, t_od, small_frac=0.001):
 def _add_pale_tissue(rgb, mask, um_px):
     """Union of the grayscale mask with the saturation/texture mask, then fill
     non-glass holes and drop specks below the original min_area scale."""
-    full = mask.astype(bool)
+    # Full-size arrays are only views / one upsampled copy (same as cellcast's wsi_tissue_mask).
+    full = np.ascontiguousarray(mask, dtype=bool)
     h0, w0 = full.shape
     # Every scale below is >= ~16 um, so work on <= 4 MP and upsample the result.
     f = max(1.0, (h0 * w0 / 4e6) ** 0.5)
@@ -411,10 +412,10 @@ def _add_pale_tissue(rgb, mask, um_px):
     if f > 1:
         size = (max(1, int(round(w0 / f))), max(1, int(round(h0 / f))))
         rgb = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
-        mask = cv2.resize(full.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
+        mask = cv2.resize(full.view(np.uint8), size, interpolation=cv2.INTER_NEAREST).view(bool)
         um_px = um_px * w0 / size[0]
     if int((rgb.max(-1) > 20).sum()) < 100:  # blank / black thumbnail: nothing to add
-        return full.astype(np.uint8)
+        return full.view(np.uint8)
     st_mask, od_s, t_od, sat_s, t_s = _saturation_texture_mask(rgb, um_px)
     # A region that does not touch the grayscale mask must be stained on
     # average; grey dust, out-of-focus smudges and scan edges are not.
@@ -446,10 +447,11 @@ def _add_pale_tissue(rgb, mask, um_px):
     min_area = min(max(0.0005 * h0 * w0, 2000), 0.002 * h0 * w0) * (h * w) / (h0 * w0)
     keep = st[:, cv2.CC_STAT_AREA] >= min_area
     keep[0] = False
-    m = keep[lab].astype(np.uint8)
+    m = keep[lab].view(np.uint8)
     if f > 1:
         m = cv2.resize(m, (w0, h0), interpolation=cv2.INTER_NEAREST)
-    return (full | m.astype(bool)).astype(np.uint8)
+    np.bitwise_or(m, full.view(np.uint8), out=m)
+    return m
 
 
 def _tissue_patch_coords(mask, width, height, patch_size, tissue_threshold):
