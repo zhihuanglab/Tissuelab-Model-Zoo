@@ -40,6 +40,9 @@ MIN_CELL_AREA_PX = 50
 PLAIN_IMAGE_MPP = 0.5
 # Tiles read ahead of the one on the GPU (reader thread).
 READ_AHEAD = 2
+# Tiles whose masks may still be in progress (masks thread) while the main
+# thread runs the next tile's network.
+MASKS_AHEAD = 2
 # Resolution the settings above are in; userData target_mpp overrides it.
 PROCESSING_MPP = 0.5
 
@@ -178,6 +181,7 @@ class SlideSegmentation():
         
         # Global maximum points for consistent concatenation
         self.global_max_contour_points = 32  # Set a reasonable fixed size
+        self._mask_stream = None  # CUDA stream of the masks thread (masks_from_flows)
         
         self.preload_cache = {}
         self.preload_queue = Queue()
@@ -536,17 +540,8 @@ class SlideSegmentation():
         skips the final hole filling / small-mask removal where the GPU path
         can (the caller then runs finish_masks). tissue: the patch's tissue
         mask; the GPU path skips network tiles that see none."""
-        # Cellpose 4 wants a 3-channel image.
-        if img_np.ndim == 2:
-            img_np = np.stack([img_np] * 3, axis=-1)
-        elif img_np.ndim == 3:
-            if img_np.shape[2] == 1:
-                img_np = np.repeat(img_np, 3, axis=2)
-            elif img_np.shape[2] > 3:
-                img_np = img_np[:, :, :3]
-        else:
-            raise ValueError(f"Unexpected image shape for Cellpose: {img_np.shape}")
-        
+        img_np = self._rgb(img_np)
+
         # Run Cellpose (pre/post-processing on the GPU when there is one)
         if cpsam_gpu.enabled(self.model):
             masks = cpsam_gpu.eval_masks(
@@ -570,6 +565,39 @@ class SlideSegmentation():
                 batch_size=self.batch_size,
             )
         return masks
+
+    @staticmethod
+    def _rgb(img_np):
+        """The (H, W, 3) image Cellpose 4 wants."""
+        if img_np.ndim == 2:
+            img_np = np.stack([img_np] * 3, axis=-1)
+        elif img_np.ndim == 3:
+            if img_np.shape[2] == 1:
+                img_np = np.repeat(img_np, 3, axis=2)
+            elif img_np.shape[2] > 3:
+                img_np = img_np[:, :, :3]
+        else:
+            raise ValueError(f"Unexpected image shape for Cellpose: {img_np.shape}")
+        return img_np
+
+    def _overlap_masks(self):
+        """Whether the tiled pipeline splits each tile's GPU work in two: the
+        network on the main thread, compute_masks on a masks thread and its own
+        CUDA stream, overlapping the next tile's network."""
+        return (cpsam_gpu.enabled(self.model) and self.model.device.type == "cuda"
+                and os.environ.get("CELLPOSE_SAM_GPU_MASKS", "1") != "0")
+
+    def predict_flows(self, img_np, tissue=None):
+        """The network half of predict_masks (GPU path), handed off for masks_from_flows."""
+        return cpsam_gpu.hand_off(cpsam_gpu.eval_flows(
+            self.model, self._rgb(img_np), self.diameter, self.batch_size, tissue))
+
+    def masks_from_flows(self, flows):
+        """The compute_masks half (masks thread), without the hole filling."""
+        if self._mask_stream is None:
+            self._mask_stream = torch.cuda.Stream(self.model.device)
+        return cpsam_gpu.compute_masks_on(self._mask_stream, flows, self.cellprob_threshold,
+                                          self.flow_threshold, fill_holes=False)
 
     def _tile_jobs(self, n_row, n_col):
         """Level-0 boxes of the tiles that overlap the ROI and the tissue mask."""
@@ -798,11 +826,12 @@ class SlideSegmentation():
                 print("Falling back to standard tiling process")
         
         # Below is the tiling processing code.
-        # Three stages overlap: a reader thread reads and resizes the next
-        # tiles, the main thread runs Cellpose on the GPU, and a post thread
-        # turns each label image into cells. The GPU never waits for the CPU
-        # steps, and results are kept in tile order, so the output is the same
-        # as running the tiles one after another.
+        # The stages overlap: a reader thread reads and resizes the next
+        # tiles, the main thread runs the network on the GPU, a masks thread
+        # turns the previous tile's flows into a label image (GPU, own stream),
+        # and a post thread turns each label image into cells. The network
+        # never waits for the other steps, and results are kept in tile order,
+        # so the output is the same as running the tiles one after another.
         n_col = int(np.ceil(self.dim[0]/(self.tile_size-self.overlap)))
         n_row = int(np.ceil(self.dim[1]/(self.tile_size-self.overlap)))
         total_tiles = n_row * n_col
@@ -813,6 +842,9 @@ class SlideSegmentation():
         tile_results = []
         reader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cpsam-read")
         post = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cpsam-post")
+        masker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cpsam-masks")
+        overlap_masks = self._overlap_masks()
+        in_flight = []
         try:
             pending_reads = {}
             for k in range(min(READ_AHEAD, len(jobs))):
@@ -827,13 +859,22 @@ class SlideSegmentation():
                 if tile is None:
                     continue
                 # hole filling (CPU) moves to the post thread with the cell extraction
-                masks = self.predict_masks(tile["img"], fill_holes=False, tissue=tile["tissue"])
-                tile_results.append(post.submit(self._post_tile, tile, masks))
+                if not overlap_masks:
+                    masks = self.predict_masks(tile["img"], fill_holes=False, tissue=tile["tissue"])
+                    tile_results.append(post.submit(self._post_tile, tile, masks))
+                    continue
+                flows = self.predict_flows(tile["img"], tissue=tile["tissue"])
+                while len(in_flight) >= MASKS_AHEAD:  # bounds the flows held on the GPU
+                    in_flight.pop(0).result()
+                masks = masker.submit(self.masks_from_flows, flows)
+                in_flight.append(masks)
+                tile_results.append(post.submit(lambda t=tile, m=masks: self._post_tile(t, m.result())))
             for future in tile_results:
                 self._maybe_cancel()
                 future.result()
         finally:
             reader.shutdown(wait=True, cancel_futures=True)
+            masker.shutdown(wait=True, cancel_futures=True)
             post.shutdown(wait=True, cancel_futures=True)
 
         kept = [f.result() for f in tile_results]

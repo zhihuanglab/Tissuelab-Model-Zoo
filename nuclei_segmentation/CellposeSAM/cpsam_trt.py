@@ -133,7 +133,9 @@ class TrtNet:
         io = self._session.io_binding()
         io.bind_input("input", "cuda", 0, np.float32, tuple(Xp.shape), Xp.data_ptr())
         io.bind_output("flows", "cuda", 0, np.float32, tuple(out.shape), out.data_ptr())
-        torch.cuda.synchronize()  # ORT runs on its own stream
+        # ORT runs on its own stream: wait for this stream's input only, not for
+        # other streams (compute_masks of the previous tile runs on one)
+        torch.cuda.current_stream().synchronize()
         self._session.run_with_iobinding(io)
         return out, torch.zeros((n, 256), device=X.device)
 

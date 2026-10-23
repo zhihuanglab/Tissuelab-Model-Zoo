@@ -264,16 +264,40 @@ def compute_masks(dP, cellprob, niter, cellprob_threshold, flow_threshold, min_s
     return utils.fill_holes_and_remove_small_masks(mask, min_size=min_size) if fill_holes else mask
 
 
+def eval_flows(model, img_np, diameter, batch_size, tissue=None):
+    """eval_masks' network half: dP and cellprob on the GPU, and the niter
+    compute_masks follows them for (tissue: see run_net)."""
+    img = torch.from_numpy(np.ascontiguousarray(img_np)).to(model.device)
+    rescale = 30. / diameter if diameter else 1.0
+    dP, cellprob = run_net(model.net, _normalize(img), rescale, batch_size, tissue)
+    return dP, cellprob, int(200 / rescale)  # eval(): niter_scale = rescale when resample
+
+
+def hand_off(flows):
+    """eval_flows' result, marked ready on the stream that produced it, for
+    compute_masks_on on another stream."""
+    ready = torch.cuda.Event()
+    ready.record()
+    return (*flows, ready)
+
+
+def compute_masks_on(stream, flows, cellprob_threshold, flow_threshold, fill_holes=True):
+    """compute_masks of hand_off(eval_flows(...)) on its own CUDA stream, so a
+    thread can run it while the next image's network runs on the main stream."""
+    dP, cellprob, niter, ready = flows
+    with torch.cuda.stream(stream):
+        stream.wait_event(ready)
+        dP.record_stream(stream)  # allocated on the main stream: not reused before this stream is done
+        cellprob.record_stream(stream)
+        return compute_masks(dP, cellprob, niter, cellprob_threshold, flow_threshold, fill_holes=fill_holes)
+
+
 def eval_masks(model, img_np, diameter, flow_threshold, cellprob_threshold, batch_size, fill_holes=True,
                tissue=None):
     """masks of one (Ly, Lx, 3) uint8 image, as model.eval(img_np, diameter=...,
     flow_threshold=..., cellprob_threshold=..., normalize=True, tile_overlap=0.1,
     resample=True, batch_size=...) returns them (tissue: see run_net)."""
-    device = model.device
-    img = torch.from_numpy(np.ascontiguousarray(img_np)).to(device)
-    rescale = 30. / diameter if diameter else 1.0
-    dP, cellprob = run_net(model.net, _normalize(img), rescale, batch_size, tissue)
-    niter = int(200 / rescale)  # eval(): niter_scale = rescale when resample
+    dP, cellprob, niter = eval_flows(model, img_np, diameter, batch_size, tissue)
     if os.environ.get("CELLPOSE_SAM_GPU_MASKS", "1") != "0":
         return compute_masks(dP, cellprob, niter, cellprob_threshold, flow_threshold, fill_holes=fill_holes)
     Ly0, Lx0 = img_np.shape[:2]
