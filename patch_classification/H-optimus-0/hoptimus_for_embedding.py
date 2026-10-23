@@ -412,6 +412,8 @@ def _add_pale_tissue(rgb, mask, um_px):
         rgb = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
         mask = cv2.resize(full.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
         um_px = um_px * w0 / size[0]
+    if int((rgb.max(-1) > 20).sum()) < 100:  # blank / black thumbnail: nothing to add
+        return full.astype(np.uint8)
     st_mask, od_s, t_od, sat_s, t_s = _saturation_texture_mask(rgb, um_px)
     # A region that does not touch the grayscale mask must be stained on
     # average; grey dust, out-of-focus smudges and scan edges are not.
@@ -430,7 +432,7 @@ def _add_pale_tissue(rgb, mask, um_px):
     # edges (same band as the edge-artifact rule in get_tissue_mask).
     h, w = mask.shape
     edge = np.zeros((h, w), bool)
-    my, mx = int(0.04 * h), int(0.04 * w)
+    my, mx = max(1, int(0.04 * h)), max(1, int(0.04 * w))
     edge[:my] = edge[-my:] = True
     edge[:, :mx] = edge[:, -mx:] = True
     n, lab = cv2.connectedComponents(added, connectivity=8)
