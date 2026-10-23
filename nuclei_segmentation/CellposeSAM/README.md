@@ -47,6 +47,23 @@ faster than PyTorch with the same cells (3000x3000 IHC image on an H200: 6.6 s
   libraries on `LD_LIBRARY_PATH` (TissueLab may start it without them).
 - The PyInstaller specs do not bundle TensorRT; frozen builds run PyTorch.
 
+## GPU pre/post-processing
+
+`CellposeModel.eval` runs only the network on the GPU; the normalization, the
+1.5x resize, the tiling, the tile averaging and the resize back run in numpy /
+OpenCV and allocate a few GB per eval. `cpsam_gpu.py` reproduces those steps
+in torch on the GPU (CUDA or MPS); the masks are still computed by Cellpose's
+`_compute_masks`. Measured on an H200 with the TensorRT engine:
+
+| | Cellpose eval | GPU pipeline |
+|---|---|---|
+| 3000x3000 IHC image | 5.6-6.0 s, 1,566 cells | 3.2-3.4 s, 1,563 cells |
+| CMU-1 whole slide | 455 s, 198,879 cells | 294 s, 198,873 cells |
+
+99.6-99.8% of the centroids agree within 1 px (bilinear resampling and the
+summation order differ slightly). With the PyTorch net: 6.9-7.4 s -> 4.4-4.6 s.
+`CELLPOSE_SAM_GPU_PIPELINE=0` falls back to `CellposeModel.eval`.
+
 ## Output (`Cell-Segmentation`)
 
 - `centroids` (N, 2) and `contours` (N, 32, 2), level-0 pixels

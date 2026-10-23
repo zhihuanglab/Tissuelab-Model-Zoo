@@ -16,6 +16,7 @@ import tiffslide
 import torch
 from scipy.ndimage import find_objects
 import cpsam_trt
+import cpsam_gpu
 
 opj = os.path.join
 
@@ -503,20 +504,29 @@ class SlideSegmentation():
         else:
             raise ValueError(f"Unexpected image shape for Cellpose: {img_np.shape}")
         
-        # Run Cellpose
-        masks, flows, styles = self.model.eval(
-            img_np,
-            diameter=self.diameter,
-            flow_threshold=self.flow_threshold,
-            cellprob_threshold=self.cellprob_threshold,
-            normalize=True,
-            tile_overlap=0.1,
-            resample=True,
-            batch_size=self.batch_size,
-        )
+        # Run Cellpose (pre/post-processing on the GPU when there is one)
+        if cpsam_gpu.enabled(self.model):
+            masks = cpsam_gpu.eval_masks(
+                self.model, img_np,
+                diameter=self.diameter,
+                flow_threshold=self.flow_threshold,
+                cellprob_threshold=self.cellprob_threshold,
+                batch_size=self.batch_size,
+            )
+        else:
+            masks, _, _ = self.model.eval(
+                img_np,
+                diameter=self.diameter,
+                flow_threshold=self.flow_threshold,
+                cellprob_threshold=self.cellprob_threshold,
+                normalize=True,
+                tile_overlap=0.1,
+                resample=True,
+                batch_size=self.batch_size,
+            )
         
         # Convert to StarDist format
-        points, coord, prob = self.cellpose_to_stardist_format(masks, flows, img_np.shape[:2])
+        points, coord, prob = self.cellpose_to_stardist_format(masks, None, img_np.shape[:2])
         
         return points, coord, prob
 
