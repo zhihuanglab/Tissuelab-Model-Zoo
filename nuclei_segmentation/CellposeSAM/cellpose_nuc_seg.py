@@ -56,6 +56,32 @@ _MODEL = None
 _MODEL_BATCH = TORCH_BATCH
 
 
+def _points_in_polygons(pts, polys):
+    """Whether pts[i] lies inside the closed polygon polys[i] (even-odd rule)."""
+    x, y = pts[:, 0:1], pts[:, 1:2]
+    x1, y1 = polys[..., 0].astype(np.float64), polys[..., 1].astype(np.float64)
+    x2, y2 = np.roll(x1, -1, axis=1), np.roll(y1, -1, axis=1)
+    crosses = (y1 > y) != (y2 > y)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        xi = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+    return np.count_nonzero(crosses & (x < xi), axis=1) % 2 == 1
+
+
+def _greedy_keep(n, pairs, order):
+    """Walk the n items in `order`; each one still kept removes the items it is
+    paired with. Only items that have a pair are visited."""
+    keep = np.ones(n, dtype=bool)
+    if len(pairs):
+        src = np.concatenate([pairs[:, 0], pairs[:, 1]])
+        dst = np.concatenate([pairs[:, 1], pairs[:, 0]])
+        dst = dst[np.argsort(src, kind="stable")]
+        start = np.concatenate([[0], np.cumsum(np.bincount(src, minlength=n))])
+        for idx in order[(start[1:] - start[:-1])[order] > 0].tolist():
+            if keep[idx]:
+                keep[dst[start[idx]:start[idx + 1]]] = False
+    return keep
+
+
 def get_model(use_gpu):
     """(CellposeModel, batch size) for this process, with the TensorRT net
     swapped in when it is available."""
@@ -621,6 +647,12 @@ class SlideSegmentation():
                         continue
                 jobs.append({"index": ir * n_col + ic, "ir": ir, "ic": ic,
                              "x_0": x_0, "y_0": y_0, "x_1": x_1, "y_1": y_1})
+        # Edges shared with another tile that runs (_drop_seam_duplicates).
+        grid = {(job["ir"], job["ic"]) for job in jobs}
+        for job in jobs:
+            ir, ic = job["ir"], job["ic"]
+            job["shared_edges"] = {"left": (ir, ic - 1) in grid, "right": (ir, ic + 1) in grid,
+                                   "top": (ir - 1, ic) in grid, "bottom": (ir + 1, ic) in grid}
         return jobs
 
     def _read_tile(self, job):
@@ -658,7 +690,9 @@ class SlideSegmentation():
 
     def _post_tile(self, tile, masks):
         """Cells of one tile's label image, in processing-magnification
-        coordinates of the whole slide (post thread). None when it has none."""
+        coordinates of the whole slide (post thread), with each centroid's
+        distance to the tile's shared edges and the tile index. None when it
+        has none."""
         masks = self.finish_masks(masks)
         points, coord, prob = self.cellpose_to_stardist_format(masks, None, masks.shape[:2])
         w_col, h_row = tile["w_col"], tile["h_row"]
@@ -676,6 +710,11 @@ class SlideSegmentation():
                 points, coord, prob = points[keep], coord[keep], prob[keep]
         if len(points) == 0:
             return None
+        edge = np.full(len(points), np.inf)
+        for side, dist in (("left", points[:, 0]), ("right", w_col - points[:, 0]),
+                           ("top", points[:, 1]), ("bottom", h_row - points[:, 1])):
+            if tile["shared_edges"][side]:
+                edge = np.minimum(edge, dist)
         points[:, 0] += tile["sx_0"]
         points[:, 1] += tile["sy_0"]
         points = pd.DataFrame(points, index=[(tile["ir"], tile["ic"])]*len(points), columns=['x', 'y']).reset_index()
@@ -683,7 +722,20 @@ class SlideSegmentation():
         coord[:, :, 0] += tile["sx_0"]
         coord[:, :, 1] += tile["sy_0"]
         print(f"Tile r{tile['ir']} c{tile['ic']} (x={tile['sx_0']}, y={tile['sy_0']}) detected {len(points)} nuclei")
-        return points, coord, prob
+        return points, coord, prob, edge, np.full(len(points), tile["index"])
+
+    def _drop_seam_duplicates(self, points, coord, edge, tile):
+        """Keep one detection of each cell that two tiles saw. Detections from
+        different tiles are the same cell when either centroid lies inside the
+        other's contour; the one farther from its tile's shared edges wins (more
+        context, and never cut by the edge). A cell only one tile saw is kept."""
+        from scipy.spatial import cKDTree as KDTree
+        pairs = KDTree(points).query_pairs(r=2 * self.diameter, output_type="ndarray")
+        pairs = pairs[tile[pairs[:, 0]] != tile[pairs[:, 1]]]
+        if len(pairs):
+            a, b = pairs[:, 0], pairs[:, 1]
+            pairs = pairs[_points_in_polygons(points[b], coord[a]) | _points_in_polygons(points[a], coord[b])]
+        return _greedy_keep(len(points), pairs, np.argsort(-edge, kind="stable"))
 
     def _tile_meets_roi(self, x0, y0, x1, y1):
         """Whether a level-0 tile overlaps the ROI's bounding box (no ROI: always)."""
@@ -908,6 +960,13 @@ class SlideSegmentation():
         points_all = pd.concat([r[0] for r in kept], axis=0, ignore_index=True) if kept else None
         coord_all = np.concatenate([r[1] for r in kept], axis=0) if kept else None
         prob_all = np.concatenate([r[2] for r in kept], axis=0) if kept else None
+        if kept:
+            seam_keep = self._drop_seam_duplicates(points_all[['x', 'y']].values, coord_all,
+                                                   np.concatenate([r[3] for r in kept]),
+                                                   np.concatenate([r[4] for r in kept]))
+            print(f"Removed {np.sum(~seam_keep)} detections another tile saw with more context")
+            points_all = points_all[seam_keep].reset_index(drop=True)
+            coord_all, prob_all = coord_all[seam_keep], prob_all[seam_keep]
 
         # Print clear information before generating final_points
         if points_all is None or len(points_all) == 0:
@@ -1029,22 +1088,9 @@ class SlideSegmentation():
         else:
             points_array = points
 
-        # Highest prob first
-        sorted_indices = np.argsort(-prob)
-        keep_mask = np.ones(len(points_array), dtype=bool)
-
-        tree = KDTree(points_array)
-
-        for idx in sorted_indices:
-            if not keep_mask[idx]:
-                continue
-            # Find neighbors (including self) within threshold
-            neighbors = tree.query_ball_point(points_array[idx], r=distance_threshold)
-            for nidx in neighbors:
-                if nidx == idx:
-                    continue
-                if keep_mask[nidx]:
-                    keep_mask[nidx] = False  # Remove all lower-priority neighbors
+        # Highest prob first; each kept cell removes its lower-priority neighbours
+        pairs = KDTree(points_array).query_pairs(r=distance_threshold, output_type="ndarray")
+        keep_mask = _greedy_keep(len(points_array), pairs, np.argsort(-prob))
 
         if isinstance(points, pd.DataFrame):
             filtered_points = points[keep_mask]

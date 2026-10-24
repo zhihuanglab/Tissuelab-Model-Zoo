@@ -102,6 +102,22 @@ The net thread is only used with TensorRT (ONNX Runtime runs without the
 GIL); the PyTorch net launches its kernels under the GIL and was 3-4 s
 slower on TCGA-AD-6548 with it, so it runs on the main thread.
 
+## Tile seams
+
+Whole slides run as 2048-px tiles (level 0) overlapping by 224 px, so a cell
+in an overlap is found by two tiles, and the tile whose edge cuts it keeps a
+fragment. Two detections from different tiles are taken as one cell when
+either centroid lies inside the other's contour; the one farther from its
+tile's shared edges is kept (the cut fragment is right at the edge). A cell
+only one tile found is always kept. Overlapping cells (overlap >= half the
+smaller one) went 232 -> 1 pair on CMU-1 and 1,089 -> 2 on TCGA-AD-6548; the
+dropped detections are fragments or over-merged blobs whose cell the other tile
+segmented (−165 / −1,004 cells). The step takes ~1.2 s on CMU-1.
+
+`probabilities` is not a model confidence: Cellpose gives none per cell, so it
+is an area score (how close the cell is to a 20 px circle), kept for the
+StarDist-shaped output.
+
 ## Output (`Cell-Segmentation`)
 
 - `centroids` (N, 2) and `contours` (N, 32, 2), level-0 pixels
