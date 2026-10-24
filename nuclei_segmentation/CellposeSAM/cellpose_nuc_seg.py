@@ -45,6 +45,8 @@ READ_AHEAD = 2
 MASKS_AHEAD = 2
 # Resolution the settings above are in; userData target_mpp overrides it.
 PROCESSING_MPP = 0.5
+# Cross-tile cell pairs tested per point-in-polygon pass (_drop_seam_duplicates).
+SEAM_PAIR_CHUNK = 65536
 
 
 # Cellpose's default batch of 256x256 tiles on the PyTorch path.
@@ -730,12 +732,18 @@ class SlideSegmentation():
         other's contour; the one farther from its tile's shared edges wins (more
         context, and never cut by the edge). A cell only one tile saw is kept."""
         from scipy.spatial import cKDTree as KDTree
-        pairs = KDTree(points).query_pairs(r=2 * self.diameter, output_type="ndarray")
+        r = 2 * self.diameter
+        # Only cells within the overlap (plus r) of a shared edge can be in another tile.
+        rf = self.reference_magnification / self.args.magnification if self.args.magnification is not None else 1
+        near = np.flatnonzero(edge < self.overlap * rf + r)
+        pairs = near[KDTree(points[near]).query_pairs(r=r, output_type="ndarray")] if len(near) else np.zeros((0, 2), int)
         pairs = pairs[tile[pairs[:, 0]] != tile[pairs[:, 1]]]
-        if len(pairs):
-            a, b = pairs[:, 0], pairs[:, 1]
-            pairs = pairs[_points_in_polygons(points[b], coord[a]) | _points_in_polygons(points[a], coord[b])]
-        return _greedy_keep(len(points), pairs, np.argsort(-edge, kind="stable"))
+        same = np.zeros(len(pairs), dtype=bool)
+        for s in range(0, len(pairs), SEAM_PAIR_CHUNK):  # bounds the (pairs, 32) temporaries
+            a, b = pairs[s:s + SEAM_PAIR_CHUNK, 0], pairs[s:s + SEAM_PAIR_CHUNK, 1]
+            same[s:s + SEAM_PAIR_CHUNK] = (_points_in_polygons(points[b], coord[a])
+                                           | _points_in_polygons(points[a], coord[b]))
+        return _greedy_keep(len(points), pairs[same], np.argsort(-edge, kind="stable"))
 
     def _tile_meets_roi(self, x0, y0, x1, y1):
         """Whether a level-0 tile overlaps the ROI's bounding box (no ROI: always)."""

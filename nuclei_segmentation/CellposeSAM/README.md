@@ -112,7 +112,8 @@ tile's shared edges is kept (the cut fragment is right at the edge). A cell
 only one tile found is always kept. Overlapping cells (overlap >= half the
 smaller one) went 232 -> 1 pair on CMU-1 and 1,089 -> 2 on TCGA-AD-6548; the
 dropped detections are fragments or over-merged blobs whose cell the other tile
-segmented (−165 / −1,004 cells). The step takes ~1.2 s on CMU-1.
+segmented (−165 / −1,004 cells). Only cells within the overlap of a shared
+edge are compared, in chunks; the step takes ~1.1 s on CMU-1.
 
 `probabilities` is not a model confidence: Cellpose gives none per cell, so it
 is an area score (how close the cell is to a 20 px circle), kept for the
