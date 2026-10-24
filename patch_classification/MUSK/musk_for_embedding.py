@@ -307,6 +307,155 @@ def _resolve_loader_workers(requested=None, patch_size=None):
     return max(0, min(requested, _MAX_LOADER_WORKERS))
 
 
+# Pale-tissue pass for get_tissue_mask. The grayscale adaptive threshold only
+# fires on local contrast (edges, texture), so the interior of faint or weakly
+# stained tissue relies on hole filling and drops out when that fails. This
+# adds a saturation/texture mask and fills holes that are not plain glass.
+_DEFAULT_MPP = 0.25
+
+
+def _slide_mpp(slide):
+    props = getattr(slide, "properties", None) or {}
+    for key in ("tiffslide.mpp-x", "openslide.mpp-x", "aperio.MPP"):
+        try:
+            v = float(props.get(key))
+        except (TypeError, ValueError):
+            continue
+        if 0.05 < v < 5:
+            return v
+    return _DEFAULT_MPP
+
+
+def _odd(n):
+    return max(3, int(round(n)) | 1)
+
+
+def _saturation_texture_mask(rgb, um_px):
+    """Smoothed-saturation Triangle seeds plus textured, darker-than-glass
+    regions that contain enough seed. Returns (mask, od_s, t_od, sat_s, t_s)."""
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    sat, val = hsv[..., 1], hsv[..., 2]
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    valid = val > 20
+
+    k = _odd(48 / um_px)
+    sat_s = cv2.GaussianBlur(sat, (k, k), 0)
+    t_s, _ = cv2.threshold(sat_s[valid], 0, 255, cv2.THRESH_BINARY | cv2.THRESH_TRIANGLE)
+    seed = (sat_s > t_s) & valid
+
+    # Local std of gray: glass and scanner shading are smooth, tissue is not.
+    kt = _odd(64 / um_px)
+    mu = cv2.blur(gray, (kt, kt))
+    sd = np.sqrt(np.clip(cv2.blur(gray * gray, (kt, kt)) - mu * mu, 0, None))
+    bg = ~seed & valid & (val > np.percentile(val[valid], 50))
+    if bg.sum() < 100:  # slide is nearly all tissue
+        bg = valid & (val >= np.percentile(val[valid], 95))
+    med = np.median(sd[bg])
+    mad = np.median(np.abs(sd[bg] - med)) + 1e-3
+    # Floor: compressed glass can be perfectly flat, making MAD ~ 0.
+    tex = (sd > max(med + 6 * 1.4826 * mad, 2.0)) & valid
+
+    # Pixel must be darker than glass, so the std window does not bleed into
+    # glass at tissue edges or inside narrow lumens.
+    white = np.median(rgb[bg].reshape(-1, 3), axis=0).astype(np.float32)
+    lut = (-np.log((np.arange(256, dtype=np.float32)[:, None] + 1) / (white + 1))).clip(0)
+    od = np.maximum(np.maximum(lut[rgb[..., 0], 0], lut[rgb[..., 1], 1]), lut[rgb[..., 2], 2])
+    od_s = cv2.GaussianBlur(od, (_odd(16 / um_px),) * 2, 0)
+    o_med = np.median(od_s[bg])
+    o_mad = np.median(np.abs(od_s[bg] - o_med)) + 1e-4
+    t_od = max(o_med + 4 * 1.4826 * o_mad, 0.02)
+    tex &= od_s > t_od
+
+    # Scan-edge bands are left to the original edge-artifact rule.
+    h, w = sat.shape
+    b = max(3, int(0.01 * min(h, w)))
+    border = np.zeros((h, w), bool)
+    border[:b] = border[-b:] = True
+    border[:, :b] = border[:, -b:] = True
+    seed &= ~border
+    tex &= ~border
+
+    # Keep a region only if seeds are >= 5% of it, so one stained speck
+    # cannot pull in a whole unstained film.
+    cand = cv2.morphologyEx((seed | tex).astype(np.uint8), cv2.MORPH_CLOSE,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(40 / um_px),) * 2))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    seed_px = np.bincount(lab.ravel(), weights=(seed & (cand > 0)).ravel().astype(np.float64), minlength=n)
+    keep = seed_px >= 0.05 * st[:, cv2.CC_STAT_AREA]
+    keep[0] = False
+    return keep[lab], od_s, t_od, sat_s, t_s
+
+
+def _fill_non_glass_holes(mask, od_s, t_od, small_frac=0.001):
+    """Fill every enclosed hole except large ones that are mostly glass
+    (real lumens / clefts)."""
+    inv = (~mask).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+    h, w = mask.shape
+    border = np.zeros(n, bool)
+    border[np.unique(np.r_[lab[0], lab[-1], lab[:, 0], lab[:, -1]])] = True
+    darker = (od_s > t_od).astype(np.float64)
+    area = np.maximum(st[:, cv2.CC_STAT_AREA], 1)
+    frac_tissue = np.bincount(lab.ravel(), weights=darker.ravel(), minlength=n) / area
+    fill = ~border & ((area < small_frac * h * w) | (frac_tissue >= 0.5))
+    fill[0] = False
+    return mask | fill[lab]
+
+
+def _add_pale_tissue(rgb, mask, um_px):
+    """Union of the grayscale mask with the saturation/texture mask, then fill
+    non-glass holes and drop specks below the original min_area scale."""
+    # Full-size arrays are only views / one upsampled copy (same as cellcast's wsi_tissue_mask).
+    full = np.ascontiguousarray(mask, dtype=bool)
+    h0, w0 = full.shape
+    # Every scale below is >= ~16 um, so work on <= 4 MP and upsample the result.
+    f = max(1.0, (h0 * w0 / 4e6) ** 0.5)
+    mask = full
+    if f > 1:
+        size = (max(1, int(round(w0 / f))), max(1, int(round(h0 / f))))
+        rgb = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
+        mask = cv2.resize(full.view(np.uint8), size, interpolation=cv2.INTER_NEAREST).view(bool)
+        um_px = um_px * w0 / size[0]
+    if int((rgb.max(-1) > 20).sum()) < 100:  # blank / black thumbnail: nothing to add
+        return full.view(np.uint8)
+    st_mask, od_s, t_od, sat_s, t_s = _saturation_texture_mask(rgb, um_px)
+    # A region that does not touch the grayscale mask must be stained on
+    # average; grey dust, out-of-focus smudges and scan edges are not.
+    n, lab = cv2.connectedComponents(st_mask.astype(np.uint8), connectivity=8)
+    area = np.maximum(np.bincount(lab.ravel(), minlength=n), 1)
+    mean_sat = np.bincount(lab.ravel(), weights=sat_s.ravel().astype(np.float64), minlength=n) / area
+    touches = np.zeros(n, bool)
+    touches[np.unique(lab[mask])] = True
+    keep = touches | (mean_sat >= t_s)
+    keep[0] = False
+    st_mask = keep[lab]
+    # Opening the added part drops thin grey fibers / threads that touch tissue.
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(100 / um_px),) * 2)
+    added = cv2.morphologyEx((st_mask & ~mask).astype(np.uint8), cv2.MORPH_OPEN, k)
+    # Added regions lying mostly in the slide-edge band are coverslip / mountant
+    # edges (same band as the edge-artifact rule in get_tissue_mask).
+    h, w = mask.shape
+    edge = np.zeros((h, w), bool)
+    my, mx = max(1, int(0.04 * h)), max(1, int(0.04 * w))
+    edge[:my] = edge[-my:] = True
+    edge[:, :mx] = edge[:, -mx:] = True
+    n, lab = cv2.connectedComponents(added, connectivity=8)
+    area = np.maximum(np.bincount(lab.ravel(), minlength=n), 1)
+    in_edge = np.bincount(lab.ravel(), weights=edge.ravel().astype(np.float64), minlength=n) / area
+    keep = in_edge < 0.5
+    keep[0] = False
+    m = _fill_non_glass_holes(mask | keep[lab], od_s, t_od)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
+    min_area = min(max(0.0005 * h0 * w0, 2000), 0.002 * h0 * w0) * (h * w) / (h0 * w0)
+    keep = st[:, cv2.CC_STAT_AREA] >= min_area
+    keep[0] = False
+    m = keep[lab].view(np.uint8)
+    if f > 1:
+        m = cv2.resize(m, (w0, h0), interpolation=cv2.INTER_NEAREST)
+    np.bitwise_or(m, full.view(np.uint8), out=m)
+    return m
+
+
 def _tissue_patch_coords(mask, width, height, patch_size, tissue_threshold):
     """Row-major (N, 4) int64 [x0, y0, x1, y1] of every patch whose mask
     coverage is >= tissue_threshold.
@@ -1211,6 +1360,19 @@ class MUSK:
 
             # Final mask: tissue minus artifacts
             final_mask = (mask.astype(bool) & (~artifact_mask.astype(bool))).astype(np.uint8)
+
+            # Pale-tissue pass (see _add_pale_tissue); keep the grayscale mask if it fails.
+            try:
+                rgb = np.asarray(temp_thumb.convert("RGB"))
+                um_px = _slide_mpp(slide) * int(slide.level_dimensions[0][0]) / float(rgb.shape[1])
+                before = float(final_mask.mean())
+                final_mask = _add_pale_tissue(rgb, final_mask, um_px)
+                print(f"[TissueMask] pale-tissue pass: {before:.1%} -> {final_mask.mean():.1%} "
+                      f"(um/px~{um_px:.1f})", flush=True)
+            except Exception as e:
+                if type(e).__name__ == "CooperativeCancel":
+                    raise
+                print(f"[TissueMask] pale-tissue pass skipped: {e}", flush=True)
             if debug_dir:
                 imageio.imwrite(
                     os.path.join(debug_dir, "debug_06_final_mask.png"),
