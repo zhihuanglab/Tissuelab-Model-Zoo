@@ -1,4 +1,4 @@
-# CellPose task node. Python 3.11.
+# Cellpose-SAM task node. Python 3.11.
 # Pins match TissueLab/app/service/requirements-packaging.txt where used.
 # tissuelab_sdk 0.1.14 already depends on nibabel and pydicom.
 
@@ -25,17 +25,9 @@ multiprocess==0.70.17
 tqdm>=4.66.0
 fastdist==1.1.6
 
-# Cellpose 4 is Cellpose-SAM (default cpsam_v2). Cap below 5 so a future
-# breaking release is not pulled by pip.
+# Cellpose 4 is Cellpose-SAM; the node runs its cpsam_v2 model only. Cap
+# below 5 so a future breaking release is not pulled by pip.
 cellpose>=4.2.1.1,<5
-
-# transformers 5.x is a breaking release: it rewrote several tokenizer
-# classes on top of the `tokenizers` library rather than sentencepiece
-# (verified: XLMRobertaTokenizer(<spm path>) raises TypeError under 5.16.1).
-# This node loads vinid/plip through AutoProcessor /
-# AutoModelForZeroShotImageClassification, so it is held on the 4.x line
-# together with the other task nodes.
-transformers<5
 
 # macOS: PyPI CPU/MPS. Linux/Windows: CUDA 12.6 (not PyPI's default CUDA 13).
 --extra-index-url https://download.pytorch.org/whl/cu126

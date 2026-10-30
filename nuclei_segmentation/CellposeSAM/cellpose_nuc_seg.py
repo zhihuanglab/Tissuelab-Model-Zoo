@@ -2,6 +2,7 @@
 
 from cellpose.models import CellposeModel
 from cellpose.io import logger_setup
+from cellpose import plot as cellpose_plot
 import numpy as np
 import pandas as pd
 import time
@@ -13,24 +14,53 @@ from multiprocessing import Queue
 from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFileWrapper
 import tiffslide
 import torch
+from scipy.ndimage import find_objects
 
 opj = os.path.join
 
-# Cellpose 4 builtin names. v3 nuclei/cyto/cyto2/cyto3 are ignored by v4.
-_CELLPOSE4_MODELS = {"cpsam_v2", "cpsam", "cpdino", "cpdino-vitb"}
-_CELLPOSE3_MODELS = {"nuclei", "cyto", "cyto2", "cyto3"}
+# CellposeModel.eval() always renders the flows as an RGB picture (dx_to_circ)
+# for display; this node never reads it, and it is a full-size numpy pass per
+# eval. iSight's reference segmentation disables it the same way.
+cellpose_plot.dx_to_circ = lambda *args, **kwargs: None
+
+# Cellpose-SAM, Cellpose 4's default model. The only model this node runs.
+CELLPOSE_MODEL = "cpsam_v2"
+
+# Segmentation settings of iSight v2 (iSight_v2/isight_infer.py `segment`), so
+# its target-cell model sees the cells it was trained on. Pixels are 0.5 um/px
+# (20x): whole slides are resampled to it, plain images are taken as it.
+CELL_DIAMETER_PX = 20
+FLOW_THRESHOLD = 0.4
+CELLPROB_THRESHOLD = 0.0
+MIN_CELL_AREA_PX = 50
+# Plain JPEG/PNG carry no resolution; HPA-style IHC images are 0.5 um/px.
+PLAIN_IMAGE_MPP = 0.5
+# Resolution the settings above are in; userData target_mpp overrides it.
+PROCESSING_MPP = 0.5
 
 
-def _cellpose_pretrained(name):
-    if os.path.exists(name):
-        return name
-    if name in _CELLPOSE4_MODELS:
-        return name
-    if name in _CELLPOSE3_MODELS:
-        print(f"Cellpose 4 ignores model_type={name!r}; using cpsam_v2")
-    else:
-        print(f"Unknown Cellpose model {name!r}; using cpsam_v2")
-    return "cpsam_v2"
+def parse_roi(args):
+    """(bbox, polygon) in level-0 pixels from userData: bbox "x,y,w,h", polygon
+    [[x, y], ...]. bbox wins when both are set, as in the Cytoformer node."""
+    bbox = polygon = None
+    raw = getattr(args, "bbox", None)
+    if raw:
+        try:
+            parts = [float(p) for p in str(raw).split(",")]
+            if len(parts) == 4 and parts[2] > 0 and parts[3] > 0:
+                bbox = tuple(parts)
+            else:
+                print(f"Ignoring bbox {raw!r}: expected x,y,w,h with w, h > 0")
+        except ValueError:
+            print(f"Ignoring unparsable bbox {raw!r}")
+    pts = getattr(args, "polygon_points", None)
+    if bbox is None and isinstance(pts, list) and len(pts) >= 3:
+        try:
+            polygon = np.array([(float(p[0]), float(p[1])) for p in pts], dtype=np.float32)
+        except (TypeError, ValueError, IndexError):
+            print("Ignoring unparsable polygon_points")
+    return bbox, polygon
+
 
 class SlideSegmentation():
 
@@ -38,10 +68,7 @@ class SlideSegmentation():
                  args,
                  tile_size=2048,
                  overlap=224,
-                 prob_thresh=0.3,
-                 nms_thresh=0.3,
                  n_tiles=(2,2,1),
-                 cellpose_model='cpsam_v2',
                  isIHC=False,
                  progress_callback=None,
                  cancel_checker=None,
@@ -61,20 +88,23 @@ class SlideSegmentation():
             print("No GPU found. Running Cellpose on CPU.")
             
         self.args = args
-        self.reference_magnification = 20 # Keep 20x for consistency
+        # Magnification the settings are in (20x at 0.5 um/px), or the target_mpp asked for.
+        target_mpp = getattr(args, "target_mpp", None)
+        self.processing_mpp = float(target_mpp) if target_mpp else PROCESSING_MPP
+        self.reference_magnification = 10 / self.processing_mpp
+        self.roi_bbox, self.roi_polygon = parse_roi(args)
         self.tile_size = tile_size
         self.read_data()
         
         self.wsi_mask = self.simple_get_mask()
         
-        pretrained = _cellpose_pretrained(cellpose_model)
-        print(f"Loading Cellpose model: {pretrained}")
-        self.model = CellposeModel(gpu=use_gpu, pretrained_model=pretrained)
+        print(f"Loading Cellpose-SAM model: {CELLPOSE_MODEL}")
+        self.model = CellposeModel(gpu=use_gpu, pretrained_model=CELLPOSE_MODEL)
         
-        # Cellpose parameters
-        self.diameter = 30  # Typical nucleus diameter in pixels at 20x magnification
-        self.flow_threshold = 0.4
-        self.cellprob_threshold = prob_thresh  # Use the same threshold as StarDist
+        self.diameter = CELL_DIAMETER_PX
+        self.flow_threshold = FLOW_THRESHOLD
+        self.cellprob_threshold = CELLPROB_THRESHOLD
+        self.min_cell_area = MIN_CELL_AREA_PX
         
         self.level = 0
         try:
@@ -89,8 +119,6 @@ class SlideSegmentation():
             self.mask_ratio_y = self.dim[1]/self.wsi_mask.shape[0]
         
         self.overlap = overlap
-        self.prob_thresh = prob_thresh
-        self.nms_thresh = nms_thresh
         self.n_tiles = n_tiles
         self.isIHC = isIHC
         
@@ -143,7 +171,7 @@ class SlideSegmentation():
             file_extension = os.path.splitext(self.args.slidepath)[1].lower()[1:]
             if file_extension in ['jpg', 'jpeg', 'png', 'bmp']:
                 self.slide = SimpleImageWrapper(self.args.slidepath)
-                mpp = 0.25  # Default value
+                mpp = PLAIN_IMAGE_MPP
             elif file_extension in ['dcm']:
                 self.slide = DicomImageWrapper(self.args.slidepath)
                 mpp = 0.25  # Default value
@@ -341,29 +369,28 @@ class SlideSegmentation():
         if masks.ndim > 2:
             masks = np.squeeze(masks)
 
-        # Get unique labels (excluding background 0)
-        labels = np.unique(masks)
-        labels = labels[labels > 0]
-        
-        if len(labels) == 0:
-            # No cells detected
-            return np.array([]).reshape(0, 2), np.array([]).reshape(0, self.global_max_contour_points, 2), np.array([])
-        
+        labels_img = masks.astype(np.int32)
         points = []
         coord = []
         prob = []
         
-        for label in labels:
-            # Get mask for this cell
-            cell_mask = (masks == label)
+        # One bounding box per label (find_objects), so each cell is measured on
+        # its own few pixels rather than by comparing the whole tile per label.
+        for label, sl in enumerate(find_objects(labels_img), start=1):
+            if sl is None:
+                continue
+            # 1 px margin so a contour touching the box edge is still closed.
+            y0, y1 = max(0, sl[0].start - 1), min(labels_img.shape[0], sl[0].stop + 1)
+            x0, x1 = max(0, sl[1].start - 1), min(labels_img.shape[1], sl[1].stop + 1)
+            cell_mask = labels_img[y0:y1, x0:x1] == label
             
             # Get centroid
-            y_coords, x_coords = np.where(cell_mask)
-            if len(x_coords) == 0:
+            y_coords, x_coords = np.nonzero(cell_mask)
+            if len(x_coords) < self.min_cell_area:
                 continue
                 
-            centroid_x = np.mean(x_coords)
-            centroid_y = np.mean(y_coords)
+            centroid_x = np.mean(x_coords) + x0
+            centroid_y = np.mean(y_coords) + y0
             points.append([centroid_x, centroid_y])
             
             # Get contour
@@ -376,8 +403,8 @@ class SlideSegmentation():
                 if len(contour.shape) == 1:  # Handle single point
                     contour = contour.reshape(1, 2)
                 
-                # Ensure contour is float for interpolation
-                contour = contour.astype(np.float32)
+                # Ensure contour is float for interpolation; back to tile coordinates
+                contour = contour.astype(np.float32) + np.array([x0, y0], dtype=np.float32)
                 
                 # Pad or downsample contour to global_max_contour_points
                 if len(contour) < self.global_max_contour_points:
@@ -464,10 +491,43 @@ class SlideSegmentation():
         
         return points, coord, prob
 
+    def _tile_meets_roi(self, x0, y0, x1, y1):
+        """Whether a level-0 tile overlaps the ROI's bounding box (no ROI: always)."""
+        if self.roi_bbox is not None:
+            bx, by, bw, bh = self.roi_bbox
+            rx0, ry0, rx1, ry1 = bx, by, bx + bw, by + bh
+        elif self.roi_polygon is not None:
+            rx0, ry0 = self.roi_polygon.min(axis=0)
+            rx1, ry1 = self.roi_polygon.max(axis=0)
+        else:
+            return True
+        return x0 < rx1 and x1 > rx0 and y0 < ry1 and y1 > ry0
+
+    def _keep_roi_cells(self):
+        """Drop cells whose centroid lies outside the ROI."""
+        if self.roi_bbox is None and self.roi_polygon is None:
+            return
+        pts = np.asarray(self.final_points)
+        if len(pts) == 0:
+            return
+        if self.roi_bbox is not None:
+            bx, by, bw, bh = self.roi_bbox
+            keep = (pts[:, 0] >= bx) & (pts[:, 0] < bx + bw) & (pts[:, 1] >= by) & (pts[:, 1] < by + bh)
+        else:
+            poly = self.roi_polygon.reshape(-1, 1, 2)
+            keep = np.array([cv2.pointPolygonTest(poly, (float(x), float(y)), False) >= 0 for x, y in pts], dtype=bool)
+        self.final_points = self.final_points[keep]
+        self.final_coord = self.final_coord[keep]
+        if getattr(self, "prob_all", None) is not None and len(self.prob_all) == len(keep):
+            self.prob_all = self.prob_all[keep]
+        print(f"ROI: kept {int(keep.sum())} of {len(keep)} cells")
+
     def run_WSI_segmentation(self):
-        '''
-        Modified to use Cellpose instead of StarDist
-        '''
+        """Segment the slide (or its ROI) with Cellpose-SAM."""
+        self._segment()
+        self._keep_roi_cells()
+
+    def _segment(self):
         
         # Record overall start time
         overall_start_time = time.time()
@@ -487,6 +547,15 @@ class SlideSegmentation():
                 # Directly load the entire image
                 img = self.slide.read_region((0, 0), 0, self.dim)
                 img_np = np.array(img)[:,:,:3]  # Ensure RGB format
+                # Plain images are taken as PLAIN_IMAGE_MPP; resample only when
+                # a target_mpp asks for another resolution.
+                resize_factor = self.reference_magnification / self.args.magnification
+                if abs(resize_factor - 1) > 1e-6:
+                    img_np = cv2.resize(
+                        img_np,
+                        (int(round(self.dim[0] * resize_factor)), int(round(self.dim[1] * resize_factor))),
+                        interpolation=cv2.INTER_AREA if resize_factor < 1 else cv2.INTER_LINEAR,
+                    )
                 
                 if self.progress_callback:
                     self.progress_callback(30)
@@ -494,6 +563,9 @@ class SlideSegmentation():
                 
                 # Run Cellpose prediction
                 points, coord, prob = self.predict_cellpose(img_np)
+                if abs(resize_factor - 1) > 1e-6 and len(points) > 0:
+                    points = points / resize_factor
+                    coord = coord / resize_factor
                 
                 # Filter results based on tissue mask
                 if self.wsi_mask is not None and len(points) > 0:
@@ -528,9 +600,9 @@ class SlideSegmentation():
                     self.progress_callback(80)
                 self._maybe_cancel()
                     
-                # Set final results
-                self.final_points = points.astype(np.int32)
-                self.final_coord = coord.astype(np.int32)
+                # Set final results (centroids are pixel means: round, not truncate)
+                self.final_points = np.rint(points).astype(np.int32)
+                self.final_coord = np.rint(coord).astype(np.int32)
                 self.prob_all = prob
                 
                 # Apply post-processing for simple images too
@@ -604,6 +676,9 @@ class SlideSegmentation():
                 
                 w_col = x_1 - x_0
                 h_row = y_1 - y_0
+
+                if not self._tile_meets_roi(x_0, y_0, x_1, y_1):
+                    continue
 
                 if self.wsi_mask is not None:
                     # Check mask for efficiency
@@ -753,17 +828,20 @@ class SlideSegmentation():
             
             # Add debug info when generating final_points
             try:
-                self.final_points = points_all[['x','y']].values.astype(np.int32)
-                print(f"Successfully generated final_points, shape={self.final_points.shape}")
+                # Kept as float until the end: centroids are pixel means, so round once, not truncate.
+                final_points = points_all[['x','y']].values.astype(np.float64)
+                print(f"Successfully generated final_points, shape={final_points.shape}")
                 
-                self.final_coord = coord_all.astype(np.int32)
+                final_coord = np.asarray(coord_all, dtype=np.float64)
                 self.prob_all = prob_all
                 
                 if self.args.magnification is not None:
                     # Need to scale back to original size since calculations were at 20x
                     resize_factor = self.reference_magnification / self.args.magnification
-                    self.final_points = (self.final_points/resize_factor).astype(np.int32)
-                    self.final_coord = (self.final_coord/resize_factor).astype(np.int32)
+                    final_points = final_points / resize_factor
+                    final_coord = final_coord / resize_factor
+                self.final_points = np.rint(final_points).astype(np.int32)
+                self.final_coord = np.rint(final_coord).astype(np.int32)
                 
                 print(f"Before deduplication: {len(self.final_points)} detected nuclei")
                 
