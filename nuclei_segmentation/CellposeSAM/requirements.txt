@@ -1,12 +1,14 @@
-# Cellpose-SAM task node. Python 3.11.
+# Cellpose-SAM task node. Python 3.11; macOS needs 14+ (torch 2.14 wheels).
 # Pins match TissueLab/app/service/requirements-packaging.txt where used.
-# tissuelab_sdk 0.1.14 already depends on nibabel and pydicom.
+# tissuelab_sdk 0.1.14 already depends on nibabel and pydicom; cellpose pulls
+# fastremap, segment-anything and tqdm.
 
 numpy==2.4.6
 Pillow==12.3.0
-opencv-python==5.0.0.93
+# Headless only: cellpose depends on it, and a second OpenCV package would
+# share (and clobber) the same cv2 module.
+opencv-python-headless==5.0.0.93
 scipy==1.17.1
-matplotlib==3.11.1
 zarr==3.1.6
 tifffile==2026.3.3
 tiffslide==3.0.1
@@ -16,14 +18,8 @@ pydantic==2.13.5
 requests==2.34.2
 tissuelab_sdk==0.1.14
 pandas==3.0.5
-scikit-learn==1.5.2
 scikit-image==0.26.0
 sse-starlette==3.4.6
-
-setuptools
-multiprocess==0.70.17
-tqdm>=4.66.0
-fastdist==1.1.6
 
 # Cellpose 4 is Cellpose-SAM; the node runs its cpsam_v2 model only. Cap
 # below 5 so a future breaking release is not pulled by pip.
@@ -31,7 +27,9 @@ cellpose>=4.2.1.1,<5
 
 # TensorRT path for the SAM encoder (cpsam_trt.py), Linux/Windows with CUDA only;
 # without these the node runs PyTorch. Versions match napa's cellcast_infer env.
-onnx; sys_platform != "darwin"
+# onnxruntime-gpu 1.27 drops CUDA 12. tensorrt on PyPI is a stub that fetches
+# its wheels from pypi.nvidia.com at install time.
+onnx==1.23.2; sys_platform != "darwin"
 onnxruntime-gpu==1.26.0; sys_platform != "darwin"
 tensorrt==10.9.0.34; sys_platform != "darwin"
 
