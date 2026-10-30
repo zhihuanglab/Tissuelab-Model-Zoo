@@ -16,6 +16,12 @@ import os
 # first eval of a 3000x3000 image took 169 s with it and 8 s without. Must be
 # set before numpy is imported; an explicit setting still wins.
 os.environ.setdefault("NUMPY_MADVISE_HUGEPAGE", "0")
+
+# Linux: put the TensorRT / CUDA wheel libraries on LD_LIBRARY_PATH, re-exec'ing
+# once if TissueLab started the node without them (see cpsam_trt). Must run
+# before torch / onnxruntime are imported.
+import cpsam_trt
+cpsam_trt.ensure_runtime_env()
 import time
 import json
 import threading

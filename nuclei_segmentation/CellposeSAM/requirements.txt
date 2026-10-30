@@ -29,6 +29,12 @@ fastdist==1.1.6
 # below 5 so a future breaking release is not pulled by pip.
 cellpose>=4.2.1.1,<5
 
+# TensorRT path for the SAM encoder (cpsam_trt.py), Linux/Windows with CUDA only;
+# without these the node runs PyTorch. Versions match napa's cellcast_infer env.
+onnx; sys_platform != "darwin"
+onnxruntime-gpu==1.26.0; sys_platform != "darwin"
+tensorrt==10.9.0.34; sys_platform != "darwin"
+
 # macOS: PyPI CPU/MPS. Linux/Windows: CUDA 12.6 (not PyPI's default CUDA 13).
 --extra-index-url https://download.pytorch.org/whl/cu126
 torch==2.14.0; sys_platform == "darwin"
