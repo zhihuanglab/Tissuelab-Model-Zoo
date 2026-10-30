@@ -45,6 +45,15 @@ READ_AHEAD = 2
 MASKS_AHEAD = 2
 # Resolution the settings above are in; userData target_mpp overrides it.
 PROCESSING_MPP = 0.5
+# Slide tiles and their overlap in processing pixels: a 40x slide resized to
+# 0.5 um/px gets the same tiles as a 20x one (level-0 sizes scale with it). A
+# 112 px overlap lost cells along seams (-0.3% on CMU-1, -0.55% on TCGA-AD-6548).
+TILE_PX = 2048
+OVERLAP_PX = 224
+# Slides scaled by less than this keep TILE_PX / OVERLAP_PX at level 0, their
+# tiles before: no speed to gain there, and IHC cell counts move by about +-1%
+# with any shift of the tile grid.
+SCALE_TILES_FROM = 1.5
 # Cross-tile cell pairs tested per point-in-polygon pass (_drop_seam_duplicates).
 SEAM_PAIR_CHUNK = 4096
 # A detection is the same cell as another tile's when at least this share of
@@ -148,8 +157,6 @@ class SlideSegmentation():
 
     def __init__(self,
                  args,
-                 tile_size=2048,
-                 overlap=224,
                  n_tiles=(2,2,1),
                  isIHC=False,
                  progress_callback=None,
@@ -175,7 +182,6 @@ class SlideSegmentation():
         self.processing_mpp = float(target_mpp) if target_mpp else PROCESSING_MPP
         self.reference_magnification = 10 / self.processing_mpp
         self.roi_bbox, self.roi_polygon = parse_roi(args)
-        self.tile_size = tile_size
         self.read_data()
         
         self.wsi_mask = self.simple_get_mask()
@@ -199,7 +205,6 @@ class SlideSegmentation():
             self.mask_ratio_x = self.dim[0]/self.wsi_mask.shape[1]
             self.mask_ratio_y = self.dim[1]/self.wsi_mask.shape[0]
         
-        self.overlap = overlap
         self.n_tiles = n_tiles
         self.isIHC = isIHC
         
@@ -267,20 +272,15 @@ class SlideSegmentation():
             self.args.magnification = reference_mpp_1x / mpp
             print("Magnification: ", self.args.magnification)
         
-        # Set tile size based on magnification
-        if self.args.magnification > 80+1:
-            self.tile_size = 8192
-        elif self.args.magnification > 40+1:
-            self.tile_size = 4096
-        elif self.args.magnification > 20+1:
-            self.tile_size = 2048
-        elif self.args.magnification > 10+1:
-            self.tile_size = 2048
-        else:
-            self.tile_size = 2048
+        # Level-0 tile and overlap that are TILE_PX / OVERLAP_PX once resized
+        scale = self.args.magnification / self.reference_magnification
+        if scale < SCALE_TILES_FROM:
+            scale = 1.0
+        self.tile_size = int(round(TILE_PX * scale))
+        self.overlap = int(round(OVERLAP_PX * scale))
 
         print("-"*100)
-        print(f"Tile size: {self.tile_size}")
+        print(f"Tile size: {self.tile_size}, overlap: {self.overlap} (level 0)")
         print("-"*100)
 
     def simple_get_mask(self):
@@ -341,7 +341,9 @@ class SlideSegmentation():
             # ---------------------------------------------------------------------
             # 3. Morphological closing – bridge small gaps / tears
             # ---------------------------------------------------------------------
-            mask = morphology.binary_closing(mask, morphology.disk(8))
+            # skimage's binary_closing with the same disk, in OpenCV: the same
+            # mask (default border) in ~10 ms instead of ~1 s
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, morphology.disk(8).astype(np.uint8)).astype(bool)
             if debug_dir:
                 imageio.imwrite(os.path.join(debug_dir, "debug_02_closed.png"), mask.astype(np.uint8) * 255)
 

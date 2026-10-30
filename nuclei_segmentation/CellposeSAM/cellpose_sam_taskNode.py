@@ -269,8 +269,6 @@ def run_segmentation(args):
         if not ALREADY_HAVE_SEG:
             print(f"Working on {args.slidepath} with Cellpose-SAM, isIHC={args.isIHC}")
             ss = SlideSegmentation(args,
-                                   tile_size=2048,
-                                   overlap=224,
                                    n_tiles=(2, 2, 1),
                                    isIHC=args.isIHC,
                                    progress_callback=update_progress,

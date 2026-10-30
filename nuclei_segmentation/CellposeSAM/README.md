@@ -107,9 +107,15 @@ slower on TCGA-AD-6548 with it, so it runs on the main thread.
 
 ## Tile seams
 
-Whole slides run as 2048-px tiles (level 0) overlapping by 224 px, so a cell
-in an overlap is found by two tiles, and the tile whose edge cuts it keeps a
-fragment. Detections of neighbouring tiles are compared (`_drop_seam_duplicates`):
+Whole slides run as tiles of 2048 px overlapping by 224 px. On 40x slides
+these are processing pixels (0.5 um/px or the target_mpp), ~4064 / 444 px at
+level 0; they used to be 2048 / 224 at level 0, i.e. 1024-px tiles with a 112
+px overlap once resized: TCGA-AD-6548 53 -> 47 s with +0.44% cells (a 112 px
+overlap loses cells along seams). Slides scaled by less than 1.5x (20x) keep
+2048 / 224 at level 0: no speed to gain, and on IHC the cell count moves by
+about +-1% with any shift of the tile grid (PMS2 slide: -1.17% to +0.70% for
+shifts of 9-25 px), so they keep exactly the tiles they had. A cell in an
+overlap is found by two tiles, and the tile whose edge cuts it keeps a fragment. Detections of neighbouring tiles are compared (`_drop_seam_duplicates`):
 
 - One that lies mostly inside another tile's cell (half of 17 interior sample
   points inside its contour) is that cell: a cut fragment, or the same cell
