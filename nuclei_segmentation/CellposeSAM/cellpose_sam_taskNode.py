@@ -3,9 +3,10 @@
 """
 Cellpose-SAM cell segmentation node.
 
+The segmentation for IHC slides that iSight-Cell and iSight-Target classify.
 Runs Cellpose-SAM (Cellpose 4, cpsam_v2) with iSight v2's settings (diameter
 20 px, flow 0.4, cellprob 0, min area 50 px at 0.5 um/px) and writes the cells
-only: no embeddings (the classifier that needs them computes its own).
+only, no embeddings: the classifier computes its own from the centroids.
 """
 import argparse
 import os
@@ -23,6 +24,7 @@ os.environ.setdefault("NUMPY_MADVISE_HUGEPAGE", "0")
 import cpsam_trt
 cpsam_trt.ensure_runtime_env()
 import time
+import hashlib
 import json
 import threading
 import zarr
@@ -116,9 +118,19 @@ progress_state = ProgressSSEState()
 cancel_event = threading.Event()
 
 
-# Stamped on Cell-Segmentation with the run's inputs. Another node's segmentation
-# (no stamp) or one of another region / resolution is redone, not reused.
+# Stamped on Cell-Segmentation with the run's inputs and a digest of the cells.
+# Another node's segmentation (no stamp, or cells that no longer match the
+# digest: other nodes keep the group's attrs when they re-segment) or one of
+# another region / resolution is redone, not reused.
 SEGMENTATION_MODEL = "Cellpose-SAM"
+
+
+def _cells_digest(centroids):
+    """Digest of the cell set, independent of row order: a node that embeds
+    these cells may re-sort them, and they are still these cells."""
+    c = np.asarray(centroids, dtype=np.int64).reshape(-1, 2)
+    c = c[np.lexsort((c[:, 1], c[:, 0]))]
+    return hashlib.sha1(c.tobytes()).hexdigest()
 
 
 def _segmentation_params(args):
@@ -145,7 +157,7 @@ def _stored_segmentation_matches(node_grp, args):
                 return False
         elif str(have) != want:
             return False
-    return True
+    return "centroids" in node_grp and attrs.get("segmentation_cells") == _cells_digest(node_grp["centroids"][()])
 
 
 def _mark_sse_cancelled() -> None:
@@ -270,7 +282,8 @@ def run_segmentation(args):
             result["nuclei_count"] = len(centroids)
             result["message"] = "Segmentation completed successfully"
             _persist_segmentation_to_zarr(centroids, contours, probability,
-                                          params=_segmentation_params(args))
+                                          params={**_segmentation_params(args),
+                                                  "segmentation_cells": _cells_digest(centroids)})
 
         # Ensure progress is set to 100
         update_progress(100)
@@ -420,15 +433,25 @@ def execute_node():
             elif not progress_state.complete and not progress_state.cancelled:
                 progress_state.mark_terminal_and_wait(100, 2.0)
 
-        # store the result to 'output'
+        # Run metadata as attrs of <NODE_NAME>/metadata, as StarDist and Cytoformer
+        # write it. Not a scalar <NODE_NAME>/output array: nodes that re-sort every
+        # array of the group by cell (Cytoformer, before embedding these cells)
+        # fail on one that has no rows.
         if ZARR_PATH and os.path.exists(ZARR_PATH):
             zf = zarr.open_group(ZARR_PATH, mode='a')
-            node_out_path = f"{NODE_NAME}/output"
-            if node_out_path in zf:
-                del zf[node_out_path]
-            out_str = json.dumps(out_val, ensure_ascii=False)
-            out_bytes = out_str.encode("utf-8")
-            zf.create_array(node_out_path, data=np.array(out_bytes, dtype=f'S{len(out_bytes)}'))
+            seg_grp = zf.require_group(NODE_NAME)
+            for stale in ("output", "metadata"):
+                if stale in seg_grp:
+                    del seg_grp[stale]
+            seg_grp.create_group('metadata').attrs.update({
+                'model': SEGMENTATION_MODEL,
+                'status': out_val.get('status', 'unknown'),
+                'message': out_val.get('message', ''),
+                'nuclei_count': int(out_val.get('nuclei_count', 0)),
+                'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                'has_embeddings': 'embeddings' in seg_grp,
+                'has_probabilities': 'probabilities' in seg_grp,
+            })
 
         return {"status": "ok", "output": out_val}
     finally:
