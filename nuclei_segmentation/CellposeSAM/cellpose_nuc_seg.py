@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 import time
 import cv2
-from tqdm import tqdm
 import os
 from datetime import datetime
 from multiprocessing import Queue
@@ -15,8 +14,10 @@ from tissuelab_sdk.wrapper import SimpleImageWrapper, DicomImageWrapper, TiffFil
 import tiffslide
 import torch
 from scipy.ndimage import find_objects
+from concurrent.futures import ThreadPoolExecutor
 import cpsam_trt
 import cpsam_gpu
+from cellpose import utils
 
 opj = os.path.join
 
@@ -37,8 +38,21 @@ CELLPROB_THRESHOLD = 0.0
 MIN_CELL_AREA_PX = 50
 # Plain JPEG/PNG carry no resolution; HPA-style IHC images are 0.5 um/px.
 PLAIN_IMAGE_MPP = 0.5
+# Tiles read ahead of the one on the GPU (reader thread).
+READ_AHEAD = 2
+# Tiles whose masks may still be in progress (masks thread) while the main
+# thread runs the next tile's network.
+MASKS_AHEAD = 2
 # Resolution the settings above are in; userData target_mpp overrides it.
 PROCESSING_MPP = 0.5
+# Cross-tile cell pairs tested per point-in-polygon pass (_drop_seam_duplicates).
+SEAM_PAIR_CHUNK = 4096
+# A detection is the same cell as another tile's when at least this share of
+# its interior lies inside the other's contour.
+SEAM_SAME_CELL = 0.5
+# A detection containing two or more of another tile's cells that together
+# cover this share of it is a merge of them; their split is kept.
+SEAM_MERGE_COVER = 0.75
 
 
 # Cellpose's default batch of 256x256 tiles on the PyTorch path.
@@ -48,6 +62,42 @@ TORCH_BATCH = 8
 # weights (or the TensorRT engine) every run would dominate small images.
 _MODEL = None
 _MODEL_BATCH = TORCH_BATCH
+
+
+def _points_in_polygons(pts, polys):
+    """Whether pts[i] ((n, 2)), or each of pts[i, :] ((n, k, 2)), lies inside
+    the closed polygon polys[i] (even-odd rule). float32: coordinates are
+    pixels well below 2**24."""
+    single = pts.ndim == 2
+    p = (pts[:, None, :] if single else pts).astype(np.float32)
+    x, y = p[..., 0:1], p[..., 1:2]                       # (n, k, 1)
+    x1, y1 = polys[:, None, :, 0].astype(np.float32), polys[:, None, :, 1].astype(np.float32)
+    x2, y2 = np.roll(x1, -1, axis=2), np.roll(y1, -1, axis=2)   # (n, 1, m)
+    crosses = (y1 > y) != (y2 > y)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        xi = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+    inside = np.count_nonzero(crosses & (x < xi), axis=2) % 2 == 1
+    return inside[:, 0] if single else inside
+
+
+def _interior_samples(pts, polys):
+    """The centroid and the 16 points halfway from it to every other contour
+    vertex: (n, 17, 2) points inside the cell, away from its outline."""
+    c = pts[:, None, :]
+    return np.concatenate([c, (c + polys[:, ::2]) / 2], axis=1)
+
+
+def _greedy_keep(n, src, dst, order, keep=None):
+    """Walk the n items in `order`; each one still kept removes the items it
+    points to (src -> dst). Only items with an edge are visited."""
+    keep = np.ones(n, dtype=bool) if keep is None else keep.copy()
+    if len(src):
+        dst = dst[np.argsort(src, kind="stable")]
+        start = np.concatenate([[0], np.cumsum(np.bincount(src, minlength=n))])
+        for idx in order[(start[1:] - start[:-1])[order] > 0].tolist():
+            if keep[idx]:
+                keep[dst[start[idx]:start[idx + 1]]] = False
+    return keep
 
 
 def get_model(use_gpu):
@@ -175,6 +225,7 @@ class SlideSegmentation():
         
         # Global maximum points for consistent concatenation
         self.global_max_contour_points = 32  # Set a reasonable fixed size
+        self._mask_stream = None  # CUDA stream of the masks thread (masks_from_flows)
         
         self.preload_cache = {}
         self.preload_queue = Queue()
@@ -401,88 +452,118 @@ class SlideSegmentation():
             masks = np.squeeze(masks)
 
         labels_img = masks.astype(np.int32)
-        points = []
-        coord = []
-        prob = []
-        
-        # One bounding box per label (find_objects), so each cell is measured on
-        # its own few pixels rather than by comparing the whole tile per label.
-        for label, sl in enumerate(find_objects(labels_img), start=1):
-            if sl is None:
-                continue
-            # 1 px margin so a contour touching the box edge is still closed.
-            y0, y1 = max(0, sl[0].start - 1), min(labels_img.shape[0], sl[0].stop + 1)
-            x0, x1 = max(0, sl[1].start - 1), min(labels_img.shape[1], sl[1].stop + 1)
-            cell_mask = labels_img[y0:y1, x0:x1] == label
-            
-            # Get centroid
-            y_coords, x_coords = np.nonzero(cell_mask)
-            if len(x_coords) < self.min_cell_area:
-                continue
-                
-            centroid_x = np.mean(x_coords) + x0
-            centroid_y = np.mean(y_coords) + y0
-            points.append([centroid_x, centroid_y])
-            
-            # Get contour
-            contours, _ = cv2.findContours(cell_mask.astype(np.uint8), 
-                                          cv2.RETR_EXTERNAL, 
-                                          cv2.CHAIN_APPROX_SIMPLE)
-            
-            if contours and len(contours[0]) > 0:
-                contour = contours[0].squeeze()
-                if len(contour.shape) == 1:  # Handle single point
-                    contour = contour.reshape(1, 2)
-                
-                # Ensure contour is float for interpolation; back to tile coordinates
-                contour = contour.astype(np.float32) + np.array([x0, y0], dtype=np.float32)
-                
-                # Pad or downsample contour to global_max_contour_points
-                if len(contour) < self.global_max_contour_points:
-                    # Interpolate points along the contour
-                    if len(contour) > 1:
-                        # Close the contour for smooth interpolation
-                        contour_closed = np.vstack([contour, contour[0]])
-                        
-                        # Calculate cumulative distances
-                        diffs = np.diff(contour_closed, axis=0)
-                        distances = np.cumsum(np.sqrt(np.sum(diffs**2, axis=1)))
-                        distances = np.insert(distances, 0, 0)
-                        
-                        # Create evenly spaced points
-                        alpha = np.linspace(0, distances[-1], self.global_max_contour_points + 1)[:-1]
-                        
-                        # Interpolate x and y separately
-                        cx = np.interp(alpha, distances, contour_closed[:, 0])
-                        cy = np.interp(alpha, distances, contour_closed[:, 1])
-                        contour_padded = np.column_stack([cx, cy])
-                    else:
-                        # Single point - just repeat it
-                        contour_padded = np.repeat(contour, self.global_max_contour_points, axis=0)
-                else:
-                    # Downsample if too many points
-                    indices = np.round(np.linspace(0, len(contour) - 1, self.global_max_contour_points)).astype(int)
-                    contour_padded = contour[indices]
-                
-                coord.append(contour_padded)
-                
-                # Estimate probability based on cell area
-                area = cv2.contourArea(contour.reshape(-1, 1, 2))
-                expected_area = np.pi * (self.diameter/2)**2 if self.diameter else 500
-                area_ratio = min(area / expected_area, expected_area / area) if area > 0 else 0.1
-                cell_prob = area_ratio * 0.9 + 0.1  # Scale to 0.1-1.0 range
-                prob.append(min(1.0, cell_prob))
-            else:
-                # Fallback if no contour found
-                fallback_contour = np.repeat([[centroid_x, centroid_y]], self.global_max_contour_points, axis=0)
-                coord.append(fallback_contour)
-                prob.append(0.5)
-        
-        # Convert to numpy arrays with consistent shape
-        points = np.array(points, dtype=np.float32) if points else np.empty((0, 2), dtype=np.float32)
-        coord = np.array(coord, dtype=np.float32) if coord else np.empty((0, self.global_max_contour_points, 2), dtype=np.float32)
-        prob = np.array(prob, dtype=np.float32) if prob else np.empty((0,), dtype=np.float32)
-        
+        n_pts = self.global_max_contour_points
+        empty = (np.empty((0, 2), dtype=np.float32),
+                 np.empty((0, n_pts, 2), dtype=np.float32),
+                 np.empty((0,), dtype=np.float32))
+        slices = find_objects(labels_img)
+        if not slices:
+            return empty
+
+        # Per-label boxes, indexed by label (row 0 = background).
+        box = np.zeros((len(slices) + 1, 4), dtype=np.int64)
+        box[1:] = [(s[0].start, s[0].stop, s[1].start, s[1].stop) if s is not None else (0, 0, 0, 0)
+                   for s in slices]
+        ys, xs = np.nonzero(labels_img > 0)
+        labs = labels_img[ys, xs]
+        area = np.bincount(labs, minlength=len(box))
+        keep = area >= self.min_cell_area
+        keep[0] = False
+        sel = np.flatnonzero(keep)
+        if not len(sel):
+            return empty
+        on = keep[labs]
+        ys, xs, labs = ys[on], xs[on], labs[on]
+
+        # Centroids: mean of the box-local coordinates plus the box origin (the
+        # same 1 px margin, clamped at the tile edge, the per-cell crop used).
+        y0 = np.maximum(box[:, 0] - 1, 0)
+        x0 = np.maximum(box[:, 2] - 1, 0)
+        n = area[sel]
+        cx = np.bincount(labs, weights=xs - x0[labs], minlength=len(box))[sel] / n + x0[sel]
+        cy = np.bincount(labs, weights=ys - y0[labs], minlength=len(box))[sel] / n + y0[sel]
+        points = np.stack([cx, cy], axis=1).astype(np.float32)
+
+        # Contours: copy every cell into its own slot of one "atlas" image, with a
+        # zero border around each slot so cells never touch, and trace them all in
+        # a single findContours call. Each cell's contour is then exactly the one
+        # its own crop gives (OpenCV pads the crop with zeros the same way).
+        h = box[sel, 1] - box[sel, 0] + 2
+        w = box[sel, 3] - box[sel, 2] + 2
+        atlas_w = max(2048, int(w.max()))
+        ox = np.empty_like(w)
+        oy = np.empty_like(h)
+        x = y = row_h = 0
+        for i, (hi, wi) in enumerate(zip(h.tolist(), w.tolist())):
+            if x + wi > atlas_w:
+                y, x, row_h = y + row_h, 0, 0
+            ox[i], oy[i] = x, y
+            x += wi
+            row_h = max(row_h, hi)
+        sx = np.zeros(len(box), dtype=np.int64)
+        sy = np.zeros(len(box), dtype=np.int64)
+        sx[sel] = ox + 1 - box[sel, 2]
+        sy[sel] = oy + 1 - box[sel, 0]
+        atlas = np.zeros((y + row_h, atlas_w), dtype=np.int32)
+        atlas[ys + sy[labs], xs + sx[labs]] = labs
+        contours, _ = cv2.findContours((atlas > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        first = np.array([c[0, 0] for c in contours])
+        owner = atlas[first[:, 1], first[:, 0]]
+        # A cell split into pieces has several contours; keep the first, as the
+        # per-cell call did (output order within a slot is the same).
+        _, pick = np.unique(owner, return_index=True)
+        chosen = [contours[i] for i in pick]
+        lens = np.array([len(c) for c in chosen])
+        starts = np.concatenate([[0], np.cumsum(lens)[:-1]])
+        rep = np.repeat(sel, lens)
+        pts = np.concatenate(chosen).reshape(-1, 2).astype(np.int64)
+        pts = np.stack([pts[:, 0] - sx[rep], pts[:, 1] - sy[rep]], axis=1).astype(np.float32)
+
+        coord = np.empty((len(sel), n_pts, 2), dtype=np.float32)
+        # Long contours: pick n_pts evenly spaced vertices.
+        a = np.flatnonzero(lens >= n_pts)
+        if len(a):
+            idx = np.round(np.linspace(0, lens[a] - 1, n_pts, axis=1)).astype(int)
+            coord[a] = pts[starts[a, None] + idx]
+        # Short contours: resample the closed polygon at n_pts equal arc-length
+        # steps (np.interp, written out per row so all cells go at once).
+        b = np.flatnonzero((lens > 1) & (lens < n_pts))
+        if len(b):
+            nb = lens[b]
+            k = np.arange(nb.max() + 1)
+            closed = pts[starts[b, None] + np.where(k < nb[:, None], k, 0)]
+            seg = np.sqrt(np.sum(np.diff(closed, axis=1) ** 2, axis=2))
+            dist = np.concatenate([np.zeros((len(b), 1), dtype=np.float32), np.cumsum(seg, axis=1)], axis=1)
+            rows = np.arange(len(b))[:, None]
+            alpha = np.linspace(0, dist[rows[:, 0], nb], n_pts + 1, axis=1)[:, :-1].astype(np.float64)
+            xp = dist.astype(np.float64)
+            xp[k > nb[:, None]] = np.inf
+            j = (xp[:, None, :] <= alpha[:, :, None]).sum(axis=2) - 1
+            jl = np.minimum(j, nb[:, None] - 1)
+            xl, xr = xp[rows, jl], xp[rows, jl + 1]
+            for c in (0, 1):
+                fl = closed[rows, jl, c].astype(np.float64)
+                fr = closed[rows, jl + 1, c].astype(np.float64)
+                val = (fr - fl) / (xr - xl) * (alpha - xl) + fl
+                val = np.where(alpha == xl, fl, val)
+                coord[b, :, c] = np.where(j >= nb[:, None], closed[rows, nb[:, None], c], val)
+        # Single-vertex contour: repeat it.
+        s = np.flatnonzero(lens == 1)
+        if len(s):
+            coord[s] = pts[starts[s], None]
+
+        # Probability from the polygon area (shoelace, as cv2.contourArea; the
+        # sums are exact in float64, so the order does not matter).
+        prev = np.arange(len(pts)) - 1
+        prev[starts] = starts + lens - 1
+        p = pts.astype(np.float64)
+        q = p[prev]
+        poly_area = np.abs(np.add.reduceat(q[:, 0] * p[:, 1] - q[:, 1] * p[:, 0], starts) * 0.5)
+        expected_area = np.pi * (self.diameter/2)**2 if self.diameter else 500
+        with np.errstate(divide='ignore'):
+            area_ratio = np.where(poly_area > 0, np.minimum(poly_area / expected_area, expected_area / poly_area), 0.1)
+        prob = np.minimum(1.0, area_ratio * 0.9 + 0.1).astype(np.float32)
+
         return points, coord, prob
 
     def predict_cellpose(self, img_np):
@@ -495,17 +576,16 @@ class SlideSegmentation():
         Returns:
             points, coord, prob in StarDist-like format
         """
-        # Cellpose 4 wants a 3-channel image.
-        if img_np.ndim == 2:
-            img_np = np.stack([img_np] * 3, axis=-1)
-        elif img_np.ndim == 3:
-            if img_np.shape[2] == 1:
-                img_np = np.repeat(img_np, 3, axis=2)
-            elif img_np.shape[2] > 3:
-                img_np = img_np[:, :, :3]
-        else:
-            raise ValueError(f"Unexpected image shape for Cellpose: {img_np.shape}")
-        
+        masks = self.predict_masks(img_np)
+        return self.cellpose_to_stardist_format(masks, None, masks.shape[:2])
+
+    def predict_masks(self, img_np, fill_holes=True, tissue=None):
+        """Cellpose-SAM label image of an (H, W, C) patch. fill_holes=False
+        skips the final hole filling / small-mask removal where the GPU path
+        can (the caller then runs finish_masks). tissue: the patch's tissue
+        mask; the GPU path skips network tiles that see none."""
+        img_np = self._rgb(img_np)
+
         # Run Cellpose (pre/post-processing on the GPU when there is one)
         if cpsam_gpu.enabled(self.model):
             masks = cpsam_gpu.eval_masks(
@@ -514,6 +594,8 @@ class SlideSegmentation():
                 flow_threshold=self.flow_threshold,
                 cellprob_threshold=self.cellprob_threshold,
                 batch_size=self.batch_size,
+                fill_holes=fill_holes,
+                tissue=tissue,
             )
         else:
             masks, _, _ = self.model.eval(
@@ -526,11 +608,209 @@ class SlideSegmentation():
                 resample=True,
                 batch_size=self.batch_size,
             )
-        
-        # Convert to StarDist format
-        points, coord, prob = self.cellpose_to_stardist_format(masks, None, img_np.shape[:2])
-        
-        return points, coord, prob
+        return masks
+
+    @staticmethod
+    def _rgb(img_np):
+        """The (H, W, 3) image Cellpose 4 wants."""
+        if img_np.ndim == 2:
+            img_np = np.stack([img_np] * 3, axis=-1)
+        elif img_np.ndim == 3:
+            if img_np.shape[2] == 1:
+                img_np = np.repeat(img_np, 3, axis=2)
+            elif img_np.shape[2] > 3:
+                img_np = img_np[:, :, :3]
+        else:
+            raise ValueError(f"Unexpected image shape for Cellpose: {img_np.shape}")
+        return img_np
+
+    def _overlap_masks(self):
+        """Whether the tiled pipeline splits each tile's GPU work in two: the
+        network on the main thread, compute_masks on a masks thread and its own
+        CUDA stream, overlapping the next tile's network."""
+        return (cpsam_gpu.enabled(self.model) and self.model.device.type == "cuda"
+                and os.environ.get("CELLPOSE_SAM_GPU_MASKS", "1") != "0")
+
+    def start_flows(self, img_np, tissue=None):
+        """The network half of predict_masks (GPU path), started in the
+        background; finish_flows hands it off for masks_from_flows."""
+        return cpsam_gpu.start_flows(self.model, self._rgb(img_np), self.diameter, self.batch_size, tissue)
+
+    @staticmethod
+    def finish_flows(run):
+        return cpsam_gpu.hand_off(cpsam_gpu.finish_flows(run))
+
+    def masks_from_flows(self, flows):
+        """The compute_masks half (masks thread), without the hole filling."""
+        if self._mask_stream is None:
+            self._mask_stream = torch.cuda.Stream(self.model.device)
+        return cpsam_gpu.compute_masks_on(self._mask_stream, flows, self.cellprob_threshold,
+                                          self.flow_threshold, fill_holes=False)
+
+    def _tile_jobs(self, n_row, n_col):
+        """Level-0 boxes of the tiles that overlap the ROI and the tissue mask."""
+        jobs = []
+        for ir in range(n_row):
+            for ic in range(n_col):
+                x_0 = ic*(self.tile_size-self.overlap)
+                y_0 = ir*(self.tile_size-self.overlap)
+                x_1 = int(np.min((x_0 + self.tile_size, self.dim[0])))
+                y_1 = int(np.min((y_0 + self.tile_size, self.dim[1])))
+                if not self._tile_meets_roi(x_0, y_0, x_1, y_1):
+                    continue
+                if self.wsi_mask is not None:
+                    mask = self.wsi_mask[int(y_0/self.mask_ratio_y):int(y_1/self.mask_ratio_y),
+                                        int(x_0/self.mask_ratio_x):int(x_1/self.mask_ratio_x)]
+                    if np.sum(mask) == 0:
+                        continue
+                jobs.append({"index": ir * n_col + ic, "ir": ir, "ic": ic,
+                             "x_0": x_0, "y_0": y_0, "x_1": x_1, "y_1": y_1})
+        # Edges shared with another tile that runs (_drop_seam_duplicates). A
+        # tile clipped at the slide's edge is not cut there, even when the last
+        # tile is a strip inside it.
+        grid = {(job["ir"], job["ic"]) for job in jobs}
+        for job in jobs:
+            ir, ic = job["ir"], job["ic"]
+            job["shared_edges"] = {"left": (ir, ic - 1) in grid,
+                                   "right": (ir, ic + 1) in grid and job["x_1"] < self.dim[0],
+                                   "top": (ir - 1, ic) in grid,
+                                   "bottom": (ir + 1, ic) in grid and job["y_1"] < self.dim[1]}
+        return jobs
+
+    def _read_tile(self, job):
+        """Read a tile at the processing magnification (reader thread). None
+        when it is mostly white."""
+        x_0, y_0, x_1, y_1 = job["x_0"], job["y_0"], job["x_1"], job["y_1"]
+        w_col, h_row = x_1 - x_0, y_1 - y_0
+        img = self.slide.read_region((x_0, y_0), self.level, (w_col, h_row))
+        if self.args.magnification is not None:
+            resize_factor = self.reference_magnification / self.args.magnification
+            img = img.resize((int(np.round(w_col*resize_factor)), int(np.round(h_row*resize_factor))))
+            x_0 = int(np.round(x_0*resize_factor))
+            x_1 = int(np.round(x_1*resize_factor))
+            y_0 = int(np.round(y_0*resize_factor))
+            y_1 = int(np.round(y_1*resize_factor))
+        img_np = np.array(img)
+        img_np = img_np[:, :, :3] if img_np.ndim == 3 else img_np[:, :, np.newaxis]
+        # Skip if mostly white pixels (>240)
+        n_dark_pixels = np.sum(np.any(img_np < 240, axis=2))
+        if n_dark_pixels < 50:
+            print(f"Tile r{job['ir']} c{job['ic']} is mostly white, skipping")
+            return None
+        tissue = None
+        if self.wsi_mask is not None:
+            tissue = self.wsi_mask[int(job["y_0"] / self.mask_ratio_y):int(job["y_1"] / self.mask_ratio_y),
+                                   int(job["x_0"] / self.mask_ratio_x):int(job["x_1"] / self.mask_ratio_x)]
+        return {**job, "img": img_np, "tissue": tissue,
+                "sx_0": x_0, "sy_0": y_0, "w_col": x_1 - x_0, "h_row": y_1 - y_0}
+
+    @staticmethod
+    def finish_masks(masks):
+        """Cellpose's last mask step, fill_holes_and_remove_small_masks (CPU);
+        a no-op on masks that already had it."""
+        return utils.fill_holes_and_remove_small_masks(masks, min_size=15)
+
+    def _post_tile(self, tile, masks):
+        """Cells of one tile's label image, in processing-magnification
+        coordinates of the whole slide (post thread), with each centroid's
+        distance to the tile's shared edges and the tile index. None when it
+        has none."""
+        masks = self.finish_masks(masks)
+        points, coord, prob = self.cellpose_to_stardist_format(masks, None, masks.shape[:2])
+        w_col, h_row = tile["w_col"], tile["h_row"]
+        if self.wsi_mask is not None and len(points) > 0:
+            mask_patch = self.wsi_mask[int(tile["y_0"] / self.mask_ratio_y):int(tile["y_1"] / self.mask_ratio_y),
+                                       int(tile["x_0"] / self.mask_ratio_x):int(tile["x_1"] / self.mask_ratio_x)]
+            if mask_patch.size > 0:
+                tissue_mask = cv2.resize(mask_patch.astype(np.uint8), (w_col, h_row),
+                                         interpolation=cv2.INTER_NEAREST).astype(bool)
+                # int() truncation of the (non-negative) local coordinates, as before
+                lx, ly = points[:, 0].astype(int), points[:, 1].astype(int)
+                inb = (lx >= 0) & (lx < w_col) & (ly >= 0) & (ly < h_row)
+                keep = np.zeros(len(points), bool)
+                keep[inb] = tissue_mask[ly[inb], lx[inb]]
+                points, coord, prob = points[keep], coord[keep], prob[keep]
+        if len(points) == 0:
+            return None
+        edge = np.full(len(points), np.inf)
+        for side, dist in (("left", points[:, 0]), ("right", w_col - points[:, 0]),
+                           ("top", points[:, 1]), ("bottom", h_row - points[:, 1])):
+            if tile["shared_edges"][side]:
+                edge = np.minimum(edge, dist)
+        points[:, 0] += tile["sx_0"]
+        points[:, 1] += tile["sy_0"]
+        points = pd.DataFrame(points, index=[(tile["ir"], tile["ic"])]*len(points), columns=['x', 'y']).reset_index()
+        coord = np.round(coord).astype(np.int32)
+        coord[:, :, 0] += tile["sx_0"]
+        coord[:, :, 1] += tile["sy_0"]
+        print(f"Tile r{tile['ir']} c{tile['ic']} (x={tile['sx_0']}, y={tile['sy_0']}) detected {len(points)} nuclei")
+        return points, coord, prob, edge, np.full(len(points), tile["index"])
+
+    def _seam_pairs(self, points, tile, n_col):
+        """(P, 2) detections of neighbouring tiles whose centroids are within
+        2 diameters, each pair once; tiles are queried against their neighbours
+        only, so pairs within a tile are never built."""
+        from scipy.spatial import cKDTree as KDTree
+        order = np.argsort(tile, kind="stable")
+        ids, starts = np.unique(tile[order], return_index=True)
+        members = dict(zip(ids.tolist(), np.split(order, starts[1:])))
+        trees = {t: KDTree(points[m]) for t, m in members.items()}
+        out = []
+        for t, m in members.items():
+            ir, ic = divmod(t, n_col)
+            for dr, dc in ((0, 1), (1, -1), (1, 0), (1, 1)):
+                u = (ir + dr) * n_col + ic + dc
+                if 0 <= ic + dc < n_col and u in trees:
+                    d = trees[t].sparse_distance_matrix(trees[u], 2 * self.diameter, output_type="ndarray")
+                    if len(d):
+                        out.append(np.stack([m[d["i"]], members[u][d["j"]]], axis=1))
+        return np.concatenate(out) if out else np.zeros((0, 2), dtype=np.int64)
+
+    def _drop_seam_duplicates(self, points, coord, edge, tile, n_col):
+        """Keep one detection of each cell that two tiles saw. A detection is
+        another tile's cell when most of its interior lies inside that cell's
+        contour (a cut fragment, or the same cell twice); it is dropped when that
+        cell is farther from its tile's shared edges (more context, never cut
+        there). A detection that holds two or more of another tile's cells which
+        together cover it merged them, and gives way to them. Anything else,
+        such as a cell only one tile saw, is kept."""
+        n = len(points)
+        pairs = self._seam_pairs(points, tile, n_col)
+        # Candidates: one centroid inside the other's contour. A pair without
+        # that is kept as two cells.
+        cand = np.zeros(len(pairs), dtype=bool)
+        for s in range(0, len(pairs), SEAM_PAIR_CHUNK):  # bounds the (pairs, k, 32) temporaries
+            pa, pb = pairs[s:s + SEAM_PAIR_CHUNK, 0], pairs[s:s + SEAM_PAIR_CHUNK, 1]
+            cand[s:s + len(pa)] = (_points_in_polygons(points[pb], coord[pa])
+                                   | _points_in_polygons(points[pa], coord[pb]))
+        pairs = pairs[cand]
+        a, b = pairs[:, 0], pairs[:, 1]
+        a_in_b = np.zeros((len(pairs), 17), dtype=bool)  # interior samples of a inside b's contour
+        b_in_a = np.zeros((len(pairs), 17), dtype=bool)
+        for s in range(0, len(pairs), SEAM_PAIR_CHUNK):
+            sa, sb = a[s:s + SEAM_PAIR_CHUNK], b[s:s + SEAM_PAIR_CHUNK]
+            for x, y, out in ((sa, sb, a_in_b), (sb, sa, b_in_a)):
+                out[s:s + len(sa)] = _points_in_polygons(_interior_samples(points[x], coord[x]), coord[y])
+        # Directed rows: detection x lies in detection y (another tile's).
+        x, y = np.concatenate([a, b]), np.concatenate([b, a])
+        x_in_y, y_in_x = np.concatenate([a_in_b, b_in_a]), np.concatenate([b_in_a, a_in_b])
+        inner = x_in_y.mean(axis=1) >= SEAM_SAME_CELL
+        keep = np.ones(n, dtype=bool)
+        # Merges: y holds >= 2 cells x of one tile that together cover it.
+        n_tiles = int(tile.max()) + 1 if n else 1
+        key = y[inner].astype(np.int64) * n_tiles + tile[x[inner]]
+        groups, gid = np.unique(key, return_inverse=True)
+        cover = np.zeros((len(groups), y_in_x.shape[1]), dtype=bool)
+        np.logical_or.at(cover, gid, y_in_x[inner])
+        merged = (np.bincount(gid, minlength=len(groups)) >= 2) & (cover.mean(axis=1) >= SEAM_MERGE_COVER)
+        keep[groups[merged] // n_tiles] = False
+        print(f"{n - keep.sum()} detections merged cells another tile split")
+        # The rest: y removes the x inside it when y has more context.
+        order = np.argsort(-edge, kind="stable")
+        rank = np.empty(n, dtype=np.int64)
+        rank[order] = np.arange(n)
+        e = inner & (rank[y] < rank[x])
+        return _greedy_keep(n, y[e], x[e], order, keep)
 
     def _tile_meets_roi(self, x0, y0, x1, y1):
         """Whether a level-0 tile overlaps the ROI's bounding box (no ROI: always)."""
@@ -676,184 +956,93 @@ class SlideSegmentation():
                 print(traceback.format_exc())
                 print("Falling back to standard tiling process")
         
-        # Below is the tiling processing code
+        # Below is the tiling processing code.
+        # The stages overlap: a reader thread reads and resizes the next
+        # tiles; the main thread cuts each tile into network batches, which a
+        # net thread runs back to back, and averages them (it starts the next
+        # tile's batches before averaging the current one's); a masks thread
+        # turns the flows into a label image (GPU, own stream); and a post
+        # thread turns each label image into cells. The network never waits
+        # for the other steps, and results are kept in tile order, so the
+        # output is the same as running the tiles one after another.
         n_col = int(np.ceil(self.dim[0]/(self.tile_size-self.overlap)))
         n_row = int(np.ceil(self.dim[1]/(self.tile_size-self.overlap)))
-        
-        points_all = None
-        coord_all = None
-        prob_all = None
-        
         total_tiles = n_row * n_col
-        processed_tiles = 0 
-        iter = 0
-
-        pbar = tqdm(total=total_tiles, mininterval=0.1)
-        
         print(f"Starting segmentation process - Total tiles: {n_row}x{n_col}={n_row*n_col}")
-        
-        for ir in range(n_row):
-            for ic in range(n_col):
-                # Update progress bar
-                iter += 1
-                pbar.update(1)
-                processed_tiles += 1
-                progress = int((processed_tiles / total_tiles) * 100)
+
+        jobs = self._tile_jobs(n_row, n_col)
+        print(f"{len(jobs)} tiles overlap the tissue / ROI")
+        tile_results = []
+        reader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cpsam-read")
+        post = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cpsam-post")
+        masker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cpsam-masks")
+        overlap_masks = self._overlap_masks()
+        in_flight = []
+
+        def finish(tile, run):
+            flows = self.finish_flows(run)
+            while len(in_flight) >= MASKS_AHEAD:  # bounds the flows held on the GPU
+                in_flight.pop(0).result()
+            masks = masker.submit(self.masks_from_flows, flows)
+            in_flight.append(masks)
+            tile_results.append(post.submit(lambda: self._post_tile(tile, masks.result())))
+
+        checked = 0  # tile_results[:checked] finished without error
+
+        def raise_failed():
+            """Re-raise a post thread error now rather than after the last tile."""
+            nonlocal checked
+            while checked < len(tile_results) and tile_results[checked].done():
+                tile_results[checked].result()
+                checked += 1
+
+        started = None  # (tile, run) whose network batches are in flight
+        try:
+            pending_reads = {}
+            for k in range(min(READ_AHEAD, len(jobs))):
+                pending_reads[k] = reader.submit(self._read_tile, jobs[k])
+            for k, job in enumerate(jobs):
+                if k + READ_AHEAD < len(jobs):
+                    pending_reads[k + READ_AHEAD] = reader.submit(self._read_tile, jobs[k + READ_AHEAD])
                 if self.progress_callback:
-                    self.progress_callback(progress)
+                    self.progress_callback(int((job["index"] + 1) / total_tiles * 100))
                 self._maybe_cancel()
-                
-                # Calculate current tile position
-                x_0 = ic*(self.tile_size-self.overlap)
-                y_0 = ir*(self.tile_size-self.overlap)
-                
-                print(f"Processing tile r{ir} c{ic} (x={x_0}, y={y_0}) - {processed_tiles}/{total_tiles}")
-                
-                # Record tile processing start time
-                patch_start_time = time.time()
-                
-                x_1 = np.min((x_0 + self.tile_size, self.dim[0]))
-                y_1 = np.min((y_0 + self.tile_size, self.dim[1]))
-                
-                w_col = x_1 - x_0
-                h_row = y_1 - y_0
-
-                if not self._tile_meets_roi(x_0, y_0, x_1, y_1):
+                raise_failed()
+                tile = pending_reads.pop(k).result()
+                if tile is None:
                     continue
-
-                if self.wsi_mask is not None:
-                    # Check mask for efficiency
-                    mask = self.wsi_mask[int(y_0/self.mask_ratio_y):int(y_1/self.mask_ratio_y),
-                                        int(x_0/self.mask_ratio_x):int(x_1/self.mask_ratio_x)]
-                    
-                    if np.sum(mask) == 0: 
-                        print(f"Tile r{ir} c{ic} is empty in mask, skipping")
-                        continue
-                
-                # Record image reading start time
-                read_start_time = time.time()
-                img = self.slide.read_region((x_0, y_0), self.level, (w_col, h_row))
-                # Record image reading end time
-                read_end_time = time.time()
-                read_duration = read_end_time - read_start_time
-                
-                if self.args.magnification is not None:
-                    st = time.time()
-                    resize_factor = self.reference_magnification / self.args.magnification
-                    img = img.resize((int(np.round(w_col*resize_factor)), int(np.round(h_row*resize_factor))))
-                    et = time.time()
-                    
-                    x_0 = int(np.round(x_0*resize_factor)) 
-                    x_1 = int(np.round(x_1*resize_factor))
-                    y_0 = int(np.round(y_0*resize_factor))
-                    y_1 = int(np.round(y_1*resize_factor))
-                    
-                    w_col = x_1 - x_0
-                    h_row = y_1 - y_0
-
-                img_np = np.array(img)
-                if len(img_np.shape) == 3:
-                    #RGB
-                    img_np = img_np[:,:,:3]
-                else:
-                    #greyscale
-                    img_np = img_np[:, :, np.newaxis]
-                
-                # Skip if mostly white pixels (>240)
-                n_dark_pixels = np.sum(np.any(img_np < 240, axis=2) if len(img_np.shape) == 3 else img_np < 240)
-                if n_dark_pixels < 50:
-                    print(f"Tile r{ir} c{ic} is mostly white, skipping")
+                # hole filling (CPU) moves to the post thread with the cell extraction
+                if not overlap_masks:
+                    masks = self.predict_masks(tile["img"], fill_holes=False, tissue=tile["tissue"])
+                    tile_results.append(post.submit(self._post_tile, tile, masks))
                     continue
-                
-                # Run Cellpose prediction
-                points, coord, prob = self.predict_cellpose(img_np)
-                
-                # Filter results based on tissue mask
-                if self.wsi_mask is not None and len(points) > 0:
-                    # Calculate the mask region corresponding to this patch
-                    # Use original coordinates before magnification adjustment
-                    orig_x_0 = ic*(self.tile_size-self.overlap)
-                    orig_y_0 = ir*(self.tile_size-self.overlap)
-                    orig_x_1 = np.min((orig_x_0 + self.tile_size, self.dim[0]))
-                    orig_y_1 = np.min((orig_y_0 + self.tile_size, self.dim[1]))
-                    
-                    mask_x0 = int(orig_x_0 / self.mask_ratio_x)
-                    mask_y0 = int(orig_y_0 / self.mask_ratio_y)
-                    mask_x1 = int(orig_x_1 / self.mask_ratio_x)
-                    mask_y1 = int(orig_y_1 / self.mask_ratio_y)
-                    
-                    # Extract mask patch
-                    mask_patch = self.wsi_mask[mask_y0:mask_y1, mask_x0:mask_x1]
-                    
-                    # Resize mask to match the image patch size
-                    if mask_patch.size > 0:
-                        tissue_mask = cv2.resize(
-                            mask_patch.astype(np.uint8), 
-                            (w_col, h_row), 
-                            interpolation=cv2.INTER_NEAREST
-                        ).astype(bool)
-                        
-                        # Filter points based on tissue mask
-                        keep_indices = []
-                        for i, (x, y) in enumerate(points):
-                            # Points are in local coordinates
-                            local_x = int(x)
-                            local_y = int(y)
-                            
-                            # Check if the point is within bounds and in tissue area
-                            if (0 <= local_x < w_col and 0 <= local_y < h_row and 
-                                tissue_mask[local_y, local_x]):
-                                keep_indices.append(i)
-                        
-                        # Keep only the cells that are in tissue areas
-                        if keep_indices:
-                            initial_count = len(points)
-                            points = points[keep_indices]
-                            coord = coord[keep_indices]
-                            prob = prob[keep_indices]
-                            print(f"Filtered {len(keep_indices)} cells in tissue area out of {initial_count} total detected")
-                        else:
-                            # No cells in tissue area
-                            points = np.array([]).reshape(0, 2)
-                            coord = np.array([]).reshape(0, self.global_max_contour_points, 2)
-                            prob = np.array([])
-                            print("No cells found in tissue area after filtering")
-                
-                # Only process if we have points
-                if len(points) > 0:
-                    # Adjust coordinates to global position
-                    points[:,0] += x_0
-                    points[:,1] += y_0
-                    points = pd.DataFrame(points, index=[(ir, ic)]*len(points), columns=['x','y']).reset_index()
-                    
-                    coord = np.round(coord).astype(np.int32)
-                    coord[:,:,0] += x_0
-                    coord[:,:,1] += y_0
-                    
-                    # Calculate tile processing time
-                    patch_end_time = time.time()
-                    patch_duration = patch_end_time - patch_start_time
-                    compute_duration = patch_duration - read_duration
-                    
-                    # Print nuclei detection results for each tile
-                    print("\n========================================")
-                    print(f"Tile r{ir} c{ic} (x={x_0}, y={y_0}) detected {len(points)} nuclei")
-                    print("========================================\n")
-                    
-                    # Print processing time information
-                    print(f"Tile r{ir} c{ic} processing time: {patch_duration:.4f}s (read: {read_duration:.4f}s, compute: {compute_duration:.4f}s)")
-                    print(f"Start: {datetime.fromtimestamp(patch_start_time).strftime('%H:%M:%S')} - End: {datetime.fromtimestamp(patch_end_time).strftime('%H:%M:%S')}")
-                    
-                    # Accumulate results from all tiles
-                    if points_all is None:
-                        points_all = points
-                        coord_all = coord
-                        prob_all = prob
-                    else:
-                        points_all = pd.concat((points_all, points), axis=0, ignore_index=True)
-                        coord_all = np.concatenate((coord_all, coord), axis=0)
-                        prob_all = np.concatenate((prob_all, prob), axis=0)
-        
+                run = self.start_flows(tile["img"], tissue=tile["tissue"])
+                if started is not None:
+                    finish(*started)
+                started = (tile, run)
+            if started is not None:
+                finish(*started)
+            for future in tile_results:
+                self._maybe_cancel()
+                future.result()
+        finally:
+            reader.shutdown(wait=True, cancel_futures=True)
+            masker.shutdown(wait=True, cancel_futures=True)
+            post.shutdown(wait=True, cancel_futures=True)
+
+        kept = [f.result() for f in tile_results]
+        kept = [r for r in kept if r is not None]
+        points_all = pd.concat([r[0] for r in kept], axis=0, ignore_index=True) if kept else None
+        coord_all = np.concatenate([r[1] for r in kept], axis=0) if kept else None
+        prob_all = np.concatenate([r[2] for r in kept], axis=0) if kept else None
+        if kept:
+            seam_keep = self._drop_seam_duplicates(points_all[['x', 'y']].values, coord_all,
+                                                   np.concatenate([r[3] for r in kept]),
+                                                   np.concatenate([r[4] for r in kept]), n_col)
+            print(f"Removed {np.sum(~seam_keep)} detections another tile saw with more context")
+            points_all = points_all[seam_keep].reset_index(drop=True)
+            coord_all, prob_all = coord_all[seam_keep], prob_all[seam_keep]
+
         # Print clear information before generating final_points
         if points_all is None or len(points_all) == 0:
             print("Warning: points_all is empty or has length 0!")
@@ -906,8 +1095,6 @@ class SlideSegmentation():
         if self.progress_callback:
             self.progress_callback(100)
         self._maybe_cancel()
-
-        pbar.close()
 
         # Record overall end time and duration
         overall_end_time = time.time()
@@ -976,22 +1163,10 @@ class SlideSegmentation():
         else:
             points_array = points
 
-        # Highest prob first
-        sorted_indices = np.argsort(-prob)
-        keep_mask = np.ones(len(points_array), dtype=bool)
-
-        tree = KDTree(points_array)
-
-        for idx in sorted_indices:
-            if not keep_mask[idx]:
-                continue
-            # Find neighbors (including self) within threshold
-            neighbors = tree.query_ball_point(points_array[idx], r=distance_threshold)
-            for nidx in neighbors:
-                if nidx == idx:
-                    continue
-                if keep_mask[nidx]:
-                    keep_mask[nidx] = False  # Remove all lower-priority neighbors
+        # Highest prob first; each kept cell removes its lower-priority neighbours
+        pairs = KDTree(points_array).query_pairs(r=distance_threshold, output_type="ndarray")
+        keep_mask = _greedy_keep(len(points_array), np.concatenate([pairs[:, 0], pairs[:, 1]]),
+                                 np.concatenate([pairs[:, 1], pairs[:, 0]]), np.argsort(-prob))
 
         if isinstance(points, pd.DataFrame):
             filtered_points = points[keep_mask]
