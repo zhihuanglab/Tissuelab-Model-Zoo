@@ -49,11 +49,12 @@ def enabled():
 
 
 def cache_dir():
-    """CELLPOSE_SAM_CACHE, else cache/ next to the node (next to the executable when frozen)."""
+    """CELLPOSE_SAM_CACHE, else tissuelab/cellpose-sam in the user's cache directory,
+    so checkouts share one engine and an app update does not drop it."""
     if os.environ.get("CELLPOSE_SAM_CACHE"):
         return Path(os.environ["CELLPOSE_SAM_CACHE"])
-    base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-    return base / "cache"
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return Path(base) / "tissuelab" / "cellpose-sam"
 
 
 def _lib_dirs(subdirs):

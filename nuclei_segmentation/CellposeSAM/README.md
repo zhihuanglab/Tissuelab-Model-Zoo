@@ -56,10 +56,11 @@ Without TensorRT (PyTorch on CUDA / MPS) the same folded attention runs through
 tiles, 3.9 s -> 2.3 s per 3000x3000 image on an H200, 99.7-99.8% of centroids
 within 1 px. `CELLPOSE_SAM_FUSED_ATTENTION=0` keeps SAM's attention.
 
-- First use exports `cache/cpsam_v2_fa2_dyn16.onnx` (batch 1-16: a tile's
-  last, partial batch runs only its real tiles), builds the engine in
-  `cache/trt_ep_ctx_engines/` (~60-90 s) and writes the EPContext model
-  `cache/cpsam_v2_fa2_dyn16_ctx.onnx` that points at it. Later processes load the
+- First use exports `cpsam_v2_fa2_dyn16.onnx` (batch 1-16: a tile's last,
+  partial batch runs only its real tiles) to the cache directory,
+  `~/.cache/tissuelab/cellpose-sam` (`$XDG_CACHE_HOME/tissuelab/cellpose-sam`
+  when set), builds the engine in its `trt_ep_ctx_engines/` (~60-90 s) and writes
+  the EPContext model `cpsam_v2_fa2_dyn16_ctx.onnx` that points at it. Later processes load the
   EPContext model in a second or two (once per node process; the model stays
   loaded between runs). One that no longer loads (other GPU or TensorRT
   version) is deleted and the engine rebuilt.
