@@ -150,9 +150,14 @@ while a node that only embedded and re-sorted these cells keeps them reused
 ## Setup
 
 ```bash
-conda create -n cellpose_sam_environment python=3.11 -y
+conda env create -f environment.yml
 conda activate cellpose_sam_environment
-pip install -r requirements.txt
 ```
+
+`requirements.txt` holds the same pins for a pip-only install into any
+Python 3.11 env (`pip install -r requirements.txt`).
+
+macOS needs 14+ (Apple Silicon). On Linux/Windows the install also reaches
+download.pytorch.org (CUDA 12.6 torch) and pypi.nvidia.com (TensorRT wheels).
 
 Run: `python cellpose_sam_taskNode.py --port 8011 --name Cell-Segmentation`.
