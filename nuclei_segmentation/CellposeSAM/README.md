@@ -28,6 +28,58 @@ userData (from the Cell Segmentation panel):
   segment only that region; tiles outside it are skipped and cells whose
   centre falls outside it are dropped. `bbox` wins when both are set.
 
+## TensorRT
+
+On Linux / Windows with CUDA and `onnxruntime-gpu` + `tensorrt` installed, the
+SAM encoder runs as a bf16 TensorRT engine (ONNX Runtime TensorRT EP). SAM's
+decomposed relative-position bias kept TensorRT from fusing the attention, so
+the export folds it into q and k (`_fusable_attention`, exact in fp32): 83 ->
+43 ms per 16 tiles on an H200. fp16 is not used: it loses ~4% of the cells.
+
+| H200, TensorRT | 3000x3000 IHC image | CMU-1 whole slide |
+|---|---|---|
+| Cellpose eval, unfused engine | 5.6-6.0 s | 455 s |
+| GPU pipeline + overlap, unfused | 3.2-3.4 s | 214 s |
+| + batch 1-16, fused attention | 1.5 s | 114 s |
+
+Cells agree with Cellpose's own eval to 99.7-99.9% of centroids within 1 px.
+
+Without TensorRT (PyTorch on CUDA / MPS) the same folded attention runs through
+`scaled_dot_product_attention` (`use_fused_attention`): 59.6 -> 33.3 ms per 8
+tiles, 3.9 s -> 2.3 s per 3000x3000 image on an H200, 99.7-99.8% of centroids
+within 1 px. `CELLPOSE_SAM_FUSED_ATTENTION=0` keeps SAM's attention.
+
+- First use exports `cache/cpsam_v2_fa2_dyn16.onnx` (batch 1-16: a tile's
+  last, partial batch runs only its real tiles), builds the engine in
+  `cache/trt_ep_ctx_engines/` (~60-90 s) and writes the EPContext model
+  `cache/cpsam_v2_fa2_dyn16_ctx.onnx` that points at it. Later processes load the
+  EPContext model in a second or two (once per node process; the model stays
+  loaded between runs). One that no longer loads (other GPU or TensorRT
+  version) is deleted and the engine rebuilt.
+- `CELLPOSE_SAM_CACHE` moves the cache; `CELLPOSE_SAM_TRT=0` forces PyTorch.
+- Missing CUDA / packages, or any build failure, falls back to PyTorch.
+- On Linux the node re-execs itself once to put the TensorRT / CUDA wheel
+  libraries on `LD_LIBRARY_PATH` (TissueLab may start it without them).
+- The PyInstaller specs do not bundle TensorRT; frozen builds run PyTorch.
+
+## GPU pre/post-processing
+
+`CellposeModel.eval` runs only the network on the GPU; the normalization, the
+1.5x resize, the tiling, the tile averaging and the resize back run in numpy /
+OpenCV and allocate a few GB per eval. `cpsam_gpu.py` reproduces those steps
+in torch on the GPU (CUDA only: they keep Cellpose's float64 steps, which
+MPS does not support, so on a Mac Cellpose's own eval runs); the masks are still computed by Cellpose's
+`_compute_masks`. Measured on an H200 with the TensorRT engine:
+
+| | Cellpose eval | GPU pipeline |
+|---|---|---|
+| 3000x3000 IHC image | 5.6-6.0 s, 1,566 cells | 3.2-3.4 s, 1,563 cells |
+| CMU-1 whole slide | 455 s, 198,879 cells | 294 s, 198,873 cells |
+
+99.6-99.8% of the centroids agree within 1 px (bilinear resampling and the
+summation order differ slightly). With the PyTorch net: 6.9-7.4 s -> 4.4-4.6 s.
+`CELLPOSE_SAM_GPU_PIPELINE=0` falls back to `CellposeModel.eval`.
+
 ## Output (`Cell-Segmentation`)
 
 - `centroids` (N, 2) and `contours` (N, 32, 2), level-0 pixels
