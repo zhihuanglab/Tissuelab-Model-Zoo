@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Segmentation Node for nuclei segmentation + embedding generation using Cellpose
+Cellpose-SAM cell segmentation node.
+
+Runs Cellpose-SAM (Cellpose 4, cpsam_v2) with iSight v2's settings (diameter
+20 px, flow 0.4, cellprob 0, min area 50 px at 0.5 um/px) and writes the cells
+only: no embeddings (the classifier that needs them computes its own).
 """
 import argparse
 import os
+
+# NumPy asks Linux for transparent huge pages on every large array. On a server
+# whose THP defrag is "madvise" and whose memory is fragmented, each such
+# allocation compacts memory synchronously: measured on napa, Cellpose-SAM's
+# first eval of a 3000x3000 image took 169 s with it and 8 s without. Must be
+# set before numpy is imported; an explicit setting still wins.
+os.environ.setdefault("NUMPY_MADVISE_HUGEPAGE", "0")
 import time
 import json
 import threading
@@ -76,7 +87,6 @@ class CancelWatcher:
 
 
 from cellpose_nuc_seg import SlideSegmentation
-from nuc_embedding_mac import NucleiEmbedding
 
 app = FastAPI()
 
@@ -100,20 +110,50 @@ progress_state = ProgressSSEState()
 cancel_event = threading.Event()
 
 
-_EMBED_CHECKPOINT = os.path.join(os.path.dirname(__file__), "checkpoints", "checkpoint_step_10000.pt")
+# Stamped on Cell-Segmentation with the run's inputs. Another node's segmentation
+# (no stamp) or one of another region / resolution is redone, not reused.
+SEGMENTATION_MODEL = "Cellpose-SAM"
+
+
+def _segmentation_params(args):
+    """The inputs a stored segmentation must match to be reused, as stored in attrs."""
+    target_mpp = getattr(args, "target_mpp", None)
+    polygon = getattr(args, "polygon_points", None)
+    return {
+        "segmentation_model": SEGMENTATION_MODEL,
+        "bbox": str(getattr(args, "bbox", None) or ""),
+        "target_mpp": float(target_mpp) if target_mpp else "",
+        "polygon_points": json.dumps(polygon) if polygon else "",
+    }
+
+
+def _stored_segmentation_matches(node_grp, args):
+    attrs = node_grp.attrs
+    for key, want in _segmentation_params(args).items():
+        have = attrs.get(key, "")
+        if isinstance(want, float):
+            try:
+                if abs(float(have) - want) > 1e-6:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        elif str(have) != want:
+            return False
+    return True
 
 
 def _mark_sse_cancelled() -> None:
     progress_state.mark_cancelled()
 
 
-def _persist_segmentation_to_zarr(centroids, contours, probability=None, drop_embeddings=False):
-    """Write segmentation without deleting the node group (keeps embeddings unless drop_embeddings)."""
+def _persist_segmentation_to_zarr(centroids, contours, probability=None, params=None):
+    """Write segmentation without deleting the node group. Embeddings in the
+    shared slot belonged to the previous cells, so they go."""
     if centroids is None or not ZARR_PATH or not NODE_NAME:
         return
     zf = zarr.open_group(ZARR_PATH, mode="a")
     node_grp = zf.require_group(NODE_NAME)
-    if drop_embeddings and "embeddings" in node_grp:
+    if "embeddings" in node_grp:
         del node_grp["embeddings"]
     if "centroids" in node_grp:
         del node_grp["centroids"]
@@ -126,6 +166,8 @@ def _persist_segmentation_to_zarr(centroids, contours, probability=None, drop_em
         if "probabilities" in node_grp:
             del node_grp["probabilities"]
         node_grp.create_array("probabilities", data=probability)
+    if params:
+        node_grp.attrs.update(params)
 
 
 def parse_args():
@@ -134,12 +176,10 @@ def parse_args():
     parser.add_argument('--name', type=str, default='Cell-Segmentation', help='node name')
     parser.add_argument('--manager_host', type=str, default='http://localhost:5001', help='manager service URL')
 
-    # ===  segmentation + embedding parameters ===
+    # ===  segmentation parameters ===
     parser.add_argument('--slidepath', default='', type=str)
     parser.add_argument('--read_image_method', default='tiffslide', type=str,
                         choices=['openslide', 'tiffslide', 'PIL', 'numpy'])
-    parser.add_argument('--cellpose_model', default='cpsam_v2', type=str,
-                        help='Cellpose 4 model (cpsam_v2, cpsam, cpdino, cpdino-vitb) or path to weights')
     parser.add_argument('--isIHC', default=False, type=bool)
 
     return parser.parse_args()
@@ -169,11 +209,9 @@ def update_progress(value):
 
 def run_segmentation(args):
     """
-    Combined "Segmentation + Embedding" logic in one node.
-    1) if already have segmentation => skip cellpose
-    2) or run cellpose to get segmentation
-    3) according to segmentation, generate embedding
-    4) write segmentation + embedding to workflow_data.h5
+    1) a stored Cellpose-SAM segmentation of the same region / resolution => reuse it
+    2) otherwise run Cellpose-SAM
+    3) write the cells to Cell-Segmentation
     """
 
     if ZARR_PATH is None or NODE_NAME is None:
@@ -195,7 +233,9 @@ def run_segmentation(args):
 
         if os.path.exists(ZARR_PATH):
             zf = zarr.open_group(ZARR_PATH, mode='r')
-            if NODE_NAME in zf:
+            if NODE_NAME in zf and not _stored_segmentation_matches(zf[NODE_NAME], args):
+                print("Stored segmentation is not Cellpose-SAM's for this region / resolution => re-run.")
+            elif NODE_NAME in zf:
                 # if already have segmentation => skip cellpose
                 try:
                     centroids = zf[f"{NODE_NAME}/centroids"][()]
@@ -209,14 +249,11 @@ def run_segmentation(args):
 
         # Step B: if not have segmentation => run cellpose
         if not ALREADY_HAVE_SEG:
-            print(f"Working on {args.slidepath} with cellpose_model={args.cellpose_model}, isIHC={args.isIHC}")
+            print(f"Working on {args.slidepath} with Cellpose-SAM, isIHC={args.isIHC}")
             ss = SlideSegmentation(args,
                                    tile_size=2048,
                                    overlap=224,
-                                   prob_thresh=0.3,
-                                   nms_thresh=0.3,
                                    n_tiles=(2, 2, 1),
-                                   cellpose_model=args.cellpose_model,
                                    isIHC=args.isIHC,
                                    progress_callback=update_progress,
                                    cancel_checker=cancel_checker)
@@ -226,58 +263,10 @@ def run_segmentation(args):
             probability = np.asarray(getattr(ss, "prob_all", np.array([])), dtype=np.float32)
             result["nuclei_count"] = len(centroids)
             result["message"] = "Segmentation completed successfully"
-            # Persist before embedding so a later PLIP/checkpoint failure does not lose segmentation.
-            _persist_segmentation_to_zarr(centroids, contours, probability, drop_embeddings=True)
+            _persist_segmentation_to_zarr(centroids, contours, probability,
+                                          params=_segmentation_params(args))
 
-        # Step C: embeddings (skip empty / missing checkpoint rather than failing after a long seg run)
-        if centroids is not None and len(centroids) > 0:
-            have_cached_embedding = False
-            if ALREADY_HAVE_SEG:
-                zf = zarr.open_group(ZARR_PATH, mode="a")
-                if NODE_NAME in zf and "embeddings" in zf[NODE_NAME]:
-                    try:
-                        if zf[NODE_NAME]["embeddings"].shape[0] == len(centroids):
-                            have_cached_embedding = True
-                            print("found existing embeddings => skip embedding calculation")
-                    except Exception:
-                        have_cached_embedding = False
-
-            if not have_cached_embedding:
-                if not os.path.exists(_EMBED_CHECKPOINT):
-                    print(
-                        f"PLIP checkpoint not found at {_EMBED_CHECKPOINT}; "
-                        "skipping embedding. Segmentation was saved."
-                    )
-                    result["message"] = (
-                        (result.get("message") or "Segmentation completed")
-                        + "; embeddings skipped (missing checkpoints/checkpoint_step_10000.pt)"
-                    )
-                else:
-                    print("no cached embeddings => generate new embeddings directly into Zarr")
-                    try:
-                        ne = NucleiEmbedding(
-                            args, centroids,
-                            progress_callback=update_progress,
-                            cancel_checker=cancel_checker,
-                        )
-                        ne.generate_embeddings(
-                            zarr_path=ZARR_PATH,
-                            dataset_path=f"{NODE_NAME}/embeddings",
-                        )
-                    except CooperativeCancel:
-                        raise
-                    except Exception as embed_err:
-                        print(f"Embedding failed after segmentation was saved: {embed_err}")
-                        import traceback
-                        print(traceback.format_exc())
-                        result["status"] = "error"
-                        result["message"] = (
-                            f"Segmentation saved, but embedding failed: {embed_err}"
-                        )
-        elif centroids is not None and len(centroids) == 0:
-            print("No nuclei detected; skipping embedding.")
-
-        # Ensure progress is set to 100 after Step C and D are completed
+        # Ensure progress is set to 100
         update_progress(100)
         if not progress_state.mark_terminal_and_wait(100, 2.0):
             print("[SSE] Timed out waiting for progress flush after 100%")
@@ -320,7 +309,7 @@ def init_node():
     global IS_MODEL_INITED
     if not IS_MODEL_INITED:
         IS_MODEL_INITED = True
-        print("[Cell-Segmentation] /init => inited model/resources (with embedding)")
+        print("[Cell-Segmentation] /init => inited model/resources")
         return {"status": "ok", "message": "Cell-Segmentation init done"}
     else:
         print("[Cell-Segmentation] /init => already done.")
@@ -344,9 +333,14 @@ def read_node(data: Dict[str, Any]):
         ARGS = argparse.Namespace(
             slidepath="",
             read_image_method="tiffslide",
-            cellpose_model="cpsam_v2",
-            isIHC=False
+            isIHC=False,
         )
+    # Region / resolution are per run: reset so a previous run's do not stick
+    # (magnification is derived from the slide on every run).
+    ARGS.magnification = None
+    ARGS.bbox = None
+    ARGS.polygon_points = None
+    ARGS.target_mpp = None
 
     zf = zarr.open_group(ZARR_PATH, mode='r')
     user_data_path = f"{NODE_NAME}/userData"
@@ -364,10 +358,17 @@ def read_node(data: Dict[str, Any]):
                 ARGS.slidepath = val_json
             elif k == "read_image_method":
                 ARGS.read_image_method = val_json
-            elif k == "cellpose_model":
-                ARGS.cellpose_model = val_json
             elif k == "isIHC":
                 ARGS.isIHC = (val_json in [True, "true", "True"])
+            elif k == "bbox":
+                ARGS.bbox = val_json or None
+            elif k == "polygon_points":
+                ARGS.polygon_points = val_json if isinstance(val_json, list) and val_json else None
+            elif k == "target_mpp":
+                try:
+                    ARGS.target_mpp = float(val_json) if val_json not in (None, "") else None
+                except (TypeError, ValueError):
+                    print(f"[Cell-Segmentation] bad target_mpp={val_json!r}; using 0.5 um/px")
 
     return {"status": "ok", "message": "Cell-Segmentation read done"}
 
