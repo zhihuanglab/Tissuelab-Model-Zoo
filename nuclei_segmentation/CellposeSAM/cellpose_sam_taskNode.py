@@ -112,6 +112,9 @@ ARGS = None
 IS_MODEL_INITED = False
 ZARR_PATH = None
 NODE_NAME = None
+# Zarr group for params and results: factory-bound, not the node name. Set from
+# /read payload `zarr_group`.
+ZARR_GROUP = "Cell-Segmentation"
 DEPENDENCIES = []
 # Per-folder SSE progress (progress_sse.py). Stream end does not reset.
 progress_state = ProgressSSEState()
@@ -170,7 +173,7 @@ def _persist_segmentation_to_zarr(centroids, contours, probability=None, params=
     if centroids is None or not ZARR_PATH or not NODE_NAME:
         return
     zf = zarr.open_group(ZARR_PATH, mode="a")
-    node_grp = zf.require_group(NODE_NAME)
+    node_grp = zf.require_group(ZARR_GROUP)
     if "embeddings" in node_grp:
         del node_grp["embeddings"]
     if "centroids" in node_grp:
@@ -251,13 +254,13 @@ def run_segmentation(args):
 
         if os.path.exists(ZARR_PATH):
             zf = zarr.open_group(ZARR_PATH, mode='r')
-            if NODE_NAME in zf and not _stored_segmentation_matches(zf[NODE_NAME], args):
+            if ZARR_GROUP in zf and not _stored_segmentation_matches(zf[ZARR_GROUP], args):
                 print("Stored segmentation is not Cellpose-SAM's for this region / resolution => re-run.")
-            elif NODE_NAME in zf:
+            elif ZARR_GROUP in zf:
                 # if already have segmentation => skip cellpose
                 try:
-                    centroids = zf[f"{NODE_NAME}/centroids"][()]
-                    contours = zf[f"{NODE_NAME}/contours"][()] if f"{NODE_NAME}/contours" in zf else None
+                    centroids = zf[f"{ZARR_GROUP}/centroids"][()]
+                    contours = zf[f"{ZARR_GROUP}/contours"][()] if f"{ZARR_GROUP}/contours" in zf else None
                     ALREADY_HAVE_SEG = True
                     print("Using existing nuclei segmentation => skip cellpose.")
                     result["message"] = "Using existing nuclei segmentation"
@@ -335,12 +338,13 @@ def init_node():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS
+    global NODE_NAME, DEPENDENCIES, ZARR_PATH, ARGS, ZARR_GROUP
     NODE_NAME = data.get("node_name", "Cell-Segmentation")
+    ZARR_GROUP = data.get("zarr_group") or "Cell-Segmentation"
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
 
-    print(f"[Cell-Segmentation] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
+    print(f"[Cell-Segmentation] /read => node_name={NODE_NAME}, zarr_group={ZARR_GROUP}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}")
 
     if not ZARR_PATH or not os.path.exists(ZARR_PATH):
         print("[Cell-Segmentation] no zarr store => skip read.")
@@ -360,7 +364,7 @@ def read_node(data: Dict[str, Any]):
     ARGS.target_mpp = None
 
     zf = zarr.open_group(ZARR_PATH, mode='r')
-    user_data_path = f"{NODE_NAME}/userData"
+    user_data_path = f"{ZARR_GROUP}/userData"
     if user_data_path in zf:
         for k in zf[user_data_path].keys():
             raw_bytes = zf[user_data_path][k][()]
@@ -431,13 +435,13 @@ def execute_node():
             elif not progress_state.complete and not progress_state.cancelled:
                 progress_state.mark_terminal_and_wait(100, 2.0)
 
-        # Run metadata as attrs of <NODE_NAME>/metadata, as StarDist and Cytoformer
-        # write it. Not a scalar <NODE_NAME>/output array: nodes that re-sort every
+        # Run metadata as attrs of <ZARR_GROUP>/metadata, as StarDist and Cytoformer
+        # write it. Not a scalar <ZARR_GROUP>/output array: nodes that re-sort every
         # array of the group by cell (Cytoformer, before embedding these cells)
         # fail on one that has no rows.
         if ZARR_PATH and os.path.exists(ZARR_PATH):
             zf = zarr.open_group(ZARR_PATH, mode='a')
-            seg_grp = zf.require_group(NODE_NAME)
+            seg_grp = zf.require_group(ZARR_GROUP)
             for stale in ("output", "metadata"):
                 if stale in seg_grp:
                     del seg_grp[stale]
