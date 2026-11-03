@@ -13,20 +13,25 @@ uvicorn[standard]==0.52.4
 pydantic==2.13.5
 requests==2.34.2
 xgboost==3.0.5
+# xgboost's XGBClassifier needs scikit-learn (no other requirement pulls it in), and
+# xgboost 3.0.5 cannot save a classifier with scikit-learn >= 1.8 (TypeError:
+# `_estimator_type` undefined), so a fresh install could neither train nor write .tlcls.
+scikit-learn==1.7.2
 pandas==3.0.5
 scikit-image==0.26.0
 sse-starlette==3.4.6
 
 timm==0.9.8
-einops
-pyarrow
-transformers<5
-sentencepiece
-fairscale
-huggingface-hub
-safetensors
-datasets
-tqdm>=4.66.0
+einops==0.8.2
+pyarrow==26.0.1
+transformers==4.57.6
+sentencepiece==0.2.2
+fairscale==0.4.13
+# huggingface-hub 1.x+ is not supported by transformers 4.x; one version across the nodes.
+huggingface-hub==0.36.2
+safetensors==0.8.0
+datasets==5.0.1
+tqdm==4.70.1
 
 # macOS: PyPI CPU/MPS. Linux/Windows: CUDA 12.6 (not PyPI's default CUDA 13).
 --extra-index-url https://download.pytorch.org/whl/cu126
