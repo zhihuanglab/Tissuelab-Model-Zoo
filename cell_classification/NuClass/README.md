@@ -18,8 +18,9 @@ WSI formats such as `.svs`, `.ndpi`, `.mrxs`, and JPEG-2000 TIFF need a **full**
 
 **macOS**
 ```bash
-brew install vips
+brew install vips libomp
 ```
+`libomp` is the OpenMP runtime the xgboost wheel links against; without it `import xgboost` fails on macOS.
 
 **Linux (Debian/Ubuntu)**
 ```bash
