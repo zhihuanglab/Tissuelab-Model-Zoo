@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 import zarr
 import numpy as np
+import re
 import time
 import json
 import tempfile
@@ -424,7 +425,7 @@ def save_segmentation_to_zarr(segmentation_data: np.ndarray, original_image: sit
         else:
             print(f"[Zarr] Creating new sub-group: {NODE_NAME}/voxel_mask")
             voxel_group = cardiac_node.create_group("voxel_mask")
-            
+        if True:  # (re)write the view's dataset on every run, not only when the group is new
             # Use view name as dataset name
             dataset_name = view_name
             print(f"[Zarr] Dataset name: {dataset_name}")
@@ -459,6 +460,10 @@ def save_segmentation_to_zarr(segmentation_data: np.ndarray, original_image: sit
                 except Exception as e:
                     print(f"[Zarr] Warning: Could not extract image metadata: {e}")
             
+            for key in ("pixel_spacing_mm", "slice_thickness_mm", "cardiac_number_of_images"):
+                if key in metadata:
+                    seg_dataset.attrs[key] = metadata[key]
+            seg_dataset.attrs['axes'] = "(slice/frame, row, col) on the input image grid"
             # Add class information
             view_config = AVAILABLE_VIEWS[view_name]
             seg_dataset.attrs['num_classes'] = view_config['num_classes']
@@ -550,7 +555,7 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
         
         # Setup device
         if device == "gpu" and torch.cuda.is_available():
-            os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+            os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")  # keep the GPU the service chose
             use_gpu = True
             logger.info(f"[Process] Using GPU")
             print(f"[Process] Using GPU")
@@ -705,9 +710,29 @@ def process_segmentation_sync(input_path: str, view_name: str, device: str = "gp
         # Save to Zarr
         logger.info(f"[Process] Saving segmentation to Zarr...")
         print(f"[Process] Saving segmentation to Zarr...")
+        # predict() returns the image as a numpy array; re-read the (converted) input with
+        # SimpleITK so the mask carries pixel spacing / origin / direction for downstream
+        # measurements (wall thickness in mm needs the in-plane spacing).
+        ref_image = original_image_result if hasattr(original_image_result, "GetSpacing") else None
+        if ref_image is None:
+            try:
+                ref_image = sitk.ReadImage(str(converted_path))
+            except Exception as _e:
+                print(f"[Process] Could not read reference image for spacing: {_e}")
+        if input_type == 'dicom':
+            try:
+                first = sorted(list(Path(input_path).glob("*.dcm")) + list(Path(input_path).glob("*.DCM")))[0]
+                hdr = sitk.ReadImage(str(first))
+                metadata['pixel_spacing_mm'] = [float(x) for x in hdr.GetSpacing()[:2]]
+                if hdr.HasMetaDataKey("0018|0050"):
+                    metadata['slice_thickness_mm'] = float(hdr.GetMetaData("0018|0050").strip())
+                if hdr.HasMetaDataKey("0018|1090"):
+                    metadata['cardiac_number_of_images'] = int(float(hdr.GetMetaData("0018|1090").strip()))
+            except Exception as _e:
+                print(f"[Process] Could not read DICOM header spacing: {_e}")
         save_segmentation_to_zarr(
             prediction_result,
-            original_image_result,
+            ref_image,
             ZARR_PATH,
             metadata,
             view_name
@@ -834,46 +859,74 @@ def init_model():
 
 @app.post("/read")
 def read_node(data: Dict[str, Any]):
-    """Read configuration data from frontend"""
+    """Read the run's inputs.
+
+    Parameters arrive in the request body (TissueLab forwards every node input):
+    `path` / `image_path` (NIfTI file or DICOM folder) and `view` (LVSA | 4CH | VLA |
+    LVOT), or a prompt / class list naming the view. `userData` in the zarr is only a
+    fallback for older services. Without a view the short-axis cine (LVSA) is used,
+    the view LV mass and wall thickness are measured on.
+    """
     global NODE_NAME, ZARR_PATH, INPUT_PATH, SELECTED_VIEW
-    
-    print("=" * 60)
     print("POST /read - Reading configuration")
-    print("=" * 60)
-    print(f"Received data: {data}")
-    
     NODE_NAME = data.get("node_name", "CardiacSegmentation")
     ZARR_PATH = data.get("zarr_path", None)
-    
-    print(f"[Read] node_name={NODE_NAME}, zarr_path={ZARR_PATH}")
-    
-    # Check if Zarr store exists and read user data from it
-    if ZARR_PATH and os.path.exists(ZARR_PATH):
+    INPUT_PATH, SELECTED_VIEW = None, None   # per-run state
+    control = {"node_name", "dependencies", "zarr_path", "zarr_group", "dependencies_zarr_groups"}
+    for k, v in data.items():
+        if k not in control:
+            _apply_parameter(k, v)
+    if (not INPUT_PATH) and ZARR_PATH and os.path.exists(ZARR_PATH):
         try:
             zf = zarr.open_group(ZARR_PATH, mode="r")
-            user_data_path = f"{NODE_NAME}/userData"
-            if user_data_path in zf:
-                print(f"[Read] Found userData in Zarr store")
+            for grp in [data.get("zarr_group"), NODE_NAME, "CardiacSegmentation"]:
+                user_data_path = f"{grp}/userData"
+                if not grp or user_data_path not in zf:
+                    continue
                 for k in zf[user_data_path].keys():
-                    raw_bytes = zf[user_data_path][k][()]
-                    raw_str = raw_bytes.decode("utf-8")
+                    if k.startswith("_"):
+                        continue
+                    raw = zf[user_data_path][k][()]
+                    raw = raw.tobytes() if hasattr(raw, "tobytes") else raw
+                    text = raw.decode("utf-8", "replace").rstrip("\x00") if isinstance(raw, bytes) else str(raw)
                     try:
-                        val_json = json.loads(raw_str)
-                    except:
-                        val_json = raw_str
-                    print(f"[Read] user param {k} => {val_json}")
-                    
-                    if k == "path":
-                        INPUT_PATH = val_json
-                    elif k == "view":
-                        SELECTED_VIEW = val_json
-                    elif k in AVAILABLE_VIEWS:
-                        SELECTED_VIEW = k
-                        print(f"[Read] Selected view: {k}")
+                        _apply_parameter(k, json.loads(text))
+                    except Exception:
+                        _apply_parameter(k, text)
+                if INPUT_PATH:
+                    break
         except Exception as e:
             print(f"[Read] Error reading Zarr store: {e}")
-    
+    if not SELECTED_VIEW:
+        SELECTED_VIEW = "LVSA"
+        print("[Read] No view given; defaulting to LVSA (short-axis cine)")
+    print(f"[Read] node_name={NODE_NAME} input={INPUT_PATH} view={SELECTED_VIEW}")
     return {"status": "ok", "message": f"[{NODE_NAME}] read done"}
+
+
+def _apply_parameter(k: str, v) -> None:
+    """Set INPUT_PATH / SELECTED_VIEW from one node input (request body or userData)."""
+    global INPUT_PATH, SELECTED_VIEW
+    if k in ("path", "image_path", "input_path"):
+        if isinstance(v, str) and v:
+            INPUT_PATH = v
+    elif k == "view":
+        if isinstance(v, str) and v.strip().upper() in AVAILABLE_VIEWS:
+            SELECTED_VIEW = v.strip().upper()
+    elif k in AVAILABLE_VIEWS:
+        SELECTED_VIEW = k
+    elif k in ("prompt", "tissue_classes", "classes", "targets") and v:
+        text = ", ".join(map(str, v)) if isinstance(v, (list, tuple)) else str(v)
+        m = re.search(r"\bview\s*=\s*([A-Za-z0-9]+)", text, re.I)
+        cand = (m.group(1) if m else "").upper()
+        if cand in AVAILABLE_VIEWS:
+            SELECTED_VIEW = cand
+        else:
+            for name in AVAILABLE_VIEWS:
+                if re.search(r"\b" + re.escape(name) + r"\b", text, re.I):
+                    SELECTED_VIEW = name
+                    break
+
 
 @app.post("/execute")
 def execute_model():
