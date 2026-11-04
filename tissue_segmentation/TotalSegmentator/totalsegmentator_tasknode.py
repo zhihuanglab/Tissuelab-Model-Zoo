@@ -7,6 +7,14 @@ outputting NIfTI format results and storing in Zarr files with SegmentorNode str
 
 import os
 import sys
+
+# pandas (via nnunetv2) imports pyarrow, whose bundled jemalloc starts a background
+# thread. fork() from this multithreaded CUDA process then deadlocks (the parent hangs
+# inside fork, or the child never returns from it) - seen as runs stuck at
+# "Finalizing segmentation" / "Predicting part 1". jemalloc reads this variable when
+# the library loads, so it must be set before anything imports pandas/pyarrow.
+os.environ.setdefault("JE_ARROW_MALLOC_CONF", "background_thread:false")
+
 import argparse
 import zarr
 import numpy as np
@@ -19,6 +27,8 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import faulthandler
+import signal
 import uvicorn
 from fastapi import FastAPI, BackgroundTasks, Request, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -137,6 +147,25 @@ PROGRESS_MESSAGE = ""
 IS_PROCESSING = False
 progress_complete = False  # Flag to indicate completion
 cancel_event = threading.Event()
+
+# `kill -USR1 <pid>` dumps every thread's Python stack to stderr (the node log) so a
+# stuck run can be diagnosed without a debugger.
+try:
+    faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+except Exception:
+    pass
+
+# ---- Unified Tissue-Segmentation output structure (TissueSeg factory) ----
+# Same layout VISTA writes, so consumers depend on one fixed group, not the node name:
+#   Tissue-Segmentation/masks/<organ>/mask (3D bool) + classes/{name,color} + userData
+# plus `image` (int16 HU volume on the same grid) so analysis code can measure
+# intensities (e.g. mean liver HU) without re-reading the original scan.
+TISSUE_SEG_GROUP = "Tissue-Segmentation"
+MODEL_NAME = "TotalSegmentator"
+ZARR_GROUP: Optional[str] = None
+TISSUE_COLORS: List[str] = []
+_DEFAULT_PALETTE = ["#e6194b", "#3cb44b", "#ffe119", "#4363d8", "#f58231",
+                    "#911eb4", "#46f0f0", "#f032e6", "#bcf60c", "#fabebe"]
 
 # Event-driven progress updates
 progress_event = asyncio.Event()
@@ -736,86 +765,228 @@ def load_nifti_file(file_path: str) -> Optional[np.ndarray]:
         print(f"Error loading NIfTI file {file_path}: {e}")
         return None
 
-def save_organ_to_zarr(organ_name: str, organ_data: np.ndarray, zarr_path: str, metadata: Dict[str, Any], file_prefix: str = None):
-    """Save individual organ data to Zarr file in SegmentorNode with voxel_mask sub-group"""
+def _as_class_list(val) -> List[str]:
+    """Accept a list, a JSON list string, or a comma-separated string ("Liver,Spleen")."""
+    if val is None:
+        return []
+    if isinstance(val, (list, tuple)):
+        return [str(x).strip() for x in val if str(x).strip()]
+    s = str(val).strip()
+    if not s:
+        return []
+    if s.startswith("["):
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def _read_userdata_fallback(zarr_path: str, groups: List[Optional[str]]) -> Dict[str, Any]:
+    """Legacy source of node params: <group>/userData written by the orchestrator.
+
+    The TissueLab service writes them under the registry `zarr_group`, or under the
+    factory group (Patch-Segmentation for TissueSeg) when the registry has none, so try
+    each candidate in order and use the first one holding real parameters.
+    """
     try:
-        print(f"[Zarr] Starting to save organ: {organ_name}")
-        print(f"[Zarr] Data shape: {organ_data.shape if organ_data is not None else 'None'}")
-        print(f"[Zarr] Data type: {organ_data.dtype if organ_data is not None else 'None'}")
-        print(f"[Zarr] Data min: {organ_data.min()}, max: {organ_data.max()}, non-zero count: {np.count_nonzero(organ_data)}")
-        print(f"[Zarr] Zarr path: {zarr_path}")
-        print(f"[Zarr] File prefix: {file_prefix}")
-
-        # Ensure data is uint8
-        if organ_data.dtype != np.uint8:
-            print(f"[Zarr] Converting data from {organ_data.dtype} to uint8")
-            organ_data = organ_data.astype(np.uint8)
-
-        # Open Zarr store
-        store = zarr.open(zarr_path, mode="a")
-        print(f"[Zarr] Opened Zarr store successfully")
-        print(f"[Zarr] Existing groups: {list(store.keys())}")
-
-        # Create SegmentorNode if it doesn't exist
-        if NODE_NAME not in store:
-            print(f"[Zarr] Creating new group: {NODE_NAME}")
-            seg_node = store.create_group(NODE_NAME)
-        else:
-            print(f"[Zarr] Using existing group: {NODE_NAME}")
-            seg_node = store[NODE_NAME]
-
-        # Create voxel_mask sub-group if it doesn't exist
-        if "voxel_mask" not in seg_node:
-            print(f"[Zarr] Creating new sub-group: {NODE_NAME}/voxel_mask")
-            voxel_group = seg_node.create_group("voxel_mask")
-        else:
-            print(f"[Zarr] Using existing sub-group: {NODE_NAME}/voxel_mask")
-            voxel_group = seg_node["voxel_mask"]
-
-        print(f"[Zarr] Existing datasets in {NODE_NAME}/voxel_mask: {list(voxel_group.keys())}")
-
-        # Use file_prefix if provided, otherwise use organ_name
-        dataset_name = file_prefix if file_prefix else organ_name
-        print(f"[Zarr] Dataset name: {dataset_name}")
-
-        # Delete existing dataset if it exists
-        if dataset_name in voxel_group:
-            print(f"[Zarr] Deleting existing dataset: {dataset_name}")
-            del voxel_group[dataset_name]
-
-        # Create organ dataset in voxel_mask group
-        print(f"[Zarr] Creating dataset with shape {organ_data.shape}")
-        organ_dataset = voxel_group.create_array(
-            dataset_name,
-            data=organ_data,
-            compressors=[zarr.codecs.GzipCodec(level=3)],
-        )
-        print(f"[Zarr] Dataset created successfully")
-
-        # Add organ-specific metadata as attributes
-        organ_dataset.attrs['organ_name'] = organ_name
-        organ_dataset.attrs['dataset_name'] = dataset_name
-        organ_dataset.attrs['file_prefix'] = file_prefix if file_prefix else ""
-        organ_dataset.attrs['shape'] = str(organ_data.shape)
-        organ_dataset.attrs['dtype'] = str(organ_data.dtype)
-        organ_dataset.attrs['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
-        print(f"[Zarr] Metadata added")
-
-        # Add general metadata to SegmentorNode
-        seg_node.attrs.update(metadata)
-        seg_node.attrs['last_updated'] = time.strftime('%Y-%m-%d %H:%M:%S')
-
-        # Count total organs in voxel_mask group
-        total_organs = len([k for k in voxel_group.keys() if isinstance(voxel_group[k], zarr.Array)])
-        seg_node.attrs['total_organs'] = total_organs
-
-        print(f"[Zarr] SUCCESS: Successfully saved {dataset_name} (organ: {organ_name}) data with shape {organ_data.shape} to {NODE_NAME}/voxel_mask/")
-
+        store = zarr.open(zarr_path, mode="r")
     except Exception as e:
-        print(f"[Zarr] ERROR saving {organ_name} to Zarr: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+        print(f"[Read] Could not open zarr for userData fallback: {e}")
+        return {}
+    seen = set()
+    for grp in groups:
+        if not grp or grp in seen:
+            continue
+        seen.add(grp)
+        ud_path = f"{grp}/userData"
+        if ud_path not in store:
+            continue
+        params: Dict[str, Any] = {}
+        for k in store[ud_path].keys():
+            if k.startswith("_"):
+                continue
+            try:
+                raw = store[ud_path][k][()]
+                if isinstance(raw, np.ndarray):
+                    raw = raw.reshape(-1)[0] if raw.size else b""
+                val = raw.decode("utf-8") if isinstance(raw, (bytes, np.bytes_)) else str(raw)
+                try:
+                    val = json.loads(val)
+                except Exception:
+                    pass
+                params[k] = val
+            except Exception as e:
+                print(f"[Read] Could not read {ud_path}/{k}: {e}")
+        if params:
+            print(f"[Read] userData fallback from {ud_path}: {sorted(params.keys())}")
+            return params
+    return {}
+
+
+def _apply_params(params: Dict[str, Any]) -> None:
+    """Set INPUT_PATH / MODEL_CONFIG / ROI_SUBSET / TISSUE_COLORS from node inputs.
+
+    Accepted keys: path, model, tissue_classes (list or "a,b"), the aliases the planner
+    may emit (targets / organs / classes / roi_subset / class), tissue_colors, prompt.
+    A model is always chosen (default: the `total` task), so /execute never fails just
+    because no organ list arrived - it then segments every organ.
+    """
+    global MODEL_CONFIG, INPUT_PATH, ROI_SUBSET, TISSUE_COLORS
+    classes: List[str] = []
+    model_field: Optional[str] = None
+    prompt_text: Optional[str] = None
+    for k, val in params.items():
+        print(f"[Read] param {k} => {val}")
+        if k == "path":
+            INPUT_PATH = str(val) if val else None
+        elif k == "model":
+            model_field = str(val).strip() if val else None
+        elif k in ("tissue_classes", "targets", "organs", "classes", "roi_subset", "class"):
+            classes.extend(_as_class_list(val))
+        elif k == "tissue_colors":
+            TISSUE_COLORS = _as_class_list(val)
+        elif k == "prompt":
+            prompt_text = str(val) if val else None
+    if not classes and prompt_text:
+        classes = parse_prompt_for_tissue_classes(prompt_text)
+        if classes:
+            print(f"[Read] No explicit classes; parsed from prompt: {classes}")
+    uniq: List[str] = []
+    for c in classes:
+        if c not in uniq:
+            uniq.append(c)
+    classes = uniq
+
+    if model_field:
+        MODEL_CONFIG = AVAILABLE_MODELS.get(model_field)
+        if MODEL_CONFIG is None:
+            print(f"[Read] Warning: model '{model_field}' not in AVAILABLE_MODELS; choosing from classes")
+    if MODEL_CONFIG is None:
+        selected = determine_model_from_tissue_classes(classes)  # "total_3mm" when empty
+        MODEL_CONFIG = AVAILABLE_MODELS[selected]
+        print(f"[Read] Selected model: {selected}")
+    ROI_SUBSET = normalize_tissue_classes(classes) if classes else []
+    print(f"[Read] INPUT_PATH={INPUT_PATH} ROI_SUBSET={ROI_SUBSET} task={MODEL_CONFIG['task']}")
+
+
+def _sanitize_organ_name(name: str) -> str:
+    s = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in str(name).strip().lower())
+    return s.strip("_") or "organ"
+
+
+def _colors_for(class_names: List[str]) -> List[str]:
+    colors = []
+    for i, _ in enumerate(class_names):
+        if i < len(TISSUE_COLORS) and TISSUE_COLORS[i]:
+            colors.append(TISSUE_COLORS[i])
+        else:
+            colors.append(_DEFAULT_PALETTE[i % len(_DEFAULT_PALETTE)])
+    return colors
+
+
+def _put_str_dataset(grp, key: str, value: str) -> None:
+    """Same encoding VISTA uses for Tissue-Segmentation/userData (1-element |S array)."""
+    b = str(value).encode("utf-8") or b" "
+    if key in grp:
+        del grp[key]
+    grp.create_array(key, data=np.frombuffer(b, dtype=f"S{len(b)}"))
+
+
+def _write_tissue_segmentation(ct_nifti_path: str, seg_output: Path, roi_subset: Optional[List[str]],
+                               metadata: Dict[str, Any]) -> List[str]:
+    """Write the run in the unified TissueSeg layout (as VISTA does), plus the CT volume:
+
+      Tissue-Segmentation/
+        image                    int16 HU volume, NIfTI voxel order (x, y, z); attrs affine/spacing
+        masks/<organ>/mask       3D bool on the same grid as `image`
+        classes/{name,color}     ordered class metadata
+        userData/{path,model,tissue_class,config}
+
+    The group is rebuilt on every run so organs from an earlier run never linger.
+    """
+    import nibabel as nib
+
+    ct_img = nib.load(str(ct_nifti_path))
+    ct = np.clip(np.rint(ct_img.get_fdata(dtype=np.float32)), -32768, 32767).astype(np.int16)
+    affine = ct_img.affine.tolist()
+    spacing = [float(x) for x in ct_img.header.get_zooms()[:3]]
+    axes = "xyz (NIfTI voxel order)"
+
+    seg_output = Path(seg_output)
+    organ_files: List[tuple] = []
+    if roi_subset:
+        for organ in roi_subset:
+            cands = [seg_output] if seg_output.is_file() else [seg_output / f"{organ}.nii.gz", seg_output / f"{organ}.nii"]
+            f = next((c for c in cands if c.exists()), None)
+            if f is None:
+                print(f"[Zarr] WARNING: no output file for organ '{organ}' in {seg_output}")
+                continue
+            organ_files.append((organ, f))
+    else:
+        files = (sorted(seg_output.glob("*.nii.gz")) + sorted(seg_output.glob("*.nii"))) if seg_output.is_dir() else [seg_output]
+        for f in files:
+            organ_files.append((f.name[:-7] if f.name.endswith(".nii.gz") else f.stem, f))
+    if not organ_files:
+        raise RuntimeError(f"No segmentation outputs found in {seg_output}")
+
+    zf = zarr.open(ZARR_PATH, mode="a")
+    if TISSUE_SEG_GROUP in zf:
+        print(f"[Zarr] Rebuilding existing group {TISSUE_SEG_GROUP}")
+        del zf[TISSUE_SEG_GROUP]
+    out_grp = zf.create_group(TISSUE_SEG_GROUP)
+    out_grp.attrs.update({
+        "modality": "radiology", "model": MODEL_NAME, "task": metadata.get("model"),
+        "axes": axes, "affine": affine, "voxel_spacing_mm": spacing,
+        "image_dataset": "image", "intensity_units": "HU", "source_path": INPUT_PATH or "",
+        "last_updated": time.strftime('%Y-%m-%d %H:%M:%S'),
+    })
+
+    compressors = [zarr.codecs.BloscCodec(cname="zstd", clevel=3)]
+    img_arr = out_grp.create_array("image", data=ct, chunks=tuple(min(128, s) for s in ct.shape),
+                                   compressors=compressors)
+    img_arr.attrs.update({
+        "units": "HU", "axes": axes, "affine": affine, "voxel_spacing_mm": spacing,
+        "source_path": INPUT_PATH or "",
+        "description": "CT intensities in Hounsfield units on the same grid as masks/<organ>/mask",
+    })
+    print(f"[Zarr] image saved: {ct.shape} int16 HU")
+
+    masks_grp = out_grp.create_group("masks")
+    class_names: List[str] = []
+    used = set()
+    for i, (organ, f) in enumerate(organ_files):
+        m = np.asarray(nib.load(str(f)).dataobj) > 0
+        if m.shape != ct.shape:
+            print(f"[Zarr] WARNING: mask '{organ}' shape {m.shape} != image shape {ct.shape}")
+        sub = _sanitize_organ_name(organ)
+        if sub in used:
+            sub = f"{sub}_{i}"
+        used.add(sub)
+        arr = masks_grp.create_group(sub).create_array(
+            "mask", data=m, chunks=tuple(min(128, s) for s in m.shape), compressors=compressors)
+        n = int(m.sum())
+        arr.attrs.update({"organ_name": organ, "voxel_count": n,
+                          "volume_ml": float(n * spacing[0] * spacing[1] * spacing[2] / 1000.0)})
+        class_names.append(organ)
+        print(f"[Zarr] mask saved: masks/{sub}/mask {m.shape} bool, {n} voxels")
+        update_progress(int(80 + (i + 1) / len(organ_files) * 15), f"Saved {organ} ({i + 1}/{len(organ_files)})")
+
+    classes_grp = out_grp.create_group("classes")
+    classes_grp.create_array("name", data=np.array([n.encode("utf-8") for n in class_names], dtype="S256"))
+    classes_grp.create_array("color", data=np.array([c.encode("utf-8") for c in _colors_for(class_names)], dtype="S256"))
+
+    ud = out_grp.create_group("userData")
+    _put_str_dataset(ud, "path", INPUT_PATH or "")
+    _put_str_dataset(ud, "model", MODEL_NAME)
+    _put_str_dataset(ud, "tissue_class", ",".join(class_names))
+    _put_str_dataset(ud, "config", json.dumps(
+        {**metadata, "image_dataset": "image", "intensity_units": "HU", "axes": axes},
+        ensure_ascii=False, default=str))
+    print(f"[Zarr] Saved {len(class_names)} class(es) to {TISSUE_SEG_GROUP}: {class_names}")
+    return class_names
 
 def extract_organ_from_nifti(nifti_path: str, organ_name: str) -> Optional[np.ndarray]:
     """Extract specific organ data from NIfTI segmentation file or directory"""
@@ -872,76 +1043,6 @@ def extract_organ_from_nifti(nifti_path: str, organ_name: str) -> Optional[np.nd
         import traceback
         traceback.print_exc()
         return None
-
-def process_organs_parallel(organs: List[str], nifti_path: str, zarr_path: str, metadata: Dict[str, Any], file_prefix: str = None):
-    """Process multiple organs in parallel"""
-    print(f"[Parallel] Processing {len(organs)} organs in parallel (prefix: {file_prefix})")
-    
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = []
-        
-        for organ in organs:
-            future = executor.submit(process_single_organ, organ, nifti_path, zarr_path, metadata, file_prefix)
-            futures.append((organ, future))
-        
-        # Wait for all organs to complete
-        completed_count = 0
-        for organ, future in futures:
-            try:
-                future.result()  # This will raise an exception if the task failed
-                completed_count += 1
-                progress = 80 + (completed_count / len(organs)) * 20  # 80-100%
-                update_progress(int(progress), f"Completed {organ} ({completed_count}/{len(organs)})")
-            except Exception as e:
-                print(f"Error processing {organ}: {e}")
-                update_progress(100, f"Error processing {organ}: {e}")
-    
-    print(f"[Parallel] Completed processing {completed_count}/{len(organs)} organs")
-
-def process_single_organ(organ: str, nifti_path: str, zarr_path: str, metadata: Dict[str, Any], file_prefix: str = None):
-    """Process a single organ"""
-    try:
-        print("=" * 60)
-        print(f"[Organ] Processing organ: {organ}")
-        print(f"[Organ] File prefix: {file_prefix}")
-        print(f"[Organ] NIfTI path: {nifti_path}")
-        print(f"[Organ] Zarr path: {zarr_path}")
-        print("=" * 60)
-        
-        # Extract organ data from NIfTI
-        print(f"[Organ] Extracting data from NIfTI...")
-        organ_data = extract_organ_from_nifti(nifti_path, organ)
-        
-        if organ_data is not None:
-            print(f"[Organ] SUCCESS: Data extracted successfully")
-            print(f"[Organ] Data shape: {organ_data.shape}")
-            print(f"[Organ] Data dtype: {organ_data.dtype}")
-            print(f"[Organ] Data min: {organ_data.min()}, max: {organ_data.max()}, mean: {organ_data.mean()}")
-            
-            # Check if data is all zeros
-            non_zero_count = np.count_nonzero(organ_data)
-            total_voxels = organ_data.size
-            print(f"[Organ] Non-zero voxels: {non_zero_count} / {total_voxels} ({100*non_zero_count/total_voxels:.2f}%)")
-            
-            if non_zero_count == 0:
-                print(f"[Organ] WARNING: Data is all zeros! No {organ} detected in the image.")
-                print(f"[Organ] This could mean:")
-                print(f"[Organ]   - The organ is not present in this image")
-                print(f"[Organ]   - The segmentation failed to detect it")
-                print(f"[Organ]   - Wrong organ name requested")
-            
-            # Save to Zarr with file prefix (even if all zeros, for consistency)
-            print(f"[Organ] Saving to Zarr...")
-            save_organ_to_zarr(organ, organ_data, zarr_path, metadata, file_prefix)
-            print(f"[Organ] SUCCESS: Successfully processed {organ}")
-        else:
-            print(f"[Organ] FAILED: Failed to extract data for {organ}")
-            
-    except Exception as e:
-        print(f"[Organ] ERROR processing {organ}: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
 
 # FastAPI endpoints
 
@@ -1120,7 +1221,7 @@ def read_node(data: Dict[str, Any]):
     Read configuration data from frontend
     Updated to handle new frontend format with tissue_classes
     """
-    global NODE_NAME, ZARR_PATH, MODEL_CONFIG, INPUT_PATH, ROI_SUBSET
+    global NODE_NAME, ZARR_PATH, ZARR_GROUP, MODEL_CONFIG, INPUT_PATH, ROI_SUBSET, TISSUE_COLORS
     
     print("=" * 60)
     print("POST /read - Reading configuration")
@@ -1128,83 +1229,37 @@ def read_node(data: Dict[str, Any]):
     print(f"Received data: {data}")
     
     NODE_NAME = data.get("node_name", "TotalSegmentator")
-    ZARR_PATH = data.get("zarr_path", None)  # Changed from h5_path to zarr_path
+    ZARR_PATH = data.get("zarr_path", None)
+    ZARR_GROUP = data.get("zarr_group") or TISSUE_SEG_GROUP
+    # Per-run state: never carry a previous run's params into this one.
+    MODEL_CONFIG = None
+    INPUT_PATH = None
+    ROI_SUBSET = None
+    TISSUE_COLORS = []
 
-    print(f"[Read] node_name={NODE_NAME}, zarr_path={ZARR_PATH}")
+    print(f"[Read] node_name={NODE_NAME}, zarr_path={ZARR_PATH}, zarr_group={ZARR_GROUP}")
 
-    # Check if Zarr file exists and read user data from it
+    # 1) The orchestrator forwards every node input in the /read body (path,
+    #    tissue_classes, tissue_colors, prompt, ...), exactly as for the other
+    #    TissueSeg nodes (VISTA) - read them from here first.
+    _control_keys = {"node_name", "dependencies", "zarr_path", "zarr_group", "dependencies_zarr_groups"}
+    params = {k: v for k, v in data.items() if k not in _control_keys}
+    # 2) Fallback for older orchestrators / standalone use: <group>/userData. The
+    #    service writes it under the registry zarr_group or, when that is unset, the
+    #    factory group (Patch-Segmentation for TissueSeg) - never under this node's
+    #    own name - so look in every candidate. Our own output group is skipped: its
+    #    userData is provenance from the previous run, not input.
     if ZARR_PATH and os.path.exists(ZARR_PATH):
-        try:
-            store = zarr.open(ZARR_PATH, mode="r")
-            user_data_path = f"{NODE_NAME}/userData"
-            if user_data_path in store:
-                print(f"[Read] Found userData in Zarr file")
-                tissue_classes_found = []
-                model_field_value = None  # Track model field separately
-                has_tissue_classes_field = False  # Track if tissue_classes field was processed
-
-                # First pass: collect all data
-                for k in store[user_data_path].keys():
-                    raw_bytes = store[user_data_path][k][()]
-                    raw_str = raw_bytes.decode("utf-8")
-                    try:
-                        val_json = json.loads(raw_str)
-                    except:
-                        val_json = raw_str
-                    print(f"[Read] user param {k} => {val_json}")
-
-                    if k == "path":
-                        INPUT_PATH = val_json
-                    elif k == "model":
-                        # Store model field value for later processing
-                        model_field_value = val_json if isinstance(val_json, str) else str(val_json)
-                    elif k == "tissue_classes":
-                        # New format: tissue_classes is a list
-                        has_tissue_classes_field = True
-                        if isinstance(val_json, list):
-                            tissue_classes_found = val_json
-                            print(f"[Read] Found tissue_classes: {tissue_classes_found}")
-                        else:
-                            print(f"[Read] tissue_classes is not a list: {type(val_json)}")
-                    elif k == "prompt":
-                        # Extract tissue classes from prompt field
-                        prompt_classes = parse_prompt_for_tissue_classes(val_json)
-                        if prompt_classes:
-                            print(f"[Read] Found classes in prompt: {prompt_classes}")
-                            # If we don't have tissue_classes yet, use prompt classes
-                            if not tissue_classes_found:
-                                tissue_classes_found = prompt_classes
-                            else:
-                                # Merge with existing tissue_classes
-                                tissue_classes_found.extend(prompt_classes)
-                                print(f"[Read] Merged prompt classes with existing: {tissue_classes_found}")
-
-                # Step 1: Set model first (priority: model field > tissue_classes)
-                if model_field_value:
-                    # Handle model field directly - highest priority
-                    MODEL_CONFIG = AVAILABLE_MODELS.get(model_field_value)
-                    if MODEL_CONFIG:
-                        print(f"[Read] Model field '{model_field_value}' => Model config set")
-                    else:
-                        print(f"[Read] Warning: Model '{model_field_value}' not found in AVAILABLE_MODELS")
-                elif tissue_classes_found:
-                    # Only determine model from tissue_classes if model field is not provided
-                    # Normalize tissue class names to lowercase
-                    normalized_classes = normalize_tissue_classes(tissue_classes_found)
-                    # Determine model based on tissue classes
-                    selected_model = determine_model_from_tissue_classes(normalized_classes)
-                    MODEL_CONFIG = AVAILABLE_MODELS.get(selected_model)
-                    print(f"[Read] Using new format tissue_classes: {normalized_classes}")
-                    print(f"[Read] Selected model: {selected_model}")
-
-                # Step 2: Set ROI_SUBSET from tissue_classes (if field was found)
-                if has_tissue_classes_field:
-                    # Normalize tissue class names to lowercase
-                    ROI_SUBSET = normalize_tissue_classes(tissue_classes_found) if tissue_classes_found else []
-                    print(f"[Read] ROI_SUBSET set from tissue_classes: {ROI_SUBSET}")
-
-        except Exception as e:
-            print(f"[Read] Error reading Zarr file: {e}")
+        fallback = _read_userdata_fallback(
+            ZARR_PATH, [data.get("zarr_group"), NODE_NAME, "Patch-Segmentation", "Patch-Classification"])
+        for k, v in fallback.items():
+            params.setdefault(k, v)
+    try:
+        _apply_params(params)
+    except Exception as e:
+        print(f"[Read] Error applying params: {e}")
+        import traceback
+        traceback.print_exc()
     
     return {"status": "ok", "message": f"[{NODE_NAME}] read done"}
 
@@ -1350,17 +1405,37 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
                 temp_output = Path(temp_dir) / "output"
                 temp_output.mkdir(exist_ok=True)
             
+            # TotalSegmentator accepts DICOM folders itself, but we need the CT volume on
+            # the very grid the masks come back on (for Tissue-Segmentation/image), so
+            # convert DICOM to NIfTI here and feed that file to the model.
+            ct_nifti_path = Path(input_path)
+            if input_type == "dicom":
+                update_progress(12, "Converting DICOM to NIfTI")
+                from totalsegmentator.dicom_io import dcm_to_nifti
+                try:
+                    import dicom2nifti.settings as _d2n_settings
+                    _d2n_settings.disable_validate_slice_increment()  # tolerate uneven slice spacing
+                except Exception:
+                    pass
+                ct_nifti_path = Path(temp_dir) / "converted_dcm.nii.gz"
+                dcm_to_nifti(Path(input_path), ct_nifti_path, tmp_dir=Path(temp_dir), verbose=True)
+                print(f"[Process] DICOM converted to {ct_nifti_path}")
+
             update_progress(15, "Starting TotalSegmentator")
             
             # Prepare TotalSegmentator parameters
             ts_kwargs = {
-                'input': input_path,
+                'input': str(ct_nifti_path),
                 'output': str(temp_output),
                 'task': MODEL_CONFIG['task'],
                 'fast': MODEL_CONFIG['fast'],
                 'device': "gpu" if MODEL_CONFIG else "cpu",
                 'quiet': False,
-                'verbose': True
+                'verbose': True,
+                # Save masks on this thread. The default (6) uses multiprocessing.Pool,
+                # i.e. fork() inside this CUDA + uvicorn process, which deadlocks the
+                # child intermittently ("Finalizing segmentation" hangs at 70%).
+                'nr_thr_saving': 1,
             }
             
             # Add ROI subset only for tasks that support it (total and total_mr)
@@ -1493,80 +1568,13 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
                 'roi_subset': roi_subset if roi_subset else "all_organs"
             }
             
-            update_progress(75, "Converting to Zarr format")
-            
-            # Process organs in parallel
-            print(f"[Process] ROI subset received: {roi_subset}")
-            print(f"[Process] ROI subset type: {type(roi_subset)}")
-            print(f"[Process] Task supports ROI: {supports_roi}")
-            
-            if roi_subset:
-                print(f"[Process] Processing {len(roi_subset)} organs: {roi_subset}")
-                
-                # For tasks that don't support ROI, we need to check which organs are actually in the output
-                if not supports_roi:
-                    print(f"[Process] Task '{task_name}' ran without ROI filtering, checking available organs in output")
-                    # For cerebral_bleed task, the output might be different
-                    # We'll try to load and filter the results
-                
-                # Process each organ separately with its own file prefix
-                for i, organ in enumerate(roi_subset):
-                    print(f"[Process] Processing organ {i+1}/{len(roi_subset)}: {organ}")
-                    file_prefix = organ  # Each organ gets its own file prefix
-                    
-                    try:
-                        # Process single organ
-                        process_single_organ(organ, str(temp_output), ZARR_PATH, metadata, file_prefix)
-                        
-                        # Update progress
-                        progress = 75 + (i + 1) / len(roi_subset) * 20  # 75-95%
-                        update_progress(int(progress), f"Completed {organ} ({i+1}/{len(roi_subset)})")
-                    except Exception as e:
-                        print(f"[Process] Warning: Could not process organ '{organ}': {e}")
-                        # Continue with next organ
-                
-                print(f"[Process] Completed processing requested organs")
-            else:
-                # Process all organs - auto-detect from output files
-                print(f"[Process] No ROI subset provided, auto-detecting organs from output files")
-                
-                # Find all NIfTI files in output directory
-                nii_files = []
-                if temp_output.is_dir():
-                    nii_files = list(temp_output.glob("*.nii.gz")) + list(temp_output.glob("*.nii"))
-                elif temp_output.is_file() and (temp_output.suffix == ".gz" or temp_output.suffix == ".nii"):
-                    nii_files = [temp_output]
-                
-                if nii_files:
-                    print(f"[Process] Found {len(nii_files)} NIfTI file(s) to process")
-                    for i, nii_file in enumerate(nii_files):
-                        # Extract organ name from filename (remove .nii.gz extension)
-                        organ_name = nii_file.stem
-                        if organ_name.endswith('.nii'):
-                            organ_name = organ_name[:-4]  # Remove .nii if present
-                        print(f"[Process] Processing file {i+1}/{len(nii_files)}: {nii_file.name} -> organ: {organ_name}")
-                        
-                        try:
-                            # Process the file directly (it's already a single-organ file)
-                            process_single_organ(organ_name, str(nii_file), ZARR_PATH, metadata, organ_name)
-                            
-                            # Update progress
-                            progress = 75 + (i + 1) / len(nii_files) * 20  # 75-95%
-                            update_progress(int(progress), f"Completed {organ_name} ({i+1}/{len(nii_files)})")
-                        except Exception as e:
-                            print(f"[Process] Warning: Could not process file '{nii_file.name}': {e}")
-                            import traceback
-                            traceback.print_exc()
-                            # Continue with next file
-                    
-                    print(f"[Process] Completed processing all detected files")
-                else:
-                    print(f"[Process] WARNING: No NIfTI files found in output directory")
-                    update_progress(100, "No output files found")
+            update_progress(78, "Writing masks and CT volume to Zarr")
+            class_names = _write_tissue_segmentation(str(ct_nifti_path), temp_output, roi_subset, metadata)
+            print(f"[Process] Completed: {class_names}")
             
             update_progress(100, "Processing completed successfully")
             progress_complete = True  # Mark completion
-            return {"status": "success", "message": "Processing completed successfully"}
+            return {"status": "success", "message": f"Masks saved to {TISSUE_SEG_GROUP}: {', '.join(class_names)}"}
             
     except CooperativeCancel:
         print("[Process] Cancelled by user")

@@ -280,11 +280,31 @@ def nnUNetv2_predict(dir_in, dir_out, task_id, model="3d_fullres", folds=None,
         checkpoint_name=chk,
     )
     # new nnunetv2 feature: keep dir_out empty to return predictions as return value
-    predictor.predict_from_files(dir_in, dir_out,
-                                 save_probabilities=save_probabilities, overwrite=not continue_prediction,
-                                 num_processes_preprocessing=npp, num_processes_segmentation_export=nps,
-                                 folder_with_segs_from_prev_stage=prev_stage_predictions,
-                                 num_parts=num_parts, part_id=part_id)
+    if npp <= 1 and nps <= 1 and hasattr(predictor, "predict_from_files_sequential"):
+        # No worker processes at all. predict_from_files() always spawns preprocessing and
+        # export processes, and process creation from a multithreaded CUDA host (the
+        # TissueLab task node) deadlocks the child intermittently; with one image per call
+        # the sequential path costs nothing.
+        # The input/output lists are built here because passing a folder makes nnunetv2
+        # build them in a fork()-based Pool (utilities.utils.create_lists_from_splitted_dataset_folder).
+        import re
+        file_ending = predictor.dataset_json["file_ending"]
+        files = sorted(f for f in os.listdir(dir_in) if f.endswith(file_ending))
+        case_ids = sorted({f[:-(len(file_ending) + 5)] for f in files})
+        inputs = [[os.path.join(dir_in, f) for f in files
+                   if re.fullmatch(re.escape(cid) + r"_\d\d\d\d" + re.escape(file_ending), f)]
+                  for cid in case_ids]
+        outputs = [os.path.join(dir_out, cid) for cid in case_ids]
+        predictor.predict_from_files_sequential(inputs, outputs,
+                                                save_probabilities=save_probabilities,
+                                                overwrite=not continue_prediction,
+                                                folder_with_segs_from_prev_stage=prev_stage_predictions)
+    else:
+        predictor.predict_from_files(dir_in, dir_out,
+                                     save_probabilities=save_probabilities, overwrite=not continue_prediction,
+                                     num_processes_preprocessing=npp, num_processes_segmentation_export=nps,
+                                     folder_with_segs_from_prev_stage=prev_stage_predictions,
+                                     num_parts=num_parts, part_id=part_id)
 
     if save_probabilities:
         shutil.copy(Path(dir_out) / "s01.npz", save_probabilities_path)
