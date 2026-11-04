@@ -375,7 +375,7 @@ def _save_results_to_zarr(predictions, disease_list, image_name):
         ud = group.create_group("userData")
         for k, v in (("path", ARGS.image_path if ARGS else ""), ("model", "Ark+")):
             b = str(v).encode("utf-8")
-            ud.create_array(k, data=np.frombuffer(b, dtype=f"S{len(b)}") if b else np.array(b"", dtype="S1"))
+            ud.create_array(k, data=np.array(b, dtype=f"S{max(len(b), 1)}"))  # 0-d: arr[()] -> bytes
         print(f"[{NODE_NAME}] Results saved to Zarr: {ZARR_GROUP}")
     except Exception as e:
         print(f"[{NODE_NAME}] Error saving results to Zarr: {e}")

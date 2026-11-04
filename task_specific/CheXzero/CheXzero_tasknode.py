@@ -233,8 +233,10 @@ def _labels_for_run() -> List[str]:
 
 # ---- zarr ---------------------------------------------------------------------
 def _put_str(grp, key: str, value: str):
+    """0-d byte-string dataset: `arr[()]` gives the bytes, which is what generated
+    analysis scripts expect (a 1-element 1-D array would hand them an array)."""
     b = value.encode("utf-8")
-    grp.create_array(key, data=np.frombuffer(b, dtype=f"S{len(b)}") if b else np.array(b"", dtype="S1"))
+    grp.create_array(key, data=np.array(b, dtype=f"S{max(len(b), 1)}"))
 
 
 def _save_results(scores: Dict[str, Any], labels: List[str], image_name: str) -> None:
