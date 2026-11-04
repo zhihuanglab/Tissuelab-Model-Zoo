@@ -7,8 +7,8 @@ A FastAPI-based tasknode for TotalSegmentator medical image segmentation, suppor
 - **Multiple Model Support**: 7 different TotalSegmentator models (total_3mm, total_6mm, body, lung_vessels, total_mr, total_mr_fast, cerebral_bleed)
 - **Input Formats**: DICOM folders and NIfTI files (.nii, .nii.gz)
 - **ROI Filtering**: Process only specified organs (e.g., liver, spleen, kidneys)
-- **Parallel Processing**: Concurrent processing of multiple organs
-- **Zarr Storage**: Results stored in SegmentorNode with compression
+- **Single-process inference**: no worker processes are spawned (fork from the CUDA node process deadlocks), so runs are reproducible and easy to debug
+- **Zarr Storage**: one 3D mask per organ plus the HU volume in `Tissue-Segmentation/` (same layout as VISTA), with compression
 - **Progress Tracking**: Real-time progress updates with SSE
 - **Metadata Storage**: Comprehensive metadata for each organ
 
@@ -153,6 +153,33 @@ Download the full `vips-dev-w64-all` build from [libvips Windows releases](https
 ```bash
 python totalsegmentator_tasknode.py --host 0.0.0.0 --port 8000
 ```
+
+## Using from TissueLab
+
+TissueLab runs each model as a separate task node. This node is not shipped as a
+pre-built bundle, so register it once as a **custom node** from the TissueLab app:
+
+1. Clone this repository on the machine that runs the TissueLab service (the node
+   needs a GPU; CPU works but is slow).
+2. In TissueLab open **Models → Create custom node** and fill in:
+
+   | Field | Value |
+   |---|---|
+   | Node Name | `TotalSegmentatorSegmentation` (must match the registry entry the planner uses) |
+   | Service Path | `<repo>/tissue_segmentation/TotalSegmentator/totalsegmentator_tasknode.py` |
+   | Dependency Path | `<repo>/tissue_segmentation/TotalSegmentator/requirements.txt` |
+   | Factory | TissueSeg |
+   | Conda Env | leave blank (TissueLab creates one) or the name of an env built from `requirements.txt` |
+
+   TissueLab creates the conda environment, installs `requirements.txt` and starts the
+   node. Model weights are downloaded automatically on the first run (see below).
+3. Open a CT volume (NIfTI file or DICOM folder) and ask a question in the chat. The
+   planner fills the node's **Organs to segment** field (e.g. `Liver, Spleen`); leave it
+   empty to segment all organs.
+
+Parameters arrive in the `/read` request body (`path`, `tissue_classes`,
+`tissue_colors`, `prompt`); results land in `Tissue-Segmentation/` as described above,
+where the 3D viewer and the Coding Agent read them.
 
 ## Configuration
 
