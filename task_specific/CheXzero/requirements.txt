@@ -1,0 +1,17 @@
+# CheXzero task node. Python 3.11. Pins match TissueLab/app/service/requirements-packaging.txt where used.
+# macOS: use the PyPI CPU/MPS torch wheels (drop the +cu126 suffix and the extra index).
+numpy==2.4.6
+Pillow==12.3.0
+zarr==3.1.6
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+pydantic==2.13.5
+requests==2.34.2
+pydicom==3.0.2
+sse-starlette==3.4.6
+ftfy==6.3.1
+regex==2025.9.18
+tqdm>=4.66.0
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.14.0+cu126
+torchvision==0.29.0+cu126

@@ -188,6 +188,22 @@ def preprocess_image(image_path, input_size=768):
         raise
 
 
+CHECKPOINT_NAME = "Ark6_swinLarge768_ep50.pth.tar"
+# Heads of the Ark+ checkpoint, in the order the model emits them; the flat
+# `predictions` array is the concatenation of these heads (52 values).
+HEADS = [("MIMIC-CXR", 14), ("CheXpert", 14), ("ChestX-ray14", 14), ("RSNA-Pneumonia", 3), ("VinDr-CXR", 6), ("Shenzhen", 1)]
+
+
+def _checkpoint_path() -> str:
+    """ARK_PLUS_CHECKPOINT env var, else checkpoints/ next to this file (or the
+    bundle's resource dir); the node must not depend on the working directory."""
+    env = os.environ.get("ARK_PLUS_CHECKPOINT")
+    if env:
+        return env
+    base = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "checkpoints", CHECKPOINT_NAME)
+
+
 def load_model_at_init():
     """Load the Ark+ model at initialization"""
     global ARK_MODEL
@@ -196,13 +212,8 @@ def load_model_at_init():
     print(f"[{NODE_NAME}] Using device: {device}")
     
     # Fixed model configuration
-    model_path = "checkpoints/Ark6_swinLarge768_ep50.pth.tar"
+    model_path = _checkpoint_path()
     input_size = 768
-    
-    # Check if running from bundled executable
-    if getattr(sys, 'frozen', False):
-        base_path = sys._MEIPASS
-        model_path = os.path.join(base_path, model_path)
     
     # Check if model file exists
     if not os.path.exists(model_path):
@@ -338,11 +349,29 @@ def _save_results_to_zarr(predictions, disease_list, image_name):
         if ZARR_GROUP in zf:
             del zf[ZARR_GROUP]
         group = zf.create_group(ZARR_GROUP)
+        group.attrs.update({
+            "modality": "radiology", "model": "Ark+ (zero-shot chest X-ray classifier)",
+            "description": "predictions[i] is the sigmoid probability for disease_list[i]; the heads are "
+                           "concatenated in the order given by `heads`. scores_json holds the same values "
+                           "grouped per head so a finding name that occurs in several heads is unambiguous.",
+            "heads": [h for h, _ in HEADS], "head_sizes": [n for _, n in HEADS],
+            "image_name": image_name, "input_size": 768,
+        })
         group.create_array("predictions", data=predictions.astype(np.float32))
         img_bytes = image_name.encode('utf-8')
         group.create_array("image_name", data=np.array(img_bytes, dtype=f'S{len(img_bytes)}'))
         dl = np.array(disease_list, dtype='S')
         group.create_array("disease_list", data=dl)
+        scores, i = {}, 0
+        for head, n in HEADS:
+            scores[head] = {disease_list[i + j]: float(predictions[i + j]) for j in range(n)}
+            i += n
+        sj = json.dumps(scores).encode("utf-8")
+        group.create_array("scores_json", data=np.array(sj, dtype=f"S{len(sj)}"))
+        ud = group.create_group("userData")
+        for k, v in (("path", ARGS.image_path if ARGS else ""), ("model", "Ark+")):
+            b = str(v).encode("utf-8")
+            ud.create_array(k, data=np.frombuffer(b, dtype=f"S{len(b)}") if b else np.array(b"", dtype="S1"))
         print(f"[{NODE_NAME}] Results saved to Zarr: {ZARR_GROUP}")
     except Exception as e:
         print(f"[{NODE_NAME}] Error saving results to Zarr: {e}")
@@ -385,7 +414,9 @@ def read_node(data: Dict[str, Any]):
     NODE_NAME = data.get("node_name", "ArkPlusZeroShot")
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
-    ZARR_GROUP = data.get("zarr_group") or "ArkPlusNode"
+    # Results go to the group the service associates with this node: its registry
+    # zarr_group when set, else the node name (where the service also wrote userData).
+    ZARR_GROUP = data.get("zarr_group") or NODE_NAME or "ArkPlusNode"
     DEP_ZARR_GROUPS = data.get("dependencies_zarr_groups", {})
 
     print(f"[{NODE_NAME}] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}, zarr_group={ZARR_GROUP}")
@@ -397,14 +428,24 @@ def read_node(data: Dict[str, Any]):
     
     # Initialize ARGS with fixed defaults if not already initialized
     if ARGS is None:
-        ARGS = argparse.Namespace(
-            image_path="",
-            input_size=768,  # Fixed: model input size
-            model_path="checkpoints/Ark6_swinLarge768_ep50.pth.tar"  # Fixed: model checkpoint path
-        )
-    
-    # Read and apply user parameters from Zarr (only image_path)
-    _load_parameters_from_zarr(ZARR_PATH, ZARR_GROUP)
+        ARGS = argparse.Namespace()
+    # main() stores the CLI namespace (port/name) in ARGS; make sure the run fields exist.
+    ARGS.input_size = getattr(ARGS, "input_size", None) or 768
+    ARGS.model_path = getattr(ARGS, "model_path", None) or _checkpoint_path()
+    ARGS.image_path = ""  # per-run state: never reuse the previous image
+
+    # Parameters arrive in the request body (the service forwards every node input);
+    # userData in the zarr is only a fallback for older service versions.
+    control = {"node_name", "dependencies", "zarr_path", "zarr_group", "dependencies_zarr_groups"}
+    for k, v in data.items():
+        if k not in control:
+            _apply_parameter(k, v)
+    if not ARGS.image_path:
+        for grp in [data.get("zarr_group"), NODE_NAME, "ArkPlusNode", "Ark"]:
+            if grp:
+                _load_parameters_from_zarr(ZARR_PATH, grp)
+                if ARGS.image_path:
+                    break
     
     # Log final parameters
     print(f"[{NODE_NAME}] Configuration:")
@@ -425,6 +466,8 @@ def _load_parameters_from_zarr(zarr_path: str, zarr_group: str):
             print(f"[{NODE_NAME}] No userData found in {zarr_group}")
             return
         for param_name in zf[user_data_path].keys():
+            if param_name.startswith("_"):
+                continue
             raw_bytes = zf[user_data_path][param_name][()]
             param_value = _decode_zarr_parameter(raw_bytes)
             if param_value is not None:
@@ -462,7 +505,7 @@ def _apply_parameter(param_name: str, param_value):
         param_handlers[param_name](param_value)
         print(f"[{NODE_NAME}] Set {param_name} => {param_value}")
     else:
-        print(f"[{NODE_NAME}] Ignoring user parameter: {param_name} (not configurable)")
+        print(f"[{NODE_NAME}] Ignoring parameter: {param_name} (not configurable)")
 
 
 def _set_image_path(value):

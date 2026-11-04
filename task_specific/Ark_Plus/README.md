@@ -53,6 +53,27 @@ sudo apt-get install -y libvips-dev
 **Windows**
 Download the full `vips-dev-w64-all` build from [libvips Windows releases](https://github.com/libvips/build-win64-mxe/releases), unpack to `C:\vips` (or set `TL_VIPS_DIR`), and add `C:\vips\bin` to `PATH`.
 
+## TissueLab task node: inputs and outputs
+
+Put the Ark+ checkpoint at `checkpoints/Ark6_swinLarge768_ep50.pth.tar` next to
+`Ark_Plus_tasknode.py` (or point `ARK_PLUS_CHECKPOINT` at the file). Parameters arrive in
+the `/read` request body (TissueLab forwards every node input; `userData` in the zarr is only
+a fallback): `path` / `image_path` is the chest X-ray (PNG / JPEG / DICOM). Results go to the
+zarr group named after the node (`Ark/` unless the registry sets `zarr_group`):
+
+```
+Ark/
+  predictions    float32[52]  sigmoid probability per finding, heads concatenated
+  disease_list   |S           finding names aligned with predictions
+  scores_json    |S           {head: {finding: probability}} for MIMIC-CXR, CheXpert,
+                              ChestX-ray14, RSNA-Pneumonia, VinDr-CXR and Shenzhen
+  output         |S           JSON summary of the run
+  userData/{path, model}
+```
+
+The group attrs record the head names and sizes. A finding such as "Pneumonia" occurs in
+several heads; downstream code should pick the head that matches the image source.
+
 ## Dataset
 1. [CheXpert](https://stanfordmlgroup.github.io/competitions/chexpert/)
 2. [ChestX-ray14](https://nihcc.app.box.com/v/ChestXray-NIHCC)
