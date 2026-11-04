@@ -156,26 +156,33 @@ python totalsegmentator_tasknode.py --host 0.0.0.0 --port 8000
 
 ## Using from TissueLab
 
-TissueLab runs each model as a separate task node. This node is not shipped as a
-pre-built bundle, so register it once as a **custom node** from the TissueLab app:
+TissueLab runs each model as a separate task node in its own conda environment. This
+node is already listed on the TissueLab **Models** page as *TotalSegmentator Segmentation*;
+it just is not shipped as a pre-built bundle, so activate it once against a local checkout:
 
-1. Clone this repository on the machine that runs the TissueLab service (the node
-   needs a GPU; CPU works but is slow).
-2. In TissueLab open **Models → Create custom node** and fill in:
+1. Clone this repository on the machine that runs the TissueLab service and build the
+   environment (a GPU is recommended; CPU works but is slow):
+   ```bash
+   conda create -n totalseg python=3.11 -y
+   conda activate totalseg
+   pip install -r tissue_segmentation/TotalSegmentator/requirements.txt
+   ```
+2. In TissueLab open **Models**, find **TotalSegmentator Segmentation** and click
+   **Activate**. In the dialog set
+   - *Service Path*: `<repo>/tissue_segmentation/TotalSegmentator/totalsegmentator_tasknode.py`
+   - *Conda env*: `totalseg` (the environment from step 1)
 
-   | Field | Value |
-   |---|---|
-   | Node Name | `TotalSegmentatorSegmentation` (must match the registry entry the planner uses) |
-   | Service Path | `<repo>/tissue_segmentation/TotalSegmentator/totalsegmentator_tasknode.py` |
-   | Dependency Path | `<repo>/tissue_segmentation/TotalSegmentator/requirements.txt` |
-   | Factory | TissueSeg |
-   | Conda Env | leave blank (TissueLab creates one) or the name of an env built from `requirements.txt` |
-
-   TissueLab creates the conda environment, installs `requirements.txt` and starts the
-   node. Model weights are downloaded automatically on the first run (see below).
+   TissueLab starts the node; model weights are downloaded automatically on the first
+   run (see below). The activation is remembered, so later launches start the node
+   without the dialog.
 3. Open a CT volume (NIfTI file or DICOM folder) and ask a question in the chat. The
    planner fills the node's **Organs to segment** field (e.g. `Liver, Spleen`); leave it
    empty to segment all organs.
+
+If you prefer TissueLab to create the environment for you, use **Models → Create custom
+node** instead, with Node Name `TotalSegmentatorSegmentation` (must match the registry
+entry the planner uses), Factory `TissueSeg`, the same Service Path, and Dependency Path
+`<repo>/tissue_segmentation/TotalSegmentator/requirements.txt`.
 
 Parameters arrive in the `/read` request body (`path`, `tissue_classes`,
 `tissue_colors`, `prompt`); results land in `Tissue-Segmentation/` as described above,
