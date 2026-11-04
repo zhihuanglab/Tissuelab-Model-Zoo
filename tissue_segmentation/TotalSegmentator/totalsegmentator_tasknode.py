@@ -228,8 +228,23 @@ AVAILABLE_MODELS = {
 # Mapping from tissue classes to appropriate TotalSegmentator models
 # Based on TotalSegmentator documentation: https://github.com/wasserth/TotalSegmentator
 TISSUE_CLASS_TO_MODEL_MAPPING = {
-    # Cerebral bleed specific classes
+    # Cerebral bleed specific classes. The model has one output class
+    # (intracerebral_hemorrhage); the other spellings a planner or user may send
+    # all run the same model and are written under the requested name.
     "intracerebral_hemorrhage": "cerebral_bleed",
+    "intracranial_hemorrhage": "cerebral_bleed",
+    "intraparenchymal_hemorrhage": "cerebral_bleed",
+    "intraventricular_hemorrhage": "cerebral_bleed",
+    "cerebral_hemorrhage": "cerebral_bleed",
+    "brain_hemorrhage": "cerebral_bleed",
+    "hemorrhage": "cerebral_bleed",
+    "haemorrhage": "cerebral_bleed",
+    "intracranial_haemorrhage": "cerebral_bleed",
+    "intracerebral_haemorrhage": "cerebral_bleed",
+    "hematoma": "cerebral_bleed",
+    "intracranial_hematoma": "cerebral_bleed",
+    "brain_bleed": "cerebral_bleed",
+    "cerebral_bleed": "cerebral_bleed",
     "intracerebral_hemorrhage_left": "cerebral_bleed", 
     "intracerebral_hemorrhage_right": "cerebral_bleed",
     "subarachnoid_hemorrhage": "cerebral_bleed",
@@ -895,7 +910,7 @@ def _put_str_dataset(grp, key: str, value: str) -> None:
     grp.create_array(key, data=np.frombuffer(b, dtype=f"S{len(b)}"))
 
 
-def _write_tissue_segmentation(ct_nifti_path: str, seg_output: Path, roi_subset: Optional[List[str]],
+def _write_tissue_segmentation(ct_nifti_path: str, organ_files: List[tuple],
                                metadata: Dict[str, Any]) -> List[str]:
     """Write the run in the unified TissueSeg layout (as VISTA does), plus the CT volume:
 
@@ -905,7 +920,9 @@ def _write_tissue_segmentation(ct_nifti_path: str, seg_output: Path, roi_subset:
         classes/{name,color}     ordered class metadata
         userData/{path,model,tissue_class,config}
 
-    The group is rebuilt on every run so organs from an earlier run never linger.
+    `organ_files` is the ordered list of (class name, NIfTI mask path) collected from
+    the model run(s). The group is rebuilt on every run so organs from an earlier run
+    never linger.
     """
     import nibabel as nib
 
@@ -915,22 +932,8 @@ def _write_tissue_segmentation(ct_nifti_path: str, seg_output: Path, roi_subset:
     spacing = [float(x) for x in ct_img.header.get_zooms()[:3]]
     axes = "xyz (NIfTI voxel order)"
 
-    seg_output = Path(seg_output)
-    organ_files: List[tuple] = []
-    if roi_subset:
-        for organ in roi_subset:
-            cands = [seg_output] if seg_output.is_file() else [seg_output / f"{organ}.nii.gz", seg_output / f"{organ}.nii"]
-            f = next((c for c in cands if c.exists()), None)
-            if f is None:
-                print(f"[Zarr] WARNING: no output file for organ '{organ}' in {seg_output}")
-                continue
-            organ_files.append((organ, f))
-    else:
-        files = (sorted(seg_output.glob("*.nii.gz")) + sorted(seg_output.glob("*.nii"))) if seg_output.is_dir() else [seg_output]
-        for f in files:
-            organ_files.append((f.name[:-7] if f.name.endswith(".nii.gz") else f.stem, f))
     if not organ_files:
-        raise RuntimeError(f"No segmentation outputs found in {seg_output}")
+        raise RuntimeError("No segmentation outputs found")
 
     zf = zarr.open(ZARR_PATH, mode="a")
     if TISSUE_SEG_GROUP in zf:
@@ -1309,6 +1312,142 @@ def execute_model():
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+# Tasks whose model emits a single class whatever name was requested.
+_SINGLE_CLASS_TASKS = {"cerebral_bleed": "intracerebral_hemorrhage"}
+# Models that have to be present for a task to run (cropping / part models).
+_TASK_DEPENDENCIES = {
+    150: [(298, "total_6mm")],   # cerebral_bleed crops to the brain with total_6mm
+    260: [(298, "total_6mm")],   # hip_implant
+    258: [(298, "total_6mm")],   # lung_vessels
+}
+
+
+def _model_name_of(cfg: Optional[Dict[str, Any]]) -> str:
+    for name, c in AVAILABLE_MODELS.items():
+        if c is cfg:
+            return name
+    return "total_3mm"
+
+
+def _group_classes_by_model(roi_subset: Optional[List[str]]) -> Dict[str, List[str]]:
+    """Group the requested (normalized) classes by the model that produces them.
+
+    Liver + spleen + intracerebral hemorrhage -> {"total_3mm": [liver, spleen],
+    "cerebral_bleed": [intracerebral_hemorrhage]}. With no classes the model chosen
+    at /read time runs on its own (every organ it knows).
+    """
+    classes = normalize_tissue_classes(roi_subset) if roi_subset else []
+    if not classes:
+        return {_model_name_of(MODEL_CONFIG): []}
+    groups: Dict[str, List[str]] = {}
+    for cls in classes:
+        model = TISSUE_CLASS_TO_MODEL_MAPPING.get(cls, "total_3mm")
+        if model == "total_3mm" and MODEL_CONFIG is not None and MODEL_CONFIG["task"] in ("total", "total_mr"):
+            model = _model_name_of(MODEL_CONFIG)  # honour an explicit total_6mm / total_mr choice
+        groups.setdefault(model, []).append(cls)
+    return groups
+
+
+def _ensure_model_weights(model_name: str, classes: List[str]) -> bool:
+    cfg = AVAILABLE_MODELS[model_name]
+    task_name, task_id = cfg["task"], cfg["task_id"]
+    print(f"[Process] Checking models for task '{task_name}' (ID: {task_id})")
+    if not check_and_download_model(task_id, task_name):
+        return False
+    for dep_id, dep_name in _TASK_DEPENDENCIES.get(task_id, []):
+        print(f"[Process] Task '{task_name}' requires '{dep_name}'")
+        if not check_and_download_model(dep_id, dep_name):
+            return False
+    if task_name in ("total", "total_mr") and classes:
+        # ROI runs use the part models rather than the fast whole-body net
+        part1 = (291, "total_part1_organs") if task_name == "total" else (850, "total_mr_part1_organs")
+        if not check_and_download_model(*part1):
+            return False
+        if task_name == "total" and any(k in c for c in classes for k in ("vertebrae", "vertebra", "spinal")):
+            if not check_and_download_model(292, "total_part2_vertebrae"):
+                return False
+    return True
+
+
+def _run_totalsegmentator(ts_kwargs: Dict[str, Any], progress_lo: int, progress_hi: int) -> None:
+    """Run TotalSegmentator on a worker thread, advancing progress and honouring cancel."""
+    seg_exception = None
+
+    def run_segmentation():
+        nonlocal seg_exception
+        try:
+            print(f"[Process] Starting TotalSegmentator: {ts_kwargs}")
+            result = totalsegmentator(**ts_kwargs)
+            print(f"[Process] TotalSegmentator returned: {result}")
+        except Exception as e:  # re-raised on the caller's thread
+            seg_exception = e
+            import traceback
+            traceback.print_exc()
+
+    seg_thread = threading.Thread(target=run_segmentation)
+    seg_thread.start()
+    phases = ["Generating rough segmentation...", "Resampling image...", "Starting prediction...",
+              "Running main model...", "Processing organs...", "Finalizing segmentation..."]
+    t0 = time.time()
+    span = max(progress_hi - progress_lo, 1)
+    while seg_thread.is_alive():
+        if cancel_event.is_set():
+            raise CooperativeCancel("cancelled")
+        phase = min(int((time.time() - t0) // 30), len(phases) - 1)
+        update_progress(progress_lo + int(span * (phase + 1) / (len(phases) + 1)), phases[phase])
+        seg_thread.join(timeout=5.0)
+    if seg_exception:
+        raise seg_exception
+
+
+def _run_model(model_name: str, classes: List[str], ct_nifti_path: Path, out_dir: Path,
+               progress_lo: int, progress_hi: int) -> List[tuple]:
+    """Run one TotalSegmentator model and return the (class, mask file) pairs it produced."""
+    cfg = AVAILABLE_MODELS[model_name]
+    task_name = cfg["task"]
+    supports_roi = task_name in ("total", "total_mr")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts_kwargs = {
+        "input": str(ct_nifti_path),
+        "output": str(out_dir),
+        "task": task_name,
+        "fast": cfg["fast"],
+        "device": "gpu",
+        "quiet": False,
+        "verbose": True,
+        # Save masks on this thread. The default (6) uses multiprocessing.Pool,
+        # i.e. fork() inside this CUDA + uvicorn process, which deadlocks the
+        # child intermittently ("Finalizing segmentation" hangs at 70%).
+        "nr_thr_saving": 1,
+    }
+    if classes and supports_roi:
+        ts_kwargs["roi_subset"] = list(classes)
+    _run_totalsegmentator(ts_kwargs, progress_lo, progress_hi)
+
+    files = sorted(out_dir.glob("*.nii.gz")) + sorted(out_dir.glob("*.nii"))
+    by_name = {(f.name[:-7] if f.name.endswith(".nii.gz") else f.stem): f for f in files}
+    print(f"[Process] {model_name} produced {len(by_name)} mask file(s): {sorted(by_name)[:20]}")
+    organ_files: List[tuple] = []
+    if task_name in _SINGLE_CLASS_TASKS:
+        f = by_name.get(_SINGLE_CLASS_TASKS[task_name])
+        if f is None:
+            print(f"[Zarr] WARNING: {model_name} produced no {_SINGLE_CLASS_TASKS[task_name]} mask")
+            return organ_files
+        for cls in (classes or [_SINGLE_CLASS_TASKS[task_name]]):
+            organ_files.append((cls, f))   # written under the requested name
+        return organ_files
+    if classes:
+        for cls in classes:
+            f = by_name.get(cls)
+            if f is None:
+                print(f"[Zarr] WARNING: no output file for class '{cls}' from {model_name}")
+                continue
+            organ_files.append((cls, f))
+    else:
+        organ_files.extend(sorted(by_name.items()))
+    return organ_files
+
+
 def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
     """
     Main processing function (synchronous)
@@ -1333,78 +1472,19 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
         print(f"[Process] Input validation passed: {message}")
         update_progress(7, "Input validated")
         
-        # Check and download required models
-        task_name = MODEL_CONFIG['task']
-        task_id = MODEL_CONFIG['task_id']
-        
+        # Which model(s) to run: classes are grouped by the model that produces them
+        # (liver / spleen -> total, intracerebral hemorrhage -> cerebral_bleed) and each
+        # model runs once; its masks are merged into one Tissue-Segmentation group.
+        model_groups = _group_classes_by_model(roi_subset)
+        print(f"[Process] Model plan: {model_groups}")
         update_progress(8, "Checking model weights...")
-        print(f"[Process] Checking models for task '{task_name}' (ID: {task_id})")
-        
-        # Check main task model
-        if not check_and_download_model(task_id, task_name):
-            update_progress(100, f"Failed to download model for {task_name}")
-            return
-        
-        # For tasks that require cropping, also check the cropping model
-        # cerebral_bleed needs total_6mm (298) for cropping to brain region
-        # Other tasks may also need cropping models
-        tasks_needing_crop_model = {
-            150: (298, "total_6mm"),  # cerebral_bleed needs total for brain cropping
-            260: (298, "total_6mm"),  # hip_implant needs total for cropping
-            258: (298, "total_6mm"),  # lung_vessels needs total for cropping
-        }
-        
-        if task_id in tasks_needing_crop_model:
-            crop_task_id, crop_task_name = tasks_needing_crop_model[task_id]
-            print(f"[Process] Task '{task_name}' requires cropping model '{crop_task_name}'")
-            if not check_and_download_model(crop_task_id, crop_task_name):
-                update_progress(100, f"Failed to download cropping model {crop_task_name}")
+        for model_name, classes in model_groups.items():
+            if not _ensure_model_weights(model_name, classes):
+                update_progress(100, f"Failed to download model weights for {model_name}")
                 return
-        
-        # For total tasks with roi_subset, also check part models
-        # These are required for organ-specific segmentation
-        if task_name in ['total', 'total_mr'] and roi_subset:
-            print(f"[Process] Task '{task_name}' with ROI subset requires part models")
-            
-            # Check part1_organs model (Dataset291 for CT, Dataset850 for MR)
-            if task_name == 'total':
-                part1_id, part1_name = 291, "total_part1_organs"
-                part2_id, part2_name = 292, "total_part2_vertebrae"
-            else:  # total_mr
-                part1_id, part1_name = 850, "total_mr_part1_organs"
-                part2_id, part2_name = None, None  # MR doesn't have part2 yet
-            
-            print(f"[Process] Checking part1 model: {part1_name} (ID: {part1_id})")
-            if not check_and_download_model(part1_id, part1_name):
-                update_progress(100, f"Failed to download part1 model {part1_name}")
-                return
-            
-            # Check if any ROI needs vertebrae (part2)
-            vertebrae_keywords = ['vertebrae', 'vertebra', 'spinal']
-            needs_part2 = any(any(kw in organ.lower() for kw in vertebrae_keywords) for organ in roi_subset)
-            
-            if needs_part2 and part2_id:
-                print(f"[Process] ROI includes vertebrae, checking part2 model: {part2_name} (ID: {part2_id})")
-                if not check_and_download_model(part2_id, part2_name):
-                    update_progress(100, f"Failed to download part2 model {part2_name}")
-                    return
-        
         update_progress(10, "Models ready")
-        
-        # Create temporary output directory for TotalSegmentator
+
         with tempfile.TemporaryDirectory() as temp_dir:
-            # For tasks that support ROI, output to a single file
-            # For others, output to a directory
-            task_name = MODEL_CONFIG['task']
-            supports_roi = task_name in ['total', 'total_mr']
-            
-            if supports_roi:
-                temp_output = Path(temp_dir) / "segmentation.nii.gz"
-            else:
-                # For cerebral_bleed and other tasks, output to directory
-                temp_output = Path(temp_dir) / "output"
-                temp_output.mkdir(exist_ok=True)
-            
             # TotalSegmentator accepts DICOM folders itself, but we need the CT volume on
             # the very grid the masks come back on (for Tissue-Segmentation/image), so
             # convert DICOM to NIfTI here and feed that file to the model.
@@ -1422,160 +1502,38 @@ def process_segmentation_sync(input_path: str, roi_subset: Optional[List[str]]):
                 print(f"[Process] DICOM converted to {ct_nifti_path}")
 
             update_progress(15, "Starting TotalSegmentator")
-            
-            # Prepare TotalSegmentator parameters
-            ts_kwargs = {
-                'input': str(ct_nifti_path),
-                'output': str(temp_output),
-                'task': MODEL_CONFIG['task'],
-                'fast': MODEL_CONFIG['fast'],
-                'device': "gpu" if MODEL_CONFIG else "cpu",
-                'quiet': False,
-                'verbose': True,
-                # Save masks on this thread. The default (6) uses multiprocessing.Pool,
-                # i.e. fork() inside this CUDA + uvicorn process, which deadlocks the
-                # child intermittently ("Finalizing segmentation" hangs at 70%).
-                'nr_thr_saving': 1,
-            }
-            
-            # Add ROI subset only for tasks that support it (total and total_mr)
-            task_name = MODEL_CONFIG['task']
-            supports_roi = task_name in ['total', 'total_mr']
-            
-            if roi_subset and supports_roi:
-                # Ensure ROI subset is normalized to lowercase
-                normalized_roi_subset = normalize_tissue_classes(roi_subset)
-                ts_kwargs['roi_subset'] = normalized_roi_subset
-                print(f"[Process] ROI subset: {normalized_roi_subset} (task '{task_name}' supports ROI filtering)")
-            elif roi_subset and not supports_roi:
-                print(f"[Process] Task '{task_name}' does not support ROI filtering. Will filter results after segmentation.")
-                print(f"[Process] Requested ROI: {roi_subset}")
-            
-            print(f"[Process] Running TotalSegmentator with params: {ts_kwargs}")
-            
-            # Verify output path before running
-            print(f"[Process] Verifying output path...")
-            print(f"[Process] Output path: {temp_output}")
-            print(f"[Process] Output path exists: {temp_output.exists()}")
-            print(f"[Process] Output path absolute: {temp_output.absolute()}")
-            
-            # Execute segmentation in background thread with progress simulation
             start_time = time.time()
-            
-            # Run TotalSegmentator in a separate thread
-            seg_exception = None
-            def run_segmentation():
-                nonlocal seg_exception
-                try:
-                    print(f"[Process] Starting TotalSegmentator (no timeout)")
-                    result = totalsegmentator(**ts_kwargs)
-                    print(f"[Process] TotalSegmentator returned: {result}")
-                    # Force sync to ensure files are written
-                    import os
-                    os.sync() if hasattr(os, 'sync') else None
-                except Exception as e:
-                    seg_exception = e
-                    print(f"[Process] TotalSegmentator exception: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            seg_thread = threading.Thread(target=run_segmentation)
-            seg_thread.start()
-            
-            # Event-driven progress monitoring based on actual TotalSegmentator phases
-            print(f"[Process] Starting event-driven progress monitoring...")
-            
-            # Define progress phases based on TotalSegmentator execution
-            progress_phases = [
-                (20, "Generating rough segmentation..."),
-                (30, "Resampling image..."),
-                (40, "Starting prediction..."),
-                (50, "Running main model..."),
-                (60, "Processing organs..."),
-                (70, "Finalizing segmentation...")
-            ]
-            
-            current_phase = 0
-            start_time = time.time()
-            
-            # Monitor progress based on actual events, not time
-            while seg_thread.is_alive():
-                if cancel_event.is_set():
-                    raise CooperativeCancel("cancelled")
-                elapsed = time.time() - start_time
-                
-                # Update progress based on elapsed time and phases
-                if current_phase < len(progress_phases):
-                    phase_progress, phase_message = progress_phases[current_phase]
-                    
-                    # Move to next phase based on elapsed time (rough estimates)
-                    phase_times = [30, 60, 90, 120, 150, 180]  # seconds for each phase
-                    if current_phase < len(phase_times) and elapsed > phase_times[current_phase]:
-                        current_phase += 1
-                        if current_phase < len(progress_phases):
-                            phase_progress, phase_message = progress_phases[current_phase]
-                            update_progress(phase_progress, phase_message)
-                    elif current_phase == 0:  # First phase
-                        update_progress(phase_progress, phase_message)
-                
-                # Check every 5 seconds (much less frequent than before)
-                seg_thread.join(timeout=5.0)
-            
-            # Final progress update
-            update_progress(75, "Segmentation completed")
-            
-            # Check if there was an exception
-            if seg_exception:
-                raise seg_exception
-            
-            end_time = time.time()
-            processing_time = end_time - start_time
-            update_progress(70, f"Segmentation completed in {processing_time:.1f}s")
-            
-            # Check if output was created
-            if not temp_output.exists():
-                update_progress(100, "Error: Segmentation output not found")
-                return
-            
-            # Debug: Check what files were actually created
-            print(f"[Debug] Checking temp_output: {temp_output}")
-            print(f"[Debug] temp_output exists: {temp_output.exists()}")
-            print(f"[Debug] temp_output is_dir: {temp_output.is_dir()}")
-            print(f"[Debug] temp_output is_file: {temp_output.is_file()}")
-            
-            if temp_output.is_dir():
-                all_files = list(temp_output.iterdir())
-                print(f"[Debug] Files in temp_output directory ({len(all_files)} total):")
-                for f in all_files[:20]:  # Show first 20 files
-                    print(f"[Debug]   - {f.name} ({f.stat().st_size} bytes)")
-                
-                # Check for .nii.gz files specifically
-                nii_files = list(temp_output.glob("*.nii.gz")) + list(temp_output.glob("*.nii"))
-                print(f"[Debug] NIfTI files found: {len(nii_files)}")
-                for nf in nii_files:
-                    print(f"[Debug]   NIfTI: {nf.name} ({nf.stat().st_size} bytes)")
-            elif temp_output.is_file():
-                print(f"[Debug] temp_output is a file: {temp_output.name} ({temp_output.stat().st_size} bytes)")
-            
-            # Prepare metadata
+            organ_files: List[tuple] = []
+            n_models = len(model_groups)
+            for i, (model_name, classes) in enumerate(model_groups.items()):
+                lo = 15 + int(55 * i / n_models)
+                hi = 15 + int(55 * (i + 1) / n_models)
+                organ_files.extend(_run_model(model_name, classes, ct_nifti_path,
+                                              Path(temp_dir) / f"out_{model_name}", lo, hi))
+            processing_time = time.time() - start_time
+            update_progress(72, f"Segmentation completed in {processing_time:.1f}s")
+            if not organ_files:
+                raise RuntimeError("No segmentation outputs produced for the requested classes")
+
             metadata = {
-                'model': MODEL_CONFIG['task'],
-                'task_id': MODEL_CONFIG['task_id'],
+                'model': ",".join(AVAILABLE_MODELS[m]['task'] for m in model_groups),
+                'models': {m: {'task': AVAILABLE_MODELS[m]['task'], 'task_id': AVAILABLE_MODELS[m]['task_id'],
+                               'classes': c} for m, c in model_groups.items()},
                 'input_path': input_path,
                 'input_type': input_type,
                 'processing_time': processing_time,
                 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'roi_subset': roi_subset if roi_subset else "all_organs"
             }
-            
+
             update_progress(78, "Writing masks and CT volume to Zarr")
-            class_names = _write_tissue_segmentation(str(ct_nifti_path), temp_output, roi_subset, metadata)
+            class_names = _write_tissue_segmentation(str(ct_nifti_path), organ_files, metadata)
             print(f"[Process] Completed: {class_names}")
-            
+
             update_progress(100, "Processing completed successfully")
             progress_complete = True  # Mark completion
             return {"status": "success", "message": f"Masks saved to {TISSUE_SEG_GROUP}: {', '.join(class_names)}"}
-            
+
     except CooperativeCancel:
         print("[Process] Cancelled by user")
         CURRENT_PROGRESS = 0

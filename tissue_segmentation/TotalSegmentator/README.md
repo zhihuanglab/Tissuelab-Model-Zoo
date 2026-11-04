@@ -7,8 +7,8 @@ A FastAPI-based tasknode for TotalSegmentator medical image segmentation, suppor
 - **Multiple Model Support**: 7 different TotalSegmentator models (total_3mm, total_6mm, body, lung_vessels, total_mr, total_mr_fast, cerebral_bleed)
 - **Input Formats**: DICOM folders and NIfTI files (.nii, .nii.gz)
 - **ROI Filtering**: Process only specified organs (e.g., liver, spleen, kidneys)
-- **Parallel Processing**: Concurrent processing of multiple organs
-- **Zarr Storage**: Results stored in SegmentorNode with compression
+- **Single-process inference**: no worker processes are spawned (fork from the CUDA node process deadlocks), so runs are reproducible and easy to debug
+- **Zarr Storage**: one 3D mask per organ plus the HU volume in `Tissue-Segmentation/` (same layout as VISTA), with compression
 - **Progress Tracking**: Real-time progress updates with SSE
 - **Metadata Storage**: Comprehensive metadata for each organ
 
