@@ -73,25 +73,33 @@ Common organs that can be segmented:
 
 ## Zarr Output Structure
 
-```
-SegmentorNode/
-├── liver/          # 3D segmentation data for liver
-├── spleen/         # 3D segmentation data for spleen
-├── kidney_left/    # 3D segmentation data for left kidney
-├── kidney_right/   # 3D segmentation data for right kidney
-└── ...             # Other segmented organs
+Results use the unified TissueSeg layout (the same group VISTA writes), plus the CT
+volume so analysis code can measure intensities without re-reading the scan:
 
-Attributes:
-- model: TotalSegmentator model used
-- task_id: Model task ID
-- input_path: Original input path
-- input_type: Input format (dicom/nifti)
-- processing_time: Time taken for segmentation
-- timestamp: Processing timestamp
-- roi_subset: Organs that were segmented
-- last_updated: Last update timestamp
-- total_organs: Number of organs in the dataset
 ```
+Tissue-Segmentation/                 (rebuilt on every run)
+├── image                            int16 Hounsfield units, NIfTI voxel order (x, y, z)
+│                                    attrs: affine, voxel_spacing_mm, units, source_path
+├── masks/<organ>/mask               3D bool on the same grid as `image`
+│                                    attrs: organ_name, voxel_count, volume_ml
+├── classes/name, classes/color      ordered class names / colours (|S256)
+└── userData/{path, model, tissue_class, config}
+                                     provenance: input path, "TotalSegmentator",
+                                     "liver,spleen", JSON run config (task, task_id,
+                                     input_type, processing_time, roi_subset, ...)
+
+Group attrs: modality="radiology", model, task, axes, affine, voxel_spacing_mm,
+image_dataset="image", intensity_units="HU", source_path, last_updated
+```
+
+Node inputs are read from the `/read` request body (`path`, `tissue_classes` or the
+planner aliases `targets`/`organs`/`classes`, `tissue_colors`, `model`, `prompt`),
+with `<group>/userData` as a fallback. When no organ list arrives the `total` task
+runs on every organ.
+
+DICOM input is converted to NIfTI first (so `image` and the masks share one grid);
+prediction and mask saving run without worker processes, because process creation
+from this multithreaded CUDA server deadlocks intermittently.
 
 ## Usage Example
 
