@@ -340,6 +340,46 @@ def validate_input(input_path: str) -> tuple[bool, Optional[str], str]:
     
     return False, None, "Invalid input path"
 
+LAST_DICOM_LAYOUT: Optional[Dict[str, Any]] = None
+
+
+def _cine_order(files: List[str]) -> Optional[Dict[str, Any]]:
+    """Sort a DICOM series slice-major: by slice position, then trigger time (then
+    instance number). Returns None for a plain 3D series (one frame per position)
+    or when the headers lack the tags."""
+    try:
+        fr = sitk.ImageFileReader()
+        rows = []
+        for f in files:
+            fr.SetFileName(f)
+            fr.ReadImageInformation()
+            g = lambda k: fr.GetMetaData(k).strip() if fr.HasMetaDataKey(k) else None
+            ipp = g("0020|0032")
+            pos = float(g("0020|1041")) if g("0020|1041") else (float(ipp.split("\\")[2]) if ipp else 0.0)
+            tt = float(g("0018|1060")) if g("0018|1060") else None
+            inst = int(float(g("0020|0013"))) if g("0020|0013") else 0
+            rows.append((f, round(pos, 3), tt, inst))
+        positions = sorted(set(r[1] for r in rows))
+        per_pos = {p: sorted([r for r in rows if r[1] == p], key=lambda r: ((r[2] if r[2] is not None else 0.0), r[3])) for p in positions}
+        n_frames = {len(v) for v in per_pos.values()}
+        if n_frames == {1} or len(n_frames) != 1:
+            return None
+        nf = n_frames.pop()
+        ordered = [r for p in positions for r in per_pos[p]]
+        return {
+            "files": [r[0] for r in ordered],
+            "n_slices": len(positions),
+            "n_frames": nf,
+            "slice_location_mm": positions,
+            "trigger_time_ms": [r[2] for r in per_pos[positions[0]]],
+            "slice_index": [i // nf for i in range(len(ordered))],
+            "frame_index": [i % nf for i in range(len(ordered))],
+        }
+    except Exception as e:
+        print(f"[DICOM] cine ordering skipped: {e}")
+        return None
+
+
 def convert_dicom_to_nifti(dicom_folder: str) -> str:
     """
     Convert DICOM folder to NIfTI file using SimpleITK
@@ -357,11 +397,16 @@ def convert_dicom_to_nifti(dicom_folder: str) -> str:
         # Read DICOM series
         reader = sitk.ImageSeriesReader()
         dicom_names = reader.GetGDCMSeriesFileNames(str(dicom_folder))
-        
         if not dicom_names:
             raise ValueError(f"No DICOM series found in {dicom_folder}")
-        
         print(f"[DICOM] Found {len(dicom_names)} DICOM files")
+        # A cine series holds several time frames per slice position. GDCM's sort
+        # interleaves them unpredictably, so order the files slice-major (slice
+        # position, then trigger time) and remember the layout for the mask attrs.
+        global LAST_DICOM_LAYOUT
+        LAST_DICOM_LAYOUT = _cine_order(list(dicom_names))
+        if LAST_DICOM_LAYOUT is not None:
+            dicom_names = LAST_DICOM_LAYOUT["files"]
         reader.SetFileNames(dicom_names)
         image = reader.Execute()
         
@@ -463,7 +508,20 @@ def save_segmentation_to_zarr(segmentation_data: np.ndarray, original_image: sit
             for key in ("pixel_spacing_mm", "slice_thickness_mm", "cardiac_number_of_images"):
                 if key in metadata:
                     seg_dataset.attrs[key] = metadata[key]
-            seg_dataset.attrs['axes'] = "(slice/frame, row, col) on the input image grid"
+            layout = LAST_DICOM_LAYOUT if (LAST_DICOM_LAYOUT and LAST_DICOM_LAYOUT["n_slices"] * LAST_DICOM_LAYOUT["n_frames"] == segmentation_data.shape[0]) else None
+            if layout:
+                seg_dataset.attrs['axes'] = ("(slice*frame, row, col): first axis is slice-major, index = slice_index * n_frames + frame_index; "
+                                             "reshape to (n_slices, n_frames, rows, cols)")
+                seg_dataset.attrs['n_slices'] = layout["n_slices"]
+                seg_dataset.attrs['n_frames'] = layout["n_frames"]
+                seg_dataset.attrs['slice_location_mm'] = layout["slice_location_mm"]
+                seg_dataset.attrs['trigger_time_ms'] = layout["trigger_time_ms"]
+                for name in ("slice_index", "frame_index"):
+                    if name in voxel_group:
+                        del voxel_group[name]
+                    voxel_group.create_array(name, data=np.array(layout[name], dtype=np.int32))
+            else:
+                seg_dataset.attrs['axes'] = "(slice, row, col) on the input image grid"
             # Add class information
             view_config = AVAILABLE_VIEWS[view_name]
             seg_dataset.attrs['num_classes'] = view_config['num_classes']
