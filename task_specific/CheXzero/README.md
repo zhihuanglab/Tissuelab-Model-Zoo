@@ -37,11 +37,12 @@ Parameters arrive in the `/read` request body (TissueLab forwards every node inp
 | `prompt` | `classes=...` is parsed; other text is ignored |
 
 Every run scores a default list of common findings (NIH ChestX-ray14 and CheXpert label
-sets) plus the requested ones. Results go to the zarr group named after the node
-(`CheXzero/` unless the registry sets `zarr_group`):
+sets) plus the requested ones. Results go to the shared image-level classification group
+(`Image-Classification/`, the same layout for every chest X-ray classifier; the registry's
+`zarr_group` can override it):
 
 ```
-CheXzero/
+Image-Classification/
   predictions    float32[n]   ensemble probability per finding
   disease_list   |S           finding names aligned with predictions
   scores_json    |S           {"CheXzero-ensemble": {...}, "per_model": {<checkpoint>: {...}}}

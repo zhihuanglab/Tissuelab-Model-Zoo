@@ -59,10 +59,11 @@ Put the Ark+ checkpoint at `checkpoints/Ark6_swinLarge768_ep50.pth.tar` next to
 `Ark_Plus_tasknode.py` (or point `ARK_PLUS_CHECKPOINT` at the file). Parameters arrive in
 the `/read` request body (TissueLab forwards every node input; `userData` in the zarr is only
 a fallback): `path` / `image_path` is the chest X-ray (PNG / JPEG / DICOM). Results go to the
-zarr group named after the node (`Ark/` unless the registry sets `zarr_group`):
+shared image-level classification group (`Image-Classification/`, the same layout for
+every chest X-ray classifier; the registry's `zarr_group` can override it):
 
 ```
-Ark/
+Image-Classification/
   predictions    float32[52]  sigmoid probability per finding, heads concatenated
   disease_list   |S           finding names aligned with predictions
   scores_json    |S           {head: {finding: probability}} for MIMIC-CXR, CheXpert,

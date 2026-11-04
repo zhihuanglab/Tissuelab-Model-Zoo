@@ -189,6 +189,9 @@ def preprocess_image(image_path, input_size=768):
 
 
 CHECKPOINT_NAME = "Ark6_swinLarge768_ep50.pth.tar"
+# Whole-image classification results share one group across models (Ark+, CheXzero, ...),
+# as segmentation results share Tissue-Segmentation / Cell-Segmentation.
+IMAGE_CLS_GROUP = "Image-Classification"
 # Heads of the Ark+ checkpoint, in the order the model emits them; the flat
 # `predictions` array is the concatenation of these heads (52 values).
 HEADS = [("MIMIC-CXR", 14), ("CheXpert", 14), ("ChestX-ray14", 14), ("RSNA-Pneumonia", 3), ("VinDr-CXR", 6), ("Shenzhen", 1)]
@@ -350,7 +353,8 @@ def _save_results_to_zarr(predictions, disease_list, image_name):
             del zf[ZARR_GROUP]
         group = zf.create_group(ZARR_GROUP)
         group.attrs.update({
-            "modality": "radiology", "model": "Ark+ (zero-shot chest X-ray classifier)",
+            "modality": "radiology", "image_type": "chest X-ray", "task": "image_classification",
+            "model": "Ark+ (zero-shot chest X-ray classifier)",
             "description": "predictions[i] is the sigmoid probability for disease_list[i]; the heads are "
                            "concatenated in the order given by `heads`. scores_json holds the same values "
                            "grouped per head so a finding name that occurs in several heads is unambiguous.",
@@ -414,9 +418,9 @@ def read_node(data: Dict[str, Any]):
     NODE_NAME = data.get("node_name", "ArkPlusZeroShot")
     DEPENDENCIES = data.get("dependencies", [])
     ZARR_PATH = data.get("zarr_path", None)
-    # Results go to the group the service associates with this node: its registry
-    # zarr_group when set, else the node name (where the service also wrote userData).
-    ZARR_GROUP = data.get("zarr_group") or NODE_NAME or "ArkPlusNode"
+    # Results go to the registry zarr_group when the service passes one, else to the
+    # shared image-level classification group (same layout for every X-ray classifier).
+    ZARR_GROUP = data.get("zarr_group") or IMAGE_CLS_GROUP
     DEP_ZARR_GROUPS = data.get("dependencies_zarr_groups", {})
 
     print(f"[{NODE_NAME}] /read => node_name={NODE_NAME}, deps={DEPENDENCIES}, zarr_path={ZARR_PATH}, zarr_group={ZARR_GROUP}")
@@ -441,7 +445,7 @@ def read_node(data: Dict[str, Any]):
         if k not in control:
             _apply_parameter(k, v)
     if not ARGS.image_path:
-        for grp in [data.get("zarr_group"), NODE_NAME, "ArkPlusNode", "Ark"]:
+        for grp in [data.get("zarr_group"), IMAGE_CLS_GROUP, NODE_NAME, "ArkPlusNode", "Ark"]:
             if grp:
                 _load_parameters_from_zarr(ZARR_PATH, grp)
                 if ARGS.image_path:

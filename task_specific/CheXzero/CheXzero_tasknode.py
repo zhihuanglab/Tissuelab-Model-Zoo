@@ -16,7 +16,7 @@ Inputs (/read request body, as forwarded by TissueLab; zarr userData is a fallba
   tissue_classes | classes | targets | findings | labels
                                extra findings to score (list or "a, b")
   prompt                       "classes=Nodule, Mass" is parsed; other text ignored
-Outputs (zarr group = registry zarr_group, else the node name):
+Outputs (zarr group = registry zarr_group, else "Image-Classification", shared by all image classifiers):
   predictions   float32[n]     ensemble probability per finding
   disease_list  |S             finding names, aligned with predictions
   scores_json   |S             {"CheXzero-ensemble": {finding: p}, "per_model": {ckpt: {finding: p}}}
@@ -77,6 +77,9 @@ DEFAULT_LABELS = [
     "Pleural Effusion", "Pleural Other", "Fracture", "Support Devices",
 ]
 PAIR_TEMPLATE = ("{}", "no {}")   # CheXzero's positive / negative prompts
+# Whole-image classification results share one group across models (Ark+, CheXzero, ...),
+# as segmentation results share Tissue-Segmentation / Cell-Segmentation.
+IMAGE_CLS_GROUP = "Image-Classification"
 IMAGE_SIZE = 320                  # preprocessing size used for the MIMIC-CXR h5 files
 MODEL_INPUT = 224                 # ViT-B/32 input
 PIXEL_MEAN, PIXEL_STD = 101.48761, 83.43944   # CheXzero's per-pixel stats (0-255 scale)
@@ -240,7 +243,8 @@ def _save_results(scores: Dict[str, Any], labels: List[str], image_name: str) ->
         del zf[ZARR_GROUP]
     g = zf.create_group(ZARR_GROUP)
     g.attrs.update({
-        "modality": "radiology", "model": "CheXzero (zero-shot CLIP chest X-ray classifier, ensemble)",
+        "modality": "radiology", "image_type": "chest X-ray", "task": "image_classification",
+        "model": "CheXzero (zero-shot CLIP chest X-ray classifier, ensemble)",
         "description": "predictions[i] is the ensemble probability that the image shows disease_list[i] "
                        "(softmax of '<finding>' vs 'no <finding>' CLIP similarities, averaged over the "
                        "checkpoints). scores_json holds the ensemble and per-checkpoint values.",
@@ -285,14 +289,14 @@ def read_node(data: Dict[str, Any]):
     global NODE_NAME, ZARR_PATH, ZARR_GROUP, IMAGE_PATH, EXTRA_LABELS
     NODE_NAME = data.get("node_name", NODE_NAME)
     ZARR_PATH = data.get("zarr_path")
-    ZARR_GROUP = data.get("zarr_group") or NODE_NAME
+    ZARR_GROUP = data.get("zarr_group") or IMAGE_CLS_GROUP
     IMAGE_PATH, EXTRA_LABELS = "", []
     control = {"node_name", "dependencies", "zarr_path", "zarr_group", "dependencies_zarr_groups"}
     for k, v in data.items():
         if k not in control:
             _apply_parameter(k, v)
     if not IMAGE_PATH and ZARR_PATH and os.path.exists(ZARR_PATH):
-        for grp in [data.get("zarr_group"), NODE_NAME, "CheXzero"]:
+        for grp in [data.get("zarr_group"), IMAGE_CLS_GROUP, NODE_NAME, "CheXzero"]:
             if grp:
                 _load_parameters_from_zarr(ZARR_PATH, grp)
                 if IMAGE_PATH:
