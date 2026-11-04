@@ -26,6 +26,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -199,8 +200,11 @@ def _apply_parameter(name: str, value) -> None:
             print(f"[{NODE_NAME}] Warning: image path does not exist: {value}")
     elif name in ("tissue_classes", "classes", "targets", "findings", "labels", "class"):
         EXTRA_LABELS.extend(_as_list(value))
-    elif name == "prompt" and isinstance(value, str) and "classes=" in value.lower():
-        EXTRA_LABELS.extend(_as_list(value.split("=", 1)[1]))
+    elif name == "prompt" and isinstance(value, str):
+        # "classes=Nodule, Mass" possibly among other key=value items; stop at the next key=
+        m = re.search(r"(?:^|[,;\s])(?:tissue_)?classes\s*=\s*([^=]*?)(?=(?:[,;\s]+\w+\s*=)|$)", value, re.I)
+        if m:
+            EXTRA_LABELS.extend(_as_list(m.group(1)))
 
 
 def _load_parameters_from_zarr(zarr_path: str, group: str) -> None:
@@ -226,8 +230,13 @@ def _load_parameters_from_zarr(zarr_path: str, group: str) -> None:
 def _labels_for_run() -> List[str]:
     out: List[str] = []
     for l in EXTRA_LABELS + DEFAULT_LABELS:
-        if l and l.lower() not in {o.lower() for o in out}:
-            out.append(l)
+        l = l.strip().strip("\"'")
+        if not l or l.lower() in {o.lower() for o in out}:
+            continue
+        if len(l) > 60 or "/" in l or "\\" in l:   # a path or a sentence, not a finding
+            print(f"[{NODE_NAME}] ignoring label that is not a finding name: {l[:80]!r}")
+            continue
+        out.append(l)
     return out
 
 
@@ -241,8 +250,9 @@ def _put_str(grp, key: str, value: str):
 
 def _save_results(scores: Dict[str, Any], labels: List[str], image_name: str) -> None:
     zf = zarr.open_group(ZARR_PATH, mode="a")
-    if ZARR_GROUP in zf:
-        del zf[ZARR_GROUP]
+    for stale in {ZARR_GROUP, "CheXzero", "Ark", "ArkPlusNode"}:  # one classification result per image
+        if stale in zf:
+            del zf[stale]
     g = zf.create_group(ZARR_GROUP)
     g.attrs.update({
         "modality": "radiology", "image_type": "chest X-ray", "task": "image_classification",

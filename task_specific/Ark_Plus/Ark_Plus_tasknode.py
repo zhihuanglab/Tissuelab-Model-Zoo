@@ -349,8 +349,9 @@ def _save_results_to_zarr(predictions, disease_list, image_name):
     global ZARR_PATH, ZARR_GROUP
     try:
         zf = zarr.open_group(ZARR_PATH, mode="a")
-        if ZARR_GROUP in zf:
-            del zf[ZARR_GROUP]
+        for stale in {ZARR_GROUP, "Ark", "ArkPlusNode", "CheXzero"}:  # one classification result per image
+            if stale in zf:
+                del zf[stale]
         group = zf.create_group(ZARR_GROUP)
         group.attrs.update({
             "modality": "radiology", "image_type": "chest X-ray", "task": "image_classification",
