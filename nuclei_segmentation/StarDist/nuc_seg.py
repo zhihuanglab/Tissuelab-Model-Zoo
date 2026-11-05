@@ -142,13 +142,18 @@ class SlideSegmentation():
         
         self.wsi_mask = self.simple_get_mask()
         
-        # Load model from local path instead of downloading
+        # Load model from local path instead of downloading. The local folder must hold the network
+        # weights (*.h5 / *.hdf5): csbdeep only warns when they are missing and then runs a randomly
+        # initialised network, whose uniform probability map turns the NMS of the first tile into an
+        # hours-long computation.
+        import glob as _glob
         local_model_path = os.path.join(os.path.dirname(__file__), 'models', stardist_pretrain)
-        if os.path.exists(local_model_path):
+        local_weights = _glob.glob(os.path.join(local_model_path, '*.h5')) + _glob.glob(os.path.join(local_model_path, '*.hdf5'))
+        if os.path.isdir(local_model_path) and local_weights:
             print(f"Loading StarDist model from local path: {local_model_path}")
             self.model = StarDist2D(None, name=stardist_pretrain, basedir=os.path.join(os.path.dirname(__file__), 'models'))
         else:
-            print(f"Local model not found at {local_model_path}, attempting to download...")
+            print(f"Local StarDist weights not found in {local_model_path}, downloading pretrained '{stardist_pretrain}'...")
             self.model = StarDist2D.from_pretrained(stardist_pretrain)
         
         # Optimize model prediction performance
