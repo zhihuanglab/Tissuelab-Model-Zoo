@@ -69,3 +69,6 @@ downloads
 !zero2_config.json
 pretrain/
 patch_classification/MUSK/debug/*.png
+
+# model weights (see README)
+checkpoints/
