@@ -14,7 +14,7 @@ pip install -r requirements.txt
 
 ### libvips / pyvips
 
-`requirements.txt` installs `pyvips[binary]`, which bundles its own libvips and is enough for plain TIFF, OME-TIFF and `.svs` slides (no system package, no root needed). The steps below are only required for formats that need a **full** libvips (`.ndpi`, `.mrxs`, JPEG-2000 TIFF, HEIF).
+`requirements.txt` installs only the `pyvips` Python binding; the libvips library itself comes from the system. Do **not** `pip install pyvips[binary]`: that wheel ships a cut-down libvips without JPEG-2000 / OpenSlide loaders (TCGA `.svs` slides are JPEG-2000) and, once installed, it is used in preference to the system library.
 
 WSI formats such as `.svs`, `.ndpi`, `.mrxs`, and JPEG-2000 TIFF need a **full** libvips. `pip install pyvips[binary]` only ships a cut-down libvips (no OpenSlide / JPEG-2000 / HEIF / JXL loaders), so install the system library first.
 
@@ -27,9 +27,13 @@ brew install vips
 ```bash
 sudo apt-get install -y libvips-dev
 ```
+Without root, install it into the node's conda environment instead:
+```bash
+conda install -c conda-forge libvips
+```
 
 **Windows**
-Download the full `vips-dev-w64-all` build from [libvips Windows releases](https://github.com/libvips/build-win64-mxe/releases), unpack to `C:\vips` (or set `TL_VIPS_DIR`), and add `C:\vips\bin` to `PATH`.
+`scoop install libvips` (Scoop), or download the full `vips-dev-w64-all` build from [libvips Windows releases](https://github.com/libvips/build-win64-mxe/releases), unpack to `C:\vips` (or set `TL_VIPS_DIR`), and add `C:\vips\bin` to `PATH`.
 
 Verify (in the same conda env as the task node, not `base`):
 ```python
