@@ -25,6 +25,10 @@ import cv2
 import numpy as np
 import requests
 import torch
+# torchvision loads torch's compiler stack (triton) at import time; it has to come in before
+# TensorFlow (imported by nuc_seg), otherwise the two LLVM runtimes clash and the node
+# segfaults on start in a fresh environment (torch 2.14 + tensorflow 2.21).
+import torchvision  # noqa: F401
 import uvicorn
 import zarr
 from fastapi import FastAPI
