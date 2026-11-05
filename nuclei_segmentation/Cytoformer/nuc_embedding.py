@@ -49,7 +49,9 @@ def _open_tiffslide(path):
     import tiffslide
     return tiffslide.TiffSlide(path, tifffile_options={'is_shaped': False})
 
-VIPS_AVAILABLE = importlib.util.find_spec("pyvips") is not None
+# A real import check: nuc_stat tries `import pyvips`; a pyvips wheel without a system libvips raises OSError there,
+# and find_spec() alone would still report it as available and route .tiff slides to VipsSlide.
+from nuc_stat import VIPS_AVAILABLE
 
 """
 For this embedding, we use PLIP model from vinid/plip.

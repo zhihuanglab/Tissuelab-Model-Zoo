@@ -14,6 +14,8 @@ pip install -r requirements.txt
 
 ### libvips / pyvips
 
+`requirements.txt` installs `pyvips[binary]`, which bundles its own libvips and is enough for plain TIFF, OME-TIFF and `.svs` slides (no system package, no root needed). The steps below are only required for formats that need a **full** libvips (`.ndpi`, `.mrxs`, JPEG-2000 TIFF, HEIF).
+
 WSI formats such as `.svs`, `.ndpi`, `.mrxs`, and JPEG-2000 TIFF need a **full** libvips. `pip install pyvips[binary]` only ships a cut-down libvips (no OpenSlide / JPEG-2000 / HEIF / JXL loaders), so install the system library first.
 
 **macOS**
