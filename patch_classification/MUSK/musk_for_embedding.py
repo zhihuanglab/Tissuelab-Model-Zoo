@@ -27,7 +27,7 @@ import platform
 try:
     import pyvips
     _VIPS_AVAILABLE = True
-except ImportError:
+except Exception:  # ImportError, or OSError when the pyvips wheel finds no libvips on the system
     pyvips = None
     _VIPS_AVAILABLE = False
 

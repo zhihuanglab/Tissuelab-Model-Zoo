@@ -1,0 +1,22 @@
+# CellCharter spatial-domain task node. Python 3.11.
+# The TissueLab zarr store is zarr v3; squidpy/spatialdata releases before 2025 pin zarr<3,
+# so the data stack below is the first set that imports with zarr 3.
+numpy>=1.26,<3
+scipy>=1.13
+scikit-learn>=1.5
+pandas>=2.2
+anndata>=0.11
+scanpy>=1.11
+squidpy>=1.6.5
+spatialdata>=0.4
+cellcharter>=0.3.3
+torchgmm>=0.1.2
+lightning>=2.5
+zarr==3.1.6
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+pydantic==2.13.5
+requests==2.34.2
+sse-starlette==3.4.6
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.7.0+cu126
