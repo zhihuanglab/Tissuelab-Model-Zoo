@@ -101,8 +101,9 @@ def _as_int_list(val) -> List[int]:
 def _apply_parameter(name: str, value) -> None:
     global ST_PATH, IMAGE_PATH, KS
     if name in ("st_path", "h5ad_path", "expression_path", "spatial_path", "adata_path"):
-        if isinstance(value, str) and value:
-            ST_PATH = value
+        # Planner / panel placeholders ("default", "auto", ...) mean "find the .h5ad next to the image".
+        if isinstance(value, str) and value.strip() and value.strip().lower() not in ("default", "auto", "none", "null", "<default>"):
+            ST_PATH = value.strip()
     elif name in ("path", "image_path"):
         if isinstance(value, str) and value:
             IMAGE_PATH = value

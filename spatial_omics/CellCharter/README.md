@@ -22,7 +22,7 @@ Parameters arrive in the `/read` request body (TissueLab forwards every node inp
 
 | Key | Meaning |
 |---|---|
-| `st_path` / `h5ad_path` | the `.h5ad` file; if absent, `<image>.h5ad` or the single `.h5ad` next to the opened image is used |
+| `st_path` / `h5ad_path` | the `.h5ad` file; if absent or a placeholder (`default`, `auto`), `<image>.h5ad` or the single `.h5ad` next to the opened image is used |
 | `n_clusters` / `k` | one K or a list (`"5,6,7,8,9,10"`); default 9 |
 | `prompt` | `k=9` is parsed; other text ignored |
 | `n_top_genes`, `n_pcs`, `n_layers`, `random_state` | optional overrides of the defaults above |
