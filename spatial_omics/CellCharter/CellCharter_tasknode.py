@@ -66,7 +66,8 @@ progress_value = 0
 progress_complete = False
 execution_active = False
 cancel_event = threading.Event()
-DEFAULTS = {"n_top_genes": 2000, "n_pcs": 30, "n_layers": 3, "random_state": 42, "n_markers": 15}
+# match_radius_px: nearest-centroid join to Cell-Segmentation when obs_names are not its rows (level-0 px)
+DEFAULTS = {"n_top_genes": 2000, "n_pcs": 30, "n_layers": 3, "random_state": 42, "n_markers": 15, "match_radius_px": 8}
 
 
 def _check_cancel():
@@ -222,19 +223,33 @@ def _put_str(grp, key: str, value: str):
 
 
 
-def _segmentation_index(zf, obs_names):
-    """If every obs_name is an integer row of Cell-Segmentation/centroids in this zarr (the
-    per-nucleus h5ad was built from the slide's nucleus segmentation), return those rows."""
+def _segmentation_index(zf, obs_names, centroids=None, match_radius_px=8.0):
+    """Row of Cell-Segmentation/centroids for each h5ad nucleus.
+    (a) if every obs_name is an integer row of this zarr's segmentation, use it directly;
+    (b) otherwise match each h5ad centroid to the nearest segmented nucleus within `match_radius_px`
+        (level-0 px; -1 when none), so a fresh segmentation of the same slide still joins with the ST data.
+    Returns (index array or None, info dict)."""
     try:
         if "Cell-Segmentation" not in zf or "centroids" not in zf["Cell-Segmentation"]:
-            return None
-        n_seg = int(zf["Cell-Segmentation/centroids"].shape[0])
-        idx = np.array([int(str(x)) for x in obs_names], dtype=np.int64)
-        if idx.min() < 0 or idx.max() >= n_seg or len(np.unique(idx)) != len(idx):
-            return None
-        return idx
+            return None, {}
+        seg = np.asarray(zf["Cell-Segmentation/centroids"][:], dtype=np.float64)
+        n_seg = int(seg.shape[0])
+        try:
+            idx = np.array([int(str(x)) for x in obs_names], dtype=np.int64)
+            if idx.min() >= 0 and idx.max() < n_seg and len(np.unique(idx)) == len(idx):
+                return idx, {"method": "obs_names are segmentation rows", "match_fraction": 1.0}
+        except Exception:
+            pass
+        if centroids is None or n_seg == 0:
+            return None, {}
+        from scipy.spatial import cKDTree
+        dist, j = cKDTree(seg).query(np.asarray(centroids, dtype=np.float64), k=1)
+        idx = np.where(dist <= float(match_radius_px), j, -1).astype(np.int64)
+        frac = float((idx >= 0).mean())
+        return idx, {"method": f"nearest segmented nucleus within {match_radius_px:g} px", "match_fraction": frac,
+                     "median_distance_px": float(np.median(dist))}
     except Exception:
-        return None
+        return None, {}
 
 def _save_results(res: Dict[str, Any], ks: List[int], params: Dict[str, Any]) -> None:
     adata = res["adata"]
@@ -253,16 +268,17 @@ def _save_results(res: Dict[str, Any], ks: List[int], params: Dict[str, Any]) ->
         "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
     })
     centroids = np.asarray(adata.obsm["spatial"], dtype=np.float32)
-    seg_index = _segmentation_index(zf, adata.obs_names)
+    seg_index, seg_info = _segmentation_index(zf, adata.obs_names, centroids, float(PARAMS.get("match_radius_px", 8.0)))
     if seg_index is not None:
-        # the h5ad rows are nuclei of the slide's segmentation: report the segmentation's own
-        # centroids so every downstream array (Cell-Segmentation, Cell-Classification,
-        # User-Annotations) can be indexed with `segmentation_index`, whatever frame the h5ad used
-        centroids = np.asarray(zf["Cell-Segmentation/centroids"][:], dtype=np.float32)[seg_index]
+        if seg_info.get("match_fraction") == 1.0 and "obs_names" in seg_info.get("method", ""):
+            centroids = np.asarray(zf["Cell-Segmentation/centroids"][:], dtype=np.float32)[seg_index]
         g.create_array("segmentation_index", data=seg_index.astype(np.int64))
         g.attrs["aligned_to"] = "Cell-Segmentation"
-        g.attrs["segmentation_index_note"] = ("segmentation_index[i] is the row of Cell-Segmentation/centroids (and of "
-                                             "Cell-Classification/class_indices, User-Annotations/cell) for nucleus i")
+        g.attrs["segmentation_index_note"] = (
+            "segmentation_index[i] is the row of Cell-Segmentation/centroids (and Cell-Classification/class_indices, "
+            "User-Annotations/cell) for nucleus i; -1 when no segmented nucleus lies within the match radius. "
+            f"Method: {seg_info.get('method')}; match fraction {seg_info.get('match_fraction', 0):.3f}.")
+        g.attrs["segmentation_match_fraction"] = float(seg_info.get("match_fraction", 0))
     g.create_array("centroids", data=centroids)
     g.create_array("nucleus_id", data=np.array([str(x) for x in adata.obs_names], dtype="S"))
     cg = g.create_group("clusters")
