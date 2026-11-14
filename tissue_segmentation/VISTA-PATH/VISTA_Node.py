@@ -922,6 +922,18 @@ def _get_mask_node_coords_for_tissue(zf, tissue_name: Optional[str]):
         return None
 
 
+def _has_patch_classification(zf) -> bool:
+    """True when the slide has a patch classification VISTA can pick tissue patches from."""
+    try:
+        if not zf or "Patch-Classification" not in zf or "Patch-Segmentation" not in zf:
+            return False
+        cls_grp = zf["Patch-Classification"]
+        return "classes/name" in cls_grp and "class_indices" in cls_grp
+    except Exception as e:
+        print(f"[{NODE_NAME}] _has_patch_classification: {e}")
+        return False
+
+
 def _get_all_patch_coords(zf):
     """
     All patch coordinates from the patch station (Patch-Segmentation/coordinates),
@@ -1291,24 +1303,50 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
         mask_writer = _TissueMaskWriter(level_width, level_height)
         tile_reader = _TileCachedReader(slide, level)
         total_patches_overall = 0
-        
+
+        # Plan every tissue's windows first, so progress runs once from 10 to 90 over
+        # the whole run instead of starting again at 10 for each tissue.
+        # Tiling coordinates come from the patch station (guaranteed to exist, checked above):
+        #   - tissue_class matches a Patch-Classification class -> only those patches
+        #   - otherwise -> all patches from Patch-Segmentation/coordinates
+        # A tissue from the panel's class list that the patch classification found no
+        # patch of is skipped: segmenting the whole slide under its name would draw an
+        # outline of a tissue that is not there (an earlier run's type, or one with
+        # no patches on this slide).
+        classified = bool(TISSUE_CLASSES) and _has_patch_classification(zf_check)
+        plans = []
+        not_found = []
         for current_tissue in tissue_run_list:
-            _check_cancel()
-            # Tiling coordinates come from the patch station (guaranteed to exist, checked above):
-            #   - tissue_class matches a Patch-Classification class -> only those patches
-            #   - otherwise -> all patches from Patch-Segmentation/coordinates
             mask_node_coords = _get_mask_node_coords_for_tissue(zf_check, current_tissue) if current_tissue else None
             coord_source = "Patch-Classification"
             if mask_node_coords is None:
+                if current_tissue and classified:
+                    not_found.append(current_tissue)
+                    continue
                 mask_node_coords = _get_all_patch_coords(zf_check)
                 coord_source = "Patch-Segmentation"
-            n_patches = len(mask_node_coords)
             # Slide VISTA's own window over the slide and keep only the windows that
             # overlap a patch of this tissue; each kept window is segmented whole.
             window_coords = _windows_covering(mask_node_coords, window, level_width, level_height)
             # Visit windows tile by tile: decoding one 4096x4096 JPEG per read was
             # 98% of the non-inference time. Order does not affect the result.
             window_coords = tile_reader.sort_by_tile(window_coords)
+            plans.append((current_tissue, len(mask_node_coords), coord_source, window_coords))
+        if not_found:
+            print(f"[{NODE_NAME}] Skipping {not_found} - no patch of this type on the slide")
+        if not plans:
+            # Nothing on the slide to outline; the previous run's masks stay as they are.
+            msg = (f"[{NODE_NAME}] Nothing to segment - no patch on this slide was "
+                   f"classified as {not_found}.")
+            print(msg)
+            progress_value = 100
+            return {"status": "ok", "message": msg, "num_patches": 0, "num_objects": 0}
+        windows_overall = max(1, sum(len(plan[3]) for plan in plans))
+        windows_done = 0
+        progress_value = 10
+
+        for current_tissue, n_patches, coord_source, window_coords in plans:
+            _check_cancel()
             total_patches = len(window_coords)
             print(f"[{NODE_NAME}] Tissue {current_tissue!r}: {n_patches} patches from "
                   f"{coord_source} -> {total_patches} windows of {window}px, {tile_reader.describe()}")
@@ -1319,7 +1357,6 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             PASEG_MODEL.set_prompt(f"an image of {prompt_tissue}")
             print(f"[{NODE_NAME}] Text prompt: {PASEG_MODEL.default_text!r}")
 
-            progress_value = 10
             full_mask = np.zeros((level_height, level_width), dtype=np.uint8)
             batch_imgs = []
             batch_coords = []  # store (x0, y0, x1, y1) for each image in batch
@@ -1395,8 +1432,8 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
                         
                     processed_patches += len(batch_imgs)
                         
-                    # Update progress (10-90% for patch processing)
-                    progress_value = int(10 + (processed_patches / total_patches) * 80)
+                    # Update progress (10-90% over every tissue's windows)
+                    progress_value = int(10 + ((windows_done + processed_patches) / windows_overall) * 80)
                     if processed_patches % 50 == 0 or processed_patches == total_patches:
                         print(f"[{NODE_NAME}] Progress: {progress_value}% ({processed_patches}/{total_patches} windows)")
                         
@@ -1411,6 +1448,7 @@ def run_segmentation_sequential(args) -> Dict[str, Any]:
             tissue_display = current_tissue if current_tissue else "default"
             mask_writer.write(tissue_display, full_mask)
             full_mask = None
+            windows_done += total_patches
             total_patches_overall += total_patches
         
         progress_value = 90
