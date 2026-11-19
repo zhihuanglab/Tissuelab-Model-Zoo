@@ -2748,9 +2748,11 @@ def run_classification(args) -> Dict[str, Any]:
         if eff_renames_run:
             _persist_nuclei_rename_to_user_annotation(zf, eff_renames_run, nuclei_classes, nuclei_colors)
 
-        # A) annotations alone decide the path: anything the user labelled by hand
+        # A) annotations decide the path: anything the user labelled by hand
         # makes this a supervised run trained on those labels. Zero-shot (the
-        # per-organ head) is only for a slide with no annotations at all.
+        # per-organ head) runs on a slide with no annotations, or when the caller
+        # asks for it explicitly with use_supervised=false (the annotations are
+        # kept but not trained on).
         #
         # The panel's nuclei_classes is NOT a filter here. It can legitimately
         # disagree with the User-Annotations palette (an earlier zero-shot run
@@ -2764,13 +2766,14 @@ def run_classification(args) -> Dict[str, Any]:
                 has_annotations = True
             else:
                 annotations_data = None
-        # `use_supervised` in the payload is legacy — kept for older callers, but the
-        # presence of annotations is what selects the path.
-        use_supervised = has_annotations
-        if has_annotations and not bool(getattr(args, "use_supervised", True)):
+        # A caller that omits `use_supervised` gets the default (True, set in /read):
+        # annotations select the supervised path. Only an explicit false opts out.
+        zero_shot_requested = not bool(getattr(args, "use_supervised", True))
+        use_supervised = has_annotations and not zero_shot_requested
+        if has_annotations and zero_shot_requested:
             print(
-                "[Cell-Classification] use_supervised=false but the slide has "
-                "User-Annotations; training on them instead of running zero-shot."
+                "[Cell-Classification] use_supervised=false: running zero-shot; the "
+                "slide's User-Annotations are kept but not trained on."
             )
         
         # B) Read the 1536-d features from the canonical Cell-Segmentation/embeddings
