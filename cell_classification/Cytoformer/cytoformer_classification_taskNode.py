@@ -1508,6 +1508,98 @@ def _with_background_negatives(embeddings, annotations, X, y, w, class_names):
             np.concatenate([w, np.full(len(background), weight)]))
 
 
+# Refine changes the slide's cell types only where the marks say so. It stays on
+# the types the slide had before the refine started (its "base": the zero-shot
+# result or a saved classifier's), so a relearn after each mark does not spread
+# the same marks again from its own last result.
+#  - A refined type's binary for THIS slide learns a correction to the base: each
+#    row starts at +REFINE_BASE_MARGIN (the base calls the cell that type) or
+#    -REFINE_BASE_MARGIN (it does not), as XGBoost's base_margin, and the trees
+#    learn only what the marks change. Where they learn nothing the base stands.
+#  - A random sample of the unmarked cells joins as weak rows labelled by the base.
+#    Together they weigh max(marks, REFINE_MIN_WEIGHT): never less than the marks,
+#    or a type marked alone is learned as half the slide.
+# The saved .tlcls has to work on other slides, which have no such base, so it is
+# a standalone binary fitted on the same rows plus the file's earlier slides.
+# Measured on four TCGA-COAD slides (159k-2.1M cells) with 30-3,000 simulated
+# marks: with 30 marks that agree with the base, retraining the type outright
+# changed 2,180 other cells of TCGA-A6-2671 and the correction 83; its corrections
+# spread to similar cells as far as the retrained binary's did. A total weight
+# equal to the marks changed up to 7x more cells than the floor; floors of
+# 3,000-10,000 did alike, 1,000 worse. Margin 4 overfits 3,000 marks (11k changed).
+REFINE_ROWS = 100000
+REFINE_MIN_WEIGHT = 3000
+REFINE_BASE_MARGIN = 2.0
+REFINE_BASE_GROUP = "refine_base"
+LAST_RUN_REFINED = False  # set by run_ovr_classification: this run corrected a base
+
+
+def _read_refine_base(zf, n_cells, renames=()):
+    """The cell types a refine stays on, as (class_index [N], class names): the
+    base an earlier refine of this result kept, else the slide's current types.
+    None when there are none or they are for another segmentation. Names follow
+    this run's renames."""
+    try:
+        if ZARR_GROUP not in zf or 'class_indices' not in zf[ZARR_GROUP]:
+            return None
+        grp = zf[ZARR_GROUP]
+        src = grp[REFINE_BASE_GROUP] if REFINE_BASE_GROUP in grp else grp
+        idx = np.asarray(src['class_indices'][()], dtype=np.int64)
+        if idx.ndim != 1 or len(idx) != n_cells:
+            print(f"[OvR] refine base not used: {len(idx)} labels for {n_cells} cells")
+            return None
+        names = list(src.attrs.get('class_names') or [])
+        if not names and 'classes/name' in src:
+            names = [n.decode('utf-8') if hasattr(n, 'decode') else str(n) for n in src['classes/name'][()]]
+        if not names:
+            return None
+        graph = {op["from"]: op["to"] for op in (renames or [])}
+        return idx, [_resolve_rename_terminal(str(n), graph) for n in names]
+    except Exception as e:
+        print(f"[OvR] could not read the refine base: {e}")
+        return None
+
+
+def _write_refine_base(grp_cls, base):
+    """Keep the base with the result it produced, for the next refine of it."""
+    idx, names = base
+    sub = grp_cls.require_group(REFINE_BASE_GROUP)
+    sub.create_array('class_indices', data=np.asarray(idx, dtype=np.int32))
+    sub.attrs['class_names'] = [str(n) for n in names]
+
+
+def _base_labels(base, class_names, n_cells):
+    """Each cell's base type as an index into class_names; -1 for a type this
+    run does not list."""
+    idx, names = base
+    to_final = np.array([class_names.index(n) if n in class_names else -1 for n in names], dtype=np.int64)
+    lab = np.full(n_cells, -1, dtype=np.int64)
+    ok = (idx >= 0) & (idx < len(names))
+    lab[ok] = to_final[idx[ok]]
+    return lab
+
+
+def _refine_weak_rows(base_lab, annotations, n_marks, n_cells):
+    """(cell ids, base type, weight) for a random sample of the unmarked cells
+    with a listed base type, so each type keeps its share of the slide; None when
+    there is none."""
+    usable = base_lab >= 0
+    if annotations is not None and not annotations.empty and "cell_ID" in annotations.columns:
+        marked = pd.to_numeric(annotations["cell_ID"], errors="coerce").dropna().astype(int).values
+        usable[marked[(marked >= 0) & (marked < n_cells)]] = False
+    pool = np.flatnonzero(usable)
+    if len(pool) == 0:
+        return None
+    k = int(min(len(pool), REFINE_ROWS))
+    ids = np.sort(np.random.default_rng(0).choice(pool, size=k, replace=False))
+    w = min(1.0, max(n_marks, REFINE_MIN_WEIGHT) / k)
+    return ids, base_lab[ids], np.full(k, w)
+
+
+def _base_margin(base_lab, ci):
+    return np.where(base_lab == ci, REFINE_BASE_MARGIN, -REFINE_BASE_MARGIN).astype(np.float32)
+
+
 def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFrame, nuclei_classes: list = None, nuclei_colors: list[str] = None):
     """
     Train a linear classifier for cell classification.
@@ -2219,7 +2311,7 @@ def _ovr_prior_training_data(cls, dim):
     return None
 
 
-def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_colors, organ=None):
+def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_colors, organ=None, base=None):
     """
     One-vs-rest classification: every class is its own independent binary
     classifier stored in a separate .tlcls file.
@@ -2230,9 +2322,17 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     binary XGB — positives = cells annotated as that class; negatives = cells
     annotated as any other class + the shared negative-control vectors + any
     cells explicitly marked "not this class" (weak, 0.3). Rows already in the
-    class's .tlcls (earlier slides) are merged in. With no negative at all,
-    unannotated cells outside the class stand in (weak). Save each binary
-    that has a path; the others are used from memory for this run.
+    class's .tlcls (earlier slides) are merged in. When the slide already has
+    cell types (`base`, from _read_refine_base) a sample of its unmarked cells
+    joins as weak rows labelled by them; without them, and with fewer Negative
+    control examples than marks, unannotated cells outside the marked classes
+    stand in as weak negatives. Save each binary that has a path; the others
+    are used from memory for this run.
+
+    Refine (a base and marks for the class on this slide): this slide's column
+    for the class comes from a correction of the base instead (REFINE_BASE_MARGIN),
+    so only what the marks change moves. The standalone binary is still fitted
+    and saved when the class has a path, for other slides.
 
     Predict: for every class that ends up with a classifier — freshly trained
     or pre-attached (CLASSIFIER_PATHS) — score all cells
@@ -2247,7 +2347,8 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     the slide has annotations, organ zero-shot when it does not. None is also
     returned on cancellation.
     """
-    global SAVE_CLASSIFIER_PATH, cancel_event
+    global SAVE_CLASSIFIER_PATH, cancel_event, LAST_RUN_REFINED
+    LAST_RUN_REFINED = False
 
     # --- split annotations (same masks as train_linear_classifier) ---
     if annotations is None:
@@ -2295,12 +2396,13 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     }
 
     X_pos = y_pos = None
+    pos_ids = np.empty(0, dtype=int)
     if not positive_annotations.empty:
         cell_indices = positive_annotations['cell_ID'].astype(int).values
         X_pos = cell_embeddings[cell_indices]
         y_pos = _annotation_labels_to_classifier_indices(positive_annotations, final_class_names, nuclei_classes)
         valid = y_pos >= 0
-        X_pos, y_pos = X_pos[valid], y_pos[valid]
+        X_pos, y_pos, pos_ids = X_pos[valid], y_pos[valid], cell_indices[valid]
 
     # cells explicitly annotated "not <class>" -> hard negatives for that class
     excl_cells = {}
@@ -2354,7 +2456,17 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     nc_i = name_to_idx.get("Negative control")
     n_nc = (0 if X_pos is None else int(np.sum(y_pos == nc_i))) + (0 if nc_vectors is None else len(nc_vectors))
     n_marked = 0 if X_pos is None else int(np.sum((y_pos >= 0) & (y_pos != nc_i)))
-    if n_nc < n_marked:
+    # Refine: the base's cell types are the "rest" of each binary, near neighbours
+    # of the marks included. The stand-ins below are only cells far from every
+    # mark, so a type marked alone took everything between its marks and them.
+    n_marks = n_marked + int(np.sum(y_pos == nc_i) if X_pos is not None else 0) \
+        + len({c for ids in excl_cells.values() for c in ids})
+    base_lab = _base_labels(base, final_class_names, n_cells) if base is not None else None
+    weak = _refine_weak_rows(base_lab, annotations, n_marks, n_cells) if base_lab is not None else None
+    if weak is not None:
+        print(f"[OvR] refine: {len(weak[0])} unmarked cells keep their base type as weak rows "
+              f"(weight {weak[2][0]:.3f} each)")
+    elif n_nc < n_marked:
         found = _background_negatives(
             cell_embeddings, annotations, [X_pos[y_pos == c] for c in np.unique(y_pos) if c >= 0 and c != nc_i])
         if found is not None:
@@ -2367,6 +2479,7 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     # and each binary trained without a path from memory, then combines them.
     trained_paths = {}  # class_name -> path we just wrote (source of truth for Phase 2)
     trained_models = {}  # class_name -> binary trained without a save destination
+    corrected = {}  # class_name -> this slide's probabilities from a correction of the base
     # Update replaces this slide's rows in each class's file with the slide's
     # current marks, so it runs whether or not the slide has an "is X" mark: "not X"
     # marks alone still teach X's binary, and removed marks still leave the file.
@@ -2407,6 +2520,29 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
         Xb = np.concatenate(parts_X, axis=0)
         yb = np.concatenate(parts_y, axis=0).astype(int)
         wb = np.concatenate(parts_w, axis=0)
+        # This slide's result for a class marked here: a correction of the base.
+        if base_lab is not None and (np.any(pos_sel) or hard_ids):
+            r_ids = [pos_ids[pos_sel], pos_ids[~pos_sel], np.asarray(hard_ids, dtype=int)]
+            r_y = [np.ones(int(pos_sel.sum())), np.zeros(int((~pos_sel).sum()) + len(hard_ids))]
+            r_w = [np.ones(len(pos_ids) + len(hard_ids))]
+            if weak is not None:
+                r_ids.append(weak[0]); r_y.append((weak[1] == ci).astype(float)); r_w.append(weak[2])
+            r_ids = np.concatenate(r_ids).astype(int)
+            r_y = np.concatenate(r_y).astype(int)
+            r_w = np.concatenate(r_w)
+            if np.any(r_y == 1) and np.any(r_y == 0):
+                corr = xgb.XGBClassifier(**xgb_params_bin)
+                corr.fit(cell_embeddings[r_ids], r_y, sample_weight=r_w,
+                         base_margin=_base_margin(base_lab[r_ids], ci))
+                if cancel_event.is_set():
+                    progress_state.value = 0
+                    return None
+                _match_booster_device_to_data(corr)
+                corrected[cls] = corr.predict_proba(cell_embeddings, base_margin=_base_margin(base_lab, ci))[:, 1]
+                print(f"[OvR] '{cls}': corrected the base with {int(pos_sel.sum())} marks, "
+                      f"{int((~pos_sel).sum()) + len(hard_ids)} other marks")
+            if cls in corrected and not save_to:
+                continue  # nothing to save: this slide's correction is all this run needs
         # Refine, not replace: the class's existing .tlcls carries the rows it was
         # trained on (other slides). Merge them in; a cell annotated again on this
         # slide keeps only its current label.
@@ -2451,6 +2587,11 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
             else:
                 print(f"[OvR] skip '{cls}': no positive annotations")
             continue
+        if weak is not None:
+            k_ids, k_lab, k_w = weak
+            Xb = np.concatenate([Xb, cell_embeddings[k_ids].astype(Xb.dtype, copy=False)], axis=0)
+            yb = np.concatenate([yb, (k_lab == ci).astype(yb.dtype)])
+            wb = np.concatenate([wb, k_w])
         if background is not None:
             Xb = np.concatenate([Xb, background.astype(Xb.dtype, copy=False)], axis=0)
             yb = np.concatenate([yb, np.zeros(len(background), dtype=yb.dtype)])
@@ -2507,6 +2648,12 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     if CLASSIFIER_PATHS:
         predict_map.update(CLASSIFIER_PATHS)
     predict_map.update(trained_paths)
+    # Corrected on this slide: its column is the correction's, not the saved file's.
+    for cls, probs in corrected.items():
+        prediction_probs[:, name_to_idx[cls]] = probs
+        filled_cols.append(name_to_idx[cls])
+        predict_map.pop(cls, None)
+    LAST_RUN_REFINED = bool(corrected)
     # Trained this run but not saved (no classifier attached): predict from memory.
     for cls, clf in trained_models.items():
         _match_booster_device_to_data(clf)
@@ -2845,9 +2992,13 @@ def run_classification(args) -> Dict[str, Any]:
         # Returns None (=> fall through) when the mode is off or no per-class
         # classifier exists at all (then zero-shot handles it below).
         ovr_result = None
+        refine_base = None
         if CLASSIFIER_MODE == "one-vs-rest":
+            # Read before this run replaces them below (section D).
+            refine_base = _read_refine_base(zf, cell_embeddings.shape[0], eff_renames_run)
             ovr_result = run_ovr_classification(
-                cell_embeddings, annotations_data, nuclei_classes, nuclei_colors, organ
+                cell_embeddings, annotations_data, nuclei_classes, nuclei_colors, organ,
+                base=refine_base,
             )
             if ovr_result is None and cancel_event.is_set():
                 cancel_event.clear()
@@ -3133,6 +3284,14 @@ def run_classification(args) -> Dict[str, Any]:
             grp_cls.attrs['class_colors'] = [str(c) for c in final_class_colors]
         except Exception as e:
             print(f"Warning: Could not set Cell-Classification attrs: {e}")
+
+        # A refine keeps its base for the next refine of this result; any other
+        # run starts a new base (this group was just replaced).
+        if ovr_result is not None and LAST_RUN_REFINED and refine_base is not None:
+            try:
+                _write_refine_base(grp_cls, refine_base)
+            except Exception as e:
+                print(f"Warning: could not keep the refine base: {e}")
 
         if prediction_probs is not None:
             grp_cls.create_array('probabilities', data=prediction_probs.astype(np.float32))
