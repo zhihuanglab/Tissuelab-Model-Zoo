@@ -1527,9 +1527,15 @@ def _with_background_negatives(embeddings, annotations, X, y, w, class_names):
 # spread to similar cells as far as the retrained binary's did. A total weight
 # equal to the marks changed up to 7x more cells than the floor; floors of
 # 3,000-10,000 did alike, 1,000 worse. Margin 4 overfits 3,000 marks (11k changed).
+# Fits with the weak rows bin each feature into REFINE_MAX_BIN steps instead of
+# XGBoost's 256: their time is the histograms over ~100k rows x 1536 features, and
+# on TCGA-A6-2671 and TCGA-DM-A0XD 64 bins cut a fit 3-4x (18s -> 5s on 32 threads,
+# 119s -> 66s on one, as macOS runs it) with the same cells changed and missed as
+# 256 bins; 32 bins changed more. Fewer trees or fewer weak rows changed more too.
 REFINE_ROWS = 100000
 REFINE_MIN_WEIGHT = 3000
 REFINE_BASE_MARGIN = 2.0
+REFINE_MAX_BIN = 64
 REFINE_BASE_GROUP = "refine_base"
 LAST_RUN_REFINED = False  # set by run_ovr_classification: this run corrected a base
 
@@ -2531,7 +2537,7 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
             r_y = np.concatenate(r_y).astype(int)
             r_w = np.concatenate(r_w)
             if np.any(r_y == 1) and np.any(r_y == 0):
-                corr = xgb.XGBClassifier(**xgb_params_bin)
+                corr = xgb.XGBClassifier(**xgb_params_bin, max_bin=REFINE_MAX_BIN)
                 corr.fit(cell_embeddings[r_ids], r_y, sample_weight=r_w,
                          base_margin=_base_margin(base_lab[r_ids], ci))
                 if cancel_event.is_set():
@@ -2601,7 +2607,7 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
             continue
         if merge_note:
             print(merge_note)
-        clf = xgb.XGBClassifier(**xgb_params_bin)
+        clf = xgb.XGBClassifier(**xgb_params_bin, **({'max_bin': REFINE_MAX_BIN} if weak is not None else {}))
         clf.fit(Xb, yb, sample_weight=wb)
         if cancel_event.is_set():  # a cut-short fit must not be saved
             progress_state.value = 0
@@ -2724,7 +2730,23 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     predictions = np.zeros(n_cells, dtype=np.int32)          # default index 0 (NC)
     predictions[claimed] = sup_win[claimed]
 
-    unclaimed = ~claimed
+    # Refine: a cell no binary claims keeps its type from before the refine, so the
+    # cells nobody marked stay as they were however those types were made. Not when
+    # that type is one marked here (its correction no longer claims the cell) or a
+    # "not X" mark rules it out: those go to the fallback below.
+    kept_base = np.zeros(n_cells, dtype=bool)
+    if corrected and base_lab is not None:
+        kept_base = ~claimed & (base_lab >= 0) & ~np.isin(base_lab, [name_to_idx[c] for c in corrected])
+        for cname, ids in excl_cells.items():
+            if cname in name_to_idx and ids:
+                ids = np.asarray(ids, dtype=int)
+                kept_base[ids[base_lab[ids] == name_to_idx[cname]]] = False
+        rows_k = np.flatnonzero(kept_base)
+        prediction_probs[rows_k, :] = 0.0
+        prediction_probs[rows_k, base_lab[rows_k]] = 1.0
+        predictions[rows_k] = base_lab[rows_k]
+
+    unclaimed = ~claimed & ~kept_base
     n_unclaimed = int(unclaimed.sum())
     if n_unclaimed > 0:
         # Wipe the (sub-0.5) supervised residue on unclaimed rows so the saved
@@ -2770,7 +2792,8 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
 
     progress_state.value = 90
     print(f"[OvR] done: {len(filled_cols)} classifier(s), "
-          f"{int(claimed.sum())} supervised / {n_unclaimed} fallback over {n_cells} cells")
+          f"{int(claimed.sum())} supervised / {int(kept_base.sum())} kept from the base / "
+          f"{n_unclaimed} fallback over {n_cells} cells")
     return predictions, prediction_probs, final_class_names, final_class_colors, "supervised-ovr"
 
 
