@@ -899,6 +899,30 @@ def generate_distinct_colors(nuclei_classes: list[str]) -> list[str]:
 BOOSTER_CLASS_INDEX_ATTR = "trained_class_indices"
 
 
+# CPU threads for XGBoost and torch. All of a many-core server's threads is slower,
+# not faster, once other jobs share it: OpenMP threads wait on each other. On napa
+# (256 threads, busy) one XGBoost fit over 100k rows x 1536 took 140s at 256 threads,
+# 57s at 128 and 7s at 32; torch's matmuls were also fastest at 32-64. macOS trains
+# on one thread (libomp is not fork-safe in a forked task node) and predicts as before.
+MAX_CPU_THREADS = 32
+
+
+def _cpu_threads():
+    try:
+        n = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        n = os.cpu_count() or 1
+    return max(1, min(MAX_CPU_THREADS, n))
+
+
+def _xgb_fit_threads():
+    import platform as _platform
+    return 1 if _platform.system() == 'Darwin' else _cpu_threads()
+
+
+torch.set_num_threads(min(torch.get_num_threads(), MAX_CPU_THREADS))
+
+
 def _match_booster_device_to_data(clf):
     """Predict on the device the embeddings already live on.
 
@@ -910,7 +934,11 @@ def _match_booster_device_to_data(clf):
     inference is retargeted, and that does not change the predictions.
     """
     try:
-        clf.set_params(device="cpu")
+        import platform as _platform
+        if _platform.system() == 'Darwin':
+            clf.set_params(device="cpu")
+        else:
+            clf.set_params(device="cpu", n_jobs=_cpu_threads())
     except Exception as e:
         print(f"[Cell-Classification] could not retarget booster to cpu for prediction: {e}")
 
@@ -1489,9 +1517,7 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
     # multiple OpenMP threads inside a forked task-node process crashes the
     # worker silently with "leaked semaphore objects" right after fit() starts.
     # Pin to single-threaded training to keep the worker stable; throughput is
-    # still acceptable for the cell-counts we operate on.
-    import platform as _platform
-    _is_darwin = _platform.system() == 'Darwin'
+    # still acceptable for the cell-counts we operate on. Elsewhere: _cpu_threads().
     xgb_params = {
         'max_depth': 8,
         'tree_method': 'hist',
@@ -1499,8 +1525,8 @@ def train_linear_classifier(cell_embeddings: np.ndarray, annotations: pd.DataFra
         'eval_metric': 'mlogloss',
         'random_state': 42,
         'base_score': 0.5,  # Initial value for XGBoost, must be in (0,1) for logistic loss
-        'n_jobs': 1 if _is_darwin else -1,
-        'nthread': 1 if _is_darwin else -1,
+        'n_jobs': _xgb_fit_threads(),
+        'nthread': _xgb_fit_threads(),
         'callbacks': [_CancelTrainingCallback()],
     }
 
@@ -2242,15 +2268,13 @@ def run_ovr_classification(cell_embeddings, annotations, nuclei_classes, nuclei_
     n_cells = int(cell_embeddings.shape[0])
     print(f"[OvR] one-vs-rest mode, classes={final_class_names}")
 
-    # Darwin-safe single-threaded params (same rationale as train_linear_classifier).
-    import platform as _platform
-    _is_darwin = _platform.system() == 'Darwin'
+    # Single-threaded on macOS, capped elsewhere (same as train_linear_classifier).
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     xgb_params_bin = {
         'max_depth': 8, 'tree_method': 'hist', 'device': device,
         'objective': 'binary:logistic', 'eval_metric': 'logloss',
         'random_state': 42, 'base_score': 0.5,
-        'n_jobs': 1 if _is_darwin else -1, 'nthread': 1 if _is_darwin else -1,
+        'n_jobs': _xgb_fit_threads(), 'nthread': _xgb_fit_threads(),
         'callbacks': [_CancelTrainingCallback()],
     }
 

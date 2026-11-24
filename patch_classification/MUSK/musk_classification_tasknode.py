@@ -67,6 +67,36 @@ class CooperativeCancel(Exception):
 
 from musk_for_train import MUSK
 
+# CPU threads for XGBoost and torch. All of a many-core server's threads is slower,
+# not faster, once other jobs share it: OpenMP threads wait on each other. On napa
+# (256 threads, busy) one XGBoost fit over 100k rows x 1536 took 140s at 256 threads,
+# 57s at 128 and 7s at 32; torch's matmuls were also fastest at 32-64. macOS trains
+# on one thread (libomp is not fork-safe in a forked task node) and predicts as before.
+MAX_CPU_THREADS = 32
+
+
+def _cpu_threads():
+    try:
+        n = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        n = os.cpu_count() or 1
+    return max(1, min(MAX_CPU_THREADS, n))
+
+
+def _xgb_fit_threads():
+    import platform as _platform
+    return 1 if _platform.system() == 'Darwin' else _cpu_threads()
+
+
+def _xgb_predict_threads():
+    """n_jobs for a classifier loaded to predict; None (all threads) on macOS, as before."""
+    import platform as _platform
+    return None if _platform.system() == 'Darwin' else _cpu_threads()
+
+
+torch.set_num_threads(min(torch.get_num_threads(), MAX_CPU_THREADS))
+
+
 app = FastAPI()
 
 # Add CORS middleware to allow cross-origin requests
@@ -721,7 +751,7 @@ def load_classifier_params():
         except OSError:
             pass
 
-        clf = xgb.XGBClassifier()
+        clf = xgb.XGBClassifier(n_jobs=_xgb_predict_threads())
         clf.load_model(CLASSIFIER_PATH)
         
         # get class information and training data from model attributes
@@ -1055,8 +1085,6 @@ def train_linear_classifier(
     # objects" right after fit() starts. Pin to single-threaded training to keep
     # the worker stable; throughput is still acceptable for the patch counts we
     # operate on.
-    import platform as _platform
-    _is_darwin = _platform.system() == 'Darwin'
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     xgb_params = {
         'max_depth': 8,
@@ -1065,8 +1093,8 @@ def train_linear_classifier(
         'eval_metric': 'mlogloss',
         'random_state': 42,
         'base_score': 0.5,  # Initial value for XGBoost, must be in (0,1) for logistic loss
-        'n_jobs': 1 if _is_darwin else -1,
-        'nthread': 1 if _is_darwin else -1,
+        'n_jobs': _xgb_fit_threads(),
+        'nthread': _xgb_fit_threads(),
     }
 
     if annotations is None:
@@ -1757,7 +1785,7 @@ def _ovr_prior_training_data(cls, dim):
         if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
             continue
         try:
-            clf = xgb.XGBClassifier()
+            clf = xgb.XGBClassifier(n_jobs=_xgb_predict_threads())
             clf.load_model(path)
             booster = clf.get_booster()
             blob = booster.attr("train_data")
@@ -1803,14 +1831,12 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
     n_cells = int(cell_embeddings.shape[0])
     print(f"[OvR] one-vs-rest mode, classes={final_class_names}")
 
-    import platform as _platform
-    _is_darwin = _platform.system() == 'Darwin'
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     xgb_params_bin = {
         'max_depth': 8, 'tree_method': 'hist', 'device': device,
         'objective': 'binary:logistic', 'eval_metric': 'logloss',
         'random_state': 42, 'base_score': 0.5,
-        'n_jobs': 1 if _is_darwin else -1, 'nthread': 1 if _is_darwin else -1,
+        'n_jobs': _xgb_fit_threads(), 'nthread': _xgb_fit_threads(),
     }
 
     if annotations is None:
@@ -2030,7 +2056,7 @@ def run_ovr_classification(cell_embeddings, annotations, tissue_classes, tissue_
         except OSError:
             pass
         try:
-            clf = xgb.XGBClassifier(); clf.load_model(path)
+            clf = xgb.XGBClassifier(n_jobs=_xgb_predict_threads()); clf.load_model(path)
             binary_probs = clf.predict_proba(cell_embeddings)
             if binary_probs.shape != (n_cells, 2):
                 raise ValueError("One-vs-rest requires a binary classifier with two probability columns")
@@ -2132,7 +2158,7 @@ def run_classification(args) -> Dict[str, Any]:
                 _has_bytes = True
             if _has_bytes:
                 try:
-                    _probe = xgb.XGBClassifier()
+                    _probe = xgb.XGBClassifier(n_jobs=_xgb_predict_threads())
                     _probe.load_model(CLASSIFIER_PATH)
                     _saved_model = (_probe.get_booster().attr('model_name') or '').strip()
                 except Exception:
